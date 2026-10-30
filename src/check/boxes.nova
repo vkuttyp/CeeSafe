@@ -187,6 +187,7 @@ fn checkBoxCreate(
         return c.errorResult(span.start, span.end);
     }
     values.push(value)?;
+    ensurePlaced(c, valueType, 0);
     let box = boxOf(c, valueType, allocator)?;
     let allocError = c.allocErrorType;
     let result = resultOf(c, box, allocError)?;

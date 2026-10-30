@@ -1,0 +1,1365 @@
+// Context effects (the reference's Analysis/EffectChecker.cs; type-system.md §32): infers the `sleep` and `alloc`
+// effects of every compiled function over the package, then reports each operation whose effect is forbidden where it
+// runs: in an `@context` function, while an `@context(atomic)` value is live, or beyond a function's `@effects` bound.
+// Runs on NIR after drop elaboration, so drops are explicit operations. An operation's description (the reference's
+// Witness) is kept as its parts and spelled out only when a message needs it.
+
+fn maxEffectChain() -> u32 => 6;
+
+// Operation kinds: what the description says.
+fn opDrop() -> u32 => 0;         // drops a 'T'
+fn opFree() -> u32 => 1;         // frees a 'T'
+fn opCall() -> u32 => 2;         // calls 'f'
+fn opCallLiteral() -> u32 => 3;  // calls 'f' with the closure at path:line
+fn opCallTyped() -> u32 => 4;    // calls 'f' with a 'T'
+fn opBoxAllocate() -> u32 => 5;  // allocates a 'T'
+fn opBoxHeap() -> u32 => 6;      // allocates a 'T' from the heap
+fn opBoxPlaced() -> u32 => 7;    // places a 'T', which runs 'f'
+fn opMayAllocate() -> u32 => 8;  // may allocate (…), `builtin` says what
+fn opDestroys() -> u32 => 9;     // destroys elements, each a 'T'
+fn opText() -> u32 => 10;        // fixed text, `builtin` says which
+fn opCallThrough() -> u32 => 11; // calls through a closure or function value of type 'T'
+fn opNames() -> u32 => 12;       // names 'f'
+
+/// An operation with effects, and why (Witness): `next` is the function to follow for the rest of the chain.
+struct EffectOp {
+    effects: u32;
+    kind: u32;
+    typ: u32;      // the type the description names, or none
+    function: u32; // the callee or method the description names, or none
+    literal: u32;  // a closure literal's HIR function, or none
+    builtin: u32;
+    next: u32;
+}
+
+fn effectOp(effects: u32, kind: u32, typ: u32, function: u32, next: u32) -> EffectOp =>
+    EffectOp {
+        effects: effects,
+        kind: kind,
+        typ: typ,
+        function: function,
+        literal: none(),
+        builtin: none(),
+        next: next,
+    };
+
+struct InferredEffects {
+    present: bool;
+    effects: u32;
+    hasSleep: bool;
+    sleep: EffectOp;
+    hasAlloc: bool;
+    alloc: EffectOp;
+}
+
+struct DropEffect {
+    stamp: u32; // the inference round it was computed in; 0 for never
+    effects: u32;
+    via: u32;
+}
+
+struct Origins {
+    computed: bool;
+    literalLocals: Vector<u32>;
+    literalBodies: Vector<u32>;
+    ownLocals: Vector<bool>; // by local
+}
+
+struct EffectReport {
+    file: u32;
+    start: u32;
+    message: Vector<u8>;
+}
+
+struct Effects {
+    functions: Vector<u32>;            // NirProgram.functions that are not generic
+    inferred: Vector<InferredEffects>; // by HIR function
+    dropEffects: Vector<DropEffect>;   // by type
+    round: u32;
+    holdsAtomic: Vector<u32>; // by type: 0 unknown, 1 no (or being computed), 2 yes
+    origins: Vector<Origins>; // by NIR function
+    current: u32;             // the NIR function being looked at, or none
+    reported: Vector<EffectReport>;
+}
+
+fn blankOp() -> EffectOp => effectOp(0, 0, none(), none(), none());
+
+fn growTo<T: Copy>(values: borrow mut Vector<T>, length: usize, value: T) -> Result<void, AllocError> {
+    while (values.length < length) {
+        values.push(value)?;
+    }
+    return Ok();
+}
+
+/// The effects of a function as a callee (EffectsOf): an extern's or a `dyn` method's declaration (§37.3), a Nova
+/// function's inference; nothing for generic code, which is never compiled.
+fn effectsOf(c: borrow Checker, e: borrow Effects, function: u32) -> u32 {
+    let f = borrow c.hir.functions[function as usize];
+    if (isExternFunction(c, function) || f.isDynMethod) {
+        return if (f.declaredEffects == none()) allEffects() else f.declaredEffects;
+    }
+    return if ((function as usize) < e.inferred.length &&
+        e.inferred[function as usize].present) e.inferred[function as usize].effects else 0;
+}
+
+/// The effect list of a function or closure type (TypeEffects, §36.3): both effects without one.
+fn typeEffects(c: borrow Checker, typ: u32) -> u32 {
+    if (c.types.is(typ, TypeKind.Function)) {
+        return c.types.info(typ).effects;
+    }
+    if (c.types.isClosure(typ)) {
+        return c.types.info(c.types.info(typ).pointee).effects;
+    }
+    return allEffects();
+}
+
+/// A function's effects as a value (EffectsAsValue, §32.5): its own, and its `@effectsOf` parameters' type lists.
+fn effectsAsValue(c: borrow Checker, e: borrow Effects, function: u32) -> u32 {
+    var effects = effectsOf(c, e, function);
+    for (index in c.hir.functions[function as usize].effectsOfParameters.view()) {
+        let local = c.hir.functions[function as usize].parameters[index as usize];
+        effects = effects | typeEffects(c, c.hir.locals[local as usize].typ);
+    }
+    return effects;
+}
+
+fn structOf(c: borrow Checker, typ: u32) -> u32 =>
+    if (typ != none() && c.types.is(typ, TypeKind.Struct)) c.types.info(typ).structDef else none();
+
+fn allocatorMethod(c: borrow Checker, typ: u32, deallocate: bool) -> u32 {
+    let allocator = c.types.info(typ).allocator;
+    let definition = structOf(c, allocator);
+    if (definition == none()) {
+        return none();
+    }
+    return if (deallocate) c.types.structs[definition as usize]
+        .deallocateMethod else c.types.structs[definition as usize].allocateMethod;
+}
+
+/// The effects of destroying a value of `typ`, and the function that explains them (DropEffects).
+fn dropEffects(c: borrow Checker, e: borrow mut Effects, typ: u32) -> Result<DropEffect, AllocError> {
+    growTo(mut e.dropEffects, c.types.types.length, DropEffect { stamp: 0, effects: 0, via: none() })?;
+    if (e.dropEffects[typ as usize].stamp == e.round) {
+        return Ok(e.dropEffects[typ as usize]);
+    }
+    e.dropEffects[typ as usize] = DropEffect { stamp: e.round, effects: 0, via: none() }; // a recursive type adds nothing
+    var effects: u32 = 0;
+    var via: u32 = none();
+    var parts = Vector<DropEffect>.create();
+    let info = c.types.info(typ);
+    if (c.types.is(typ, TypeKind.Struct)) {
+        let definition = info.structDef;
+        let dropFn = c.types.structs[definition as usize].dropFunction;
+        if (dropFn != none()) {
+            parts.push(DropEffect { stamp: 0, effects: effectsOf(c, e, dropFn), via: dropFn })?;
+        }
+        let count = c.types.structs[definition as usize].fields.length;
+        for (k in 0..count) {
+            let field = c.types.structs[definition as usize].fields[k];
+            parts.push(dropEffects(c, e, c.types.fields[field as usize].typ)?)?;
+        }
+    } else if (c.types.is(typ, TypeKind.Enum)) {
+        let definition = info.enumDef;
+        let variantCount = c.types.enums[definition as usize].variants.length;
+        for (v in 0..variantCount) {
+            let variant = c.types.enums[definition as usize].variants[v];
+            let payloadCount = c.types.variants[variant as usize].payload.length;
+            for (k in 0..payloadCount) {
+                let field = c.types.variants[variant as usize].payload[k];
+                parts.push(dropEffects(c, e, c.types.fields[field as usize].typ)?)?;
+            }
+        }
+    } else if (c.types.is(typ, TypeKind.Thread)) {
+        parts.push(DropEffect { stamp: 0, effects: sleepEffect(), via: none() })?; // dropping a thread waits for it (§38.2)
+        parts.push(dropEffects(c, e, info.element)?)?;
+    } else if (c.types.is(typ, TypeKind.Box)) {
+        parts.push(dropEffects(c, e, info.pointee)?)?;
+        let deallocate = allocatorMethod(c, typ, true);
+        if (deallocate != none()) {
+            parts.push(DropEffect { stamp: 0, effects: effectsOf(c, e, deallocate), via: deallocate })?;
+        }
+    } else if (c.types.is(typ, TypeKind.Array) || c.types.is(typ, TypeKind.StableVector) ||
+        c.types.is(typ, TypeKind.SlotMap) || c.types.is(typ, TypeKind.Vector)) {
+        var element = info.element;
+        if (element == none() && info.pointee != none()) {
+            element = c.types.info(info.pointee).element;
+        }
+        if (element != none()) {
+            parts.push(dropEffects(c, e, element)?)?;
+        }
+    }
+    for (part in parts.view()) {
+        if ((part.effects & (allEffects() ^ effects)) != 0 && via == none()) {
+            via = part.via;
+        }
+        effects = effects | part.effects;
+    }
+    let result = DropEffect { stamp: e.round, effects: effects, via: via };
+    e.dropEffects[typ as usize] = result;
+    return Ok(result);
+}
+
+/// The `@placed` methods placing C state of `typ` runs (PlacedMethods, §33.3): its fields', then its own.
+fn placedMethods(c: borrow Checker, typ: u32, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    let definition = structOf(c, typ);
+    if (definition == none() || c.types.structs[definition as usize].isImported || !c.types.isCLaidOut(typ, 0)) {
+        return Ok();
+    }
+    let count = c.types.structs[definition as usize].fields.length;
+    for (k in 0..count) {
+        let field = c.types.structs[definition as usize].fields[k];
+        placedMethods(c, c.types.fields[field as usize].typ, out)?;
+    }
+    let placed = c.types.structs[definition as usize].placedMethod;
+    if (placed != none()) {
+        out.push(placed)?;
+    }
+    return Ok();
+}
+
+// ---- Origins of closure locals (§32.5) ----
+
+fn assignedValues(
+    n: borrow NirProgram,
+    function: u32,
+    bareOnly: bool,
+    locals: borrow mut Vector<u32>,
+    values: borrow mut Vector<Vector<u32>>,
+) -> Result<void, AllocError> {
+    for (block in n.functions[function as usize].blocks.view()) {
+        for (s in block.statements.view()) {
+            match (n.statements[s as usize]) {
+                NirStatement.Assign(target, value) => {
+                    let p = n.places[target as usize];
+                    noteAssignment(locals, values, p.local, if (p.projections.count == 0) value else none())?;
+                }
+                NirStatement.Unpack(_, _, targets) => {
+                    for (k in 0..targets.count) {
+                        let target = n.at(targets, k);
+                        if (target != none()) {
+                            noteAssignment(locals, values, target, none())?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    return Ok();
+}
+
+fn noteAssignment(
+    locals: borrow mut Vector<u32>,
+    values: borrow mut Vector<Vector<u32>>,
+    local: u32,
+    value: u32,
+) -> Result<void, AllocError> {
+    for (k in 0..locals.length) {
+        if (locals[k] == local) {
+            return values[k].push(value);
+        }
+    }
+    locals.push(local)?;
+    var list = Vector<u32>.create();
+    list.push(value)?;
+    return values.push(list);
+}
+
+fn lookup(keys: borrow Vector<u32>, values: borrow Vector<u32>, key: u32) -> u32 {
+    for (k in 0..keys.length) {
+        if (keys[k] == key) {
+            return values[k];
+        }
+    }
+    return none();
+}
+
+/// The bare local a place operand reads, or none.
+fn bareOperandLocal(n: borrow NirProgram, operand: u32) -> u32 {
+    let place = operandPlace(n, operand);
+    if (place == none() || n.places[place as usize].projections.count != 0) {
+        return none();
+    }
+    return n.places[place as usize].local;
+}
+
+/// `Ref` of a place whose projections are exactly one deref: its local, else none.
+fn reborrowedLocal(n: borrow NirProgram, place: u32) -> u32 {
+    let p = n.places[place as usize];
+    if (p.projections.count != 1 || !isDerefProjectionN(n.projections[p.projections.start as usize])) {
+        return none();
+    }
+    return p.local;
+}
+
+/// The body of the closure a value makes or carries, if known (ClosureSpecialisation.Closure).
+fn closureOf(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    function: u32,
+    value: u32,
+    knownLocals: borrow Vector<u32>,
+    knownBodies: borrow Vector<u32>,
+    codeLocals: borrow Vector<u32>,
+    codeBodies: borrow Vector<u32>,
+    locals: borrow Vector<u32>,
+    values: borrow Vector<Vector<u32>>,
+) -> u32 {
+    if (value == none()) {
+        return none();
+    }
+    match (n.rvalues[value as usize]) {
+        NirRvalue.Ref(_, place) => {
+            let p = n.places[place as usize];
+            if (p.projections.count == 1 && isFieldProjectionN(n.projections[p.projections.start as usize])) {
+                // A closure made here: a reference to field 0 of its environment, whose field 0 is the body's address.
+                let definition = structOf(c, n.functions[function as usize].locals[p.local as usize].typ);
+                if (definition == none() || c.types.structs[definition as usize].fields.length == 0 ||
+                    c.types.structs[definition as usize].fields[0] !=
+                        n.projections[p.projections.start as usize].field) {
+                    return none();
+                }
+                var index = locals.length;
+                for (k in 0..locals.length) {
+                    if (locals[k] == p.local) {
+                        index = k;
+                    }
+                }
+                if (index == locals.length) {
+                    return none();
+                }
+                var agreed: u32 = none();
+                for (environment in values[index].view()) {
+                    var one: u32 = none();
+                    if (environment != none()) {
+                        match (n.rvalues[environment as usize]) {
+                            NirRvalue.Aggregate(fields) => {
+                                if (fields.count > 0) {
+                                    let code = bareOperandLocal(n, n.at(fields, 0));
+                                    if (code != none()) {
+                                        one = lookup(codeLocals, codeBodies, code);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if (one == none() || (agreed != none() && agreed != one)) {
+                        return none();
+                    }
+                    agreed = one;
+                }
+                return agreed;
+            }
+            let reborrowed = reborrowedLocal(n, place);
+            return if (reborrowed == none()) none() else lookup(knownLocals, knownBodies, reborrowed);
+        }
+        NirRvalue.Use(operand) => {
+            let local = bareOperandLocal(n, operand);
+            return if (local == none()) none() else lookup(knownLocals, knownBodies, local);
+        }
+        NirRvalue.Cast(operand) => {
+            let local = bareOperandLocal(n, operand);
+            return if (local == none()) none() else lookup(knownLocals, knownBodies, local);
+        }
+        _ => { return none(); }
+    }
+}
+
+fn closureCode(c: borrow Checker, n: borrow NirProgram, value: u32) -> u32 {
+    if (value == none()) {
+        return none();
+    }
+    return match (n.rvalues[value as usize]) {
+        NirRvalue.FunctionAddress(f) => if (c.hir.functions[f as usize].isClosure) f else none(),
+        _ => none(),
+    };
+}
+
+/// The closure literal each local is known to hold (ClosureSpecialisation.KnownClosures, with no bindings).
+fn knownClosures(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    function: u32,
+    outLocals: borrow mut Vector<u32>,
+    outBodies: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    var locals = Vector<u32>.create();
+    var values = Vector<Vector<u32>>.create();
+    assignedValues(n, function, true, mut locals, mut values)?;
+    var codeLocals = Vector<u32>.create();
+    var codeBodies = Vector<u32>.create();
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (k in 0..locals.length) {
+            let local = locals[k];
+            if (lookup(codeLocals, codeBodies, local) == none()) {
+                var agreed: u32 = none();
+                var ok = true;
+                for (v in values[k].view()) {
+                    let one = closureCode(c, n, v);
+                    if (one == none() || (agreed != none() && agreed != one)) {
+                        ok = false;
+                        break;
+                    }
+                    agreed = one;
+                }
+                if (ok && agreed != none()) {
+                    codeLocals.push(local)?;
+                    codeBodies.push(agreed)?;
+                    changed = true;
+                }
+            }
+            if (lookup(outLocals, outBodies, local) == none() &&
+                c.types.isClosure(n.functions[function as usize].locals[local as usize].typ)) {
+                var agreed: u32 = none();
+                var ok = true;
+                for (v in values[k].view()) {
+                    let one = closureOf(
+                        c,
+                        n,
+                        function,
+                        v,
+                        outLocals,
+                        outBodies,
+                        codeLocals,
+                        codeBodies,
+                        locals,
+                        values,
+                    );
+                    if (one == none() || (agreed != none() && agreed != one)) {
+                        ok = false;
+                        break;
+                    }
+                    agreed = one;
+                }
+                if (ok && agreed != none()) {
+                    outLocals.push(local)?;
+                    outBodies.push(agreed)?;
+                    changed = true;
+                }
+            }
+        }
+    }
+    return Ok();
+}
+
+fn originsOf(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    e: borrow mut Effects,
+    function: u32,
+) -> Result<void, AllocError> {
+    if (e.origins[function as usize].computed) {
+        return Ok();
+    }
+    var literalLocals = Vector<u32>.create();
+    var literalBodies = Vector<u32>.create();
+    knownClosures(c, n, function, mut literalLocals, mut literalBodies)?;
+    var ownLocals = Vector<bool>.create();
+    growTo(mut ownLocals, n.functions[function as usize].locals.length, false)?;
+    let source = n.functions[function as usize].source;
+    var ownCount: usize = 0;
+    for (index in c.hir.functions[source as usize].effectsOfParameters.view()) {
+        ownLocals[index as usize] = true;
+        ownCount += 1;
+    }
+    if (ownCount > 0) {
+        // A local holds the parameter if every assignment to it copies, casts or reborrows one that does.
+        var locals = Vector<u32>.create();
+        var values = Vector<Vector<u32>>.create();
+        assignedValues(n, function, true, mut locals, mut values)?;
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (k in 0..locals.length) {
+                let local = locals[k];
+                if (ownLocals[local as usize]) {
+                    continue;
+                }
+                var all = true;
+                for (v in values[k].view()) {
+                    var held = false;
+                    if (v != none()) {
+                        match (n.rvalues[v as usize]) {
+                            NirRvalue.Use(operand) => {
+                                let from = bareOperandLocal(n, operand);
+                                held = from != none() && ownLocals[from as usize];
+                            }
+                            NirRvalue.Cast(operand) => {
+                                let from = bareOperandLocal(n, operand);
+                                held = from != none() && ownLocals[from as usize];
+                            }
+                            NirRvalue.Ref(_, place) => {
+                                let from = reborrowedLocal(n, place);
+                                held = from != none() && ownLocals[from as usize];
+                            }
+                            _ => {}
+                        }
+                    }
+                    if (!held) {
+                        all = false;
+                        break;
+                    }
+                }
+                if (all) {
+                    ownLocals[local as usize] = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+    e.origins[function as usize] = Origins {
+        computed: true,
+        literalLocals: literalLocals,
+        literalBodies: literalBodies,
+        ownLocals: ownLocals,
+    };
+    return Ok();
+}
+
+/// The literal an operand of the current function is known to hold, or none (Origin's first half).
+fn originLiteral(n: borrow NirProgram, e: borrow Effects, operand: u32) -> u32 {
+    let local = bareOperandLocal(n, operand);
+    if (e.current == none() || local == none()) {
+        return none();
+    }
+    let o = borrow e.origins[e.current as usize];
+    return lookup(o.literalLocals, o.literalBodies, local);
+}
+
+/// Is the operand the current function's own @effectsOf parameter (Origin's second half)?
+fn originOwn(n: borrow NirProgram, e: borrow Effects, operand: u32) -> bool {
+    let local = bareOperandLocal(n, operand);
+    if (e.current == none() || local == none()) {
+        return false;
+    }
+    return e.origins[e.current as usize].ownLocals[local as usize];
+}
+
+// ---- Operations ----
+
+/// A call's effects (CallEffects, §32.1, §32.5): the callee's own, and for each of its `@effectsOf` parameters, the
+/// argument's: a known closure literal's body, nothing for the caller's own such parameter passed on, else its type's.
+fn callOperations(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    e: borrow Effects,
+    callee: u32,
+    arguments: Range,
+    out: borrow mut Vector<EffectOp>,
+) -> Result<void, AllocError> {
+    let calleeEffects = effectsOf(c, e, callee);
+    if (calleeEffects != 0) {
+        out.push(effectOp(calleeEffects, opCall(), none(), callee, callee))?;
+    }
+    for (index in c.hir.functions[callee as usize].effectsOfParameters.view()) {
+        if (index >= arguments.count) {
+            continue;
+        }
+        let argument = n.at(arguments, index);
+        if (originOwn(n, e, argument)) {
+            continue;
+        }
+        let literal = originLiteral(n, e, argument);
+        if (literal != none()) {
+            let effects = effectsOf(c, e, literal);
+            if (effects != 0) {
+                var op = effectOp(effects, opCallLiteral(), none(), callee, literal);
+                op.literal = literal;
+                out.push(op)?;
+            }
+        } else {
+            let typ = n.operandTypes[argument as usize];
+            let typed = typeEffects(c, typ);
+            if (typed != 0) {
+                out.push(effectOp(typed, opCallTyped(), typ, callee, none()))?;
+            }
+        }
+    }
+    return Ok();
+}
+
+fn textOp(effects: u32, text: u32) -> EffectOp {
+    var op = effectOp(effects, opText(), none(), none(), none());
+    op.builtin = text;
+    return op;
+}
+
+/// The effects of built-in operations (BuiltinEffects, the table of §32.1); effects 0 for none.
+fn builtinOperation(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    e: borrow mut Effects,
+    rvalue: u32,
+    function: u32,
+    arguments: Range,
+) -> Result<EffectOp, AllocError> {
+    let sleep = sleepEffect();
+    let alloc = allocEffect();
+    if (function == bfBoxCreate()) {
+        let typ = n.rvalueTypes[rvalue as usize];
+        var box: u32 = none();
+        if (c.types.is(typ, TypeKind.Enum)) {
+            box = c.types.enums[c.types.info(typ).enumDef as usize].resultOk;
+        }
+        let allocate = if (box == none()) none() else allocatorMethod(c, box, false);
+        var op = if (allocate != none()) effectOp(
+            effectsOf(c, e, allocate),
+            opBoxAllocate(),
+            box,
+            none(),
+            allocate,
+        ) else effectOp(
+            alloc,
+            opBoxHeap(),
+            box,
+            none(),
+            none(),
+        );
+        if (box != none()) {
+            // Placing C state runs the `@placed` methods (type-system.md §33.3).
+            var placed = Vector<u32>.create();
+            placedMethods(c, c.types.info(box).pointee, mut placed)?;
+            for (method in placed.view()) {
+                let extra = effectsOf(c, e, method) & (allEffects() ^ op.effects);
+                if (extra != 0) {
+                    let effects = op.effects;
+                    op = effectOp(effects, opBoxPlaced(), c.types.info(box).pointee, method, method);
+                }
+                op.effects = op.effects | extra;
+            }
+        }
+        return Ok(op);
+    }
+    if (function == bfArenaAlloc() || function == bfArenaAllocArray()) {
+        let region = n.operandTypes[n.at(arguments, 0) as usize];
+        if (c.types.is(region, TypeKind.Reference) && regionIndex(c.types.info(c.types.info(region).pointee).region) ==
+            regionIndex(RegionKind.FixedBuffer)) {
+            return Ok(blankOp()); // a fixed buffer never asks a heap (§19.4)
+        }
+    }
+    if (function == bfArenaCreate() || function == bfArenaAlloc() || function == bfArenaAllocArray() ||
+        function == bfScratchEnter() || function == bfPoolCreate() || function == bfVectorWithCapacity() ||
+        function == bfVectorPush() || function == bfStringAppend() || function == bfStringAppendNumber() ||
+        function == bfStableVectorPush() || function == bfSlotMapInsert()) {
+        var op = effectOp(alloc, opMayAllocate(), none(), none(), none());
+        op.builtin = function;
+        return Ok(op);
+    }
+    if (function == bfVectorClear() || function == bfVectorTruncate()) {
+        // Destroying the elements runs their drops (§32.1: dropping a value).
+        let receiver = n.operandTypes[n.at(arguments, 0) as usize];
+        let element = c.types.info(c.types.info(c.types.info(receiver).pointee).pointee).element;
+        let d = dropEffects(c, e, element)?;
+        return Ok(effectOp(d.effects, opDestroys(), element, none(), d.via));
+    }
+    if (function == bfProcessRun()) {
+        return Ok(textOp(sleep | alloc, 0));
+    }
+    if (function == bfConsoleWrite() || function == bfConsoleWriteLine() || function == bfConsoleRead() ||
+        function == bfConsoleWriteBytes() ||
+        function == bfConsoleWriteError() || function == bfConsoleWriteErrorLine()) {
+        return Ok(textOp(sleep, 1));
+    }
+    if (function == bfFileOpen() || function == bfFileCreate() || function == bfFileRemove() ||
+        function == bfResourceRead() || function == bfResourceWrite() || function == bfTcpListen() ||
+        function == bfTcpAccept() || function == bfTcpConnect() || function == bfTcpShutdownWrite()) {
+        return Ok(textOp(sleep, 2));
+    }
+    if (function == bfThreadSpawn() || function == bfThreadSpawnBoxed()) {
+        return Ok(textOp(sleep | alloc, 3));
+    }
+    if (function == bfThreadJoin()) {
+        return Ok(textOp(sleep, 4));
+    }
+    if (function == bfThreadBoth()) {
+        return Ok(textOp(sleep | alloc, 5));
+    }
+    if (function == bfCallPointer()) {
+        return Ok(textOp(sleep | alloc, 6));
+    }
+    if (function == bfCallClosure() || function == bfCallFunction()) {
+        let argument = n.at(arguments, 0);
+        // A call through the function's own @effectsOf parameter is its callers' effect (§32.5).
+        if (originOwn(n, e, argument)) {
+            return Ok(blankOp());
+        }
+        // The type's effect list (type-system.md §36.3): every value of the type is checked against it.
+        let argumentType = n.operandTypes[argument as usize];
+        let typ = if (function == bfCallClosure()) c.types.info(argumentType).pointee else argumentType;
+        var op = effectOp(c.types.info(typ).effects, opCallThrough(), argumentType, none(), none());
+        op.builtin = function;
+        return Ok(op);
+    }
+    return Ok(blankOp());
+}
+
+/// The operations of a statement with effects (Operations).
+fn statementOperations(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    e: borrow mut Effects,
+    s: u32,
+    out: borrow mut Vector<EffectOp>,
+) -> Result<void, AllocError> {
+    let locals = borrow n.functions[e.current as usize].locals;
+    var rvalue: u32 = none();
+    match (n.statements[s as usize]) {
+        NirStatement.Assign(_, value) => { rvalue = value; }
+        NirStatement.Eval(value) => { rvalue = value; }
+        NirStatement.Drop(place, _) => {
+            let typ = nirPlaceType(c, n, locals, place);
+            let d = dropEffects(c, e, typ)?;
+            if (d.effects != 0) {
+                out.push(effectOp(d.effects, opDrop(), typ, none(), d.via))?;
+            }
+        }
+        NirStatement.BoxFree(place, _) => {
+            let typ = nirPlaceType(c, n, locals, place);
+            let deallocate = allocatorMethod(c, typ, true);
+            if (deallocate != none()) {
+                out.push(effectOp(effectsOf(c, e, deallocate), opFree(), typ, none(), deallocate))?;
+            }
+        }
+        _ => {}
+    }
+    if (rvalue == none()) {
+        return Ok();
+    }
+    match (n.rvalues[rvalue as usize]) {
+        NirRvalue.Call(callee, arguments) => { callOperations(c, n, e, callee, arguments, out)?; }
+        NirRvalue.Builtin(function, arguments) => {
+            let op = builtinOperation(c, n, e, rvalue, function, arguments)?;
+            if (op.effects != 0) {
+                out.push(op)?;
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+// ---- Descriptions ----
+
+/// 'f' or 'Owner.f' (Describe).
+fn appendDescribedFunction(c: borrow Checker, function: u32, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let f = borrow c.hir.functions[function as usize];
+    appendText(out, "'")?;
+    if (f.owner != none()) {
+        appendBytes(out, c.typeName(f.owner))?;
+        appendText(out, ".")?;
+    }
+    appendBytes(out, c.name(f.name))?;
+    return appendText(out, "'");
+}
+
+fn lineOfOffset(text: borrow Vector<u8>, offset: u32) -> u64 {
+    var line: u64 = 1;
+    var i: usize = 0;
+    while (i < offset as usize && i < text.length) {
+        if (text[i] == '\r') {
+            if (i + 1 < text.length && text[i + 1] == '\n') {
+                i += 1;
+            }
+            if (i < offset as usize) {
+                line += 1;
+            }
+        } else if (text[i] == '\n') {
+            line += 1;
+        }
+        i += 1;
+    }
+    return line;
+}
+
+fn appendOpDescription(c: borrow Checker, op: borrow EffectOp, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let kind = op.kind;
+    if (kind == opDrop() || kind == opFree() || kind == opBoxAllocate() || kind == opDestroys()) {
+        appendText(
+            out,
+            if (kind ==
+                opDrop()) "drops a " else if (kind ==
+                opFree()) "frees a " else if (kind == opBoxAllocate()) "allocates a " else "destroys elements, each a ",
+        )?;
+        return appendQuotedType(out, c, op.typ);
+    }
+    if (kind == opCall() || kind == opCallLiteral() || kind == opCallTyped()) {
+        appendText(out, "calls ")?;
+        appendDescribedFunction(c, op.function, out)?;
+        if (kind == opCallLiteral()) {
+            let f = borrow c.hir.functions[op.literal as usize];
+            let start = c.front.ast.functions[f.syntax as usize].start;
+            appendText(out, " with the closure at ")?;
+            appendBytes(out, c.filePaths[f.file as usize].view())?;
+            appendText(out, ":")?;
+            appendDecimal(out, lineOfOffset(c.fileTexts[f.file as usize], start))?;
+        } else if (kind == opCallTyped()) {
+            appendText(out, " with a ")?;
+            appendQuotedType(out, c, op.typ)?;
+            if (op.effects == allEffects()) {
+                appendText(out, ", which has no effect list (type-system.md §36.3)")?;
+            }
+        }
+        return Ok();
+    }
+    if (kind == opBoxHeap()) {
+        appendText(out, "allocates a '")?;
+        if (op.typ == none()) {
+            appendText(out, "Box")?;
+        } else {
+            appendBytes(out, c.typeName(op.typ))?;
+        }
+        return appendText(out, "' from the heap");
+    }
+    if (kind == opBoxPlaced()) {
+        appendText(out, "places a ")?;
+        appendQuotedType(out, c, op.typ)?;
+        appendText(out, ", which runs ")?;
+        return appendDescribedFunction(c, op.function, out);
+    }
+    if (kind == opMayAllocate()) {
+        let b = op.builtin;
+        appendText(out, "may allocate (")?;
+        appendText(
+            out,
+            if (b == bfArenaCreate() ||
+                b == bfPoolCreate()) "makes a region" else if (b == bfArenaAlloc() ||
+                b ==
+                    bfArenaAllocArray()) "allocates from a region" else if (b ==
+                bfScratchEnter()) "enters a scratch frame" else "grows a collection",
+        )?;
+        return appendText(out, ")");
+    }
+    if (kind == opText()) {
+        let text = match (op.builtin) {
+            0 => "runs a process",
+            1 => "does console I/O",
+            2 => "does file or socket I/O",
+            3 => "starts a thread (type-system.md §38.2)",
+            4 => "waits for a thread (type-system.md §38.2)",
+            5 => "runs two closures on two threads (type-system.md §38.6)",
+            _ => "calls through a C function pointer, which may do anything (type-system.md §32.1)",
+        };
+        return appendText(out, text);
+    }
+    if (kind == opCallThrough()) {
+        appendText(
+            out,
+            if (op.builtin ==
+                bfCallClosure()) "calls through a closure of type " else "calls through a function value of type ",
+        )?;
+        appendQuotedType(out, c, op.typ)?;
+        if (op.effects == allEffects()) {
+            appendText(out, ", which has no effect list (type-system.md §36.3)")?;
+        }
+        return Ok();
+    }
+    appendText(out, "names ")?;
+    return appendDescribedFunction(c, op.function, out);
+}
+
+/// The chain of calls from an operation to where the effect comes from (Explain).
+fn explainOp(
+    c: borrow Checker,
+    e: borrow Effects,
+    op: borrow EffectOp,
+    effect: u32,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    appendOpDescription(c, op, out)?;
+    var seen = Vector<u32>.create();
+    var next = op.next;
+    var depth: u32 = 0;
+    while (next != none() && !containsU32(seen, next)) {
+        seen.push(next)?;
+        if (isExternFunction(c, next)) {
+            let declared = c.hir.functions[next as usize].declaredEffects;
+            if (declared != none()) {
+                appendText(out, ", declared @effects(")?;
+                appendEffectNames(out, declared)?;
+                appendText(out, ")")?;
+            } else {
+                appendText(out, ", a C function without @effects, which may do anything")?;
+            }
+            break;
+        }
+        if ((next as usize) >= e.inferred.length || !e.inferred[next as usize].present) {
+            break;
+        }
+        let inferred = borrow e.inferred[next as usize];
+        let has = if (effect == sleepEffect()) inferred.hasSleep else inferred.hasAlloc;
+        if (!has) {
+            break;
+        }
+        if (depth == maxEffectChain()) {
+            appendText(out, ", …")?;
+            break;
+        }
+        let step = if (effect == sleepEffect()) inferred.sleep else inferred.alloc;
+        appendText(out, ", which ")?;
+        appendOpDescription(c, step, out)?;
+        next = step.next;
+        depth += 1;
+    }
+    return Ok();
+}
+
+// ---- Inference (§32.1) ----
+
+fn inferEffects(c: borrow Checker, n: borrow NirProgram, e: borrow mut Effects) -> Result<void, AllocError> {
+    for (k in e.functions.view()) {
+        e.inferred[n.functions[k as usize].source as usize].present = true;
+    }
+    // Effects only grow, so iterating to a fixed point terminates (two bits per function).
+    var changed = true;
+    while (changed) {
+        changed = false;
+        e.round += 1; // a new round forgets the drop effects of the last
+        for (i in 0..e.functions.length) {
+            let function = e.functions[i];
+            e.current = function;
+            originsOf(c, n, e, function)?;
+            let source = n.functions[function as usize].source;
+            for (block in n.functions[function as usize].blocks.view()) {
+                for (s in block.statements.view()) {
+                    var ops = Vector<EffectOp>.create();
+                    statementOperations(c, n, e, s, mut ops)?;
+                    for (op in ops.view()) {
+                        let inferred = borrow mut e.inferred[source as usize];
+                        if ((op.effects & (allEffects() ^ inferred.effects)) == 0) {
+                            continue;
+                        }
+                        changed = true;
+                        if ((op.effects & sleepEffect()) != 0 && !inferred.hasSleep) {
+                            inferred.hasSleep = true;
+                            inferred.sleep = op;
+                        }
+                        if ((op.effects & allocEffect()) != 0 && !inferred.hasAlloc) {
+                            inferred.hasAlloc = true;
+                            inferred.alloc = op;
+                        }
+                        inferred.effects = inferred.effects | op.effects;
+                    }
+                }
+            }
+        }
+    }
+    return Ok();
+}
+
+// ---- Where an atomic-context value is live (§32.3) ----
+
+/// Does a value of this type hold an `@context(atomic)` struct by value, or in a box it owns (HoldsAtomic)?
+fn holdsAtomic(c: borrow Checker, e: borrow mut Effects, typ: u32) -> Result<bool, AllocError> {
+    growTo(mut e.holdsAtomic, c.types.types.length, 0)?;
+    if (e.holdsAtomic[typ as usize] != 0) {
+        return Ok(e.holdsAtomic[typ as usize] == 2);
+    }
+    e.holdsAtomic[typ as usize] = 1;
+    var holds = false;
+    let info = c.types.info(typ);
+    if (c.types.is(typ, TypeKind.Struct)) {
+        let definition = info.structDef;
+        holds = c.types.structs[definition as usize].isAtomicContext;
+        let count = c.types.structs[definition as usize].fields.length;
+        for (k in 0..count) {
+            if (holds) {
+                break;
+            }
+            let field = c.types.structs[definition as usize].fields[k];
+            holds = holdsAtomic(c, e, c.types.fields[field as usize].typ)?;
+        }
+    } else if (c.types.is(typ, TypeKind.Enum)) {
+        let definition = info.enumDef;
+        let variantCount = c.types.enums[definition as usize].variants.length;
+        for (v in 0..variantCount) {
+            let variant = c.types.enums[definition as usize].variants[v];
+            let payloadCount = c.types.variants[variant as usize].payload.length;
+            for (k in 0..payloadCount) {
+                if (!holds) {
+                    let field = c.types.variants[variant as usize].payload[k];
+                    holds = holdsAtomic(c, e, c.types.fields[field as usize].typ)?;
+                }
+            }
+        }
+    } else if (c.types.is(typ, TypeKind.Box)) {
+        holds = holdsAtomic(c, e, info.pointee)?;
+    } else if (c.types.is(typ, TypeKind.Array)) {
+        holds = holdsAtomic(c, e, info.element)?;
+    }
+    e.holdsAtomic[typ as usize] = if (holds) 2 else 1;
+    return Ok(holds);
+}
+
+/// Moves of whole locals an rvalue makes (Moved).
+fn movedLocals(n: borrow NirProgram, rvalue: u32, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    match (n.rvalues[rvalue as usize]) {
+        NirRvalue.Use(o) => { return movedLocal(n, o, out); }
+        NirRvalue.Call(_, arguments) => { return movedLocalsIn(n, arguments, out); }
+        NirRvalue.Builtin(_, arguments) => { return movedLocalsIn(n, arguments, out); }
+        NirRvalue.Aggregate(fields) => { return movedLocalsIn(n, fields, out); }
+        NirRvalue.EnumAggregate(_, payload) => { return movedLocalsIn(n, payload, out); }
+        NirRvalue.Array(elements) => { return movedLocalsIn(n, elements, out); }
+        _ => { return Ok(); }
+    }
+}
+
+fn movedLocalsIn(n: borrow NirProgram, operands: Range, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    for (k in 0..operands.count) {
+        movedLocal(n, n.at(operands, k), out)?;
+    }
+    return Ok();
+}
+
+fn movedLocal(n: borrow NirProgram, operand: u32, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    match (n.operands[operand as usize]) {
+        NirOperand.Place(place, isMove) => {
+            if (isMove && n.places[place as usize].projections.count == 0) {
+                out.push(n.places[place as usize].local)?;
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+/// Holder locals a statement ends: moved away, dropped, or whose storage ends (Killed).
+fn killedHolders(
+    n: borrow NirProgram,
+    s: u32,
+    holders: borrow Vector<bool>,
+    out: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    var ids = Vector<u32>.create();
+    match (n.statements[s as usize]) {
+        NirStatement.Drop(place, _) => {
+            if (n.places[place as usize].projections.count == 0) {
+                ids.push(n.places[place as usize].local)?;
+            }
+        }
+        NirStatement.StorageDead(local) => { ids.push(local)?; }
+        NirStatement.Assign(_, value) => { movedLocals(n, value, mut ids)?; }
+        NirStatement.Eval(value) => { movedLocals(n, value, mut ids)?; }
+        _ => {}
+    }
+    for (id in ids.view()) {
+        if (holders[id as usize]) {
+            out.push(id)?;
+        }
+    }
+    return Ok();
+}
+
+fn transferHolders(
+    n: borrow NirProgram,
+    live: borrow mut Vector<bool>,
+    s: u32,
+    holders: borrow Vector<bool>,
+) -> Result<void, AllocError> {
+    var killed = Vector<u32>.create();
+    killedHolders(n, s, holders, mut killed)?;
+    for (id in killed.view()) {
+        live[id as usize] = false;
+    }
+    match (n.statements[s as usize]) {
+        NirStatement.Assign(target, _) => {
+            let p = n.places[target as usize];
+            if (p.projections.count == 0 && holders[p.local as usize]) {
+                live[p.local as usize] = true;
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn copyBools(values: borrow Vector<bool>) -> Result<Vector<bool>, AllocError> {
+    var out = Vector<bool>.create();
+    for (v in values.view()) {
+        out.push(v)?;
+    }
+    return Ok(out);
+}
+
+/// For each block position, the holder locals that may be live on entry: a forward, may analysis (LiveHolders).
+fn liveHolders(
+    n: borrow NirProgram,
+    function: u32,
+    holders: borrow Vector<bool>,
+) -> Result<Vector<Vector<bool>>, AllocError> {
+    let blockCount = n.functions[function as usize].blocks.length;
+    let count = n.functions[function as usize].locals.length;
+    var blockOf = Vector<u32>.create();
+    var liveIn = Vector<Vector<bool>>.create();
+    for (position in 0..blockCount) {
+        var bits = Vector<bool>.create();
+        growTo(mut bits, count, false)?;
+        liveIn.push(bits)?;
+        let id = n.functions[function as usize].blocks[position].id;
+        growTo(mut blockOf, (id + 1) as usize, none())?;
+        blockOf[id as usize] = truncate<u32>(position);
+    }
+    for (p in 0..n.functions[function as usize].parameterCount) {
+        if (holders[p as usize]) {
+            liveIn[0][p as usize] = true;
+        }
+    }
+    var work = Vector<u32>.create();
+    var head: usize = 0;
+    var queued = Vector<bool>.create();
+    for (position in 0..blockCount) {
+        work.push(truncate<u32>(position))?;
+        queued.push(true)?;
+    }
+    while (head < work.length) {
+        let position = work[head] as usize;
+        head += 1;
+        queued[position] = false;
+        var live = copyBools(liveIn[position])?;
+        for (s in n.functions[function as usize].blocks[position].statements.view()) {
+            transferHolders(n, mut live, s, holders)?;
+        }
+        for (successor in n.functions[function as usize].blocks[position].successors.view()) {
+            let target = blockOf[successor as usize] as usize;
+            var changed = false;
+            for (k in 0..count) {
+                if (live[k] && !liveIn[target][k]) {
+                    liveIn[target][k] = true;
+                    changed = true;
+                }
+            }
+            if (changed && !queued[target]) {
+                queued[target] = true;
+                work.push(truncate<u32>(target))?;
+            }
+        }
+    }
+    return Ok(liveIn);
+}
+
+// ---- Checking (§32.2–§32.3) ----
+
+// What a report's context says.
+fn contextOfFunction() -> u32 => 0; // 'f' is @context(…)
+fn contextLive() -> u32 => 1;       // a 'T' is live here, …
+fn contextBound() -> u32 => 2;      // 'f' is declared @effects(…), or the closure's type list
+fn contextValue() -> u32 => 3;      // 'f' is used as a 'T'
+
+fn reportEffect(
+    c: borrow mut Checker,
+    n: borrow NirProgram,
+    e: borrow mut Effects,
+    function: u32,
+    s: u32,
+    forbidden: u32,
+    op: borrow EffectOp,
+    context: u32,
+    typ: u32,
+    named: u32,
+) -> Result<void, AllocError> {
+    if (forbidden == 0) {
+        return Ok();
+    }
+    let effect = if ((forbidden & sleepEffect()) != 0) sleepEffect() else allocEffect();
+    let source = n.functions[function as usize].source;
+    var message = Vector<u8>.create();
+    if (context == contextOfFunction()) {
+        appendDescribedFunction(c, source, mut message)?;
+        appendText(
+            mut message,
+            if (c.hir.functions[source as usize].context == 2) " is @context(irq)" else " is @context(atomic)",
+        )?;
+    } else if (context == contextLive()) {
+        appendText(mut message, "a ")?;
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, " is live here, which makes this an atomic context (type-system.md §32.3)")?;
+    } else if (context == contextBound()) {
+        var declared = c.hir.functions[source as usize].declaredEffects;
+        if (declared == none()) {
+            declared = 0;
+        }
+        if (c.hir.functions[source as usize].isClosure) {
+            appendText(mut message, "this closure's type has the effect list @effects(")?;
+            appendEffectNames(mut message, declared)?;
+            appendText(mut message, ") (type-system.md §36.3)")?;
+        } else {
+            appendDescribedFunction(c, source, mut message)?;
+            appendText(mut message, " is declared @effects(")?;
+            appendEffectNames(mut message, declared)?;
+            appendText(mut message, ")")?;
+        }
+    } else {
+        appendDescribedFunction(c, named, mut message)?;
+        appendText(mut message, " is used as a ")?;
+        appendQuotedType(mut message, c, typ)?;
+    }
+    appendText(
+        mut message,
+        if (effect == sleepEffect()) ", but this may sleep: it " else ", but this may allocate: it ",
+    )?;
+    explainOp(c, e, op, effect, mut message)?;
+    let file = c.hir.functions[source as usize].file;
+    let span = n.statementSpans[s as usize];
+    for (r in e.reported.view()) {
+        if (r.file == file && r.start == span.start && sameBytes(r.message.view(), message.view())) {
+            return Ok();
+        }
+    }
+    e.reported.push(EffectReport { file: file, start: span.start, message: copyBytes(message.view())? })?;
+    return c.front.diagnostics.error(effectViolation(), file, span.start, span.end, message);
+}
+
+fn checkFunctionEffects(
+    c: borrow mut Checker,
+    n: borrow NirProgram,
+    e: borrow mut Effects,
+    function: u32,
+) -> Result<void, AllocError> {
+    e.current = function;
+    originsOf(c, n, e, function)?;
+    let source = n.functions[function as usize].source;
+    let context = c.hir.functions[source as usize].context;
+    let contextForbids = if (context == 1) sleepEffect() else if (context == 2) allEffects() else 0;
+    let declared = c.hir.functions[source as usize].declaredEffects;
+    let boundForbids = if (isExternFunction(
+        c,
+        source,
+    ) || declared == none()) 0 else allEffects() & (allEffects() ^ declared);
+    let localCount = n.functions[function as usize].locals.length;
+    var holders = Vector<bool>.create();
+    var anyHolder = false;
+    for (k in 0..localCount) {
+        let holds = holdsAtomic(c, e, n.functions[function as usize].locals[k].typ)?;
+        holders.push(holds)?;
+        if (holds) {
+            anyHolder = true;
+        }
+    }
+    var liveIn = Vector<Vector<bool>>.create();
+    if (anyHolder) {
+        liveIn = liveHolders(n, function, holders)?;
+    }
+    let blockCount = n.functions[function as usize].blocks.length;
+    for (position in 0..blockCount) {
+        var live = if (anyHolder) copyBools(liveIn[position])? else Vector<bool>.create();
+        let statementCount = n.functions[function as usize].blocks[position].statements.length;
+        for (i in 0..statementCount) {
+            let s = n.functions[function as usize].blocks[position].statements[i];
+            var firstLive: u32 = none();
+            if (anyHolder) {
+                var killed = Vector<u32>.create();
+                killedHolders(n, s, holders, mut killed)?;
+                for (k in 0..localCount) {
+                    if (live[k] && !containsU32(killed, truncate<u32>(k))) {
+                        firstLive = truncate<u32>(k);
+                        break;
+                    }
+                }
+            }
+            let guarded = if (firstLive != none()) sleepEffect() else 0;
+            let liveType =
+                if (firstLive != none()) n.functions[function as usize].locals[firstLive as usize].typ else none();
+            var ops = Vector<EffectOp>.create();
+            statementOperations(c, n, e, s, mut ops)?;
+            for (op in ops.view()) {
+                reportEffect(
+                    c,
+                    n,
+                    e,
+                    function,
+                    s,
+                    op.effects & contextForbids,
+                    op,
+                    contextOfFunction(),
+                    none(),
+                    none(),
+                )?;
+                reportEffect(
+                    c,
+                    n,
+                    e,
+                    function,
+                    s,
+                    op.effects & guarded & (allEffects() ^ contextForbids),
+                    op,
+                    contextLive(),
+                    liveType,
+                    none(),
+                )?;
+                reportEffect(c, n, e, function, s, op.effects & boundForbids, op, contextBound(), none(), none())?;
+            }
+            // A named function given a type with an effect list must have no other effects (§36.3). A closure body is
+            // bounded by its type's list instead, and checked as a function.
+            let value = match (n.statements[s as usize]) {
+                NirStatement.Assign(_, v) => v,
+                NirStatement.Eval(v) => v,
+                _ => none(),
+            };
+            if (value != none()) {
+                match (n.rvalues[value as usize]) {
+                    NirRvalue.FunctionAddress(target) => {
+                        let typ = n.rvalueTypes[value as usize];
+                        if ((c.types.is(typ, TypeKind.Function) || c.types.is(typ, TypeKind.Closure)) &&
+                            !c.hir.functions[target as usize].isClosure) {
+                            let op = effectOp(0, opNames(), none(), target, target);
+                            let forbidden = effectsAsValue(c, e, target) & (allEffects() ^ c.types.info(typ).effects);
+                            reportEffect(c, n, e, function, s, forbidden, op, contextValue(), typ, target)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if (anyHolder) {
+                transferHolders(n, mut live, s, holders)?;
+            }
+        }
+    }
+    return Ok();
+}
+
+/// EffectChecker.Check: inference over every compiled function, then each one checked.
+fn checkEffects(c: borrow mut Checker, n: borrow NirProgram) -> Result<void, AllocError> {
+    var e = Effects {
+        functions: Vector<u32>.create(),
+        inferred: Vector<InferredEffects>.create(),
+        dropEffects: Vector<DropEffect>.create(),
+        round: 0,
+        holdsAtomic: Vector<u32>.create(),
+        origins: Vector<Origins>.create(),
+        current: none(),
+        reported: Vector<EffectReport>.create(),
+    };
+    for (k in 0..n.functions.length) {
+        if (!functionIsGeneric(c, n.functions[k].source)) {
+            e.functions.push(truncate<u32>(k))?;
+        }
+        e.origins.push(
+            Origins {
+                computed: false,
+                literalLocals: Vector<u32>.create(),
+                literalBodies: Vector<u32>.create(),
+                ownLocals: Vector<bool>.create(),
+            },
+        )?;
+    }
+    for (k in 0..c.hir.functions.length) {
+        e.inferred.push(
+            InferredEffects {
+                present: false,
+                effects: 0,
+                hasSleep: false,
+                sleep: blankOp(),
+                hasAlloc: false,
+                alloc: blankOp(),
+            },
+        )?;
+    }
+    inferEffects(c, n, mut e)?;
+    for (k in 0..e.functions.length) {
+        let function = e.functions[k];
+        checkFunctionEffects(c, n, mut e, function)?;
+    }
+    return Ok();
+}

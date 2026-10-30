@@ -1,6 +1,6 @@
 // What runs after the type checker succeeded (the reference's Compilation.CreateOnCompilerStack): the HIR lowered to
 // NIR, the ownership analyses on every function that is not an instantiation, N0222 for instances whose bodies did
-// not check, then drop elaboration.
+// not check, then drop elaboration and the effect checker.
 
 fn invalidInstantiation() -> u32 => 222;
 
@@ -35,6 +35,8 @@ fn analyzeProgram(c: borrow mut Checker) -> Result<NirProgram, AllocError> {
                 elaborateDrops(c, mut n, truncate<u32>(k))?;
             }
         }
+        // Context effects need the drops explicit (type-system.md §32).
+        checkEffects(c, n)?;
     }
     return Ok(n);
 }
