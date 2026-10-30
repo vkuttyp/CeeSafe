@@ -74,7 +74,7 @@ the markers, and never edit between them.
 
 ## Bootstrap rules
 
-- Build only with the pinned stage-0 compiler named in `bootstrap/reference.md` (today `~/.nova/0.5.0/bin/novac`, 0.5.0).
+- Build only with the pinned stage-0 compiler named in `bootstrap/reference.md` (today `~/.nova/0.6.0/bin/novac`, 0.6.0).
   `~/.nova/bin/novac` is 0.3.1, which CosmoOS's `make nova` still pins: leave it there.
   The `novac` on `PATH` may be a development wrapper around `~/Nova`'s working tree and is not reproducible.
 - Until `ceesafec` compiles itself (ROADMAP P6R), sources are `.nova` files and the manifest is `nova.toml`, because
@@ -88,19 +88,19 @@ the markers, and never edit between them.
 ## Tools
 
 ```sh
-python3 tools/run_corpus.py --compiler ~/.nova/0.5.0/bin/novac                 # Nova's corpus against a compiler
-python3 tools/run_corpus.py --compiler out/ceesafe --reference ~/.nova/0.5.0/bin/novac --family parse-pass
-python3 tools/run_corpus.py --compiler ~/.nova/0.5.0/bin/novac --corpus probes --family run-pass --family check-fail \
+python3 tools/run_corpus.py --compiler ~/.nova/0.6.0/bin/novac                 # Nova's corpus against a compiler
+python3 tools/run_corpus.py --compiler out/ceesafe --reference ~/.nova/0.6.0/bin/novac --family parse-pass
+python3 tools/run_corpus.py --compiler ~/.nova/0.6.0/bin/novac --corpus probes --family run-pass --family check-fail \
     --family parse-fail                                                  # the P1 probes
 W=""; for f in src/support/*.nova; do W="$W --with $f"; done                # zsh: then ${=W}
-python3 tools/run_corpus.py --compiler ~/.nova/0.5.0/bin/novac --corpus tests/support --family run-pass $W --check-leaks
-python3 tools/fault_sweep.py --compiler ~/.nova/0.5.0/bin/novac tests/support/fault/alloc-sweep.nova src/support/*.nova
+python3 tools/run_corpus.py --compiler ~/.nova/0.6.0/bin/novac --corpus tests/support --family run-pass $W --check-leaks
+python3 tools/fault_sweep.py --compiler ~/.nova/0.6.0/bin/novac tests/support/fault/alloc-sweep.nova src/support/*.nova
 python3 tools/oracles/support_models.py                                  # oracle summaries for tests/support
 python3 tools/inventory.py                                               # regenerate docs/reference-inventory.md
 python3 tools/gen_catalog.py --nova <Nova at the pinned tag>            # regenerate src/diagnostics/catalog.nova
 python3 tools/compare_tokens.py --ceesafec out/ceesafe --oracle <token-dump> --root <Nova> lib tests/corpus
                                                                         # the lexer against the reference (docs/p2-frontend.md §3)
-python3 tools/compare_parse.py --ceesafec out/ceesafe --novac ~/.nova/0.5.0/bin/novac --root <Nova> lib tests/corpus
+python3 tools/compare_parse.py --ceesafec out/ceesafe --novac ~/.nova/0.6.0/bin/novac --root <Nova> lib tests/corpus
                                                                         # trees and diagnostics against novac (§6)
 python3 tools/parser_fuzz.py <dir> 3000 <seed> <files>                  # broken variants for compare_parse.py
 ```

@@ -6,7 +6,7 @@ with both compilers, from the same working directory, and requires the same exit
 `--command check` it runs `check --dump-hir --diagnostics-format=json FILE` and `check FILE` instead (P3), with the file's
 `// option:` and `// profile:` lines as options, as tools/run_corpus.py passes them.
 
-usage: tools/compare_parse.py --ceesafec out/ceesafe --novac ~/.nova/0.5.0/bin/novac [--command check] [--root DIR]
+usage: tools/compare_parse.py --ceesafec out/ceesafe --novac ~/.nova/0.6.0/bin/novac [--command check] [--root DIR]
        PATH...
 """
 

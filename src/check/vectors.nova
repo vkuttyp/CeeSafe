@@ -4,9 +4,9 @@
 // call lib/core (`retain`, `swap`, `sortBy`, `forEach`, `any`, `all`, `splitAt`, `splitAtMut`) come with the library
 // (S5) and closures (S6).
 
-fn builtinVector() -> u32 => 12;
-fn builtinString() -> u32 => 13;
-fn builtinStringView() -> u32 => 22;
+fn builtinVector() -> u32 => 14;
+fn builtinString() -> u32 => 15;
+fn builtinStringView() -> u32 => 24;
 
 /// The vector or string type, with the types its built-in operations return: `Result<void, AllocError>` and, for a
 /// vector, `T?` (VectorType, §23). `element` is none for a string.

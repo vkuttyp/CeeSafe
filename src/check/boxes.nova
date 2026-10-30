@@ -4,7 +4,7 @@
 
 fn notAnAllocator() -> u32 => 263;
 
-fn builtinBox() -> u32 => 7;
+fn builtinBox() -> u32 => 9;
 
 /// The SystemHeap and FailingAllocator types (IsAllocatorType).
 fn isAllocatorType(c: borrow Checker, typ: u32) -> bool => typ == c.systemHeapType || typ == c.structs[1].typ;

@@ -202,7 +202,7 @@ fn checkFloatConversion(
     }
     let typeSyntax = c.front.ast.at(typeArguments, 0);
     var target = c.resolveType(typeSyntax, false)?;
-    let toFloat = builtin == 6;
+    let toFloat = builtin == builtinRound();
     let wrongTarget = if (toFloat) !c.types.is(target, TypeKind.Float) else !c.types.is(target, TypeKind.Integer);
     if (!c.types.isBottom(target) && wrongTarget) {
         let typeSpan = c.front.ast.typeSpans[typeSyntax as usize];
@@ -257,7 +257,7 @@ fn checkFloatConversion(
         }
         return c.expr(HirExpr.Cast(operand), target, span.start, span.end);
     }
-    if (builtin == 4) {
+    if (builtin == builtinCheckedTruncate()) {
         let optional = optionOf(c, target)?;
         return c.expr(HirExpr.FloatToInt(operand, FloatToIntMode.Checked), optional, span.start, span.end);
     }

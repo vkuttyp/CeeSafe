@@ -1,8 +1,8 @@
 // Slot maps, stable vectors and handles (the reference's ResolveContainerType, ContainerType, CheckContainerCreate,
 // CheckContainerMethod, the slot map case of SynthMember, and `Handle<T>`): P3 S3c (§24).
 
-fn builtinSlotMap() -> u32 => 14;
-fn builtinStableVector() -> u32 => 15;
+fn builtinSlotMap() -> u32 => 16;
+fn builtinStableVector() -> u32 => 17;
 
 fn containerName(isMap: bool) -> StringView => if (isMap) "SlotMap" else "StableVector";
 

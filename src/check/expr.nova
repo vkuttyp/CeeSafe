@@ -835,14 +835,20 @@ fn synthCall(
                     }
                 }
                 Entity.Builtin(b) => {
-                    if (b == 2) {
+                    if (b == builtinTruncate()) {
                         return checkTruncate(c, name, typeArguments, arguments, calleeSpan, span);
                     }
-                    if (b == 4 || b == 5 || b == 6) {
+                    if (b == builtinCheckedTruncate() || b == builtinSaturatingTruncate() || b == builtinRound()) {
                         return checkFloatConversion(c, b, name, typeArguments, arguments, calleeSpan, span);
                     }
-                    if (b == 3) {
+                    if (b == builtinLayoutOf()) {
                         return checkLayoutOf(c, typeArguments, arguments, span);
+                    }
+                    if (b == builtinOffsetOf()) {
+                        return checkOffsetOf(c, typeArguments, arguments, span);
+                    }
+                    if (b == builtinCallerAddress()) {
+                        return checkCallerAddress(c, typeArguments, arguments, span);
                     }
                     // Other built-in names are not functions (SynthCall's last case).
                     var message = Vector<u8>.create();
@@ -953,7 +959,8 @@ fn synthCall(
                                     let isScratch = b == builtinScratch();
                                     return checkRegionConstructor(c, member, arguments, isScratch, span);
                                 }
-                                if (b == builtinConsole() || b == builtinProcess() || b == 23 || b == 24) {
+                                if (b == builtinConsole() ||
+                                    b == builtinProcess() || b == builtinCpu() || b == builtinTarget()) {
                                     return checkBuiltinMemberCall(c, b, targetName, member, arguments, span);
                                 }
                                 // Any other built-in is a receiver like any value (CheckMethodCall).
@@ -1129,13 +1136,13 @@ fn checkBuiltinMemberCall(
     } else if (owner == builtinConsole() && sameText(m, "writeErrorLine")) {
         function = bfConsoleWriteErrorLine();
         maxArgs = 1;
-    } else if (owner == 23 && sameText(m, "spinHint")) {
+    } else if (owner == builtinCpu() && sameText(m, "spinHint")) {
         function = bfSpinHint();
-    } else if (owner == 24 && sameText(m, "isX86_64")) {
+    } else if (owner == builtinTarget() && sameText(m, "isX86_64")) {
         function = bfTargetIsX8664();
-    } else if (owner == 24 && sameText(m, "isAArch64")) {
+    } else if (owner == builtinTarget() && sameText(m, "isAArch64")) {
         function = bfTargetIsAArch64();
-    } else if (owner == 24 && sameText(m, "pointerBits")) {
+    } else if (owner == builtinTarget() && sameText(m, "pointerBits")) {
         function = bfTargetPointerBits();
     }
     if (function == none()) {

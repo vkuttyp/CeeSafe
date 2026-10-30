@@ -1,0 +1,32 @@
+struct Pair {
+    a: u8;
+    b: u64;
+}
+struct Laid {
+    x: u32;
+    y: u16;
+}
+@header("probe.h")
+extern "C" {
+    struct probe_state {
+        count: u32;
+        next: u32;
+    }
+}
+struct Holder {
+    state: probe_state;
+    tag: u32;
+}
+
+static FIRST: usize = offsetOf<Pair>(a);
+
+/// Safety: nothing unsafe; callerAddress only reads the hidden parameter.
+@export
+fn entry() -> usize => callerAddress() + offsetOf<Holder>(tag);
+
+fn main() {
+    let size = layoutOf<Laid>();
+    let y = offsetOf<Laid>(y);
+    let c = offsetOf<probe_state>(next);
+    Console.writeLine(FIRST + y + c + size.size + offsetOf<Pair>(a));
+}

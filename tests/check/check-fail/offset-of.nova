@@ -1,0 +1,21 @@
+struct Pair {
+    a: u8;
+    b: u64;
+}
+struct Box2<T> { v: T; }
+
+fn helper() -> usize => callerAddress();
+@export
+fn exported() -> usize {
+    let f = () => callerAddress();
+    return f() + callerAddress(1);
+}
+
+fn main() {
+    let a = offsetOf<u32>(a);
+    let b = offsetOf<Pair>(c);
+    let c = offsetOf<Pair>();
+    let d = offsetOf(a);
+    let e = offsetOf<Pair>(1);
+    let g = offsetOf<Box2<u8>>(v);
+}

@@ -5,10 +5,10 @@
 
 fn notRegionContent() -> u32 => 264;
 
-fn builtinArena() -> u32 => 8;
-fn builtinFixedBufferAllocator() -> u32 => 9;
-fn builtinScratch() -> u32 => 10;
-fn builtinPool() -> u32 => 11;
+fn builtinArena() -> u32 => 10;
+fn builtinFixedBufferAllocator() -> u32 => 11;
+fn builtinScratch() -> u32 => 12;
+fn builtinPool() -> u32 => 13;
 
 /// The region names of a parameter list (TypeParameter indexes).
 fn pushRegionNames(c: borrow Checker, regions: Range, out: borrow mut Vector<u32>) -> Result<void, AllocError> {

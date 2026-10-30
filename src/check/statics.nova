@@ -337,7 +337,7 @@ fn staticFold(
         HirExpr.StringConst(_) => { return Ok(e); }
         HirExpr.StaticCString(_) => { return Ok(e); }
         HirExpr.BuiltinCall(function, _) => {
-            if (function == bfLayoutOf()) {
+            if (function == bfLayoutOf() || function == bfOffsetOf()) {
                 return Ok(e);
             }
             return staticFail(c, e, "this expression");
@@ -678,6 +678,121 @@ fn checkLayoutOf(c: borrow mut Checker, typeArguments: Range, arguments: Range, 
     return layoutLiteral(c, layout, truncate<u64>(sizeAlign.size), sizeAlign.align as u64, span);
 }
 
+/// `offsetOf<T>(field)` (CheckOffsetOf, §30.1; ADR 0030): a field's offset in bytes, as `usize`; for a C-laid-out `T`
+/// a built-in C writes as `offsetof`. One deliberate divergence: the reference reads the field's offset without laying
+/// the struct out first, so it is 0 unless something had already asked for the layout (novac 0.6.0); ceesafec lays it
+/// out and gives the true offset (docs/p3-plan.md).
+fn checkOffsetOf(c: borrow mut Checker, typeArguments: Range, arguments: Range, span: Span) -> Result<u32, AllocError> {
+    var fieldName = none();
+    var fieldSpan = span;
+    if (arguments.count == 1) {
+        let argument = c.front.ast.at(arguments, 0);
+        match (c.front.ast.exprs[argument as usize]) {
+            ExprNode.Name(n, t) => {
+                if (t.count == 0) {
+                    fieldName = n;
+                    fieldSpan = c.front.ast.exprSpans[argument as usize];
+                }
+            }
+            _ => {}
+        }
+    }
+    if (typeArguments.count != 1 || fieldName == none()) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "offsetOf takes one type argument and a field's name: offsetOf<T>(field)")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let typeSyntax = c.front.ast.at(typeArguments, 0);
+    c.allowImported = true;
+    let measured = c.resolveType(typeSyntax, false)?;
+    if (c.types.isBottom(measured)) {
+        return c.errorResult(span.start, span.end);
+    }
+    let usize = c.types.usize;
+    if (!c.types.is(measured, TypeKind.Struct)) {
+        let typeSpan = c.front.ast.typeSpans[typeSyntax as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "offsetOf needs a struct type, and ")?;
+        appendQuotedType(mut message, c, measured)?;
+        appendText(mut message, " is not one (type-system.md §30.1)")?;
+        c.error(offsetOfField(), typeSpan.start, typeSpan.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (c.types.isGeneric(measured)) {
+        return c.expr(HirExpr.IntConst(IntValue { negative: false, magnitude: 0 }), usize, span.start, span.end);
+    }
+    let definition = c.types.info(measured).structDef;
+    let symbol = c.front.ast.idents[fieldName as usize].symbol;
+    let member = findField(c, definition, symbol);
+    if (member == none()) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, measured)?;
+        appendText(mut message, " has no field ")?;
+        appendQuotedName(mut message, c, symbol)?;
+        appendText(mut message, " (type-system.md §30.1)")?;
+        c.error(offsetOfField(), fieldSpan.start, fieldSpan.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (c.types.isCLaidOut(measured, 0)) {
+        // As layoutOf: the type rides on a null pointer to it, and the field on its index.
+        let zero = c.expr(HirExpr.IntConst(IntValue { negative: false, magnitude: 0 }), usize, span.start, span.end)?;
+        let pointer = c.types.pointerTo(measured, false)?;
+        let cast = c.expr(HirExpr.Cast(zero), pointer, span.start, span.end)?;
+        let index = c.types.fields[member as usize].index as u64;
+        let indexValue = c.expr(
+            HirExpr.IntConst(IntValue { negative: false, magnitude: index }),
+            usize,
+            span.start,
+            span.end,
+        )?;
+        let values = [cast, indexValue];
+        let list = c.hir.list(values[..])?;
+        return c.expr(HirExpr.BuiltinCall(bfOffsetOf(), list), usize, span.start, span.end);
+    }
+    if (!hasLayout(c, measured, 0)?) {
+        return c.errorResult(span.start, span.end); // reported where the type is declared
+    }
+    c.types.layoutOf(measured); // lays the struct out, which sets its fields' offsets
+    let offset = c.types.fields[member as usize].offset as u64;
+    return c.expr(HirExpr.IntConst(IntValue { negative: false, magnitude: offset }), usize, span.start, span.end);
+}
+
+/// `callerAddress()` (CheckCallerAddress, §28.4; ADR 0030): in the body of an `@export` function, the address its C
+/// caller returns to, as `usize`.
+fn checkCallerAddress(
+    c: borrow mut Checker,
+    typeArguments: Range,
+    arguments: Range,
+    span: Span,
+) -> Result<u32, AllocError> {
+    if (typeArguments.count != 0 || arguments.count != 0) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "callerAddress takes no arguments: callerAddress()")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let function = c.function;
+    if (function == none() || !c.hir.functions[function as usize].exported) {
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            "callerAddress() is only valid in the body of an @export function, whose C caller it names (ADR 0030)",
+        )?;
+        c.error(callerAddressOutsideExport(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    c.hir.functions[function as usize].usesCallerAddress = true;
+    let none0 = Vector<u32>.create();
+    let list = c.hir.list(none0.view())?;
+    let usize = c.types.usize;
+    return c.expr(HirExpr.BuiltinCall(bfCallerAddress(), list), usize, span.start, span.end);
+}
+
+fn offsetOfField() -> u32 => 339;
+fn callerAddressOutsideExport() -> u32 => 340;
+
 fn layoutLiteral(c: borrow mut Checker, layout: u32, size: u64, align: u64, span: Span) -> Result<u32, AllocError> {
     let definition = c.types.info(layout).structDef;
     let sizeSymbol = c.intern("size")?;
@@ -722,9 +837,9 @@ fn isHostedOnlyType(c: borrow Checker, typ: u32) -> bool {
 
 /// Built-in names whose every use needs the hosted runtime (IsHostedOnly(Builtin)).
 fn isHostedOnlyBuiltin(b: u32) -> bool =>
-    !(b == 2 ||
+    !(b == builtinTruncate() ||
         b == builtinFixedBufferAllocator() || b == builtinPtr() || b == builtinSlice() || b == builtinSliceMut() ||
-        b == builtinStringView() || b == 23 || b == 24);
+        b == builtinStringView() || b == builtinCpu() || b == builtinTarget());
 
 /// N0293 once per place (HostedOnly): `what` is not available in the freestanding profile.
 fn hostedOnly(c: borrow mut Checker, span: Span, what: Slice<u8>) -> Result<void, AllocError> {

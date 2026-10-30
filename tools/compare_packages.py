@@ -5,7 +5,7 @@ Each directory under tests/packages is one fixture: its root package is `app/` i
 itself. Both compilers run `check` there (HIR dump with JSON diagnostics, then text diagnostics), and their outputs
 must be byte-identical.
 
-usage: python3 tools/compare_packages.py --ceesafec out/ceesafe --novac ~/.nova/0.5.0/bin/novac [fixtures...]
+usage: python3 tools/compare_packages.py --ceesafec out/ceesafe --novac ~/.nova/0.6.0/bin/novac [fixtures...]
 """
 import argparse
 import os

@@ -208,6 +208,7 @@ struct HirFunction {
     context: u32;                     // `@context`: 0 none, 1 atomic, 2 irq (§32.3)
     effectsOfParameters: Vector<u32>; // the parameters `@effectsOf(…)` names, by index (§32.5)
     exported: bool;                   // `@export`: exportName is its C symbol (§28.4)
+    usesCallerAddress: bool;          // its body calls callerAddress() (ADR 0030): a hidden last parameter in C
     exportName: Range;                // Hir.text
 }
 
@@ -407,6 +408,7 @@ struct HirProgram {
             context: 0,
             effectsOfParameters: Vector<u32>.create(),
             exported: false,
+            usesCallerAddress: false,
             exportName: Range { start: 0, count: 0 },
         })?;
         return Ok(truncate<u32>(this.functions.length - 1));

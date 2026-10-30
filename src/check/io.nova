@@ -2,9 +2,9 @@
 // of CheckBuiltinMemberCall, IntegerMethod, CheckIntegerMethod, FloatMethod and CheckFloatMethod): P3 S3e (§6, §26,
 // §35). `File.kind` and `Process.capture` call lib/std's HostServices (src/check/library.nova).
 
-fn builtinFile() -> u32 => 16;
-fn builtinTcpListener() -> u32 => 17;
-fn builtinTcpStream() -> u32 => 18;
+fn builtinFile() -> u32 => 18;
+fn builtinTcpListener() -> u32 => 19;
+fn builtinTcpStream() -> u32 => 20;
 
 fn ioResult(c: borrow mut Checker, ok: u32) -> Result<u32, AllocError> {
     let ioError = c.ioErrorType;

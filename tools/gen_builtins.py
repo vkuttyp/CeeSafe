@@ -4,7 +4,7 @@ its declaration index, which HirExpr.BuiltinCall stores. The source is a Nova ch
 be clean.
 
 usage: python3 tools/gen_builtins.py [--nova PATH]   (default ~/Nova; formats with $NOVAC, default the pinned
-       ~/.nova/0.5.0/bin/novac; review the diff)
+       ~/.nova/0.6.0/bin/novac; review the diff)
 """
 
 import argparse
@@ -52,7 +52,7 @@ def main():
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "hir", "builtins.nova")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(out) + "\n")
-    novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/0.5.0/bin/novac"))
+    novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/0.6.0/bin/novac"))
     subprocess.run([novac, "fmt", path], check=True)
     print(f"{len(names)} builtin functions from {head}")
 

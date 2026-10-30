@@ -7,7 +7,7 @@ program's own check that the failure came back as an error and left its structur
 allocations (the runtime's report: live=0). A panic, a crash, an inconsistency or a leak is a failure.
 
 usage: tools/fault_sweep.py --compiler PATH [--cflag=FLAG]... SOURCE...
-example: tools/fault_sweep.py --compiler ~/.nova/0.5.0/bin/novac tests/support/fault/alloc-sweep.nova src/support/*.nova
+example: tools/fault_sweep.py --compiler ~/.nova/0.6.0/bin/novac tests/support/fault/alloc-sweep.nova src/support/*.nova
 """
 
 import argparse
