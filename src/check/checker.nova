@@ -54,6 +54,7 @@ struct Checker {
     hir: HirProgram;
     fileIsLibrary: Vector<bool>;
     fileTexts: Vector<Vector<u8>>; // each file's bytes, for fixes that quote source text
+    noFloat: bool;                 // --no-float (type-system.md §35.9)
     rootItems: Map<Word, Entity>;
     coreItems: Map<Word, Entity>;
     builtins: Map<Word, u32>;
@@ -203,8 +204,65 @@ struct Checker {
 
     // ---- Types ----
 
-    /// ResolveType for what S1a supports: built-in named types. Other forms are N0216 "not ported yet".
+    /// N0297: floats are disabled (FloatsDisabled).
+    fn floatsDisabled(borrow mut this, start: u32, end: u32, what: borrow Vector<u8>) -> Result<void, AllocError> {
+        var message = Vector<u8>.create();
+        appendBytes(mut message, what.view())?;
+        appendText(mut message, ": floats are disabled in this build (--no-float, type-system.md §35.9)")?;
+        return this.error(floatsDisabled(), start, end, message);
+    }
+
+    /// ResolveType: the core, then the checks every resolution makes (here, --no-float).
     fn resolveType(borrow mut this, typ: u32, allowVoid: bool) -> Result<u32, AllocError> {
+        let resolved = this.resolveTypeCore(typ, allowVoid)?;
+        if (this.noFloat && this.types.is(resolved, TypeKind.Float)) {
+            let span = this.front.ast.typeSpans[typ as usize];
+            var what = Vector<u8>.create();
+            appendText(mut what, "type '")?;
+            appendBytes(mut what, this.types.name(resolved))?;
+            appendText(mut what, "'")?;
+            this.floatsDisabled(span.start, span.end, what)?;
+            return Ok(this.types.error);
+        }
+        return Ok(resolved);
+    }
+
+    /// ResolveFunctionType for `fn(A, B) -> R` without an effect list (effect lists come with S6).
+    fn resolveFunctionType(
+        borrow mut this,
+        attributes: Range,
+        parameters: Range,
+        result: u32,
+        span: Span,
+    ) -> Result<u32, AllocError> {
+        if (attributes.count > 0) {
+            this.notPorted(span.start, span.end, "an effect list on a function type", "S6")?;
+            return Ok(this.types.error);
+        }
+        var types = Vector<u32>.create();
+        var bottom = false;
+        for (k in 0..parameters.count) {
+            let p = this.front.ast.at(parameters, k);
+            let t = this.resolveType(p, false)?;
+            if (this.types.isBottom(t)) {
+                bottom = true;
+            }
+            types.push(t)?;
+        }
+        let resultType = if (result == none()) this.types.voidType else this.resolveType(result, true)?;
+        if (bottom || this.types.isBottom(resultType)) {
+            return Ok(this.types.error);
+        }
+        if (this.types.isScoped(resultType)) {
+            this.notPorted(span.start, span.end, "a function type returning a reference", "S2")?;
+            return Ok(this.types.error);
+        }
+        return this.types.functionTo(types.view(), resultType, allEffects());
+    }
+
+    /// ResolveTypeCore for what S1 supports: built-in named types and function types. Other forms are N0216
+    /// "not ported yet".
+    fn resolveTypeCore(borrow mut this, typ: u32, allowVoid: bool) -> Result<u32, AllocError> {
         let span = this.front.ast.typeSpans[typ as usize];
         match (this.front.ast.types[typ as usize]) {
             TypeNode.Named(q) => {
@@ -252,6 +310,9 @@ struct Checker {
                 return Ok(found);
             }
             TypeNode.Missing => { return Ok(this.types.error); }
+            TypeNode.Function(attributes, parameters, result) => {
+                return this.resolveFunctionType(attributes, parameters, result, span);
+            }
             _ => {
                 this.notPorted(span.start, span.end, "this kind of type", "S2-S7")?;
                 return Ok(this.types.error);
@@ -283,3 +344,5 @@ fn duplicateParameter() -> u32 => 202;
 fn localRedeclared() -> u32 => 203;
 fn referenceNotAllowed() -> u32 => 246;
 fn invalidPointee() -> u32 => 281;
+fn floatsDisabled() -> u32 => 297;
+fn notAFunctionValue() -> u32 => 298;

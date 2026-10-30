@@ -106,15 +106,16 @@ fn fold(c: borrow mut Checker, e: u32) -> Result<u32, AllocError> {
             match (c.hir.exprs[folded as usize]) {
                 HirExpr.IntConst(i) => {
                     if (c.types.is(typ, TypeKind.Float)) {
-                        c.notPorted(span.start, span.end, "a constant integer-to-float cast", "S1b")?;
-                        return c.errorResult(span.start, span.end);
+                        // `as` and round<T> to a float (§35.4), rounded as at run time.
+                        let value = floatFromInteger(i, c.types.info(typ).bits);
+                        return c.expr(HirExpr.FloatConst(value), typ, span.start, span.end);
                     }
                     return c.expr(HirExpr.IntConst(i), typ, span.start, span.end);
                 }
                 HirExpr.FloatConst(f) => {
                     if (c.types.is(typ, TypeKind.Float)) {
-                        c.notPorted(span.start, span.end, "a constant float cast", "S1b")?;
-                        return c.errorResult(span.start, span.end);
+                        let value = roundFloat(f, c.types.info(typ).bits);
+                        return c.expr(HirExpr.FloatConst(value), typ, span.start, span.end);
                     }
                     return Ok(folded);
                 }
@@ -227,11 +228,14 @@ fn foldBinary(c: borrow mut Checker, e: u32, op: BinaryOp, leftExpr: u32, rightE
                 _ => {}
             }
         }
-        HirExpr.FloatConst(_) => {
+        HirExpr.FloatConst(a) => {
             match (r) {
-                HirExpr.FloatConst(_) => {
-                    c.notPorted(span.start, span.end, "folding a float constant", "S1b")?;
-                    return c.errorResult(span.start, span.end);
+                HirExpr.FloatConst(b) => {
+                    if (c.types.is(typ, TypeKind.Bool)) {
+                        return c.expr(HirExpr.BoolConst(compareFloats(op, a, b)), typ, span.start, span.end);
+                    }
+                    let value = evaluateFloats(op, a, b, c.types.info(typ).bits);
+                    return c.expr(HirExpr.FloatConst(value), typ, span.start, span.end);
                 }
                 _ => {}
             }
@@ -363,4 +367,60 @@ fn evaluateInts(
         return c.errorResult(span.start, span.end);
     }
     return c.expr(HirExpr.IntConst(intValueOf(result)), typ, span.start, span.end);
+}
+
+/// `value` rounded to f32 when `bits` is 32 (FloatSemantics.Round): to nearest, ties to even; overflow is infinity.
+fn roundFloat(value: f64, bits: u32) -> f64 => if (bits == 32) round<f32>(value) as f64 else value;
+
+/// `+ - * /` on two values of the type, rounded once to it (FloatSemantics.Evaluate).
+fn evaluateFloats(op: BinaryOp, a: f64, b: f64, bits: u32) -> f64 {
+    let index = binaryIndex(op);
+    if (bits == 32) {
+        let x = round<f32>(a);
+        let y = round<f32>(b);
+        let r = if (index == 13) x + y else if (index == 14) x - y else if (index == 15) x * y else x / y;
+        return r as f64;
+    }
+    return if (index == 13) a + b else if (index == 14) a - b else if (index == 15) a * b else a / b;
+}
+
+/// The IEEE comparisons: NaN is unordered, so only `!=` holds for it (FloatSemantics.Compare).
+fn compareFloats(op: BinaryOp, a: f64, b: f64) -> bool => match (binaryIndex(op)) {
+    2 => a == b,
+    3 => a != b,
+    4 => a < b,
+    5 => a <= b,
+    6 => a > b,
+    _ => a >= b,
+};
+
+/// An integer rounded to nearest, ties to even, in f32 or f64, in one rounding (FloatSemantics.FromInteger).
+fn floatFromInteger(v: IntValue, bits: u32) -> f64 {
+    let mantissa: u64 = if (bits == 32) 24 else 53;
+    var m = v.magnitude;
+    var shift: i64 = 0;
+    var length: u64 = 0;
+    var t = m;
+    while (t != 0) {
+        length += 1;
+        t >>= 1;
+    }
+    if (length > mantissa) {
+        let s = length - mantissa;
+        let kept = m >> truncate<u32>(s);
+        let rest = m & ((1u64 << truncate<u32>(s)) - 1);
+        let half = 1u64 << truncate<u32>(s - 1);
+        var rounded = kept;
+        if (rest > half || (rest == half && (kept & 1) == 1)) {
+            rounded += 1;
+        }
+        m = rounded;
+        shift = truncate<i64>(s);
+        if (m == 1u64 << truncate<u32>(mantissa)) {
+            m >>= 1;
+            shift += 1;
+        }
+    }
+    let magnitude = doubleOf(m, shift);
+    return if (v.negative && v.magnitude != 0) 0.0 - magnitude else magnitude;
 }

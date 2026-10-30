@@ -42,6 +42,7 @@ struct Options {
     dumpTokens: bool;
     dumpAst: bool;
     dumpHir: bool;
+    noFloat: bool;
     files: Vector<String>;
 }
 
@@ -84,6 +85,8 @@ fn readOptions(options: borrow mut Options) -> i32 {
             options.dumpAst = true;
         } else if (arg == "--dump-hir") {
             options.dumpHir = true;
+        } else if (arg == "--no-float") {
+            options.noFloat = true;
         } else if (arg == "--dump-tokens") {
             options.dumpTokens = true;
         } else if (arg.length > 0 && arg[0] == '-') {
@@ -214,6 +217,7 @@ fn parseCommand() -> i32 {
         dumpTokens: false,
         dumpAst: false,
         dumpHir: false,
+        noFloat: false,
         files: Vector<String>.create(),
     };
     let status = readOptions(mut options);
@@ -290,6 +294,7 @@ fn checkCommand() -> i32 {
         dumpTokens: false,
         dumpAst: false,
         dumpHir: false,
+        noFloat: false,
         files: Vector<String>.create(),
     };
     let status = readOptions(mut options);
@@ -330,7 +335,7 @@ fn checkCommand() -> i32 {
     for (i in 0..sources.length) {
         texts.push(copyBytes(sources[i].text.view())!)!;
     }
-    let checker = checkProgram(front, fileIsLibrary, texts)!;
+    let checker = checkProgram(front, fileIsLibrary, texts, options.noFloat)!;
     if (options.dumpHir) {
         var printer = HirPrinter.create();
         printer.printProgram(checker.hir, checker.types, checker.front.symbols)!;

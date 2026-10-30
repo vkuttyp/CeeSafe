@@ -84,6 +84,7 @@ fn checkProgram(
     front: Frontend,
     fileIsLibrary: Vector<bool>,
     fileTexts: Vector<Vector<u8>>,
+    noFloat: bool,
 ) -> Result<Checker, AllocError> {
     var c = Checker {
         front: front,
@@ -91,6 +92,7 @@ fn checkProgram(
         hir: HirProgram.create(),
         fileIsLibrary: fileIsLibrary,
         fileTexts: fileTexts,
+        noFloat: noFloat,
         rootItems: Map<Word, Entity>.create(),
         coreItems: Map<Word, Entity>.create(),
         builtins: Map<Word, u32>.create(),

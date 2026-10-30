@@ -1,0 +1,313 @@
+// Char and float literals, float conversions, `fromBits` and function values (the reference's CheckCharLiteral,
+// CheckFloatLiteral, FloatsDisabled, CheckFloatConversion, CheckFromBits, OptionOf, FunctionValue and
+// CheckFunctionValueCall): P3 S1b.
+
+/// The type a value takes where `T?` is expected (OptionOf), with the names the reference interns.
+fn optionOf(c: borrow mut Checker, value: u32) -> Result<u32, AllocError> {
+    let nullName = c.intern("null")?;
+    let someName = c.intern("Some")?;
+    let payloadName = c.intern("_0")?;
+    return c.types.optionOf(value, nullName, someName, payloadName);
+}
+
+/// `U+XXXX` with at least four uppercase hex digits.
+fn appendScalar(out: borrow mut Vector<u8>, value: u32) -> Result<void, AllocError> {
+    appendText(out, "U+")?;
+    return appendHex(out, value as u64, 4);
+}
+
+/// CheckCharLiteral: the scalar value as an integer of the expected type, else u32 (§4, M11).
+fn checkCharLiteral(c: borrow mut Checker, value: u32, expected: u32, span: Span) -> Result<u32, AllocError> {
+    var typ = integerHint(c, expected);
+    if (typ == none()) {
+        typ = c.types.u32;
+    }
+    let t = c.types.info(typ);
+    if (t.bits == 8 && value > 0x7F) {
+        var message = Vector<u8>.create();
+        appendScalar(mut message, value)?;
+        appendText(mut message, " is more than one byte in UTF-8, so it cannot be a ")?;
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, "; use its bytes, or a wider type for the scalar value")?;
+        c.error(literalOutOfRange(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let v = IntValue { negative: false, magnitude: value as u64 };
+    if (!c.types.fits(typ, bigOf(v)?)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "character literal ")?;
+        appendScalar(mut message, value)?;
+        appendText(mut message, " does not fit in ")?;
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, " (range ")?;
+        appendTypeBound(mut message, t, false)?;
+        appendText(mut message, "..")?;
+        appendTypeBound(mut message, t, true)?;
+        appendText(mut message, ")")?;
+        c.error(literalOutOfRange(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    return c.expr(HirExpr.IntConst(v), typ, span.start, span.end);
+}
+
+/// CheckFloatLiteral: the suffix's type, else an expected float type, else f64; rounded once, in that type (§35.2).
+fn checkFloatLiteral(
+    c: borrow mut Checker,
+    digits: Range,
+    suffix: FloatSuffix,
+    expected: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    if (c.noFloat) {
+        var what = Vector<u8>.create();
+        appendText(mut what, "a float literal")?;
+        c.floatsDisabled(span.start, span.end, what)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var typ = match (suffix) {
+        FloatSuffix.F32 => c.types.f32,
+        FloatSuffix.F64 => c.types.f64,
+        FloatSuffix.None => none(),
+    };
+    if (typ == none()) {
+        var hint = expected;
+        if (expected != none() && c.types.optionType(expected) != none()) {
+            hint = c.types.optionType(expected);
+        }
+        typ = if (hint != none() && c.types.is(hint, TypeKind.Float)) hint else c.types.f64;
+    }
+    var text = Vector<u8>.create();
+    appendBytes(mut text, c.front.ast.textOf(digits))?;
+    let format = if (c.types.info(typ).bits == 32) f32Format() else f64Format();
+    let value = parseDecimalFloat(text.view(), format)?;
+    if (value.bits() & 0x7FFFFFFFFFFFFFFF == 0x7FF0000000000000) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "float literal ")?;
+        appendBytes(mut message, text.view())?;
+        appendText(mut message, " is too large for ")?;
+        appendQuotedType(mut message, c, typ)?;
+        c.error(literalOutOfRange(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    return c.expr(HirExpr.FloatConst(value), typ, span.start, span.end);
+}
+
+/// A package function named as a value (FunctionValue, §36.1): its function type.
+fn functionValue(c: borrow mut Checker, function: u32, span: Span) -> Result<u32, AllocError> {
+    let name = c.hir.functions[function as usize].name;
+    let returnType = c.hir.functions[function as usize].returnType;
+    let owner = c.hir.functions[function as usize].owner;
+    let syntax = c.front.ast.functions[c.hir.functions[function as usize].syntax as usize];
+    var why = Vector<u8>.create();
+    if (syntax.isExtern) {
+        appendText(mut why, "an extern function: calling it is unsafe, and a call through a function value is safe")?;
+    } else if (syntax.isUnsafe) {
+        appendText(mut why, "an unsafe function: calling it is unsafe, and a call through a function value is safe")?;
+    } else if (syntax.regionParameters.count > 0) {
+        appendText(
+            mut why,
+            "a function with region parameters: a function type cannot say how loans flow between its arguments",
+        )?;
+    } else if (owner == none() && sameText(c.name(name), "main")) {
+        appendText(mut why, "the program's entry point")?;
+    }
+    if (why.length > 0) {
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, name)?;
+        appendText(mut message, " cannot be a function value: it is ")?;
+        appendBytes(mut message, why.view())?;
+        appendText(mut message, " (type-system.md §36.1)")?;
+        c.error(notAFunctionValue(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var parameters = Vector<u32>.create();
+    var scopedCount: u32 = 0;
+    for (k in 0..c.hir.functions[function as usize].parameters.length) {
+        let t = c.hir.locals[c.hir.functions[function as usize].parameters[k] as usize].typ;
+        if (c.types.isScoped(t)) {
+            scopedCount += 1;
+        }
+        parameters.push(t)?;
+    }
+    if (c.types.isScoped(returnType) && scopedCount != 1) {
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, name)?;
+        appendText(
+            mut message,
+            " cannot be a function value: its result's sources cannot be written in a function type (type-system.md §36.1)",
+        )?;
+        c.error(notAFunctionValue(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let typ = c.types.functionTo(parameters.view(), returnType, allEffects())?;
+    return c.expr(HirExpr.FunctionAddress(function), typ, span.start, span.end);
+}
+
+/// A call through a Nova function value (CheckFunctionValueCall): the callee is the first argument.
+fn checkFunctionValueCall(c: borrow mut Checker, callee: u32, arguments: Range, span: Span) -> Result<u32, AllocError> {
+    let t = c.typeOf(callee);
+    let info = c.types.info(t);
+    if (arguments.count != info.parameters.count) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, t)?;
+        appendText(mut message, " takes ")?;
+        appendDecimal(mut message, info.parameters.count as u64)?;
+        appendText(mut message, " argument(s) but ")?;
+        appendDecimal(mut message, arguments.count as u64)?;
+        appendText(mut message, " were supplied")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var values = Vector<u32>.create();
+    values.push(callee)?;
+    var bottom = false;
+    for (k in 0..arguments.count) {
+        let argument = c.front.ast.at(arguments, k);
+        let parameterType = c.types.listAt(info.parameters, k);
+        let value = checkArgument(c, argument, parameterType)?;
+        if (c.isBottom(value)) {
+            bottom = true;
+        }
+        values.push(value)?;
+    }
+    if (bottom) {
+        return c.errorResult(span.start, span.end);
+    }
+    let list = c.hir.list(values.view())?;
+    return c.expr(HirExpr.BuiltinCall(bfOther(), list), info.result, span.start, span.end);
+}
+
+/// `checkedTruncate<T>(f)`, `saturatingTruncate<T>(f)` (a float to an integer) and `round<T>(e)` (any number to a
+/// float), CheckFloatConversion (§35.4); `builtin` is 4, 5 or 6 in the reference's Builtin order.
+fn checkFloatConversion(
+    c: borrow mut Checker,
+    builtin: u32,
+    name: u32,
+    typeArguments: Range,
+    arguments: Range,
+    nameSpan: Span,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let text = builtinName(builtin);
+    if (typeArguments.count != 1) {
+        var message = Vector<u8>.create();
+        appendText(mut message, text)?;
+        appendText(mut message, " needs exactly one type argument: ")?;
+        appendText(mut message, text)?;
+        appendText(mut message, "<T>(value)")?;
+        c.error(unsupported(), nameSpan.start, nameSpan.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let typeSyntax = c.front.ast.at(typeArguments, 0);
+    var target = c.resolveType(typeSyntax, false)?;
+    let toFloat = builtin == 6;
+    let wrongTarget = if (toFloat) !c.types.is(target, TypeKind.Float) else !c.types.is(target, TypeKind.Integer);
+    if (!c.types.isBottom(target) && wrongTarget) {
+        let typeSpan = c.front.ast.typeSpans[typeSyntax as usize];
+        var message = Vector<u8>.create();
+        if (toFloat) {
+            appendText(mut message, "round<T> requires a float type, found ")?;
+        } else {
+            appendText(mut message, text)?;
+            appendText(mut message, "<T> requires an integer type, found ")?;
+        }
+        appendQuotedType(mut message, c, target)?;
+        c.error(invalidOperandTypes(), typeSpan.start, typeSpan.end, message)?;
+        target = c.types.error;
+    }
+    if (arguments.count != 1) {
+        var message = Vector<u8>.create();
+        appendText(mut message, text)?;
+        appendText(mut message, " takes 1 argument but ")?;
+        appendDecimal(mut message, arguments.count as u64)?;
+        appendText(mut message, " were supplied")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let argument = c.front.ast.at(arguments, 0);
+    let synthesized = synth(c, argument, none())?;
+    let operand = autoDeref(c, synthesized)?;
+    let operandType = c.typeOf(operand);
+    let isInteger = c.types.is(operandType, TypeKind.Integer);
+    let isFloat = c.types.is(operandType, TypeKind.Float);
+    let wrongOperand = if (toFloat) !isInteger && !isFloat else !isFloat;
+    if (!c.types.isBottom(operandType) && wrongOperand) {
+        let argumentSpan = c.front.ast.exprSpans[argument as usize];
+        var message = Vector<u8>.create();
+        if (toFloat) {
+            appendText(mut message, "round requires an integer or float value, found ")?;
+        } else {
+            appendText(mut message, text)?;
+            appendText(mut message, " requires a float value, found ")?;
+        }
+        appendQuotedType(mut message, c, operandType)?;
+        c.error(invalidOperandTypes(), argumentSpan.start, argumentSpan.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (c.types.isBottom(target) || c.types.isBottom(operandType)) {
+        return c.errorResult(span.start, span.end);
+    }
+    if (toFloat) {
+        if (operandType == target) {
+            c.hir.exprSpans[operand as usize] = span;
+            return Ok(operand);
+        }
+        return c.expr(HirExpr.Cast(operand), target, span.start, span.end);
+    }
+    if (builtin == 4) {
+        let optional = optionOf(c, target)?;
+        return c.expr(HirExpr.FloatToInt(operand, FloatToIntMode.Checked), optional, span.start, span.end);
+    }
+    return c.expr(HirExpr.FloatToInt(operand, FloatToIntMode.Saturating), target, span.start, span.end);
+}
+
+/// `f32.fromBits(u)` and `f64.fromBits(u)` (CheckFromBits, §35.5).
+fn checkFromBits(
+    c: borrow mut Checker,
+    floatType: u32,
+    member: u32,
+    arguments: Range,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let memberIdent = c.front.ast.idents[member as usize];
+    if (c.noFloat) {
+        var what = Vector<u8>.create();
+        appendText(mut what, "'")?;
+        appendBytes(mut what, c.typeName(floatType))?;
+        appendText(mut what, ".")?;
+        appendBytes(mut what, c.name(memberIdent.symbol))?;
+        appendText(mut what, "'")?;
+        c.floatsDisabled(span.start, span.end, what)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (!sameText(c.name(memberIdent.symbol), "fromBits")) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, floatType)?;
+        appendText(mut message, " has no static function ")?;
+        appendQuotedName(mut message, c, memberIdent.symbol)?;
+        appendText(mut message, "; it has 'fromBits'")?;
+        c.error(undefinedName(), memberIdent.start, memberIdent.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (arguments.count != 1) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'fromBits' takes one argument")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let bitsType = if (c.types.info(floatType).bits == 32) c.types.u32 else c.types.u64;
+    let argument = c.front.ast.at(arguments, 0);
+    let bits = checkExpr(c, argument, bitsType)?;
+    if (c.isBottom(bits)) {
+        return c.errorResult(span.start, span.end);
+    }
+    let codes = [bits];
+    let list = c.hir.list(codes[..])?;
+    return c.expr(HirExpr.BuiltinCall(bfOther(), list), floatType, span.start, span.end);
+}

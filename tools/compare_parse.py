@@ -3,7 +3,8 @@
 
 For each file it runs `parse --dump-ast --diagnostics-format=json FILE` and `parse FILE` (text diagnostics on stderr)
 with both compilers, from the same working directory, and requires the same exit status, stdout and stderr. With
-`--command check` it runs `check --dump-hir --diagnostics-format=json FILE` and `check FILE` instead (P3).
+`--command check` it runs `check --dump-hir --diagnostics-format=json FILE` and `check FILE` instead (P3), with the file's
+`// option:` and `// profile:` lines as options, as tools/run_corpus.py passes them.
 
 usage: tools/compare_parse.py --ceesafec out/ceesafe --novac ~/.nova/0.4.1/bin/novac [--command check] [--root DIR]
        PATH...
@@ -37,10 +38,25 @@ def outcome(compiler, argv, root):
         return "timeout", b"", b""
 
 
+def options_of(root, path):
+    """The corpus's per-file options for `check` (run_corpus.compile_options, CorpusTests.ProfileOf and the like)."""
+    with open(os.path.join(root, path), encoding="utf-8", errors="replace") as f:
+        stripped = {line.strip() for line in f.read().replace("\r\n", "\n").split("\n")}
+    options = []
+    if "// profile: freestanding" in stripped:
+        options += ["--profile", "freestanding"]
+    if "// option: no-float" in stripped:
+        options.append("--no-float")
+    if "// option: kernel cosmoos" in stripped:
+        options += ["--kernel", "cosmoos"]
+    return options
+
+
 def compare(args, root, path):
     problems = []
     dump = "--dump-ast" if args.command == "parse" else "--dump-hir"
-    for argv in ([args.command, dump, "--diagnostics-format=json", path], [args.command, path]):
+    extra = options_of(root, path) if args.command == "check" else []
+    for argv in ([args.command, dump, "--diagnostics-format=json"] + extra + [path], [args.command] + extra + [path]):
         mine = outcome(args.ceesafec, argv, root)
         ref = outcome(args.novac, argv, root)
         if mine != ref:

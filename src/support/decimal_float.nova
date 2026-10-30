@@ -1,0 +1,141 @@
+// Decimal text to the nearest f64 or f32, exactly: the reference parses float literals with .NET's correctly rounded
+// double.Parse and float.Parse (TypeChecker.CheckFloatLiteral), round to nearest, ties to even, directly in each type.
+// Nova has no float parsing, so this works on exact integers (src/support/bigint.nova). The literal is the fraction
+// N / D (digits × 10^e), and the result is m × 2^q with m of `precision` bits (fewer below the normal range): q is
+// found from bit lengths and corrected, m is the quotient, and twice the remainder against the divisor rounds it. An
+// f32 result is returned as the f64 of the same value, as the reference's `(double)float.Parse(…)` holds it.
+
+struct FloatFormat {
+    precision: usize; // significand bits, the hidden one included: 53 or 24
+    minExponent: i64; // the exponent of the smallest subnormal's unit: -1074 or -149
+    maxBits: i64;     // values at or above 2^maxBits overflow: 1024 or 128
+}
+
+fn f64Format() -> FloatFormat => FloatFormat { precision: 53, minExponent: -1074, maxBits: 1024 };
+
+fn f32Format() -> FloatFormat => FloatFormat { precision: 24, minExponent: -149, maxBits: 128 };
+
+/// The f64 nearest the decimal `text` (digits, an optional '.' and digits, an optional exponent `e±digits`), rounded
+/// in `format`; infinity if it is too large. `text` is a float literal's digits without separators.
+fn parseDecimalFloat(text: Slice<u8>, format: FloatFormat) -> Result<f64, AllocError> {
+    var digits = Vector<u8>.create();
+    var fractionDigits: i64 = 0;
+    var inFraction = false;
+    var i: usize = 0;
+    while (i < text.length && text[i] != 'e' && text[i] != 'E') {
+        if (text[i] == '.') {
+            inFraction = true;
+        } else {
+            digits.push(text[i])?;
+            if (inFraction) {
+                fractionDigits += 1;
+            }
+        }
+        i += 1;
+    }
+    var exponent: i64 = 0;
+    if (i < text.length) {
+        i += 1;
+        var sign: i64 = 1;
+        if (i < text.length && (text[i] == '+' || text[i] == '-')) {
+            if (text[i] == '-') {
+                sign = -1;
+            }
+            i += 1;
+        }
+        while (i < text.length) {
+            if (exponent < 100000) {
+                exponent = exponent * 10 + (text[i] - '0') as i64;
+            }
+            i += 1;
+        }
+        exponent *= sign;
+    }
+    let mantissa = match (BigNat.parse(digits.view(), 10)?) {
+        Some(n) => n,
+        null => BigNat.zero(),
+    };
+    if (mantissa.isZero()) {
+        return Ok(0.0);
+    }
+    let e = exponent - fractionDigits;
+    // Far outside the range: no need for huge powers of ten.
+    if (e + truncate<i64>(digits.length) > 400) {
+        return Ok(f64.fromBits(0x7FF0000000000000));
+    }
+    if (e + truncate<i64>(digits.length) < -400) {
+        return Ok(0.0);
+    }
+    var numerator = mantissa;
+    var denominator = BigNat.fromU64(1)?;
+    if (e >= 0) {
+        let scale = BigNat.power10(truncate<u32>(e))?;
+        numerator = BigNat.mul(numerator, scale)?;
+    } else {
+        denominator = BigNat.power10(truncate<u32>(0 - e))?;
+    }
+    let p = truncate<i64>(format.precision);
+    // value = N / D; choose q so that 2^(p-1) <= N / (D 2^q) < 2^p, but not below the subnormal exponent.
+    var q = truncate<i64>(numerator.bitLength()) - truncate<i64>(denominator.bitLength()) - p;
+    if (q < format.minExponent) {
+        q = format.minExponent;
+    }
+    var m = BigNat.zero();
+    var remainder = BigNat.zero();
+    var divisor = BigNat.zero();
+    loop {
+        let scaledNumerator = if (q < 0) BigNat.shiftLeft(numerator, truncate<usize>(0 - q))? else numerator.copyOf()?;
+        divisor = if (q > 0) BigNat.shiftLeft(denominator, truncate<usize>(q))? else denominator.copyOf()?;
+        let d = BigNat.divRem(scaledNumerator, divisor)?;
+        m = d.quotient;
+        remainder = d.remainder;
+        let length = truncate<i64>(m.bitLength());
+        if (length > p) {
+            q += 1;
+        } else if (length < p && q > format.minExponent) {
+            q -= 1;
+        } else {
+            break;
+        }
+    }
+    // Round to nearest, ties to even.
+    let twice = BigNat.shiftLeft(remainder, 1)?;
+    let order = twice.compare(divisor);
+    if (order > 0 || (order == 0 && !m.isEven())) {
+        m = BigNat.addSmall(m, 1)?;
+        if (truncate<i64>(m.bitLength()) > p) {
+            let half = BigNat.divRem(m, BigNat.fromU64(2)?)?;
+            m = half.quotient;
+            q += 1;
+        }
+    }
+    let length = truncate<i64>(m.bitLength());
+    if (q + length > format.maxBits) {
+        return Ok(f64.fromBits(0x7FF0000000000000));
+    }
+    let bits = match (m.toU64()) {
+        Some(b) => b,
+        null => 0,
+    };
+    return Ok(doubleOf(bits, q));
+}
+
+/// The f64 equal to m × 2^q, which must be representable (m has at most 53 bits).
+fn doubleOf(m: u64, q: i64) -> f64 {
+    if (m == 0) {
+        return 0.0;
+    }
+    var length: i64 = 0;
+    var v = m;
+    while (v != 0) {
+        length += 1;
+        v >>= 1;
+    }
+    let biased = q + length - 1 + 1023;
+    if (biased <= 0) {
+        // An f64 subnormal: its unit is 2^-1074.
+        return f64.fromBits(m << truncate<u32>(q + 1074));
+    }
+    let normalized = m << truncate<u32>(53 - length);
+    return f64.fromBits((truncate<u64>(biased) << 52) | (normalized & 0x000FFFFFFFFFFFFF));
+}
