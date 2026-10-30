@@ -94,6 +94,7 @@ fn resolveDynType(
 /// A reference's pointee or a box's contents (ResolvePointee): the only types that may be a `dyn I` (§37.1).
 fn resolvePointee(c: borrow mut Checker, syntax: u32) -> Result<u32, AllocError> {
     c.dynAllowed = true;
+    c.allowImported = true;
     let t = c.resolveType(syntax, false)?;
     c.dynAllowed = false;
     return Ok(t);

@@ -1,0 +1,52 @@
+@header("probe.h")
+extern "C" {
+    @ctype("probe_state_t")
+    struct probe_state {
+        count: u32;
+        @cname("type")
+        kind: u8;
+        next: *probe_state;
+        values: [u32; 4];
+    }
+    fn probe_init(state: *mut probe_state) -> i32;
+    @effects()
+    fn probe_sum(values: *u32, count: usize) -> u64;
+    fn probe_visit(callback: extern "C" fn(u32) -> u32, value: u32) -> u32;
+}
+
+@repr(C)
+struct Point {
+    x: i32;
+    y: i32;
+}
+@repr(u8)
+enum Mode { Off, On }
+
+@callback
+fn double(x: u32) -> u32 => x * 2;
+@export("probe_add")
+fn add(a: i32, b: i32) -> i32 => a + b;
+@export
+fn area(p: *Point) -> i64 => 0;
+@export
+const PROBE_LIMIT: u32 = 16;
+
+struct Holder {
+    run: extern "C" fn(u32) -> u32;
+}
+
+/// Safety: the probe library is linked, and the pointers come from live locals.
+fn main() {
+    let values = [1u32, 2, 3];
+    let f: extern "C" fn(u32) -> u32 = double;
+    let g: extern "C" fn(i32, i32) -> i32 = add;
+    let h = Holder { run: double };
+    let p = Point { x: 1, y: 2 };
+    let mode = Mode.On;
+    let total = unsafe { probe_sum(values[..].ptr, values.length) };
+    let visited = unsafe { probe_visit(f, 3) };
+    let direct = unsafe { f(4) + h.run(5) };
+    let sum = unsafe { g(1, 2) };
+    let state: Box<probe_state, SystemHeap>? = null;
+    Console.writeLine(total + (visited as u64) + (direct as u64) + truncate<u64>(sum + p.x) + (if (f.isNull()) 1u64 else 0u64));
+}

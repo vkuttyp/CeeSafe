@@ -96,6 +96,35 @@ fn checkExpr(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocE
     return coerce(c, value, expected, span);
 }
 
+/// The instance of generic function `g` that `name<A, B>` names (the explicit type arguments; none after an error).
+fn genericInstanceNamed(
+    c: borrow mut Checker,
+    g: u32,
+    symbol: u32,
+    typeArguments: Range,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let generic = c.genericFunctions[g as usize];
+    var parameterTypes = Vector<u32>.create();
+    listTypes(c, generic.parameters, mut parameterTypes)?;
+    var text = Vector<u8>.create();
+    appendBytes(mut text, c.name(symbol))?;
+    let pairs = Vector<InferencePair>.create();
+    var found = Vector<u32>.create();
+    let ok = typeArgumentsFor(
+        c,
+        text.view(),
+        parameterTypes.view(),
+        typeArguments,
+        emptyRange(),
+        false,
+        pairs.view(),
+        span,
+        mut found,
+    )?;
+    return if (ok) instantiateFunction(c, g, found.view(), span) else Ok(none());
+}
+
 fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError> {
     let span = c.front.ast.exprSpans[e as usize];
     match (c.front.ast.exprs[e as usize]) {
@@ -115,30 +144,33 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
             return Ok(value);
         }
         ExprNode.Name(name, typeArguments) => {
+            if (expected != none() && c.types.is(expected, TypeKind.FunctionPointer)) {
+                let symbol = c.front.ast.idents[name as usize].symbol;
+                match (c.lookup(symbol)?) {
+                    Entity.Function(function) => {
+                        if (typeArguments.count == 0) {
+                            return functionAddress(c, function, expected, span);
+                        }
+                    }
+                    Entity.GenericFunction(g) => {
+                        if (typeArguments.count > 0) {
+                            // An instance of a generic callback, named with its type arguments (§34.1).
+                            let instance = genericInstanceNamed(c, g, symbol, typeArguments, span)?;
+                            if (instance == none()) {
+                                return c.errorResult(span.start, span.end);
+                            }
+                            return functionAddress(c, instance, expected, span);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             if (typeArguments.count > 0) {
                 let symbol = c.front.ast.idents[name as usize].symbol;
                 match (c.lookup(symbol)?) {
                     Entity.GenericFunction(g) => {
                         // An instance of a generic function as a value, named with its type arguments (§36.1).
-                        let generic = c.genericFunctions[g as usize];
-                        var parameterTypes = Vector<u32>.create();
-                        listTypes(c, generic.parameters, mut parameterTypes)?;
-                        var text = Vector<u8>.create();
-                        appendBytes(mut text, c.name(symbol))?;
-                        let pairs = Vector<InferencePair>.create();
-                        var found = Vector<u32>.create();
-                        let ok = typeArgumentsFor(
-                            c,
-                            text.view(),
-                            parameterTypes.view(),
-                            typeArguments,
-                            emptyRange(),
-                            false,
-                            pairs.view(),
-                            span,
-                            mut found,
-                        )?;
-                        let instance = if (ok) instantiateFunction(c, g, found.view(), span)? else none();
+                        let instance = genericInstanceNamed(c, g, symbol, typeArguments, span)?;
                         if (instance == none()) {
                             return c.errorResult(span.start, span.end);
                         }
@@ -665,6 +697,10 @@ fn coerce(c: borrow mut Checker, e: u32, expected: u32, span: Span) -> Result<u3
     ) && h.mutableReference && !x.mutableReference && h.pointee == x.pointee) {
         return c.expr(HirExpr.Reborrow(false, e), expected, span.start, span.end);
     }
+    if (c.types.is(expected, TypeKind.RawPointer) && c.types.is(t, TypeKind.RawPointer) && h.mutablePointer &&
+        !x.mutablePointer && h.pointee == x.pointee) {
+        return c.expr(HirExpr.Cast(e), expected, span.start, span.end); // `*mut T` to `*T` (§27.1)
+    }
     // `borrow Box<T>` to `borrow T` (and mut to mut or shared): a reborrow of the box's contents (§18.2).
     if (c.types.is(expected, TypeKind.Reference) && h.pointee != none() && c.types.is(h.pointee, TypeKind.Box) &&
         c.types.info(h.pointee).pointee == x.pointee && (h.mutableReference || !x.mutableReference)) {
@@ -774,8 +810,8 @@ fn synthCall(
                         return checkClosureCall(c, value, arguments, span);
                     }
                     if (c.types.is(t, TypeKind.FunctionPointer)) {
-                        c.notPorted(span.start, span.end, "a call through a C function pointer", "S7")?;
-                        return c.errorResult(span.start, span.end);
+                        let value = c.expr(HirExpr.LocalRef(local), t, calleeSpan.start, calleeSpan.end)?;
+                        return checkPointerCall(c, value, arguments, span);
                     }
                     if (dynFunctionBehind(c, t) != none()) {
                         let value = c.expr(HirExpr.LocalRef(local), t, calleeSpan.start, calleeSpan.end)?;

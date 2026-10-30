@@ -160,7 +160,6 @@ fn processStructAttributes(c: borrow mut Checker, item: u32, s: u32) -> Result<v
             if (entry != none()) {
                 let definition = c.types.info(c.structs[entry as usize].typ).structDef;
                 c.types.structs[definition as usize].isReprC = true;
-                c.notPorted(a.start, a.end, "the C names and layout of a '@repr(C)' struct", "S7b")?;
             }
         }
     }
@@ -235,7 +234,6 @@ fn processEnumAttributes(
                     if (c.enums[index as usize].item == item) {
                         let definition = c.types.info(c.enums[index as usize].typ).enumDef;
                         c.types.enums[definition as usize].repr = integer;
-                        c.notPorted(a.start, a.end, "the C name of a '@repr' enum", "S7b")?;
                     }
                 }
                 _ => {}

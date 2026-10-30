@@ -294,6 +294,7 @@ fn resolveStructMembers(c: borrow mut Checker, index: u32) -> Result<void, Alloc
     for (k in 0..s.fields.count) {
         let field = c.front.ast.fields[c.front.ast.at(s.fields, k) as usize];
         let typeSpan = c.front.ast.typeSpans[field.typ as usize];
+        c.allowImported = true; // C state by value (§33.1)
         let resolved = c.resolveType(field.typ, false)?;
         let typ = checkMemberType(c, resolved, typeSpan, "a struct field", "struct", declarationName, hasRegions)?;
         let id = c.front.ast.idents[field.name as usize];

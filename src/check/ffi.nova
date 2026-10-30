@@ -1,0 +1,871 @@
+// C interoperability (the reference's DeclareExternBlock, DeclareImportedStruct, CheckLayoutUse, ResolveFunctionPointerType,
+// CheckFunctionPointerPart, FunctionAddress, CheckPointerCall, CheckCName, IsFfiSafe, IsCPointee, IsVolatileCell,
+// CheckSignatureIsFfiSafe and CheckForeignInterfaces): P3 S7b (type-system.md §28, §29.5, §31, §33, §34).
+
+fn notFfiSafe() -> u32 => 291;
+fn invalidCName() -> u32 => 292;
+
+/// A struct or array type written where a value of it needs a Nova layout, checked once fields are known (§33.1).
+struct LayoutUse {
+    typ: u32;
+    start: u32;
+    end: u32;
+    file: u32;
+}
+
+/// A C-laid-out type by value anywhere but a field or a box's contents is N0294 (CheckLayoutUse, §33.1).
+fn checkLayoutUse(c: borrow mut Checker, typ: u32, span: Span) -> Result<void, AllocError> {
+    if (!c.types.isCLaidOut(typ, 0)) {
+        return Ok();
+    }
+    var message = Vector<u8>.create();
+    appendQuotedType(mut message, c, typ)?;
+    appendText(
+        mut message,
+        " holds C state, which the C compiler lays out and which never moves: it can only be a field or a box's contents, made in place by 'Box.createIn' (type-system.md §33.1)",
+    )?;
+    return c.error(importedTypeByValue(), span.start, span.end, message);
+}
+
+/// The layout uses recorded before members were resolved (Check, after member resolution).
+fn checkLayoutUses(c: borrow mut Checker) -> Result<void, AllocError> {
+    let saved = c.file;
+    for (k in 0..c.layoutUses.length) {
+        let use = c.layoutUses[k];
+        c.file = use.file;
+        checkLayoutUse(c, use.typ, Span { start: use.start, end: use.end })?;
+    }
+    c.file = saved;
+    return Ok();
+}
+
+// ---- C names (§28.2) ----
+
+fn isCKeyword(name: Slice<u8>) -> bool {
+    let words =
+        "auto break case char const continue default do double else enum extern float for goto if inline int long register restrict return short signed sizeof static struct switch typedef union unsigned void volatile while bool true false main NULL alignas alignof noreturn static_assert thread_local";
+    return hasWord(words, name);
+}
+
+fn isAsciiLetter(b: u8) -> bool => (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z');
+fn isAsciiUpper(b: u8) -> bool => b >= 'A' && b <= 'Z';
+fn isAsciiDigit(b: u8) -> bool => b >= '0' && b <= '9';
+
+fn startsWithText(name: Slice<u8>, prefix: StringView) -> bool =>
+    name.length >= prefix.length && sameText(name[..prefix.length], prefix);
+
+/// A C name Nova may define or declare (CheckCName, §28.2): an identifier, no keyword, not reserved by C or by Nova's C
+/// (c-backend §2.1). N0292 otherwise.
+fn checkCName(c: borrow mut Checker, name: Slice<u8>, span: Span, what: StringView) -> Result<bool, AllocError> {
+    var valid = name.length > 0 && (isAsciiLetter(name[0]) || name[0] == '_');
+    for (b in name) {
+        if (!(isAsciiLetter(b) || isAsciiDigit(b) || b == '_')) {
+            valid = false;
+        }
+    }
+    var reason: u32 = 0;
+    if (!valid) {
+        reason = 1;
+    } else if (isCKeyword(name)) {
+        reason = 2;
+    } else if (startsWithText(name, "__") || (name.length > 1 && name[0] == '_' && isAsciiUpper(name[1]))) {
+        reason = 3;
+    } else if ((!isLibraryFile(c) && // the library calls the runtime by its names (lib/std, §38.3)
+        (startsWithText(name, "nova_") || startsWithText(name, "nv_") || startsWithText(name, "NV_"))) ||
+        (name.length > 2 && startsWithText(name, "nv") && isAsciiUpper(name[2]))) {
+        reason = 4;
+    }
+    if (reason == 0) {
+        return Ok(true);
+    }
+    var message = Vector<u8>.create();
+    appendText(mut message, what)?;
+    appendText(mut message, " '")?;
+    appendBytes(mut message, name)?;
+    appendText(mut message, "' ")?;
+    appendText(
+        mut message,
+        match (reason) {
+            1 => "is not a C identifier",
+            2 => "is a C keyword or a name C programs depend on",
+            3 => "is reserved by the C standard",
+            _ => "is reserved for the Nova runtime and generated code (c-backend.md §2.1)",
+        },
+    )?;
+    appendText(mut message, " (type-system.md §28.2)")?;
+    c.error(invalidCName(), span.start, span.end, message)?;
+    return Ok(false);
+}
+
+// ---- FFI-safe types (§28.3) ----
+
+/// `Volatile<T>` from lib/core (IsVolatileCell, §29.2): its one field has `T`'s layout.
+fn isVolatileCell(c: borrow Checker, typ: u32) -> bool {
+    let definition = c.types.info(typ).structDef;
+    if (definition == none() || c.types.structs[definition as usize].typeArguments.count != 1) {
+        return false;
+    }
+    let file = c.types.structs[definition as usize].file;
+    return file != none() && c.fileIsLibrary[file as usize] && startsWithText(c.types.name(typ), "Volatile<");
+}
+
+/// Can a value of `typ` cross to C (IsFfiSafe)?
+fn isFfiSafe(c: borrow Checker, typ: u32, isResult: bool, inStruct: bool) -> bool {
+    let t = c.types.info(typ);
+    if (c.types.is(typ, TypeKind.Integer) || c.types.is(typ, TypeKind.Float) || c.types.is(typ, TypeKind.Bool) ||
+        c.types.is(typ, TypeKind.Error) || c.types.is(typ, TypeKind.FunctionPointer)) {
+        return true;
+    }
+    if (c.types.is(typ, TypeKind.RawPointer)) {
+        return isCPointee(c, t.pointee);
+    }
+    if (c.types.is(typ, TypeKind.Void)) {
+        return isResult;
+    }
+    if (c.types.is(typ, TypeKind.Struct)) {
+        if (inStruct && isVolatileCell(c, typ)) {
+            let field = c.types.structs[t.structDef as usize].fields[0];
+            return isFfiSafe(c, c.types.fields[field as usize].typ, false, true);
+        }
+        if (inStruct && c.types.structs[t.structDef as usize].isImported) {
+            return true; // C state by value (ADR 0029)
+        }
+        return c.types.structs[t.structDef as usize].isReprC;
+    }
+    if (c.types.is(typ, TypeKind.Array) && inStruct) {
+        return isFfiSafe(c, t.element, false, true); // a C array member (ADR 0029)
+    }
+    if (c.types.is(typ, TypeKind.Enum)) {
+        return t.enumDef != none() && c.types.enums[t.enumDef as usize].repr != none() && !inStruct;
+    }
+    return false;
+}
+
+/// A pointee C can name (IsCPointee): an integer, bool, void, CChar, a @repr(C) or imported struct, or such a pointer.
+fn isCPointee(c: borrow Checker, typ: u32) -> bool {
+    if (c.types.is(typ, TypeKind.Integer) || c.types.is(typ, TypeKind.Float) || c.types.is(typ, TypeKind.Bool) ||
+        c.types.is(typ, TypeKind.Void) || c.types.is(typ, TypeKind.CChar) || c.types.is(typ, TypeKind.Error)) {
+        return true;
+    }
+    if (c.types.is(typ, TypeKind.Struct)) {
+        let s = c.types.info(typ).structDef;
+        return c.types.structs[s as usize].isReprC || c.types.structs[s as usize].isImported;
+    }
+    if (c.types.is(typ, TypeKind.RawPointer)) {
+        return isCPointee(c, c.types.info(typ).pointee);
+    }
+    return false;
+}
+
+// ---- C function pointers (§29.5) ----
+
+/// `extern "C" fn(T…) -> R` (ResolveFunctionPointerType).
+fn resolveFunctionPointerType(
+    c: borrow mut Checker,
+    abi: Range,
+    parameters: Range,
+    result: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    if (!sameText(c.front.ast.textOf(abi), "C")) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "unsupported ABI \"")?;
+        appendBytes(mut message, c.front.ast.textOf(abi))?;
+        appendText(mut message, "\": only extern \"C\" function pointers exist (type-system.md §29.5)")?;
+        c.error(invalidAttribute(), span.start, span.end, message)?;
+        return Ok(c.types.error);
+    }
+    var ok = true;
+    var types = Vector<u32>.create();
+    for (k in 0..parameters.count) {
+        let syntax = c.front.ast.at(parameters, k);
+        let parameter = c.resolveType(syntax, false)?;
+        let parameterSpan = c.front.ast.typeSpans[syntax as usize];
+        if (!checkFunctionPointerPart(c, parameter, parameterSpan, false)?) {
+            ok = false;
+        }
+        types.push(parameter)?;
+    }
+    let resultType = if (result == none()) c.types.voidType else c.resolveType(result, true)?;
+    let resultSpan = if (result == none()) span else c.front.ast.typeSpans[result as usize];
+    if (!checkFunctionPointerPart(c, resultType, resultSpan, true)?) {
+        ok = false;
+    }
+    return if (ok) c.types.functionPointerTo(types.view(), resultType) else Ok(c.types.error);
+}
+
+/// A parameter or result of a C function pointer (CheckFunctionPointerPart): FFI-safe, and no enum (N0291).
+fn checkFunctionPointerPart(c: borrow mut Checker, typ: u32, span: Span, isResult: bool) -> Result<bool, AllocError> {
+    if (c.types.isBottom(typ)) {
+        return Ok(false);
+    }
+    let isEnum = c.types.is(typ, TypeKind.Enum);
+    if (isEnum || !isFfiSafe(c, typ, isResult, false)) {
+        var message = Vector<u8>.create();
+        if (isEnum) {
+            appendText(mut message, "a C function pointer cannot take or return the @repr enum ")?;
+            appendQuotedType(mut message, c, typ)?;
+            appendText(mut message, ": a value from C could not be checked (type-system.md §29.5)")?;
+        } else {
+            appendText(mut message, "a C function pointer cannot take or return a ")?;
+            appendQuotedType(mut message, c, typ)?;
+            appendText(mut message, " (type-system.md §28.3)")?;
+        }
+        c.error(notFfiSafe(), span.start, span.end, message)?;
+        return Ok(false);
+    }
+    return Ok(true);
+}
+
+/// The C address of an extern, exported or `@callback` function where a function pointer type is expected
+/// (FunctionAddress, §29.5).
+fn functionAddress(c: borrow mut Checker, function: u32, expected: u32, span: Span) -> Result<u32, AllocError> {
+    let f = borrow c.hir.functions[function as usize];
+    let syntax = f.syntax;
+    let name = f.name;
+    let returnType = f.returnType;
+    let isExtern = c.front.ast.functions[syntax as usize].isExtern;
+    if (!isExtern && !f.exported && !containsU32(c.callbacks, syntax)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "function ")?;
+        appendQuotedName(mut message, c, name)?;
+        appendText(
+            mut message,
+            " has no C address: only extern \"C\", @export and @callback functions can be C function pointers (type-system.md §29.5, §34.1)",
+        )?;
+        c.error(notFfiSafe(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var parameters = Vector<u32>.create();
+    for (p in c.hir.functions[function as usize].parameters.view()) {
+        parameters.push(c.hir.locals[p as usize].typ)?;
+    }
+    let actual = c.types.functionPointerTo(parameters.view(), returnType)?;
+    if (actual != expected) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "expected ")?;
+        appendQuotedType(mut message, c, expected)?;
+        appendText(mut message, ", found ")?;
+        appendQuotedType(mut message, c, actual)?;
+        c.error(typeMismatch(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    return c.expr(HirExpr.FunctionAddress(function), expected, span.start, span.end);
+}
+
+/// A call through a C function pointer (CheckPointerCall, §29.5): unsafe.
+fn checkPointerCall(c: borrow mut Checker, callee: u32, arguments: Range, span: Span) -> Result<u32, AllocError> {
+    let typ = c.typeOf(callee);
+    let parameters = c.types.info(typ).parameters;
+    let result = c.types.info(typ).result;
+    let unsafeOk = requireUnsafe(c, span, "calling through a C function pointer".bytes())?;
+    if (arguments.count != parameters.count) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, " takes ")?;
+        appendDecimal(mut message, parameters.count as u64)?;
+        appendText(mut message, " argument(s) but ")?;
+        appendDecimal(mut message, arguments.count as u64)?;
+        appendText(mut message, " were supplied")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var values = Vector<u32>.create();
+    values.push(callee)?;
+    var bottom = false;
+    for (k in 0..arguments.count) {
+        let syntax = c.front.ast.at(arguments, k);
+        let parameter = c.types.listAt(parameters, k);
+        let argument = checkArgument(c, syntax, parameter)?;
+        if (c.isBottom(argument)) {
+            bottom = true;
+        }
+        values.push(argument)?;
+    }
+    if (!unsafeOk || bottom) {
+        return c.errorResult(span.start, span.end);
+    }
+    let list = c.hir.list(values.view())?;
+    return c.expr(HirExpr.BuiltinCall(bfCallPointer(), list), result, span.start, span.end);
+}
+
+// ---- Extern blocks (§28.2, §31) ----
+
+/// `extern "C" { … }` (DeclareExternBlock): its headers, and each function declared like a top-level one, without a
+/// body. Its imported structs are declared with the structs (declareImportedStruct).
+fn declareExternBlock(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
+    let entry = c.front.ast.items[item as usize];
+    var abi = emptyRange();
+    var functions = emptyRange();
+    var structs = emptyRange();
+    match (entry.kind) {
+        ItemKind.Extern(a, f, s) => {
+            abi = a;
+            functions = f;
+            structs = s;
+        }
+        _ => {}
+    }
+    var known = Vector<u32>.create();
+    knownAttributes(c, entry.attributes, "an 'extern' block", "header", mut known)?;
+    let header = if (known.length > 0) known[0] else none();
+    if (!sameText(c.front.ast.textOf(abi), "C")) {
+        let abiIdent = c.front.ast.idents[entry.name as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "unsupported ABI \"")?;
+        appendBytes(mut message, c.front.ast.textOf(abi))?;
+        appendText(mut message, "\": only extern \"C\" exists (type-system.md §28.2)")?;
+        c.error(invalidAttribute(), abiIdent.start, abiIdent.end, message)?;
+        return Ok();
+    }
+    if (header != none()) {
+        let a = c.front.ast.attributes[header as usize];
+        var allStrings = a.arguments.count > 0;
+        for (k in 0..a.arguments.count) {
+            let isString = match (c.front.ast.exprs[c.front.ast.at(a.arguments, k) as usize]) {
+                ExprNode.StringLiteral(_) => true,
+                _ => false,
+            };
+            if (!isString) {
+                allStrings = false;
+            }
+        }
+        if (!allStrings) {
+            attributeError(c, header, "'@header' takes the headers to include as strings: '@header(\"path.h\")'")?;
+        }
+        for (k in 0..a.arguments.count) {
+            let text = match (c.front.ast.exprs[c.front.ast.at(a.arguments, k) as usize]) {
+                ExprNode.StringLiteral(t) => t,
+                _ => Range { start: 0, count: 0xFFFFFFFF },
+            };
+            if (text.count == 0xFFFFFFFF) {
+                continue;
+            }
+            var path = Vector<u8>.create();
+            appendBytes(mut path, c.front.ast.textOf(text))?;
+            var badPath = path.length == 0;
+            for (b in path.view()) {
+                if (b == '"' || b == '\\' || b == '\n' || b == '\r') {
+                    badPath = true;
+                }
+            }
+            if (badPath) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "'")?;
+                appendBytes(mut message, path.view())?;
+                appendText(
+                    mut message,
+                    "' cannot be written in a C '#include \"…\"': a header path is non-empty, without quotes, backslashes or line breaks (type-system.md §31.1)",
+                )?;
+                attributeErrorBytes(c, header, message.view())?;
+            } else {
+                var present = false;
+                for (h in c.headers.view()) {
+                    if (sameBytes(h.view(), path.view())) {
+                        present = true;
+                    }
+                }
+                if (!present) {
+                    c.headers.push(path)?;
+                }
+            }
+        }
+    } else if (structs.count > 0) {
+        let first = c.front.ast.items[c.front.ast.at(structs, 0) as usize];
+        let id = c.front.ast.idents[first.name as usize];
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            "an 'extern' block that imports C types needs '@header(\"…\")' naming the headers that define them (type-system.md §31.1)",
+        )?;
+        c.error(invalidAttribute(), id.start, id.end, message)?;
+    }
+    for (k in 0..functions.count) {
+        let f = c.front.ast.at(functions, k);
+        let decl = c.front.ast.functions[f as usize];
+        var fnKnown = Vector<u32>.create();
+        knownAttributes(c, decl.attributes, "a C function", "effects constant", mut fnKnown)?;
+        readEffectAttributes(c, f, fnKnown.view())?;
+        var problem: u32 = 0;
+        if (decl.body != none() || decl.expressionBody != none()) {
+            problem = 1;
+        } else if (receiverIndex(decl.receiver) != 0) {
+            problem = 2;
+        } else if (decl.typeParameters.count > 0 || decl.regionParameters.count > 0) {
+            problem = 3;
+        } else if (decl.isUnsafe) {
+            problem = 4;
+        }
+        let id = c.front.ast.idents[decl.name as usize];
+        if (problem != 0) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "C function ")?;
+            appendQuotedName(mut message, c, id.symbol)?;
+            appendText(
+                mut message,
+                match (problem) {
+                    1 => " cannot have a body; it is defined in C (type-system.md §28.2)",
+                    2 => " cannot have a 'this' parameter (type-system.md §28.2)",
+                    3 => " cannot be generic (type-system.md §28.2)",
+                    _ => " is unsafe to call already; leave out 'unsafe' (type-system.md §28.2)",
+                },
+            )?;
+            c.error(invalidAttribute(), id.start, id.end, message)?;
+            continue;
+        }
+        // Declare(fn): the reserved and duplicate names, then the function.
+        if (isReservedName(c, decl.name)?) {
+            continue;
+        }
+        if (isDeclared(c, id.symbol)) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "'")?;
+            appendBytes(mut message, c.name(id.symbol))?;
+            appendText(mut message, "' is already defined")?;
+            c.error(duplicateItem(), id.start, id.end, message)?;
+            continue;
+        }
+        let function = declareFunction(c, f, none())?;
+        ownItem(c, id.symbol, Entity.Function(function))?;
+    }
+    return Ok();
+}
+
+/// A struct in an `extern "C"` block (DeclareImportedStruct, §31.1): a C type imported from a header, with no Nova
+/// layout.
+fn declareImportedStruct(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
+    let entry = c.front.ast.items[item as usize];
+    let s = match (entry.kind) {
+        ItemKind.Struct(index) => c.front.ast.structs[index as usize],
+        _ => { return Ok(); }
+    };
+    let generic = s.typeParameters.count > 0 || s.regionParameters.count > 0;
+    var problem: u32 = 0;
+    if (generic) {
+        problem = 1;
+    } else if (s.functions.count > 0) {
+        problem = 2;
+    } else if (s.dropBlock != none()) {
+        problem = 3;
+    }
+    let id = c.front.ast.idents[entry.name as usize];
+    if (problem != 0) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "imported C type ")?;
+        appendQuotedName(mut message, c, id.symbol)?;
+        appendText(
+            mut message,
+            match (problem) {
+                1 => " cannot be generic; its definition is the header's (type-system.md §31.1)",
+                2 => " cannot have methods; its definition is the header's (type-system.md §31.1)",
+                _ => " cannot have a 'drop' block; its definition is the header's (type-system.md §31.1)",
+            },
+        )?;
+        c.error(invalidAttribute(), id.start, id.end, message)?;
+        if (generic) {
+            return Ok();
+        }
+    }
+    declareStruct(c, item)?;
+    let index = ownStructEntry(c, item);
+    if (index == none()) {
+        return Ok();
+    }
+    let definition = c.types.info(c.structs[index as usize].typ).structDef;
+    c.types.structs[definition as usize].isImported = true;
+    c.types.structs[definition as usize].isNonCopy = true; // no value of it exists in Nova (§31.2)
+    var spelling = Vector<u8>.create();
+    appendText(mut spelling, "struct ")?;
+    appendBytes(mut spelling, c.name(id.symbol))?;
+    var known = Vector<u32>.create();
+    knownAttributes(c, entry.attributes, "an imported C type", "ctype", mut known)?;
+    for (attribute in known.view()) {
+        let a = c.front.ast.attributes[attribute as usize];
+        var text = Range { start: 0, count: 0xFFFFFFFF };
+        if (a.arguments.count == 1) {
+            match (c.front.ast.exprs[c.front.ast.at(a.arguments, 0) as usize]) {
+                ExprNode.StringLiteral(t) => { text = t; }
+                _ => {}
+            }
+        }
+        if (text.count == 0xFFFFFFFF) {
+            attributeError(c, attribute, "'@ctype' takes the C type's name as a string: '@ctype(\"name_t\")'")?;
+            continue;
+        }
+        var name = Vector<u8>.create();
+        appendBytes(mut name, c.front.ast.textOf(text))?;
+        if (checkCName(c, name.view(), Span { start: a.start, end: a.end }, "the C type name")?) {
+            spelling = name;
+        }
+    }
+    c.types.structs[definition as usize].hasCSpelling = true;
+    c.types.structs[definition as usize].cSpelling = c.types.addName(spelling)?;
+    return Ok();
+}
+
+// ---- CheckForeignInterfaces (§28.2–§28.5) ----
+
+/// One C name claimed by a C function or export.
+struct CNameClaim {
+    name: Vector<u8>;
+}
+
+fn claimCName(
+    c: borrow mut Checker,
+    claims: borrow mut Vector<CNameClaim>,
+    name: Slice<u8>,
+    span: Span,
+    what: Slice<u8>,
+) -> Result<void, AllocError> {
+    for (claim in claims.view()) {
+        if (sameBytes(claim.name.view(), name)) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "the C name '")?;
+            appendBytes(mut message, name)?;
+            appendText(mut message, "' of ")?;
+            appendBytes(mut message, what)?;
+            appendText(mut message, " is already used by another C function or export (type-system.md §28.2)")?;
+            return c.error(duplicateItem(), span.start, span.end, message);
+        }
+    }
+    return claims.push(CNameClaim { name: copyBytes(name)? });
+}
+
+/// A function whose signature crosses to C (CheckSignatureIsFfiSafe, N0291).
+fn checkSignatureIsFfiSafe(c: borrow mut Checker, function: u32, what: Slice<u8>) -> Result<void, AllocError> {
+    let syntax = c.hir.functions[function as usize].syntax;
+    let decl = c.front.ast.functions[syntax as usize];
+    for (k in 0..decl.parameters.count) {
+        let p = c.hir.functions[function as usize].parameters[k as usize];
+        let t = c.hir.locals[p as usize].typ;
+        if (!isFfiSafe(c, t, false, false)) {
+            let parameter = c.front.ast.parameters[c.front.ast.at(decl.parameters, k) as usize];
+            let span = c.front.ast.typeSpans[parameter.typ as usize];
+            var message = Vector<u8>.create();
+            appendBytes(mut message, what)?;
+            appendText(mut message, " cannot take a ")?;
+            appendQuotedType(mut message, c, t)?;
+            appendText(
+                mut message,
+                ": only integers, bool, raw pointers, @repr(C) structs and @repr enums cross to C (type-system.md §28.3)",
+            )?;
+            c.error(notFfiSafe(), span.start, span.end, message)?;
+        }
+    }
+    // A C constant macro's result is C's initialiser, never a value crossing a call (§39.4).
+    let returnType = c.hir.functions[function as usize].returnType;
+    if (!isFfiSafe(
+        c,
+        returnType,
+        true,
+        false,
+    ) && !(decl.isExtern && hasAttributeNamed(c, decl.attributes, "constant"))) {
+        let span = if (decl.returnType != none()) c.front.ast.typeSpans[decl.returnType as usize] else identSpan(
+            c,
+            decl.name,
+        );
+        var message = Vector<u8>.create();
+        appendBytes(mut message, what)?;
+        appendText(mut message, " cannot return a ")?;
+        appendQuotedType(mut message, c, returnType)?;
+        appendText(
+            mut message,
+            ": only integers, bool, raw pointers, @repr(C) structs, @repr enums and void cross to C (type-system.md §28.3)",
+        )?;
+        c.error(notFfiSafe(), span.start, span.end, message)?;
+    }
+    return Ok();
+}
+
+fn attributeSpanNamed(c: borrow Checker, attributes: Range, name: StringView) -> Span {
+    for (k in 0..attributes.count) {
+        let attribute = c.front.ast.at(attributes, k);
+        if (sameText(attributeName(c, attribute), name)) {
+            let a = c.front.ast.attributes[attribute as usize];
+            return Span { start: a.start, end: a.end };
+        }
+    }
+    return Span { start: 0, end: 0 };
+}
+
+fn identSpan(c: borrow Checker, ident: u32) -> Span {
+    let id = c.front.ast.idents[ident as usize];
+    return Span { start: id.start, end: id.end };
+}
+
+/// Once every type is resolved: FFI-safe signatures and fields, and valid, unique C names (CheckForeignInterfaces).
+fn checkForeignInterfaces(c: borrow mut Checker) -> Result<void, AllocError> {
+    let saved = c.file;
+    var claims = Vector<CNameClaim>.create();
+    for (k in 0..c.structs.length) {
+        let entry = c.structs[k];
+        let definition = c.types.info(entry.typ).structDef;
+        if (!c.types.structs[definition as usize].isReprC) {
+            continue;
+        }
+        c.file = entry.file;
+        let item = c.front.ast.items[entry.item as usize];
+        var name = Vector<u8>.create();
+        appendBytes(mut name, c.name(c.front.ast.idents[item.name as usize].symbol))?;
+        let nameSpan = identSpan(c, item.name);
+        checkCName(c, name.view(), nameSpan, "the C struct name")?;
+        let s = match (item.kind) {
+            ItemKind.Struct(index) => c.front.ast.structs[index as usize],
+            _ => { continue; }
+        };
+        let fieldCount = c.types.structs[definition as usize].fields.length;
+        for (j in 0..fieldCount) {
+            if (j >= s.fields.count as usize) {
+                break;
+            }
+            let field = c.types.structs[definition as usize].fields[j];
+            let syntax = c.front.ast.fields[c.front.ast.at(s.fields, truncate<u32>(j)) as usize];
+            c.types.fields[field as usize].hasNovaCName = true;
+            var fieldName = Vector<u8>.create();
+            appendBytes(mut fieldName, c.name(c.types.fields[field as usize].name))?;
+            let memberSpan = identSpan(c, syntax.name);
+            checkCName(c, fieldName.view(), memberSpan, "the C member name")?;
+            let t = c.types.fields[field as usize].typ;
+            if (!isFfiSafe(c, t, false, true)) {
+                let span = c.front.ast.typeSpans[syntax.typ as usize];
+                var message = Vector<u8>.create();
+                appendText(mut message, "a @repr(C) struct cannot hold a ")?;
+                appendQuotedType(mut message, c, t)?;
+                appendText(
+                    mut message,
+                    ": only integers, bool, raw pointers to C types, @repr(C) structs, imported C types and arrays of these have C layouts (type-system.md §28.5)",
+                )?;
+                c.error(notFfiSafe(), span.start, span.end, message)?;
+            }
+        }
+        let dropFunction = c.types.structs[definition as usize].dropFunction;
+        if (dropFunction != none() && c.types.isCLaidOut(entry.typ, 0)) {
+            let dropSyntax = c.front.ast.functions[c.hir.functions[dropFunction as usize].syntax as usize];
+            let span = identSpan(c, dropSyntax.name);
+            var message = Vector<u8>.create();
+            appendText(
+                mut message,
+                "a @repr(C) struct that holds C state cannot have a drop: C makes and discards it without calling Nova (type-system.md §28.5)",
+            )?;
+            c.error(notFfiSafe(), span.start, span.end, message)?;
+        }
+    }
+    for (k in 0..c.enums.length) {
+        let entry = c.enums[k];
+        if (entry.item == none()) {
+            continue;
+        }
+        let definition = c.types.info(entry.typ).enumDef;
+        if (c.types.enums[definition as usize].repr == none()) {
+            continue;
+        }
+        c.file = entry.file;
+        let nameIdent = c.front.ast.items[entry.item as usize].name;
+        var name = Vector<u8>.create();
+        appendBytes(mut name, c.name(c.front.ast.idents[nameIdent as usize].symbol))?;
+        let nameSpan = identSpan(c, nameIdent);
+        checkCName(c, name.view(), nameSpan, "the C type name")?;
+    }
+    for (k in 0..c.structs.length) {
+        let entry = c.structs[k];
+        let definition = c.types.info(entry.typ).structDef;
+        if (!c.types.structs[definition as usize].isImported) {
+            continue;
+        }
+        c.file = entry.file;
+        let item = c.front.ast.items[entry.item as usize];
+        var name = Vector<u8>.create();
+        appendBytes(mut name, c.name(c.front.ast.idents[item.name as usize].symbol))?;
+        let nameSpan = identSpan(c, item.name);
+        checkCName(c, name.view(), nameSpan, "the C struct name")?;
+        let s = match (item.kind) {
+            ItemKind.Struct(index) => c.front.ast.structs[index as usize],
+            _ => { continue; }
+        };
+        var memberCNames = Vector<Vector<u8>>.create();
+        let fieldCount = c.types.structs[definition as usize].fields.length;
+        for (j in 0..fieldCount) {
+            if (j >= s.fields.count as usize) {
+                break;
+            }
+            let field = c.types.structs[definition as usize].fields[j];
+            let syntax = c.front.ast.fields[c.front.ast.at(s.fields, truncate<u32>(j)) as usize];
+            c.types.fields[field as usize].hasNovaCName = true;
+            var cName = Vector<u8>.create();
+            appendBytes(mut cName, c.name(c.types.fields[field as usize].name))?;
+            var cNameSpan = identSpan(c, syntax.name);
+            var known = Vector<u32>.create();
+            knownAttributes(c, syntax.attributes, "a field", "cname", mut known)?;
+            for (attribute in known.view()) {
+                let a = c.front.ast.attributes[attribute as usize];
+                var text = Range { start: 0, count: 0xFFFFFFFF };
+                if (a.arguments.count == 1) {
+                    match (c.front.ast.exprs[c.front.ast.at(a.arguments, 0) as usize]) {
+                        ExprNode.StringLiteral(t) => { text = t; }
+                        _ => {}
+                    }
+                }
+                if (text.count == 0xFFFFFFFF) {
+                    attributeError(c, attribute, "'@cname' takes the C member's name as a string: '@cname(\"type\")'")?;
+                    continue;
+                }
+                cName = Vector<u8>.create();
+                appendBytes(mut cName, c.front.ast.textOf(text))?;
+                cNameSpan = Span { start: a.start, end: a.end };
+                c.types.fields[field as usize].hasCName = true;
+                c.types.fields[field as usize].cName = c.types.addName(cName)?;
+            }
+            if (checkCName(c, cName.view(), cNameSpan, "the C member name")?) {
+                var duplicate = false;
+                for (m in memberCNames.view()) {
+                    if (sameBytes(m.view(), cName.view())) {
+                        duplicate = true;
+                    }
+                }
+                if (duplicate) {
+                    var message = Vector<u8>.create();
+                    appendQuotedType(mut message, c, entry.typ)?;
+                    appendText(mut message, " already has a field with the C name '")?;
+                    appendBytes(mut message, cName.view())?;
+                    appendText(mut message, "' (type-system.md §31.1)")?;
+                    c.error(duplicateMember(), cNameSpan.start, cNameSpan.end, message)?;
+                } else {
+                    memberCNames.push(copyBytes(cName.view())?)?;
+                }
+            }
+            let t = c.types.fields[field as usize].typ;
+            let isArray = c.types.is(t, TypeKind.Array);
+            let element = if (isArray) c.types.info(t).element else none();
+            if (element != none()) {
+                let elementDef = c.types.info(element).structDef;
+                if (c.types.is(element, TypeKind.Integer) || c.types.is(element, TypeKind.Bool) ||
+                    c.types.is(element, TypeKind.Error) ||
+                    (elementDef != none() && c.types.structs[elementDef as usize].isImported)) {
+                    continue; // a C array member (C9, §31.1)
+                }
+            }
+            let fieldDef = c.types.info(t).structDef;
+            let simple = c.types.is(
+                t,
+                TypeKind.Integer,
+            ) || c.types.is(t, TypeKind.Bool) || c.types.is(t, TypeKind.Error);
+            let cPointer = c.types.is(t, TypeKind.RawPointer) && isCPointee(c, c.types.info(t).pointee);
+            let embedded = fieldDef != none() && c.types.structs[fieldDef as usize].isImported; // §33.1
+            let callback = c.types.is(t, TypeKind.FunctionPointer);                             // a C function pointer (§34.3)
+            if (!simple && !cPointer && !embedded && !callback) {
+                let span = c.front.ast.typeSpans[syntax.typ as usize];
+                var message = Vector<u8>.create();
+                appendText(mut message, "a field of an imported C type cannot be a ")?;
+                appendQuotedType(mut message, c, t)?;
+                appendText(
+                    mut message,
+                    ": only integers, bool, raw pointers to C types, embedded imported types and arrays of integers, bool or imported types are spelled alike in C and Nova (type-system.md §31.1)",
+                )?;
+                c.error(notFfiSafe(), span.start, span.end, message)?;
+            }
+        }
+    }
+    for (k in 0..c.hir.functions.length) {
+        let syntax = c.hir.functions[k].syntax;
+        if (!c.hir.functions[k].registered || !containsU32(c.callbacks, syntax) || functionIsInstantiation(
+            c,
+            truncate<u32>(k),
+        )) {
+            continue;
+        }
+        let function = truncate<u32>(k);
+        c.file = c.hir.functions[k].file;
+        var what = Vector<u8>.create();
+        appendText(mut what, "callback '")?;
+        appendBytes(mut what, c.name(c.hir.functions[k].name))?;
+        appendText(mut what, "'")?;
+        var generic = c.types.isGeneric(c.hir.functions[k].returnType);
+        for (p in c.hir.functions[k].parameters.view()) {
+            if (c.types.isGeneric(c.hir.locals[p as usize].typ)) {
+                generic = true;
+            }
+        }
+        if (generic) {
+            let span = identSpan(c, c.front.ast.functions[syntax as usize].name);
+            var message = Vector<u8>.create();
+            appendBytes(mut message, what.view())?;
+            appendText(
+                mut message,
+                " has a C signature that depends on its type parameters; every instance must have the same one (type-system.md §34.1)",
+            )?;
+            c.error(notFfiSafe(), span.start, span.end, message)?;
+            continue;
+        }
+        checkSignatureIsFfiSafe(c, function, what.view())?;
+    }
+    for (k in 0..c.hir.functions.length) {
+        if (!c.hir.functions[k].registered) {
+            continue;
+        }
+        let syntax = c.hir.functions[k].syntax;
+        let decl = c.front.ast.functions[syntax as usize];
+        let exported = c.hir.functions[k].exported;
+        if (!decl.isExtern && !exported) {
+            continue;
+        }
+        let function = truncate<u32>(k);
+        c.file = c.hir.functions[k].file;
+        var name = Vector<u8>.create();
+        if (exported) {
+            appendBytes(mut name, c.hir.textOf(c.hir.functions[k].exportName))?;
+        } else {
+            appendBytes(mut name, c.name(c.hir.functions[k].name))?;
+        }
+        var what = Vector<u8>.create();
+        if (decl.isExtern) {
+            appendText(mut what, "C function '")?;
+            appendBytes(mut what, name.view())?;
+        } else {
+            appendText(mut what, "exported function '")?;
+            appendBytes(mut what, c.name(c.hir.functions[k].name))?;
+        }
+        appendText(mut what, "'")?;
+        let span = if (decl.isExtern) identSpan(c, decl.name) else attributeSpanNamed(c, decl.attributes, "export");
+        // `_` and a lowercase letter is allowed: platforms' entry symbols (`_start`, §29.6) and C library names.
+        if (checkCName(c, name.view(), span, if (decl.isExtern) "the C function name" else "the exported symbol")?) {
+            claimCName(c, mut claims, name.view(), span, what.view())?;
+        }
+        checkSignatureIsFfiSafe(c, function, what.view())?;
+    }
+    for (k in 0..c.constants.length) {
+        let entry = c.constants[k];
+        let hir = c.hir.constants[entry.hir as usize];
+        if (!hir.exported) {
+            continue;
+        }
+        c.file = entry.file;
+        let item = c.front.ast.items[entry.item as usize];
+        let span = attributeSpanNamed(c, item.attributes, "export");
+        var name = Vector<u8>.create();
+        appendBytes(mut name, c.hir.textOf(hir.exportName))?;
+        if (checkCName(c, name.view(), span, "the exported symbol")?) {
+            var what = Vector<u8>.create();
+            appendText(mut what, "exported constant '")?;
+            appendBytes(mut what, c.name(c.front.ast.idents[item.name as usize].symbol))?;
+            appendText(mut what, "'")?;
+            claimCName(c, mut claims, name.view(), span, what.view())?;
+        }
+        let t = hir.typ;
+        if (!(c.types.is(t, TypeKind.Integer) || c.types.is(t, TypeKind.Bool) || c.types.is(t, TypeKind.Array) ||
+            c.types.is(t, TypeKind.Error))) {
+            let typeSyntax = match (item.kind) {
+                ItemKind.Const(typ, _) => typ,
+                _ => none(),
+            };
+            let typeSpan = c.front.ast.typeSpans[typeSyntax as usize];
+            var message = Vector<u8>.create();
+            appendText(mut message, "an exported constant is an integer, a bool, or an array of them, not a ")?;
+            appendQuotedType(mut message, c, t)?;
+            appendText(mut message, " (type-system.md §28.4)")?;
+            c.error(notFfiSafe(), typeSpan.start, typeSpan.end, message)?;
+        }
+    }
+    c.file = saved;
+    return Ok();
+}

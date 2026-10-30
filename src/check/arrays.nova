@@ -17,8 +17,14 @@ struct PendingElement {
 }
 
 /// `[T; N]`.
-fn resolveArrayType(c: borrow mut Checker, elementSyntax: u32, lengthSyntax: u32) -> Result<u32, AllocError> {
-    // An array of C state is C-laid-out (C9, §33.1) and allowed where its element is: S7.
+fn resolveArrayType(
+    c: borrow mut Checker,
+    elementSyntax: u32,
+    lengthSyntax: u32,
+    allowImported: bool,
+) -> Result<u32, AllocError> {
+    // An array of C state is C-laid-out (C9, §33.1) and allowed where its element is.
+    c.allowImported = allowImported;
     let element = c.resolveType(elementSyntax, false)?;
     let length = arrayLength(c, lengthSyntax);
     if (length == 0) {

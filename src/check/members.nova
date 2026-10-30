@@ -103,6 +103,21 @@ fn synthStructLiteral(
         }
         return c.errorResult(span.start, span.end);
     }
+    let declared = c.types.info(c.structs[index as usize].typ).structDef;
+    if (c.types.structs[declared as usize].isImported) {
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, nameIdent.symbol)?;
+        appendText(
+            mut message,
+            " is a C type imported from a header: Nova cannot make one, only point to one (type-system.md §31.2)",
+        )?;
+        c.error(importedTypeByValue(), nameSpan.start, nameSpan.end, message)?;
+        for (k in 0..fields.count) {
+            let init = c.front.ast.fieldInits[c.front.ast.at(fields, k) as usize];
+            synth(c, init.value, none())?;
+        }
+        return c.errorResult(span.start, span.end);
+    }
     var entry = index;
     let templateItem = c.structs[index as usize].item;
     if (isGenericItem(c, templateItem)) {
@@ -188,13 +203,31 @@ fn synthStructLiteral(
         }
         seen.push(field)?;
         let fieldType = c.types.fields[field as usize].typ;
+        let fieldDef = c.types.info(fieldType).structDef;
+        if (fieldDef != none() && c.types.structs[fieldDef as usize].isImported && !inStaticConstruction(c)) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "field ")?;
+            appendQuotedName(mut message, c, c.types.fields[field as usize].name)?;
+            appendText(mut message, " holds C state of type ")?;
+            appendQuotedType(mut message, c, fieldType)?;
+            appendText(
+                mut message,
+                ", which is zero-filled when the value is made: leave it out (type-system.md §33.2)",
+            )?;
+            c.error(importedTypeByValue(), idSpan.start, idSpan.end, message)?;
+            synth(c, init.value, none())?;
+            ok = false;
+            continue;
+        }
         let value = checkExpr(c, init.value, fieldType)?;
         values.push(HirFieldValue { field: field, value: value })?;
     }
     var missing = Vector<u8>.create();
     var missingCount: u32 = 0;
     for (f in c.types.structs[definition as usize].fields.view()) {
-        if (!containsSymbol(seen, f)) {
+        let missingDef = c.types.info(c.types.fields[f as usize].typ).structDef;
+        let cState = missingDef != none() && c.types.structs[missingDef as usize].isImported; // zero-filled (§33.2)
+        if (!containsSymbol(seen, f) && !cState) {
             if (missingCount > 0) {
                 appendText(mut missing, ", ")?;
             }
@@ -333,6 +366,15 @@ fn checkMethodCall(
         let field = findField(c, holder, memberIdent.symbol);
         if (field != none()) {
             let fieldType = c.types.fields[field as usize].typ;
+            let fieldHidden =
+                c.types.fields[field as usize].isPrivate && c.types.structs[holder as usize].file != c.file;
+            let fieldSpan = Span { start: memberIdent.start, end: memberIdent.end };
+            if (c.types.is(fieldType, TypeKind.FunctionPointer) && !fieldHidden &&
+                findMethod(c, readType, memberIdent.symbol, fieldSpan)? == none()) {
+                // A callback stored in a field.
+                let callee = c.expr(HirExpr.FieldAccess(read, field), fieldType, targetSpan.start, memberIdent.end)?;
+                return checkPointerCall(c, callee, arguments, span);
+            }
             let callable = c.types.is(fieldType, TypeKind.Function) || c.types.isClosure(fieldType) ||
                 dynFunctionBehind(c, fieldType) != none();
             let hidden = c.types.fields[field as usize].isPrivate && c.types.structs[holder as usize].file != c.file;

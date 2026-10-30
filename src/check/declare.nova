@@ -152,6 +152,10 @@ fn checkProgram(
         allowCChar: false,
         inStaticInitializer: false,
         atomicStructs: Vector<u32>.create(),
+        allowImported: false,
+        coreAllowImported: false,
+        layoutUses: Vector<LayoutUse>.create(),
+        headers: Vector<Vector<u8>>.create(),
     };
     // The constructor: the builtins' names, `this`, and a scratch frame's two parts.
     for (k in 0..26u32) {
@@ -188,10 +192,12 @@ fn checkProgram(
             match (c.front.ast.items[item as usize].kind) {
                 ItemKind.Struct(_) => { declareStruct(mut c, item)?; }
                 ItemKind.Enum(_, _, _) => { declareEnum(mut c, item)?; }
-                ItemKind.Extern(_, _, structs) => {
-                    for (s in 0..structs.count) {
-                        let imported = c.front.ast.at(structs, s);
-                        declareTypeItem(mut c, imported, "an imported C struct", "S7")?;
+                ItemKind.Extern(abi, _, structs) => {
+                    if (sameText(c.front.ast.textOf(abi), "C")) {
+                        for (s in 0..structs.count) {
+                            let imported = c.front.ast.at(structs, s);
+                            declareImportedStruct(mut c, imported)?;
+                        }
                     }
                 }
                 _ => {}
@@ -216,8 +222,10 @@ fn checkProgram(
     processFunctionAttributes(mut c)?;
     processImpls(mut c)?;
     resolveAllMembers(mut c)?;
+    checkLayoutUses(mut c)?;
     checkStructRecursion(mut c)?;
     computeCopyAndDrop(mut c)?;
+    checkForeignInterfaces(mut c)?;
     checkPendingElements(mut c)?;
 
     for (k in 0..c.constants.length) {
@@ -228,7 +236,9 @@ fn checkProgram(
     var f: usize = 0;
     while (f < c.hir.functions.length) {
         // A closure's body is checked where its literal is (§36.2).
-        if (c.hir.functions[f].registered && !c.hir.functions[f].isClosure) {
+        // A C function is defined in C (§28.2).
+        let isExtern = c.front.ast.functions[c.hir.functions[f].syntax as usize].isExtern;
+        if (c.hir.functions[f].registered && !c.hir.functions[f].isClosure && !isExtern) {
             let function = truncate<u32>(f);
             if (functionIsInstantiation(c, function)) {
                 // Its generic version reports (§20.3); a scoped type argument the body cannot take is N0274.
@@ -323,18 +333,6 @@ fn ownItem(c: borrow mut Checker, symbol: u32, entity: Entity) -> Result<void, A
     return Ok();
 }
 
-/// An imported C struct: a gap until S7, but its name is declared so later uses are not "cannot find".
-fn declareTypeItem(c: borrow mut Checker, item: u32, what: StringView, slice: StringView) -> Result<void, AllocError> {
-    let name = c.front.ast.items[item as usize].name;
-    let symbol = c.front.ast.idents[name as usize].symbol;
-    let id = c.front.ast.idents[name as usize];
-    c.notPorted(id.start, id.end, what, slice)?;
-    if (!isDeclared(c, symbol)) {
-        ownItem(c, symbol, Entity.LibraryItem(item))?;
-    }
-    return Ok();
-}
-
 /// Declare(item), for user and library units alike; unported items are gaps.
 fn declare(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
     let entry = c.front.ast.items[item as usize];
@@ -343,18 +341,7 @@ fn declare(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
             c.impls.push(ImplRef { item: item, file: c.file })?; // processed once every item is declared (§21.1)
             return Ok();
         }
-        ItemKind.Extern(_, functions, _) => {
-            c.notPorted(entry.start, entry.end, "an extern block", "S7")?;
-            // Its functions' names, so uses of them are gaps rather than "cannot find".
-            for (k in 0..functions.count) {
-                let f = c.front.ast.at(functions, k);
-                let symbol = c.front.ast.idents[c.front.ast.functions[f as usize].name as usize].symbol;
-                if (!isDeclared(c, symbol)) {
-                    ownItem(c, symbol, Entity.LibraryItem(item))?;
-                }
-            }
-            return Ok();
-        }
+        ItemKind.Extern(_, _, _) => { return declareExternBlock(c, item); }
         _ => {}
     }
     let id = c.front.ast.idents[entry.name as usize];
@@ -514,11 +501,12 @@ fn declareFunctionCore(c: borrow mut Checker, f: u32, owner: u32, environment: R
         enterEnvironmentPairs(c, pairs.view())?;
         env = storeEnvironment(c, pairs.view())?;
     }
-    let returnType = if (decl.returnType == none()) c.types.voidType else c.resolveTypeWith(
-        decl.returnType,
-        true,
-        true,
-    )?;
+    // A @constant function's result, and a C constant macro's, may hold C state: it is built at compile time (§39.4).
+    var returnType = c.types.voidType;
+    if (decl.returnType != none()) {
+        c.allowImported = hasAttributeNamed(c, decl.attributes, "constant");
+        returnType = c.resolveTypeWith(decl.returnType, true, true)?;
+    }
     let name = c.front.ast.idents[decl.name as usize].symbol;
     let library = isLibraryFile(c);
     let function = c.hir.addFunction(name, owner, returnType, c.file, f, library, c.registerNext)?;

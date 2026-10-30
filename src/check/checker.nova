@@ -116,6 +116,10 @@ struct Checker {
     allowCChar: bool;                                // the next resolution is a pointer's pointee (§28.3)
     inStaticInitializer: bool;                       // checking a static's initialiser (S7c)
     atomicStructs: Vector<u32>;                      // Ast.items of structs declared `@context(atomic)`
+    allowImported: bool;                             // the next resolution may be an imported C type (§31.2)
+    coreAllowImported: bool;                         // resolveTypeWith's allowImported, for resolveTypeCore
+    layoutUses: Vector<LayoutUse>;                   // struct types used by value before members are known
+    headers: Vector<Vector<u8>>;                     // `@header`s of extern blocks, each once, in order (§31.3)
 
     fn letKeywordOf(borrow this, local: u32) -> u32 {
         for (k in this.letKeywords.view()) {
@@ -280,7 +284,38 @@ struct Checker {
 
     /// ResolveType with `allowSources`: a source list `borrow(a, b) T` is allowed (a function's return type).
     fn resolveTypeWith(borrow mut this, typ: u32, allowVoid: bool, allowSources: bool) -> Result<u32, AllocError> {
+        let allowImported = this.allowImported;
+        this.allowImported = false;
+        this.coreAllowImported = allowImported;
         let resolved = this.resolveTypeCore(typ, allowVoid, allowSources)?;
+        let structDef = this.types.info(resolved).structDef;
+        if (structDef != none() && this.types.structs[structDef as usize].isImported && !allowImported) {
+            let span = this.front.ast.typeSpans[typ as usize];
+            var name = Vector<u8>.create();
+            appendBytes(mut name, this.types.name(resolved))?;
+            var message = Vector<u8>.create();
+            appendQuotedType(mut message, this, resolved)?;
+            appendText(
+                mut message,
+                " is a C type imported from a header, whose size only the C compiler knows: use it behind a pointer or a reference ('*",
+            )?;
+            appendBytes(mut message, name.view())?;
+            appendText(mut message, "', 'borrow ")?;
+            appendBytes(mut message, name.view())?;
+            appendText(mut message, "'; type-system.md §31.2)")?;
+            this.error(importedTypeByValue(), span.start, span.end, message)?;
+            return Ok(this.types.error);
+        }
+        if (!allowImported && (this.types.is(resolved, TypeKind.Struct) || this.types.is(resolved, TypeKind.Array))) {
+            // Whether a struct holds C state is known once every struct's fields are (§33.1).
+            let span = this.front.ast.typeSpans[typ as usize];
+            if (this.membersResolved) {
+                checkLayoutUse(this, resolved, span)?;
+            } else {
+                let file = this.file;
+                this.layoutUses.push(LayoutUse { typ: resolved, start: span.start, end: span.end, file: file })?;
+            }
+        }
         if (this.noFloat && this.types.is(resolved, TypeKind.Float)) {
             let span = this.front.ast.typeSpans[typ as usize];
             var what = Vector<u8>.create();
@@ -316,8 +351,22 @@ struct Checker {
         if (bottom || this.types.isBottom(resultType)) {
             return Ok(this.types.error);
         }
-        if (this.types.isScoped(resultType)) {
-            this.notPorted(span.start, span.end, "a function type returning a reference", "S2")?;
+        var scopedParameters = 0;
+        for (t in types.view()) {
+            if (this.types.isScoped(t)) {
+                scopedParameters += 1;
+            }
+        }
+        if (this.types.isScoped(resultType) && scopedParameters != 1) {
+            let resultSpan = this.front.ast.typeSpans[result as usize];
+            var message = Vector<u8>.create();
+            appendText(mut message, "a function type returning ")?;
+            appendQuotedType(mut message, this, resultType)?;
+            appendText(
+                mut message,
+                " needs exactly one reference or scoped parameter for the result to come from; a function type has no names for a source list (type-system.md §36.1)",
+            )?;
+            this.error(returnSourceMismatch(), resultSpan.start, resultSpan.end, message)?;
             return Ok(this.types.error);
         }
         return this.types.functionTo(types.view(), resultType, effects);
@@ -331,6 +380,8 @@ struct Checker {
         this.dynAllowed = false;
         let allowCChar = this.allowCChar;
         this.allowCChar = false;
+        let allowImported = this.coreAllowImported;
+        this.coreAllowImported = false;
         match (this.front.ast.types[typ as usize]) {
             TypeNode.Named(q) => {
                 if (q.parts.count > 1) {
@@ -417,13 +468,17 @@ struct Checker {
                 return resolveDynType(this, interfaceType, mutable, send, span, dynAllowed);
             }
             TypeNode.Optional(inner) => { return resolveOptionalType(this, inner, allowSources); }
-            TypeNode.Array(element, length) => { return resolveArrayType(this, element, length); }
+            TypeNode.Array(element, length) => { return resolveArrayType(this, element, length, allowImported); }
+            TypeNode.FunctionPointer(abi, parameters, result) => {
+                return resolveFunctionPointerType(this, abi, parameters, result, span);
+            }
             TypeNode.Reference(mutable, hasSources, sources, pointee) => {
                 return resolveReferenceType(this, mutable, hasSources, sources, pointee, allowSources, span);
             }
             TypeNode.Generic(name, arguments) => { return resolveGenericType(this, name, arguments, span); }
             TypeNode.Pointer(mutable, pointeeSyntax) => {
                 this.allowCChar = true;
+                this.allowImported = true;
                 let pointee = this.resolveType(pointeeSyntax, true)?;
                 this.allowCChar = false;
                 if (this.types.isBottom(pointee)) {
