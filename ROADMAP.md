@@ -1,6 +1,6 @@
 # CeeSafe roadmap: port the Nova compiler to Nova, as CeeSafe
 
-Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P4 complete (P4 gate passed 2026-10-30, novac 0.6.0); next: P5**.
+Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P5 complete (P5 gate passed 2026-10-30, novac 0.6.0); next: P6**.
 The probes, `src/support/`, the limits, the fault sweep and the skeleton exist (`docs/p1-probes.md`). No compiler code has been ported.
 Repository: `~/dev/CeeSafe`. Reference: `vkuttyp/Nova` (C#/.NET 10), pinned in `bootstrap/reference.md`.
 
@@ -417,16 +417,36 @@ now means the full pipeline. **Passed (2026-10-30, novac 0.6.0)**: `docs/p4-plan
 
 Dependencies: P4, N4 (process capture).
 
-- [ ] Port naming, type ordering and layout, declarations, aggregates, function/closure/vtable lowering, the runtime
-  helpers, constants, drops, source maps, panic sites, FFI and imported structs, callbacks, exports and object mode.
-- [ ] Bundle `runtime/` and `lib/` with deterministic tables. Construct `cc` and linker arguments, and publish output
-  files.
-- [ ] Add `build --emit c|exe|obj` with flat C. Flags not yet supported fail with an explicit error.
+- [x] Port naming, type ordering and layout, declarations, aggregates, function/closure/vtable lowering, the runtime
+  helpers, constants, drops, source maps, panic sites, FFI and imported structs, callbacks, exports and object mode
+  (`src/backend/`, 2026-10-30).
+- [x] Bundle `runtime/` (`tools/gen_runtime.py`) and `lib/` with deterministic tables. Construct `cc` and linker
+  arguments, and publish output files (`src/host/toolchain.nova`, `src/host/build.nova`).
+- [x] Add `build --emit c|exe|obj` with flat C, `-g`, `--line-directives`, `--split`, `--cc`, `--cflag`, `--ld`,
+  `--program` and `.c` inputs. The switches of P7's forms (`--flat-c`, `--no-placement`, `--no-bce`, `--no-oce`,
+  `--no-closure-specialisation`) are accepted: ceesafec always emits that form.
 
 Gate: run-pass (153), run-fail (40), ffi and freestanding pass under clang -O0/-O2, the overflow fallback and
 ASan+UBSan, with GCC where available. The M3 fault-injection sweep (`FaultInjectionTests.cs`, moved from P4) passes on
 every run-pass program that allocates, which shows O4 at run time. `emit-c` snapshots match, or each difference is reviewed. Objects for both
-CosmoOS architectures pass.
+CosmoOS architectures pass. **Passed (2026-10-30, novac 0.6.0)**: `docs/p5-plan.md` (S0–S3). The results:
+
+- **C:** byte-identical to novac's (`--flat-c` and the optimisations off) for all 284 programs novac builds, in four
+  forms each: flat, `--split`, `-g`, `-g --split`. CeeSafe's own C is identical too (394,094 lines; ceesafec 1.4 s,
+  novac 4.1 s), on macOS and on Linux, and a ceesafec built from it by cc or GCC behaves the same.
+- **Behaviour:** run-pass 159/159, run-fail 40/40, ffi 8/8 under Apple clang 21 (`-O2`, `-O0`, the overflow fallback,
+  `-O1` ASan+UBSan with leak checks, `--split`, `-g`, all `-Werror`), clang 18 and GCC 12 on the Ryzen box; TSan on the
+  three thread programs. One recorded divergence, the reference's: GCC 12 `-O2 -Werror` reports `-Wuninitialized` in
+  an enum constructor of `run-pass/nested-patterns`, for novac's C too, flat and default.
+- **Fault sweep:** 50 run-pass programs allocate; all 789 failure points end as accepted, on macOS and Linux, and each
+  run equals the run of novac's build.
+- **Collections:** the 30 programs of `CollectionPropertyTests` (`tools/collection_properties.py`) print their models'
+  output under every configuration, their C equals novac's, and their 156 failure points pass the sweep.
+- **Freestanding:** 3/3 host objects run under their harnesses with only allowlisted undefined symbols; both CosmoOS
+  triples have no forbidden sections, mutable state or COMMON symbols, also joined by `ld.lld`
+  (`tools/freestanding_check.py`), as for novac.
+- **emit-c snapshots:** 7 of 24 match. The 17 others are novac's default form (structured, placement, check
+  elimination, closure specialisation: P7). Reviewed: novac in the flat, unoptimised form fails the same 17.
 
 ### P6 — First verified fixed point
 
@@ -587,10 +607,9 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
 
 1. **Pinned to novac 0.5.0** (2026-10-30; 0.4.1 before it): M15 S1–S7 and the N7 fix shipped, every P1 workaround removed. The N
    track has no open blocking item.
-2. Alongside: the rest of the runner's C matrix (`-O0`, the overflow fallback, `--split`, TSan) and the package
-   fixtures (`docs/parity.md` §3).
-3. P2, P3 and P4 are done (`docs/p2-frontend.md`, `docs/p3-plan.md`, `docs/p4-plan.md`), pinned to novac 0.6.0.
-   Next: P5, the flat C backend, whose gate also carries the fault-injection sweep.
+2. P2–P5 are done (`docs/p2-frontend.md`, `docs/p3-plan.md`, `docs/p4-plan.md`, `docs/p5-plan.md`), pinned to
+   novac 0.6.0; the C matrix is complete (P5). Next: P6, the first verified fixed point. P5 already showed that a
+   ceesafec built from its own C emits that C again (identical on macOS and Linux).
 4. Upstream (Nova #6, filed 2026-10-30): novac 0.6.0's `offsetOf<T>(field)` is 0 unless `T`'s layout was computed before (CheckOffsetOf reads
    `member.Offset` without `TypeTable.LayoutOf(measured)`); ceesafec gives the true offset.
 5. Owner's call: propose upstream that N0110 count `else if` links and `?` suffixes. novac's `--dump-ast` aborts on a
@@ -619,6 +638,7 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 | 2026-10-30 | P3: the type checker (`src/check/`, `src/hir/`), slices S0–S8 (`docs/p3-plan.md`), and package mode for `check` (`src/host/packages.nova`, path dependencies) | P3 gate passed: check-pass 27/27 and the 27 HIR snapshots identical; check programs 265/320, the other 55 differ only by P4's diagnostics or novac's printer crashes; `ffi`, `freestanding`, `emit-c`, `placement`, `bounds-checks`, `overflow-checks`, `closure-calls`, `run-fail` 83/83; package fixtures 7/7; `ceesafec check` of CeeSafe itself identical to novac (HIR dump, 35,150 lines); ASan+UBSan clean |
 | 2026-10-30 | Re-pinned to novac 0.6.0 (`93e0a46`, ADR 0030) after P3; `offsetOf`/`callerAddress` ported; every completed gate rerun (`bootstrap/reference.md`) | all pass; one upstream bug found (`offsetOf` before layout is 0) |
 | 2026-10-30 | P4: NIR (`src/nir/`: model, printer, builder, move paths, drop elaboration, move/in-place/borrow/effect checkers, `passes.nova`), `build --dump-nir`, diagnostic notes, `tools/compare_nir.py`, `tools/mutation_suite.py`, `docs/p4-evidence.md`; P3 gaps found and fixed (type-parameter flow names, `Box.create`'s `@placed` methods, HIR's dead `isGeneric`) | P4 gate passed: check programs 318/322, the 4 recorded divergences; other families 84/84; NIR 284/284 and CeeSafe's own package identical; mutations 1,152/1,152 against the oracle, as with novac; `check --dump-hir` identical on 186/186 check-pass and run-pass programs; packages 7/7; `ceesafec check` of CeeSafe clean (0.77 s); ceesafec under ASan+UBSan over 295 check-fail and run-pass programs (`build --dump-nir`) and its own package: no report, `live=0` |
+| 2026-10-30 | P5: the flat C backend (`src/backend/`), the runtime embedded (`tools/gen_runtime.py`), the toolchain and `build --emit c|exe|obj` with `-g`, `--split`, `--cc`, `--cflag`, `--ld` (`src/host/toolchain.nova`, `src/host/build.nova`); `tools/compare_c.py`, `tools/fault_injection.py`, `tools/collection_properties.py`, `tools/freestanding_check.py`; P3 gaps fixed (built-in items' `Used` marks, HirProgram's Structs and DynSignatures, InHostedLibrary), one NIR span fixed (an exhaustive match's Unreachable) | P5 gate passed: C identical for 284/284 programs in four forms (flat, split, `-g`, both) and for CeeSafe itself; run-pass 159/159, run-fail 40/40, ffi 8/8 under Apple clang 21, clang 18 and GCC 12 (`-O2`, `-O0`, overflow fallback, ASan+UBSan with leak checks, split, `-g`, `-Werror`) but one GCC report that novac's C shares; TSan 3/3; fault sweep 789 points on macOS and Linux, equal to novac's runs; collection properties 30/30 with 156 swept points; freestanding host and both triples clean; emit-c differences reviewed (P7's form); ceesafec built from its own C by GCC emits the same C on Linux |
 
 **Tests run for the skeleton** (2026-10-30, novac 0.3.1, Apple clang 21.0.0):
 - `novac check` and `novac fmt --check`: clean.
@@ -663,4 +683,9 @@ under GCC 12, clang 18 and Apple clang, with and without ASan+UBSan. All passed.
   - the fault sweep under clang ASan+LSan: 573/573.
 - The earlier gate run found the missing-drop bug as a LeakSanitizer report.
 
-Not yet run: P5 or later.
+**P5 flat C backend** (2026-10-30; `docs/p5-plan.md`): C identical to novac's for 284/284 programs in four forms and
+for CeeSafe itself; run-pass, run-fail and ffi pass under Apple clang 21, clang 18 and GCC 12 in every configuration
+(one GCC report that novac's C shares); the fault sweep (789 points), the collection properties and the freestanding
+checks pass on macOS and Linux.
+
+Not yet run: P6 or later.

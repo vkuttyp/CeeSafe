@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""The M3 fault-injection sweep (the reference's FaultInjectionTests, docs/milestone-3.md criterion 1).
+
+Each run-pass program that allocates (its C calls nova_alloc, nova_region_alloc, nova_scratch_enter_root,
+nova_pool_take, nova_vec_grow or nova_svec_slot) is built with ASan+UBSan and run once with NOVA_ALLOC_REPORT=1 to
+count its allocation attempts n; then once per failure point k (NOVA_FAIL_ALLOC_AT=k): every k <= n, or for n > 200
+the first 50, the last 50 and 100 evenly spaced. Every run must end with a normal return and no live allocations, or
+with the panic of `!` on the failed allocation (exit 134); a leak, any other panic or a sanitizer report fails.
+
+With --reference, the reference compiler's build of each program must give the same stdout, stderr and status at
+every point. The interpreter's agreement (the reference's other half of the test) is P8's.
+
+usage: python3 tools/fault_injection.py --compiler out/ceesafec [--reference ~/.nova/0.6.0/bin/novac]
+           [--corpus DIR] [--filter TEXT] [--jobs N]
+"""
+import argparse
+import concurrent.futures
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+ALLOCATION_CALLS = ("nova_alloc(", "nova_region_alloc(", "nova_scratch_enter_root(", "nova_pool_take(", "nova_vec_grow(",
+                    "nova_svec_slot(")
+SWITCHES = ["--flat-c", "--no-closure-specialisation", "--no-placement", "--no-bce", "--no-oce"]
+SANITIZERS = ["-O1", "-Werror", "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"]
+REPORT = re.compile(r"nova alloc: attempts=(\d+) live=(\d+)")
+MAX_ATTEMPTS = 200
+
+
+def failure_points(attempts):
+    if attempts <= MAX_ATTEMPTS:
+        return list(range(1, attempts + 1))
+    points = list(range(1, 51)) + [attempts - k for k in range(50)] + [k * attempts // 101 for k in range(1, 101)]
+    seen, result = set(), []
+    for k in points:
+        if k not in seen:
+            seen.add(k)
+            result.append(k)
+    return result
+
+
+def run(exe, fail_at):
+    env = dict(os.environ, NOVA_ALLOC_REPORT="1", NOVA_FAIL_ALLOC_AT=str(fail_at))
+    p = subprocess.run([exe], capture_output=True, env=env, timeout=30)
+    status = 128 - p.returncode if p.returncode < 0 else p.returncode  # a signal, as .NET reports it (SIGABRT: 134)
+    return status, p.stdout, p.stderr.decode("utf-8", "replace")
+
+
+def problem(outcome):
+    status, _, stderr = outcome
+    if "Sanitizer" in stderr or "runtime error" in stderr:
+        return "sanitizer report"
+    if "nova panic: " in stderr:
+        return None if "nova panic: unwrapped an Err value" in stderr and status == 134 else "unexpected panic"
+    m = REPORT.search(stderr)
+    if not m:
+        return f"no allocation report (exit code {status})"
+    return None if m.group(2) == "0" else f"{m.group(2)} allocation(s) leaked"
+
+
+def build(compiler, corpus, path, out, reference):
+    switches = SWITCHES if reference else []
+    c_dir = out + "-c"
+    emitted = subprocess.run([compiler, "build", "--emit", "c", "-o", c_dir] + switches + [path], cwd=corpus,
+                             capture_output=True)
+    if emitted.returncode != 0:
+        return None, "C emission failed: " + emitted.stderr.decode("utf-8", "replace")[:500]
+    source = ""
+    for name in os.listdir(c_dir):
+        if name.endswith(".c") and not name.startswith("nova_rt_"):
+            with open(os.path.join(c_dir, name), encoding="utf-8") as f:
+                source += f.read()
+    if not any(call in source for call in ALLOCATION_CALLS):
+        return False, None  # the program never allocates
+    flags = [x for f in SANITIZERS for x in ("--cflag", f)]
+    built = subprocess.run([compiler, "build", "--cc", "clang"] + flags + switches + [path, "-o", out], cwd=corpus,
+                           capture_output=True)
+    if built.returncode != 0:
+        return None, "build failed: " + built.stderr.decode("utf-8", "replace")[:500]
+    return True, None
+
+
+def sweep(arguments):
+    compiler, reference, corpus, path = arguments
+    with tempfile.TemporaryDirectory() as work:
+        exe = os.path.join(work, "program")
+        allocates, error = build(compiler, corpus, path, exe, False)
+        if allocates is None:
+            return path, 0, [error]
+        if not allocates:
+            return path, None, []
+        reference_exe = None
+        if reference:
+            reference_exe = os.path.join(work, "reference")
+            ok, error = build(reference, corpus, path, reference_exe, True)
+            if not ok:
+                return path, 0, [f"reference: {error}"]
+        baseline = run(exe, 0)
+        m = REPORT.search(baseline[2])
+        if not m:
+            return path, 0, [f"baseline: no allocation report; exit code {baseline[0]}\n{baseline[2][:500]}"]
+        attempts, live = int(m.group(1)), int(m.group(2))
+        failures = []
+        if live != 0:
+            failures.append(f"{live} allocation(s) leaked without fault injection")
+        if reference_exe and run(reference_exe, 0) != baseline:
+            failures.append("baseline: the reference's run differs")
+        for k in failure_points(attempts) if attempts > 0 else []:
+            outcome = run(exe, k)
+            p = problem(outcome)
+            if p:
+                failures.append(f"allocation {k} of {attempts} failing: {p}\nstderr:\n{outcome[2][:500]}")
+            if reference_exe and run(reference_exe, k) != outcome:
+                failures.append(f"allocation {k} of {attempts} failing: the reference's run differs")
+        return path, attempts, failures
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--compiler", required=True)
+    parser.add_argument("--reference")
+    parser.add_argument("--corpus", default=os.path.expanduser("~/Nova/tests/corpus"))
+    parser.add_argument("--filter")
+    parser.add_argument("--jobs", type=int, default=os.cpu_count())
+    args = parser.parse_args()
+    compiler = os.path.abspath(os.path.expanduser(args.compiler))
+    reference = os.path.abspath(os.path.expanduser(args.reference)) if args.reference else None
+    directory = os.path.join(args.corpus, "run-pass")
+    paths = ["run-pass/" + f for f in sorted(os.listdir(directory)) if f.endswith(".nova")]
+    if args.filter:
+        paths = [p for p in paths if args.filter in p]
+    work = [(compiler, reference, args.corpus, p) for p in paths]
+    with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
+        results = list(pool.map(sweep, work))
+    swept = [(p, n, f) for p, n, f in results if n is not None]
+    failed = [(p, f) for p, _, f in swept if f]
+    points = sum(len(failure_points(n)) for _, n, _ in swept if n)
+    for p, f in failed:
+        print(f"FAIL {p}:\n  " + "\n  ".join(f[:5]))
+    print(f"fault_injection: {len(results)} run-pass programs, {len(swept)} allocate, {points} failure points"
+          f"{' (each also run as built by the reference)' if reference else ''}; {len(failed)} fail")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

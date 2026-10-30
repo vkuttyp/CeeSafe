@@ -17,7 +17,7 @@ Lines are C# lines from the inventory. A file shared between phases counts under
 | P2 frontend | `Syntax/`, `Diagnostics/` (3,959) | parse-pass 40 (`.ast`), parse-fail 27 | `LexerTests`, `ParserTests` cases as fixtures; token dump decision | not started |
 | P3 types/HIR | `Semantics/`, `Hir/` (12,133, plus `Compilation.cs` 131 shared with P4) | check-pass 27 (`.hir`), check-fail 128 (type-focused part) | `PackageTests`, `PrivateFieldTests`: two-package fixtures for N0310–N0315 | not started |
 | P4 NIR/safety | `Nir/` (not `ClosureSpecialisation`), `Analysis/` safety passes (4,346) | check-fail 128 (all) | `MutationTests` (411 lines), `UnsafeTests`; NIR dumps (`--dump-nir`) as a reference export | not started |
-| P5 flat C | `Backend.C/` (not `CStructurer`), `CoreLibrary` (4,406) | run-pass 153, run-fail 40, emit-c 24, ffi 6, freestanding 3 (partial) | C configurations (§3); `FaultInjectionTests`, `CollectionPropertyTests`, `SourceMapTests`, `NicheLayoutTests`, freestanding symbol checks | not started |
+| P5 flat C | `Backend.C/` (not `CStructurer`), `CoreLibrary` (4,406) | run-pass 153, run-fail 40, emit-c 24, ffi 6, freestanding 3 (partial) | C configurations (§3); `FaultInjectionTests`, `CollectionPropertyTests`, `SourceMapTests`, `NicheLayoutTests`, freestanding symbol checks | **done** (`docs/p5-plan.md`): C identical 284/284 in four forms; the C matrix, the fault sweep, the collection properties and the freestanding checks ported and passing. `SourceMapTests` and `NicheLayoutTests` read the C, which is novac's byte for byte with and without `-g` (inferred covered; not ported) |
 | P6/P6R | — | gen2 = gen3 comparison (`tools/compare-stages`, to write) | rename fixtures | not started |
 | P7 optimisations | `CheckElimination`, `PlacementAnalysis`, `ClosureSpecialisation`, `CStructurer` (2,379) | bounds-checks 3, overflow-checks 2, placement 3, closure-calls 1 | `StructuredCTests`; on/off runs of each switch | not started |
 | P8 tools | `Interpreter/`, `Packages/`, `Formatting/`, `Documentation/`, `Tooling/` (8,627 + `Manifest.cs` 274) | — | protocol and CLI fixtures for every test class marked P8 in the inventory | not started |
@@ -55,13 +55,13 @@ difference in `--reference` mode.
 
 ## 3. Known gaps in the black-box evidence
 
-- **Part of the C matrix.** These configurations have been run, one invocation each (`--cc`, `--cflag=…`): the
-  default `cc` on the Mac (Apple clang) and on the Ryzen box (GCC 12), clang 18 `-O2`, and clang 18 `-O1` with
-  ASan+UBSan (ROADMAP §10). Nova's suite also runs `-O0`, the portable overflow fallback
-  (`-DNV_NO_BUILTIN_OVERFLOW`), `--split` and TSan for thread programs (testing.md §3). These, and a one-command
-  matrix, are P5 tasks.
-- **Freestanding** is partial: the runner checks only that the object builds. `FreestandingTests` also checks
-  symbols and sections with `nm`/`objdump`.
+- **The C matrix** is complete since P5 (2026-10-30): `-O2`, `-O0`, the portable overflow fallback
+  (`-DNV_NO_BUILTIN_OVERFLOW`), ASan+UBSan with leak checks, `--split`, `-g`, all with `-Werror`, under Apple clang 21,
+  clang 18 and GCC 12, and TSan for the thread programs (`run_corpus.py --cflag=… --build-option=…`). MSVC is not
+  run (P9). GCC 12 `-O2 -Werror` rejects `run-pass/nested-patterns` (`-Wuninitialized` in an enum constructor) for
+  novac's C as for ceesafec's: the reference's, recorded.
+- **Freestanding**: the runner checks only that the object builds; `tools/freestanding_check.py` ports
+  `FreestandingTests` (symbols, sections, harness runs, both CosmoOS triples, `ld.lld`).
 - **20 codes have no corpus annotation** (inventory §3): N0109, N0258, N0300, N0310–N0315, N0320–N0329, N0335.
   Most are package and build errors tested by C# unit tests (`PackageTests`, `PackageManagerTests`, `CliTests`).
   They need black-box package fixtures before P3 (N0310–N0315) and P8 (the rest).

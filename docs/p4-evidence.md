@@ -78,7 +78,9 @@ The sticky shared deref (N0248, Nova `3a99b4a`) is in `check-fail/shared-path-mu
 
 - **O4 at run time.** P4 shows that the drops are placed exactly as the reference places them: the NIR after
   elaboration is identical. The reference also checks that every program runs with every drop in order. That needs
-  ceesafec's C, so it moves to P5's gate:
+  ceesafec's C, so it moved to P5's gate, which passed on 2026-10-30 (`docs/p5-plan.md`: the run corpus under ASan+UBSan
+  with leak checks, the fault sweep's 789 points, the collection properties' drop orders); the interpreter's part is
+  P8's:
   - run-pass under ASan and UBSan;
   - the M3 fault-injection sweep (`FaultInjectionTests.cs`);
   - the interpreter's agreement with native runs, which is P8's.

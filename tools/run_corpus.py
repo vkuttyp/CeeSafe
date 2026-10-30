@@ -299,7 +299,7 @@ def run_test(runner, family, path, work):
             flags.append("--line-directives")
         if "// emit-option: flat" in text:
             flags.append("--flat-c")
-        o = cmd(["build", "--emit", "c"] + options + flags + [path, "-o", out], out, ["main.c"])
+        o = cmd(["build", "--emit", "c"] + options + flags + runner.args.build_option + [path, "-o", out], out, ["main.c"])
         if "main.c" not in o.files:
             problems.append(f"no main.c (status {o.status}): {o.stderr.strip()[:500]}")
         else:
