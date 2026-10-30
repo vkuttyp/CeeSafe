@@ -1,0 +1,50 @@
+struct Cell { value: u64; }
+@noncopy
+struct Token { id: u32; }
+@align(16)
+struct Aligned { x: u64; }
+@context(atomic)
+struct Guard { held: bool; }
+
+fn guarded() -> bool {
+    let g = Guard { held: false };
+    return g.held;
+}
+
+/// Safety: `p` points to a live, writable u64.
+unsafe fn bump(p: *mut u64) {
+    p.write(p.read() + 1);
+}
+
+/// Safety: the pointers come from live locals and slices of this function.
+fn main() {
+    var x: u64 = 5;
+    let p = borrow mut x as *mut u64;
+    let q = p as *u64;
+    let address = p as usize;
+    let back = address as *mut u64;
+    let nothing = 0 as *u64;
+    var bytes = [1u8, 2, 3, 4];
+    let first = bytes[..].ptr;
+    let whole: SliceMut<u8> = borrow mut bytes[..];
+    let firstMut = whole.ptr;
+    let same = q == p;
+    unsafe {
+        bump(p);
+        bump(back);
+        let r = Ptr.toBorrow(q);
+        let w = Ptr.toBorrowMut(p);
+        let view = Slice.fromRaw(first, 4);
+        let viewMut = SliceMut.fromRaw(firstMut, 2);
+        let second = first.add(1).read();
+        let third = first.offset(2).readVolatile();
+        firstMut.writeVolatile(9);
+        Console.writeLine(view.length + viewMut.length + (second as usize) + (third as usize));
+    }
+    let boxed = Box.create(Cell { value: 3 })!;
+    let raw = Box.intoRaw(boxed);
+    let again: Box<Cell> = unsafe { Box.fromRaw(raw) };
+    let t = Token { id: 1 };
+    let a = Aligned { x: 2 };
+    Console.writeLine(x + again.value + ((address & 0) as u64) + (if (nothing.isNull() && same) 1u64 else 0u64));
+}

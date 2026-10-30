@@ -147,6 +147,11 @@ fn checkProgram(
         callbacks: Vector<u32>.create(),
         placedMethods: Vector<u32>.create(),
         moveBodies: Vector<MoveBody>.create(),
+        unsafeDepth: 0,
+        usedUnsafe: false,
+        allowCChar: false,
+        inStaticInitializer: false,
+        atomicStructs: Vector<u32>.create(),
     };
     // The constructor: the builtins' names, `this`, and a scratch frame's two parts.
     for (k in 0..26u32) {
@@ -193,6 +198,7 @@ fn checkProgram(
             }
         }
     }
+    processTypeAttributes(mut c)?;
     for (u in 0..c.front.ast.units.length) {
         c.file = c.front.ast.units[u].file;
         let items = c.front.ast.units[u].items;
@@ -250,6 +256,7 @@ fn checkProgram(
     }
     checkMain(mut c)?;
     finishFunctionFacts(mut c)?;
+    finishAtomicStructs(mut c);
     return Ok(c);
 }
 

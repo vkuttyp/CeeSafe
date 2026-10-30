@@ -11,6 +11,8 @@ fn checkFunctionBody(c: borrow mut Checker, function: u32) -> Result<void, Alloc
     let environment = c.hir.functions[function as usize].environment;
     enterEnvironment(c, environment)?;
     c.loopDepth = 0;
+    c.unsafeDepth = if (c.front.ast.functions[c.hir.functions[function as usize].syntax as usize].isUnsafe) 1 else 0;
+    c.usedUnsafe = false;
     c.scopes.truncate(0);
     c.scopeStarts.truncate(0);
     c.pushScope()?;
@@ -49,9 +51,28 @@ fn checkFunctionBody(c: borrow mut Checker, function: u32) -> Result<void, Alloc
         body = c.hir.addStmt(HirStmt.Block(statements), span.start, span.end)?;
     }
     c.hir.functions[function as usize].body = body;
-    if (syntax.isUnsafe) {
-        c.notPorted(syntax.start, syntax.end, "an unsafe function", "S7")?;
+    let doc = if (syntax.hasDoc) c.front.ast.textOf(syntax.doc) else c.front.ast.textOf(emptyRange());
+    if ((syntax.isUnsafe || c.usedUnsafe) && !hasSafetyComment(doc)) {
+        let id = c.front.ast.idents[syntax.name as usize];
+        var message = Vector<u8>.create();
+        if (syntax.isUnsafe) {
+            appendText(mut message, "unsafe function ")?;
+            appendQuotedName(mut message, c, id.symbol)?;
+            appendText(
+                mut message,
+                " needs a '/// Safety:' doc comment stating what callers must guarantee (type-system.md §27.4)",
+            )?;
+        } else {
+            appendText(mut message, "function ")?;
+            appendQuotedName(mut message, c, id.symbol)?;
+            appendText(
+                mut message,
+                " uses 'unsafe' and needs a '/// Safety:' doc comment saying why it is sound (type-system.md §27.4)",
+            )?;
+        }
+        c.error(missingSafetyComment(), id.start, id.end, message)?;
     }
+    c.unsafeDepth = 0;
     analyzeFlow(c, function)?;
     c.function = none();
     c.regions = Vector<u32>.create();
@@ -114,7 +135,13 @@ fn checkStmt(c: borrow mut Checker, stmt: u32) -> Result<u32, AllocError> {
             return c.hir.addStmt(HirStmt.Expression(value), span.start, span.end);
         }
         StmtNode.Match(scrutinee, arms) => { return checkMatchStmt(c, scrutinee, arms, span); }
-        StmtNode.Unsafe(_) => { c.notPorted(span.start, span.end, "an 'unsafe' block", "S7")?; }
+        StmtNode.Unsafe(block) => {
+            c.usedUnsafe = true;
+            c.unsafeDepth += 1;
+            let body = checkBlock(c, block)?;
+            c.unsafeDepth -= 1;
+            return Ok(body);
+        }
         StmtNode.Defer(body) => { return checkDefer(c, body, span); }
     }
     let error = c.errorResult(span.start, span.end)?;

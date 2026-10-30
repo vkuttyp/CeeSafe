@@ -86,7 +86,8 @@ fn checkExpr(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocE
         let keep = c.types.is(
             expected,
             TypeKind.Vector,
-        ) || c.types.is(expected, TypeKind.StableVector) || c.types.isDynBox(expected);
+        ) || c.types.is(expected, TypeKind.StableVector) || c.types.isDynBox(expected) ||
+            (c.types.is(expected, TypeKind.Box) && isBoxFromRaw(c, e)?);
         if (!keep && t.pointee != none()) {
             synthExpected = t.pointee;
         }
@@ -212,6 +213,14 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
         ExprNode.FloatLiteral(digits, suffix) => { return checkFloatLiteral(c, digits, suffix, expected, span); }
         ExprNode.CharLiteral(value) => { return checkCharLiteral(c, value, expected, span); }
         ExprNode.Cast(operand, typ) => { return synthCast(c, operand, typ, span); }
+        ExprNode.Unsafe(inner) => {
+            c.usedUnsafe = true;
+            c.unsafeDepth += 1;
+            let value = synth(c, inner, expected)?;
+            c.unsafeDepth -= 1;
+            c.hir.exprSpans[value as usize] = span;
+            return Ok(value);
+        }
         _ => { c.notPorted(span.start, span.end, "this expression", "S2-S7")?; }
     }
     return c.errorResult(span.start, span.end);
@@ -469,8 +478,8 @@ fn synthBinary(
     }
     leftHir = viewOf(c, leftHir);
     rightHir = viewOf(c, rightHir);
-    let lt = c.typeOf(leftHir);
-    let rt = c.typeOf(rightHir);
+    var lt = c.typeOf(leftHir);
+    var rt = c.typeOf(rightHir);
     if (c.types.isStringView(lt) && c.types.isStringView(rt)) {
         if (index != 2 && index != 3) {
             var message = Vector<u8>.create();
@@ -482,9 +491,20 @@ fn synthBinary(
         }
         return c.expr(HirExpr.Binary(op, leftHir, rightHir), boolType, span.start, span.end); // compares the bytes
     }
-    if (c.types.is(lt, TypeKind.RawPointer) && c.types.is(rt, TypeKind.RawPointer)) {
-        c.notPorted(span.start, span.end, "comparing raw pointers", "S7")?;
-        return c.errorResult(span.start, span.end);
+    if (c.types.is(lt, TypeKind.RawPointer) && c.types.is(rt, TypeKind.RawPointer) &&
+        c.types.info(lt).pointee == c.types.info(rt).pointee) {
+        // `*mut T` coerces to `*T` (§27.1).
+        let shared = c.types.pointerTo(c.types.info(lt).pointee, false)?;
+        if (c.types.info(lt).mutablePointer) {
+            let s = c.spanOf(leftHir);
+            leftHir = c.expr(HirExpr.Cast(leftHir), shared, s.start, s.end)?;
+        }
+        if (c.types.info(rt).mutablePointer) {
+            let s = c.spanOf(rightHir);
+            rightHir = c.expr(HirExpr.Cast(rightHir), shared, s.start, s.end)?;
+        }
+        lt = shared;
+        rt = shared;
     }
     if (lt != rt) {
         var message = Vector<u8>.create();
@@ -814,6 +834,10 @@ fn synthCall(
                                     span,
                                 );
                             }
+                            if ((b == builtinPtr() || b == builtinSlice() || b == builtinSliceMut()) &&
+                                typeArguments.count == 0) {
+                                return checkRawConstructor(c, b, member, arguments, span);
+                            }
                             if (b == builtinStringView() && typeArguments.count == 0) {
                                 return checkStringViewFunction(c, member, arguments, span);
                             }
@@ -919,10 +943,51 @@ fn checkUserCallWith(
     let returnType = f.returnType;
     let name = f.name;
     let owner = f.owner;
-    let syntax = c.front.ast.functions[f.syntax as usize];
-    if (syntax.isUnsafe || syntax.isExtern) {
-        c.notPorted(span.start, span.end, "calling an unsafe or C function", "S7")?;
-        return c.errorResult(span.start, span.end);
+    let syntaxIndex = f.syntax;
+    let syntax = c.front.ast.functions[syntaxIndex as usize];
+    var displayName = Vector<u8>.create();
+    if (owner != none()) {
+        appendBytes(mut displayName, c.typeName(owner))?;
+        appendText(mut displayName, ".")?;
+    }
+    appendBytes(mut displayName, c.name(name))?;
+    let isConstant = hasAttributeNamed(c, syntax.attributes, "constant");
+    let current = c.function;
+    let currentConstant = current != none() &&
+        containsU32(c.constantFunctions, c.hir.functions[current as usize].syntax);
+    if (syntax.isUnsafe) {
+        var what = Vector<u8>.create();
+        appendText(mut what, "calling unsafe function '")?;
+        appendBytes(mut what, displayName.view())?;
+        appendText(mut what, "'")?;
+        requireUnsafe(c, span, what.view())?;
+    } else if (isConstant && !syntax.isExtern && c.types.isCLaidOut(returnType, 0) && !inStaticConstruction(c)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, displayName.view())?;
+        appendText(
+            mut message,
+            "' builds C state at compile time: call it only in a static initialiser or a '@constant' function (type-system.md §39.4)",
+        )?;
+        c.error(notStaticInitializer(), span.start, span.end, message)?;
+    } else if (syntax.isExtern && containsU32(c.constantFunctions, syntaxIndex)) {
+        // A C constant macro (§39.4): only in a static initialiser or a @constant function, and safe there.
+        if (!c.inStaticInitializer && !currentConstant) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "'")?;
+            appendBytes(mut message, displayName.view())?;
+            appendText(
+                mut message,
+                "' is a C constant macro: call it only in a static initialiser or a '@constant' function (type-system.md §39.4)",
+            )?;
+            c.error(notStaticInitializer(), span.start, span.end, message)?;
+        }
+    } else if (syntax.isExtern) {
+        var what = Vector<u8>.create();
+        appendText(mut what, "calling C function '")?;
+        appendBytes(mut what, displayName.view())?;
+        appendText(mut what, "'")?;
+        requireUnsafe(c, span, what.view())?;
     }
     if (arguments.count as usize != parameterCount) {
         var message = Vector<u8>.create();
@@ -1210,8 +1275,13 @@ fn synthCast(c: borrow mut Checker, operandSyntax: u32, typeSyntax: u32, span: S
     }
     let pointerTarget = c.types.is(target, TypeKind.RawPointer) || c.types.is(target, TypeKind.FunctionPointer);
     if (pointerTarget && isFlexible(c, operandSyntax)) {
-        c.notPorted(span.start, span.end, "a literal address", "S7")?;
-        return c.errorResult(span.start, span.end);
+        // `0 as *mut T`: a literal address (§27.2, §29.5).
+        let usize = c.types.usize;
+        let address = checkExpr(c, operandSyntax, usize)?;
+        if (c.isBottom(address)) {
+            return Ok(address);
+        }
+        return c.expr(HirExpr.Cast(address), target, span.start, span.end);
     }
     // `5 as u64`, `1.5 as f32`: a flexible literal simply takes the target type, if it is of the same kind.
     if (isFlexible(c, operandSyntax) && hasFloatLiteral(c, operandSyntax) == c.types.is(target, TypeKind.Float)) {
@@ -1225,8 +1295,7 @@ fn synthCast(c: borrow mut Checker, operandSyntax: u32, typeSyntax: u32, span: S
         synthesizedType,
         TypeKind.RawPointer,
     ) || c.types.is(synthesizedType, TypeKind.FunctionPointer)) {
-        c.notPorted(span.start, span.end, "a pointer cast", "S7")?;
-        return c.errorResult(span.start, span.end);
+        return checkPointerCast(c, synthesized, target, span);
     }
     let operand = autoDeref(c, synthesized)?;
     let operandType = c.typeOf(operand);

@@ -25,6 +25,9 @@ enum Entity {
 fn builtinConsole() -> u32 => 0;
 fn builtinProcess() -> u32 => 1;
 fn builtinThread() -> u32 => 25;
+fn builtinPtr() -> u32 => 19;
+fn builtinSlice() -> u32 => 20;
+fn builtinSliceMut() -> u32 => 21;
 
 // BuiltinFunction members are in src/hir/builtins.nova (generated); only ConsoleWrite (0) and ConsoleWriteLine (1)
 // print by name (HirPrinter.BuiltinName).
@@ -108,6 +111,11 @@ struct Checker {
     callbacks: Vector<u32>;                          // Ast.functions declared `@callback`
     placedMethods: Vector<u32>;                      // Ast.functions declared `@placed`
     moveBodies: Vector<MoveBody>;                    // move literals' environments and bodies (§36.5)
+    unsafeDepth: u32;                                // > 0 in an unsafe context (§27.4)
+    usedUnsafe: bool;                                // the body has an `unsafe` block or expression
+    allowCChar: bool;                                // the next resolution is a pointer's pointee (§28.3)
+    inStaticInitializer: bool;                       // checking a static's initialiser (S7c)
+    atomicStructs: Vector<u32>;                      // Ast.items of structs declared `@context(atomic)`
 
     fn letKeywordOf(borrow this, local: u32) -> u32 {
         for (k in this.letKeywords.view()) {
@@ -321,6 +329,8 @@ struct Checker {
         let span = this.front.ast.typeSpans[typ as usize];
         let dynAllowed = this.dynAllowed;
         this.dynAllowed = false;
+        let allowCChar = this.allowCChar;
+        this.allowCChar = false;
         match (this.front.ast.types[typ as usize]) {
             TypeNode.Named(q) => {
                 if (q.parts.count > 1) {
@@ -388,7 +398,7 @@ struct Checker {
                     this.error(voidNotAllowed(), span.start, span.end, message)?;
                     return Ok(this.types.error);
                 }
-                if (this.types.is(found, TypeKind.CChar)) {
+                if (this.types.is(found, TypeKind.CChar) && !allowCChar) {
                     var message = Vector<u8>.create();
                     appendText(
                         mut message,
@@ -412,6 +422,27 @@ struct Checker {
                 return resolveReferenceType(this, mutable, hasSources, sources, pointee, allowSources, span);
             }
             TypeNode.Generic(name, arguments) => { return resolveGenericType(this, name, arguments, span); }
+            TypeNode.Pointer(mutable, pointeeSyntax) => {
+                this.allowCChar = true;
+                let pointee = this.resolveType(pointeeSyntax, true)?;
+                this.allowCChar = false;
+                if (this.types.isBottom(pointee)) {
+                    return Ok(this.types.error);
+                }
+                if (this.types.isScoped(pointee) || this.types.isUnsized(pointee)) {
+                    let pointeeSpan = this.front.ast.typeSpans[pointeeSyntax as usize];
+                    var message = Vector<u8>.create();
+                    appendText(mut message, "a raw pointer cannot point to ")?;
+                    appendQuotedType(mut message, this, pointee)?;
+                    appendText(
+                        mut message,
+                        ", which holds loans; point to the referenced type instead (type-system.md §27.1)",
+                    )?;
+                    this.error(invalidPointee(), pointeeSpan.start, pointeeSpan.end, message)?;
+                    return Ok(this.types.error);
+                }
+                return this.types.pointerTo(pointee, mutable);
+            }
             _ => {
                 this.notPorted(span.start, span.end, "this kind of type", "S2-S7")?;
                 return Ok(this.types.error);

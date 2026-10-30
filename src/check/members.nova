@@ -310,6 +310,23 @@ fn checkMethodCall(
     }
     let read = autoDeref(c, receiver)?;
     let readType = c.typeOf(read);
+    if (c.types.is(readType, TypeKind.RawPointer)) {
+        return checkPointerMethod(c, member, arguments, read, span);
+    }
+    if (c.types.is(readType, TypeKind.FunctionPointer)) {
+        if (!sameText(c.name(memberIdent.symbol), "isNull") || arguments.count != 0) {
+            var message = Vector<u8>.create();
+            appendQuotedType(mut message, c, readType)?;
+            appendText(mut message, " has only 'isNull()'; call it as f(…) (type-system.md §29.5)")?;
+            c.error(notAStruct(), memberIdent.start, memberIdent.end, message)?;
+            checkArgumentsLoosely(c, arguments)?;
+            return c.errorResult(span.start, span.end);
+        }
+        let values = [read];
+        let list = c.hir.list(values[..])?;
+        let boolType = c.types.boolType;
+        return c.expr(HirExpr.BuiltinCall(bfPtrIsNull(), list), boolType, span.start, span.end);
+    }
     let holder = c.types.info(readType).structDef;
     if (holder != none()) {
         // A function value or closure stored in a field (§36.1, §36.2), unless a method has the name.

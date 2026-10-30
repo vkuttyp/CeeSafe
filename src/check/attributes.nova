@@ -1,0 +1,285 @@
+// Attributes of structs, enums and the other type items (the reference's ProcessTypeAttributes, IsNonCopy and
+// ReprInteger): P3 S7a (type-system.md §28.1, §28.5, §29.2, §32.3, §38.3). The C names and layouts of `@repr` types
+// (CheckForeignInterfaces) are S7b.
+
+/// The attributes of every struct, enum, static and other type item, after the structs and enums are declared and
+/// before the other items (ProcessTypeAttributes).
+fn processTypeAttributes(c: borrow mut Checker) -> Result<void, AllocError> {
+    let saved = c.file;
+    for (u in 0..c.front.ast.units.length) {
+        c.file = c.front.ast.units[u].file;
+        let items = c.front.ast.units[u].items;
+        for (k in 0..items.count) {
+            let item = c.front.ast.at(items, k);
+            let attributes = c.front.ast.items[item as usize].attributes;
+            match (c.front.ast.items[item as usize].kind) {
+                ItemKind.Struct(s) => { processStructAttributes(c, item, s)?; }
+                ItemKind.Enum(variants, typeParameters, regionParameters) => {
+                    processEnumAttributes(c, item, variants, typeParameters.count + regionParameters.count)?;
+                }
+                ItemKind.Function(_) => {}
+                ItemKind.Extern(_, _, _) => {}
+                ItemKind.Const(_, _) => {}
+                ItemKind.Static(_, _, _) => {
+                    var known = Vector<u32>.create();
+                    knownAttributes(c, attributes, "a static", "", mut known)?;
+                }
+                _ => {
+                    var known = Vector<u32>.create();
+                    knownAttributes(c, attributes, "this declaration", "", mut known)?;
+                }
+            }
+        }
+    }
+    c.file = saved;
+    return Ok();
+}
+
+/// The declared struct entry of `item` among the package's own items, or none (`Own…is StructEntry entry && entry.Decl ==
+/// s`).
+fn ownStructEntry(c: borrow Checker, item: u32) -> u32 {
+    let symbol = c.front.ast.idents[c.front.ast.items[item as usize].name as usize].symbol;
+    return match (ownEntity(c, symbol)) {
+        Entity.Struct(index) => if (c.structs[index as usize].item == item) index else none(),
+        _ => none(),
+    };
+}
+
+fn processStructAttributes(c: borrow mut Checker, item: u32, s: u32) -> Result<void, AllocError> {
+    let attributes = c.front.ast.items[item as usize].attributes;
+    let generic = c.front.ast.structs[s as usize].typeParameters.count > 0 ||
+        c.front.ast.structs[s as usize].regionParameters.count > 0;
+    var known = Vector<u32>.create();
+    knownAttributes(c, attributes, "a struct", "repr align noncopy context threadSafe", mut known)?;
+    for (attribute in known.view()) {
+        if (!sameText(attributeName(c, attribute), "threadSafe")) {
+            continue;
+        }
+        // The library's thread-safe types (type-system.md §38.3); user code cannot claim it (ownership.md T3).
+        if (!isLibraryFile(c) || c.front.ast.attributes[attribute as usize].hasParentheses) {
+            attributeError(
+                c,
+                attribute,
+                "'@threadSafe' is only for the libraries' own types, and a package's whose nova.toml says 'trusted = true' (§38.3; ADR 0025)",
+            )?;
+        } else {
+            let entry = ownStructEntry(c, item);
+            if (entry != none()) {
+                let definition = c.types.info(c.structs[entry as usize].typ).structDef;
+                c.types.structs[definition as usize].isThreadSafe = true;
+                for (k in 0..c.structs.length) {
+                    if (c.structs[k].template == entry) {
+                        let instance = c.types.info(c.structs[k].typ).structDef;
+                        c.types.structs[instance as usize].isThreadSafe = true;
+                    }
+                }
+            }
+        }
+    }
+    for (attribute in known.view()) {
+        if (!sameText(attributeName(c, attribute), "context")) {
+            continue;
+        }
+        let a = c.front.ast.attributes[attribute as usize];
+        var atomic = false;
+        if (a.arguments.count == 1) {
+            match (c.front.ast.exprs[c.front.ast.at(a.arguments, 0) as usize]) {
+                ExprNode.Name(n, _) => { atomic = sameText(c.name(c.front.ast.idents[n as usize].symbol), "atomic"); }
+                _ => {}
+            }
+        }
+        if (!atomic) {
+            var message = Vector<u8>.create();
+            appendText(
+                mut message,
+                "a struct takes '@context(atomic)': holding a value of it is an atomic context (type-system.md §32.3)",
+            )?;
+            c.error(invalidAttribute(), a.start, a.end, message)?;
+        } else if (!containsU32(c.atomicStructs, item)) {
+            c.atomicStructs.push(item)?;
+        }
+    }
+    for (attribute in known.view()) {
+        if (!sameText(attributeName(c, attribute), "noncopy")) {
+            continue;
+        }
+        if (c.front.ast.attributes[attribute as usize].hasParentheses) {
+            attributeError(c, attribute, "'@noncopy' takes no arguments")?;
+        } else {
+            let entry = ownStructEntry(c, item);
+            if (entry != none()) {
+                let definition = c.types.info(c.structs[entry as usize].typ).structDef;
+                c.types.structs[definition as usize].isNonCopy = true;
+            }
+        }
+    }
+    for (attribute in known.view()) {
+        if (!sameText(attributeName(c, attribute), "align")) {
+            continue;
+        }
+        let a = c.front.ast.attributes[attribute as usize];
+        var n: u64 = 0;
+        if (a.arguments.count == 1) {
+            match (c.front.ast.exprs[c.front.ast.at(a.arguments, 0) as usize]) {
+                ExprNode.IntLiteral(value, _) => { n = value; }
+                _ => {}
+            }
+        }
+        if (n < 1 || n > 4096 || (n & (n - 1)) != 0) {
+            attributeError(c, attribute, "'@align(n)' takes a power of two from 1 to 4096")?;
+        } else if (generic) {
+            attributeError(c, attribute, "a generic struct cannot have '@align'")?;
+        } else {
+            let entry = ownStructEntry(c, item);
+            if (entry != none()) {
+                let definition = c.types.info(c.structs[entry as usize].typ).structDef;
+                c.types.structs[definition as usize].explicitAlign = truncate<u32>(n);
+            }
+        }
+    }
+    // `@repr` is read from every attribute, the repeated and unknown ones' reports aside (the reference's loop).
+    for (k in 0..attributes.count) {
+        let attribute = c.front.ast.at(attributes, k);
+        if (!sameText(attributeName(c, attribute), "repr")) {
+            continue;
+        }
+        let a = c.front.ast.attributes[attribute as usize];
+        var isC = false;
+        if (a.arguments.count == 1) {
+            match (c.front.ast.exprs[c.front.ast.at(a.arguments, 0) as usize]) {
+                ExprNode.Name(n, _) => { isC = sameText(c.name(c.front.ast.idents[n as usize].symbol), "C"); }
+                _ => {}
+            }
+        }
+        if (!isC) {
+            attributeError(c, attribute, "a struct takes '@repr(C)'")?;
+        } else if (generic) {
+            attributeError(c, attribute, "a generic struct cannot be '@repr(C)'")?;
+        } else {
+            let entry = ownStructEntry(c, item);
+            if (entry != none()) {
+                let definition = c.types.info(c.structs[entry as usize].typ).structDef;
+                c.types.structs[definition as usize].isReprC = true;
+                c.notPorted(a.start, a.end, "the C names and layout of a '@repr(C)' struct", "S7b")?;
+            }
+        }
+    }
+    return Ok();
+}
+
+/// The integer type named in `@repr(…)` (ReprInteger), or none.
+fn reprInteger(c: borrow Checker, name: Slice<u8>) -> u32 {
+    let integer = sameText(name, "u8") || sameText(name, "u16") || sameText(name, "u32") || sameText(name, "u64") ||
+        sameText(name, "i8") || sameText(name, "i16") || sameText(name, "i32") || sameText(name, "i64");
+    return if (integer) c.types.lookup(name) else none();
+}
+
+/// Does integer type `t` hold `value` (NovaType.Fits)?
+fn integerFits(c: borrow Checker, t: u32, value: u64) -> bool {
+    let name = c.types.name(t);
+    let bits: u64 = if (sameText(name, "u8") || sameText(name, "i8")) 8 else if (sameText(name, "u16") || sameText(
+        name,
+        "i16",
+    )) 16 else if (sameText(name, "u32") || sameText(name, "i32")) 32 else 64;
+    let signed = name[0] == 'i';
+    let usable = if (signed) bits - 1 else bits;
+    return usable >= 64 || value < (1u64 << usable);
+}
+
+fn processEnumAttributes(
+    c: borrow mut Checker,
+    item: u32,
+    variants: Range,
+    parameterCount: u32,
+) -> Result<void, AllocError> {
+    let attributes = c.front.ast.items[item as usize].attributes;
+    var known = Vector<u32>.create();
+    knownAttributes(c, attributes, "an enum", "repr", mut known)?;
+    for (attribute in known.view()) {
+        let a = c.front.ast.attributes[attribute as usize];
+        var integer = none();
+        if (a.arguments.count == 1) {
+            match (c.front.ast.exprs[c.front.ast.at(a.arguments, 0) as usize]) {
+                ExprNode.Name(n, _) => { integer = reprInteger(c, c.name(c.front.ast.idents[n as usize].symbol)); }
+                _ => {}
+            }
+        }
+        var payloads = false;
+        for (k in 0..variants.count) {
+            if (c.front.ast.variants[c.front.ast.at(variants, k) as usize].payload.count > 0) {
+                payloads = true;
+            }
+        }
+        if (integer == none()) {
+            attributeError(
+                c,
+                attribute,
+                "an enum takes '@repr(u8)', '@repr(u16)', '@repr(u32)', '@repr(u64)' or a signed 'i' form",
+            )?;
+        } else if (parameterCount > 0) {
+            attributeError(c, attribute, "a generic enum cannot have '@repr'")?;
+        } else if (payloads) {
+            attributeError(c, attribute, "only an enum without payloads can have '@repr'")?;
+        } else if (!integerFits(c, integer, (variants.count as u64) - 1)) {
+            var message = Vector<u8>.create();
+            appendQuotedType(mut message, c, integer)?;
+            appendText(mut message, " cannot hold the index of each of the ")?;
+            appendDecimal(mut message, variants.count as u64)?;
+            appendText(mut message, " variants")?;
+            let text = copyBytes(message.view())?;
+            attributeErrorBytes(c, attribute, text.view())?;
+        } else {
+            let symbol = c.front.ast.idents[c.front.ast.items[item as usize].name as usize].symbol;
+            match (ownEntity(c, symbol)) {
+                Entity.Enum(index) => {
+                    if (c.enums[index as usize].item == item) {
+                        let definition = c.types.info(c.enums[index as usize].typ).enumDef;
+                        c.types.enums[definition as usize].repr = integer;
+                        c.notPorted(a.start, a.end, "the C name of a '@repr' enum", "S7b")?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    return Ok();
+}
+
+fn attributeErrorBytes(c: borrow mut Checker, attribute: u32, message: Slice<u8>) -> Result<void, AllocError> {
+    let a = c.front.ast.attributes[attribute as usize];
+    var text = Vector<u8>.create();
+    appendBytes(mut text, message)?;
+    appendText(mut text, " (type-system.md §28.1)")?;
+    return c.error(invalidAttribute(), a.start, a.end, text);
+}
+
+/// Is this struct, or the generic struct it instantiates, declared `@noncopy` (IsNonCopy, OD-7, §29.2)?
+fn isNonCopy(c: borrow Checker, definition: u32) -> bool {
+    if (c.types.structs[definition as usize].isNonCopy) {
+        return true;
+    }
+    let item = c.types.structs[definition as usize].item;
+    if (item == none()) {
+        return false;
+    }
+    for (entry in c.structs.view()) {
+        if (entry.item == item && entry.template == none()) {
+            let template = c.types.info(entry.typ).structDef;
+            if (template != definition && c.types.structs[template as usize].isNonCopy) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Structs declared `@context(atomic)`, and their instances, are atomic contexts (the end of Check, §32.3).
+fn finishAtomicStructs(c: borrow mut Checker) {
+    for (k in 0..c.structs.length) {
+        let item = c.structs[k].item;
+        if (item != none() && containsU32(c.atomicStructs, item)) {
+            let definition = c.types.info(c.structs[k].typ).structDef;
+            c.types.structs[definition as usize].isAtomicContext = true;
+        }
+    }
+}

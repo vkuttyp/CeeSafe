@@ -333,8 +333,18 @@ fn arrayMember(c: borrow mut Checker, value: u32, through: u32, member: u32, spa
         _ => false,
     };
     if (c.types.isUnsized(t) && isDerefOfReference && sameText(c.name(ident.symbol), "ptr")) {
-        c.notPorted(span.start, span.end, "a slice's 'ptr'", "S7")?;
-        return c.errorResult(span.start, span.end);
+        // The address of element 0 (§27.2).
+        let reference = match (c.hir.exprs[value as usize]) {
+            HirExpr.Deref(r) => r,
+            _ => none(),
+        };
+        let view = c.typeOf(reference);
+        let targetSpan = c.spanOf(reference);
+        let slice = coerce(c, reference, view, targetSpan)?; // a SliceMut is reborrowed, not moved
+        let pointer = c.types.pointerTo(c.types.info(t).element, c.types.info(view).mutableReference)?;
+        let values = [slice];
+        let list = c.hir.list(values[..])?;
+        return c.expr(HirExpr.BuiltinCall(bfSlicePtr(), list), pointer, span.start, span.end);
     }
     if (!c.types.is(t, TypeKind.Array)) {
         return Ok(none());

@@ -1,0 +1,71 @@
+struct Cell { value: u64; }
+struct Pair { a: u32; b: u32; }
+@threadSafe
+struct Claimed { x: u32; }
+@context(irq)
+struct BadContext { x: u32; }
+@noncopy(1)
+struct BadNoncopy { x: u32; }
+@align(3)
+struct BadAlign { x: u32; }
+@align(8)
+struct GenericAlign<T> { x: T; }
+@repr(D)
+struct BadRepr { x: u32; }
+@repr(u7)
+enum BadEnumRepr { A, B }
+@repr(u8)
+enum Payload { A(u32), B }
+@repr(i8)
+enum Generic<T> { A, B }
+@noncopy
+struct Unique { x: u32; }
+@frob
+interface Marker {
+    fn mark(borrow this);
+}
+
+unsafe fn noComment() {}
+fn usesUnsafe() {
+    unsafe {}
+}
+/// Safety: callers pass a valid pointer.
+unsafe fn ok(p: *u64) -> u64 => p.read();
+
+fn main() {
+    var x: u64 = 1;
+    let p = borrow mut x as *mut u64;
+    let q = borrow x as *u64;
+    let shared = borrow x;
+    let bad = shared as *mut u64;
+    let r: *borrow u64 = p;
+    let c: CChar = 0;
+    let v = ok(q);
+    let read = q.read();
+    q.write(3);
+    let what = q.frob();
+    let count = q.add();
+    let t = Ptr.toBorrow(q);
+    let other = Ptr.fromAddress(q);
+    let s = Slice.fromRaw(q);
+    let views = "text";
+    let viewPointer = views as *u8;
+    let size = 4u32 as *u8;
+    let voidPointer = q as *void;
+    let into = Box.intoRaw(5);
+    let from = unsafe { Box.fromRaw(p) };
+    let pair = Pair { a: 1, b: 2 };
+    let pp = borrow pair as *Pair;
+    unsafe {
+        let none = voidPointer.read();
+        let mutView = SliceMut.fromRaw(q, 1);
+        q.write(2);
+        let u = Unique { x: 1 };
+        let uu = borrow u as *Unique;
+        let copied = uu.readVolatile();
+    }
+    let mixed = p == (borrow pair as *Pair);
+    let u = Unique { x: 2 };
+    let w = u;
+    let again = u;
+}

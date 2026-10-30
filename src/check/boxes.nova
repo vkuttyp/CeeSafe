@@ -74,9 +74,8 @@ fn checkBoxCreate(
     let text = c.name(ident.symbol);
     let withAllocator = sameText(text, "createIn");
     if (sameText(text, "intoRaw") || sameText(text, "fromRaw")) {
-        c.notPorted(span.start, span.end, "'Box.intoRaw' and 'Box.fromRaw'", "S7")?;
-        checkArgumentsLoosely(c, arguments)?;
-        return c.errorResult(span.start, span.end);
+        let fromRaw = sameText(text, "fromRaw");
+        return checkBoxRaw(c, arguments, fromRaw, expected, span);
     }
     if (!withAllocator && !sameText(text, "create")) {
         var message = Vector<u8>.create();

@@ -1,0 +1,510 @@
+// `unsafe` and raw pointers (the reference's RequireUnsafe, HasSafetyComment, CheckPointerCast, CheckPointerMethod,
+// CheckRawConstructor, CheckBoxRaw, IsBoxFromRaw and EnsurePlaced): P3 S7a (type-system.md §27, §34.2). C function
+// pointers and extern functions are S7b; statics and `here` are S7c.
+
+fn unsafeOutsideUnsafe() -> u32 => 280;
+fn invalidPointerOperation() -> u32 => 282;
+fn missingSafetyComment() -> u32 => 283;
+fn importedTypeByValue() -> u32 => 294;
+fn notStaticInitializer() -> u32 => 338;
+
+/// N0280 unless the code being checked is in an unsafe context (RequireUnsafe, U1, type-system.md §27.4).
+fn requireUnsafe(c: borrow mut Checker, span: Span, what: Slice<u8>) -> Result<bool, AllocError> {
+    if (c.unsafeDepth > 0) {
+        return Ok(true);
+    }
+    var message = Vector<u8>.create();
+    appendBytes(mut message, what)?;
+    appendText(
+        mut message,
+        " is unsafe: use it inside 'unsafe { ... }' or an 'unsafe fn' (type-system.md §27.3)",
+    )?;
+    c.error(unsafeOutsideUnsafe(), span.start, span.end, message)?;
+    return Ok(false);
+}
+
+/// Does a doc comment have a line starting with `Safety:` (HasSafetyComment, §27.4)?
+fn hasSafetyComment(text: Slice<u8>) -> bool {
+    var start: usize = 0;
+    for (k in 0..(text.length + 1)) {
+        if (k == text.length || text[k] == '\n') {
+            let line = text[start..k];
+            if (line.length >= 7 && sameText(line[..7], "Safety:")) {
+                return true;
+            }
+            start = k + 1;
+        }
+    }
+    return false;
+}
+
+/// The pointer conversions of type-system.md §27.2 (CheckPointerCast); all of them are safe.
+fn checkPointerCast(c: borrow mut Checker, operand: u32, target: u32, span: Span) -> Result<u32, AllocError> {
+    let from = c.typeOf(operand);
+    if (c.types.isBottom(from)) {
+        return Ok(operand);
+    }
+    let usize = c.types.usize;
+    let f = c.types.info(from);
+    let t = c.types.info(target);
+    let targetFunction = c.types.is(target, TypeKind.FunctionPointer);
+    let fromFunction = c.types.is(from, TypeKind.FunctionPointer);
+    let targetPointer = c.types.is(target, TypeKind.RawPointer);
+    let fromPointer = c.types.is(from, TypeKind.RawPointer);
+    let fromReference = c.types.is(from, TypeKind.Reference);
+    let fromView = c.types.isSlice(from) || c.types.isStringView(from);
+    var ok = false;
+    if (targetFunction || fromFunction) {
+        // A function pointer converts only to and from usize: it is not a data pointer (§29.5).
+        ok = (targetFunction && from == usize) || (fromFunction && target == usize);
+    } else if (targetPointer) {
+        ok = fromPointer || from == usize || (fromReference && !fromView && f.pointee == t.pointee &&
+            (f.mutableReference || !t.mutablePointer));
+    } else {
+        ok = fromPointer && target == usize;
+    }
+    if (!ok) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "cannot convert ")?;
+        appendQuotedType(mut message, c, from)?;
+        appendText(mut message, " to ")?;
+        appendQuotedType(mut message, c, target)?;
+        appendText(mut message, " with 'as'")?;
+        if (fromReference && c.types.is(target, TypeKind.RawPointer) && t.mutablePointer && !f.mutableReference) {
+            appendText(mut message, "; a '*mut' pointer needs a 'borrow mut' reference")?;
+        } else if (fromView) {
+            appendText(mut message, "; use '.ptr' for a slice's address")?;
+        }
+        appendText(mut message, " (type-system.md §27.2)")?;
+        c.error(invalidCast(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (from == target) {
+        c.hir.exprSpans[operand as usize] = span;
+        return Ok(operand);
+    }
+    return c.expr(HirExpr.Cast(operand), target, span.start, span.end);
+}
+
+/// A method on a raw pointer (CheckPointerMethod, §27.2–§27.3).
+fn checkPointerMethod(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    pointer: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let ident = c.front.ast.idents[member as usize];
+    var nameBytes = Vector<u8>.create();
+    appendBytes(mut nameBytes, c.name(ident.symbol))?;
+    let name = nameBytes.view();
+    let typ = c.typeOf(pointer);
+    let pointee = c.types.info(typ).pointee;
+    var function = none();
+    var argumentType = none();
+    if (sameText(name, "read")) {
+        function = bfPtrRead();
+    } else if (sameText(name, "write")) {
+        function = bfPtrWrite();
+        argumentType = pointee;
+    } else if (sameText(name, "readVolatile")) {
+        function = bfPtrReadVolatile();
+    } else if (sameText(name, "writeVolatile")) {
+        function = bfPtrWriteVolatile();
+        argumentType = pointee;
+    } else if (sameText(name, "add")) {
+        function = bfPtrAdd();
+        argumentType = c.types.usize;
+    } else if (sameText(name, "sub")) {
+        function = bfPtrSub();
+        argumentType = c.types.usize;
+    } else if (sameText(name, "offset")) {
+        function = bfPtrOffset();
+        argumentType = c.types.isize;
+    } else if (sameText(name, "isNull")) {
+        function = bfPtrIsNull();
+    }
+    if (function == none()) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, " has no method '")?;
+        appendBytes(mut message, name)?;
+        appendText(
+            mut message,
+            "'; raw pointers have read, write, readVolatile, writeVolatile, add, sub, offset and isNull (type-system.md §27, §29.1)",
+        )?;
+        c.error(notAStruct(), ident.start, ident.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let expectedCount: u32 = if (argumentType == none()) 0 else 1;
+    if (arguments.count != expectedCount) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, name)?;
+        appendText(mut message, "' takes ")?;
+        appendDecimal(mut message, expectedCount as u64)?;
+        appendText(mut message, " argument(s) but ")?;
+        appendDecimal(mut message, arguments.count as u64)?;
+        appendText(mut message, " were supplied")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (function == bfPtrIsNull()) {
+        let values = [pointer];
+        let list = c.hir.list(values[..])?;
+        let boolType = c.types.boolType;
+        return c.expr(HirExpr.BuiltinCall(function, list), boolType, span.start, span.end);
+    }
+    var what = Vector<u8>.create();
+    appendText(mut what, "'")?;
+    appendBytes(mut what, name)?;
+    appendText(mut what, "' through a raw pointer")?;
+    let unsafeOk = requireUnsafe(c, span, what.view())?;
+    let cLaidOut = c.types.isCLaidOut(pointee, 0);
+    let structDef = c.types.info(pointee).structDef;
+    let novaStruct = structDef != none() && !c.types.structs[structDef as usize].isImported;
+    // `add`, `sub` and `offset` are C's pointer arithmetic, scaled by C's own size (C9, §31.2).
+    if (function == bfPtrRead() && cLaidOut && novaStruct) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'read' would move a ")?;
+        appendQuotedType(mut message, c, pointee)?;
+        appendText(
+            mut message,
+            " out of its place, but it holds C state, which never moves (type-system.md §27.3, §33)",
+        )?;
+        c.error(invalidPointerOperation(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    // `write` of a Nova struct holding C state is a placement: the store, then its @placed init (§27.3, §33.3).
+    let arithmetic = function == bfPtrAdd() || function == bfPtrSub() || function == bfPtrOffset();
+    if (cLaidOut && !arithmetic && !(function == bfPtrWrite() && novaStruct)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, name)?;
+        appendText(mut message, "' would copy a ")?;
+        appendQuotedType(mut message, c, pointee)?;
+        appendText(
+            mut message,
+            ", whose size only the C compiler knows; use 'Ptr.toBorrow' and its fields instead (type-system.md §31.2)",
+        )?;
+        c.error(importedTypeByValue(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (c.types.is(pointee, TypeKind.Void) || c.types.is(pointee, TypeKind.CChar)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, name)?;
+        appendText(mut message, "' needs a typed pointer, but ")?;
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, " points to ")?;
+        appendQuotedType(mut message, c, pointee)?;
+        appendText(mut message, "; cast it first (type-system.md §27.3)")?;
+        c.error(invalidPointerOperation(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    // `read` and `write` move any type (ADR 0027); the volatile forms are for device registers, and copy.
+    if ((function == bfPtrReadVolatile() || function == bfPtrWriteVolatile()) && !c.types.isCopy(pointee)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, name)?;
+        appendText(mut message, "' through a raw pointer needs a Copy type, but ")?;
+        appendQuotedType(mut message, c, pointee)?;
+        appendText(mut message, " is not (type-system.md §27.3)")?;
+        c.error(invalidPointerOperation(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if ((function == bfPtrWrite() || function == bfPtrWriteVolatile()) && !c.types.info(typ).mutablePointer) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "cannot write through ")?;
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, "; writing needs a '*mut ")?;
+        appendBytes(mut message, c.typeName(pointee))?;
+        appendText(mut message, "' (type-system.md §27.3)")?;
+        c.error(invalidPointerOperation(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (function == bfPtrWrite()) {
+        ensurePlaced(c, pointee, 0); // a write of C state places it, as a box's construction does (§33.3)
+    }
+    var values = Vector<u32>.create();
+    values.push(pointer)?;
+    var bottom = false;
+    if (argumentType != none()) {
+        let syntax = c.front.ast.at(arguments, 0);
+        let argument = checkArgument(c, syntax, argumentType)?;
+        bottom = c.isBottom(argument);
+        values.push(argument)?;
+    }
+    if (!unsafeOk || bottom) {
+        return c.errorResult(span.start, span.end);
+    }
+    let result =
+        if (function == bfPtrRead() || function == bfPtrReadVolatile()) pointee else if (function == bfPtrWrite() ||
+            function == bfPtrWriteVolatile()) c.types.voidType else typ;
+    let list = c.hir.list(values.view())?;
+    return c.expr(HirExpr.BuiltinCall(function, list), result, span.start, span.end);
+}
+
+/// `Ptr.toBorrow(p)`, `Ptr.toBorrowMut(p)`, `Slice.fromRaw(p, n)`, `SliceMut.fromRaw(p, n)` (CheckRawConstructor, §27.3).
+fn checkRawConstructor(
+    c: borrow mut Checker,
+    owner: u32,
+    member: u32,
+    arguments: Range,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let ident = c.front.ast.idents[member as usize];
+    var nameBytes = Vector<u8>.create();
+    appendBytes(mut nameBytes, c.name(ident.symbol))?;
+    let name = nameBytes.view();
+    let isPtr = owner == builtinPtr();
+    let ownerName = builtinName(owner);
+    let known = if (isPtr) sameText(name, "toBorrow") || sameText(name, "toBorrowMut") else sameText(name, "fromRaw");
+    if (!known) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendText(mut message, ownerName)?;
+        appendText(mut message, "' has no function '")?;
+        appendBytes(mut message, name)?;
+        appendText(
+            mut message,
+            if (isPtr) "'; it has 'toBorrow' and 'toBorrowMut' (type-system.md §27.3)" else "'; it has 'fromRaw' (type-system.md §27.3)",
+        )?;
+        c.error(undefinedName(), ident.start, ident.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var qualified = Vector<u8>.create();
+    appendText(mut qualified, "'")?;
+    appendText(mut qualified, ownerName)?;
+    appendText(mut qualified, ".")?;
+    appendBytes(mut qualified, name)?;
+    appendText(mut qualified, "'")?;
+    let isSlice = !isPtr;
+    let expectedCount: u32 = if (isSlice) 2 else 1;
+    if (arguments.count != expectedCount) {
+        var message = Vector<u8>.create();
+        appendBytes(mut message, qualified.view())?;
+        appendText(mut message, " takes ")?;
+        appendDecimal(mut message, expectedCount as u64)?;
+        appendText(mut message, " argument(s) but ")?;
+        appendDecimal(mut message, arguments.count as u64)?;
+        appendText(mut message, " were supplied")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let unsafeOk = requireUnsafe(c, span, qualified.view())?;
+    let pointerSyntax = c.front.ast.at(arguments, 0);
+    let pointerSpan = c.front.ast.exprSpans[pointerSyntax as usize];
+    let pointer = synth(c, pointerSyntax, none())?;
+    var length = none();
+    if (isSlice) {
+        let usize = c.types.usize;
+        let lengthSyntax = c.front.ast.at(arguments, 1);
+        length = checkExpr(c, lengthSyntax, usize)?;
+    }
+    if (c.isBottom(pointer) || (length != none() && c.isBottom(length))) {
+        return c.errorResult(span.start, span.end);
+    }
+    let pointerType = c.typeOf(pointer);
+    if (!c.types.is(pointerType, TypeKind.RawPointer)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "expected a raw pointer, found ")?;
+        appendQuotedType(mut message, c, pointerType)?;
+        c.error(typeMismatch(), pointerSpan.start, pointerSpan.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let pointee = c.types.info(pointerType).pointee;
+    let mutable = sameText(name, "toBorrowMut") || owner == builtinSliceMut();
+    if (c.types.is(pointee, TypeKind.Void) || c.types.is(pointee, TypeKind.CChar)) {
+        var message = Vector<u8>.create();
+        appendBytes(mut message, qualified.view())?;
+        appendText(mut message, " needs a typed pointer, but ")?;
+        appendQuotedType(mut message, c, pointerType)?;
+        appendText(mut message, " points to ")?;
+        appendQuotedType(mut message, c, pointee)?;
+        appendText(mut message, "; cast it first")?;
+        c.error(invalidPointerOperation(), pointerSpan.start, pointerSpan.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (mutable && !c.types.info(pointerType).mutablePointer) {
+        var message = Vector<u8>.create();
+        appendBytes(mut message, qualified.view())?;
+        appendText(mut message, " gives mutable access, so it needs a '*mut ")?;
+        appendBytes(mut message, c.typeName(pointee))?;
+        appendText(mut message, "', not ")?;
+        appendQuotedType(mut message, c, pointerType)?;
+        c.error(invalidPointerOperation(), pointerSpan.start, pointerSpan.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let structDef = c.types.info(pointee).structDef;
+    if (isSlice && structDef != none() && c.types.structs[structDef as usize].isImported) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "a slice of ")?;
+        appendQuotedType(mut message, c, pointee)?;
+        appendText(mut message, " needs its size, which only the C compiler knows (type-system.md §31.2)")?;
+        c.error(importedTypeByValue(), pointerSpan.start, pointerSpan.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (isSlice && !checkElement(c, pointee, -1, pointerSpan)?) {
+        return c.errorResult(span.start, span.end);
+    }
+    if (!unsafeOk) {
+        return c.errorResult(span.start, span.end);
+    }
+    if (isSlice) {
+        let sliceType = c.types.sliceOf(pointee, mutable)?;
+        let values = [pointer, length];
+        let list = c.hir.list(values[..])?;
+        return c.expr(HirExpr.BuiltinCall(bfSliceFromRaw(), list), sliceType, span.start, span.end);
+    }
+    let reference = c.types.referenceTo(pointee, mutable)?;
+    return c.expr(HirExpr.Cast(pointer), reference, span.start, span.end);
+}
+
+/// `Box.intoRaw(b)` and `Box.fromRaw(p)` (CheckBoxRaw, §34.2): the box type of `fromRaw` is the expected one.
+fn checkBoxRaw(
+    c: borrow mut Checker,
+    arguments: Range,
+    fromRaw: bool,
+    expected: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    if (arguments.count != 1) {
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            if (fromRaw) "'Box.fromRaw' takes one pointer: 'Box.fromRaw(p)'" else "'Box.intoRaw' takes one box: 'Box.intoRaw(b)'",
+        )?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let syntax = c.front.ast.at(arguments, 0);
+    if (!fromRaw) {
+        let box = synth(c, syntax, none())?;
+        if (c.isBottom(box)) {
+            return Ok(box);
+        }
+        let boxType = c.typeOf(box);
+        if (!c.types.is(boxType, TypeKind.Box) || isPoolBox(c, boxType)) {
+            let argumentSpan = c.front.ast.exprSpans[syntax as usize];
+            var message = Vector<u8>.create();
+            appendText(mut message, "'Box.intoRaw' takes a box, not a ")?;
+            appendQuotedType(mut message, c, boxType)?;
+            appendText(mut message, " (type-system.md §34.2)")?;
+            c.error(typeMismatch(), argumentSpan.start, argumentSpan.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+        let pointer = c.types.pointerTo(c.types.info(boxType).pointee, true)?;
+        let values = [box];
+        let list = c.hir.list(values[..])?;
+        return c.expr(HirExpr.BuiltinCall(bfBoxIntoRaw(), list), pointer, span.start, span.end);
+    }
+    let unsafeOk = requireUnsafe(c, span, "'Box.fromRaw'".bytes())?;
+    if (expected == none() || !c.types.is(expected, TypeKind.Box) || isPoolBox(c, expected)) {
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            "'Box.fromRaw' needs to know the box type, allocator included: write it, as in 'let b: Box<T, A> = unsafe { Box.fromRaw(p) };' (type-system.md §34.2)",
+        )?;
+        c.error(typeMismatch(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let pointerType = c.types.pointerTo(c.types.info(expected).pointee, true)?;
+    let pointer = checkExpr(c, syntax, pointerType)?;
+    if (c.isBottom(pointer) || !unsafeOk) {
+        return c.errorResult(span.start, span.end);
+    }
+    let values = [pointer];
+    let list = c.hir.list(values[..])?;
+    return c.expr(HirExpr.BuiltinCall(bfBoxFromRaw(), list), expected, span.start, span.end);
+}
+
+/// `Box.fromRaw(p)`, possibly in `unsafe { }` (IsBoxFromRaw): its expected type is the box itself (§34.2).
+fn isBoxFromRaw(c: borrow mut Checker, e: u32) -> Result<bool, AllocError> {
+    match (c.front.ast.exprs[e as usize]) {
+        ExprNode.Unsafe(inner) => { return isBoxFromRaw(c, inner); }
+        ExprNode.Call(callee, _) => {
+            match (c.front.ast.exprs[callee as usize]) {
+                ExprNode.Member(target, member) => {
+                    match (c.front.ast.exprs[target as usize]) {
+                        ExprNode.Name(name, typeArguments) => {
+                            if (typeArguments.count != 0) {
+                                return Ok(false);
+                            }
+                            let symbol = c.front.ast.idents[name as usize].symbol;
+                            let isBox = match (c.lookup(symbol)?) {
+                                Entity.Builtin(b) => b == builtinBox(),
+                                _ => false,
+                            };
+                            return Ok(isBox && sameText(c.name(c.front.ast.idents[member as usize].symbol), "fromRaw"));
+                        }
+                        _ => { return Ok(false); }
+                    }
+                }
+                _ => { return Ok(false); }
+            }
+        }
+        _ => { return Ok(false); }
+    }
+}
+
+/// A box or write of a C-laid-out type runs the `@placed` methods of its fields' types and its own (EnsurePlaced,
+/// §33.3): finds each one in this instance and records it on the struct.
+fn ensurePlaced(c: borrow mut Checker, typ: u32, depth: u32) {
+    let definition = c.types.info(typ).structDef;
+    if (definition == none() || c.types.structs[definition as usize].isImported || !c.types.isCLaidOut(typ, 0) ||
+        depth >= 64) {
+        return;
+    }
+    let fieldCount = c.types.structs[definition as usize].fields.length;
+    for (k in 0..fieldCount) {
+        let field = c.types.structs[definition as usize].fields[k];
+        let fieldType = c.types.fields[field as usize].typ;
+        ensurePlaced(c, fieldType, depth + 1);
+    }
+    if (c.types.structs[definition as usize].placedMethod == none()) {
+        let count = c.types.structs[definition as usize].functions.length;
+        for (k in 0..count) {
+            let function = c.types.structs[definition as usize].functions[k];
+            if (c.types.structs[definition as usize].placedMethod == none() &&
+                containsU32(c.placedMethods, c.hir.functions[function as usize].syntax)) {
+                c.types.structs[definition as usize].placedMethod = function;
+            }
+        }
+    }
+}
+
+/// Does an attribute list name `@name` (IsConstantSyntax reads `@constant` this way, before attributes are processed)?
+fn hasAttributeNamed(c: borrow Checker, attributes: Range, name: StringView) -> bool {
+    for (k in 0..attributes.count) {
+        if (sameText(attributeName(c, c.front.ast.at(attributes, k)), name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Building a value at compile time (InStaticConstruction, §39.4): a static initialiser, or a `@constant` function's
+/// body.
+fn inStaticConstruction(c: borrow Checker) -> bool {
+    if (c.inStaticInitializer) {
+        return true;
+    }
+    let current = c.function;
+    if (current == none()) {
+        return false;
+    }
+    let syntax = c.front.ast.functions[c.hir.functions[current as usize].syntax as usize];
+    return hasAttributeNamed(c, syntax.attributes, "constant");
+}

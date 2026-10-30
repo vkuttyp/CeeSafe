@@ -100,9 +100,6 @@ fn declareStruct(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
     if (!checkTypeItemName(c, ident)?) {
         return Ok();
     }
-    if (entry.attributes.count > 0) {
-        c.notPorted(entry.start, entry.end, "attributes on a struct", "S7")?;
-    }
     var name = Vector<u8>.create();
     appendBytes(mut name, c.name(ident.symbol))?;
     var parameters = Vector<u32>.create();
@@ -144,9 +141,6 @@ fn declareEnum(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
     checkRegionParameters(c, regions, parameters)?;
     if (!checkTypeItemName(c, ident)?) {
         return Ok();
-    }
-    if (entry.attributes.count > 0) {
-        c.notPorted(entry.start, entry.end, "attributes on an enum", "S7")?;
     }
     var name = Vector<u8>.create();
     appendBytes(mut name, c.name(ident.symbol))?;
@@ -725,7 +719,8 @@ fn visitCopy(c: borrow mut Checker, typ: u32, done: borrow mut Vector<bool>) -> 
     if (t.structDef != none()) {
         let hasDrop = c.types.structs[t.structDef as usize].dropFunction != none();
         c.types.structs[t.structDef as usize].needsDrop = hasDrop || anyDrop;
-        c.types.structs[t.structDef as usize].isCopy = !hasDrop && allCopy;
+        // `@noncopy` opts out (OD-7; type-system.md §29.2); instances inherit it from their template's declaration.
+        c.types.structs[t.structDef as usize].isCopy = !hasDrop && allCopy && !isNonCopy(c, t.structDef);
     } else if (t.enumDef != none()) {
         c.types.enums[t.enumDef as usize].needsDrop = anyDrop;
         c.types.enums[t.enumDef as usize].isCopy = allCopy;
