@@ -14,7 +14,8 @@ usage: tools/run_corpus.py --compiler PATH [--reference PATH] [--corpus DIR] [--
                            [--jobs N] [--timeout S] [--cc CC] [--cflag=FLAG]... [--with FILE]... [--report FILE] [-v]
 
 Write C flags as --cflag=-O2: argparse reads a separate `-O2` as an option of its own.
---with adds source files to every check and build (for tests of a library such as CeeSafe's src/support/); a
+--check-leaks runs each program with the runtime's allocation report and fails one that exits normally with live
+allocations. --with adds source files to every check and build (for tests of a library such as CeeSafe's src/support/); a
 diagnostic in one of them is a failure.
 """
 
@@ -154,7 +155,10 @@ class Runner:
     def execute(self, exe):
         start = time.monotonic()
         try:
-            p = subprocess.run([exe], cwd=self.corpus, capture_output=True, timeout=self.args.timeout)
+            env = dict(os.environ)
+            if self.args.check_leaks:
+                env["NOVA_ALLOC_REPORT"] = "1"
+            p = subprocess.run([exe], cwd=self.corpus, capture_output=True, timeout=self.args.timeout, env=env)
             status, stdout, stderr = p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
         except subprocess.TimeoutExpired:
             status, stdout, stderr = "timeout", "", ""
@@ -267,6 +271,13 @@ def run_test(runner, family, path, work):
             stdout, exit_code, panic, panic_line = expectations(text)
             if run.stdout.replace("\r\n", "\n") != stdout:
                 problems.append(f"stdout differs:\n--- expected\n{stdout}--- actual\n{run.stdout}")
+            if runner.args.check_leaks:
+                m = re.search(r"nova alloc: attempts=\d+ live=(\d+)", run.stderr)
+                # A panic skips destructors (run-fail), and Process.exit ends the program before main returns, which
+                # prints no report; a report with live allocations is a leak.
+                if panic is None and m is not None and m.group(1) != "0":
+                    problems.append(f"leak check: {m.group(0)}")
+                run.stderr = re.sub(r"nova alloc: attempts=\d+ live=\d+\n?", "", run.stderr)
             if run.status != exit_code:
                 problems.append(f"exit {run.status}, expected {exit_code}; stderr: {run.stderr.strip()[:300]}")
             if panic is not None and not run.stderr.startswith(f"nova panic: {panic} at {path}:{panic_line}:"):
@@ -347,6 +358,8 @@ def main():
     parser.add_argument("--timeout", type=float, default=60.0, help="seconds per command or program run")
     parser.add_argument("--cc", help="C compiler (sets $CC for the compiler)")
     parser.add_argument("--cflag", action="append", default=[], help="extra C flag for builds (repeatable)")
+    parser.add_argument("--check-leaks", action="store_true",
+                        help="run programs with NOVA_ALLOC_REPORT=1 and require live=0 on a normal exit")
     parser.add_argument("--with", dest="with_files", action="append", default=[],
                         help="extra source file for every check and build (repeatable)")
     parser.add_argument("--report", help="write a JSON report here")

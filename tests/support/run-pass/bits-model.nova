@@ -71,7 +71,10 @@ fn checkBits() -> bool {
     if (!agrees(union, mu.view()) || !agrees(inter, mi.view()) || !agrees(diff, md.view())) {
         return false;
     }
-    if (changed != !union.equals(a) || union.unionWith(b) || !a.copyOf()!.equals(a)) {
+    // The copy is bound to a local: novac 0.3.1 does not drop a temporary made in an `if` condition
+    // (probes/upstream/condition-temporary-not-dropped.nova).
+    let again = a.copyOf()!;
+    if (changed != !union.equals(a) || union.unionWith(b) || !again.equals(a)) {
         return false;
     }
     var empty = Bits.create(size)!;
