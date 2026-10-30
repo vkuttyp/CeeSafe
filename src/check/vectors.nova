@@ -228,9 +228,15 @@ fn checkVectorMethod(
             text,
             "all",
         ) || sameText(text, "splitAt") || sameText(text, "splitAtMut") || sameText(text, "retain"))) {
-        c.notPorted(span.start, span.end, "a vector method that calls lib/core", "S5/S6")?;
-        checkArgumentsLoosely(c, arguments)?;
-        return c.errorResult(span.start, span.end);
+        if (sameText(text, "retain")) {
+            return checkVectorRetain(c, member, arguments, vector, targetSpan, span);
+        }
+        // Through the elements (§36.4): mutably for the methods that move or lend them mutably.
+        let s = c.spanOf(vector);
+        let elements = c.expr(HirExpr.Deref(vector), pointee, s.start, s.end)?;
+        let mutable = sameText(text, "swap") || sameText(text, "sortBy") || sameText(text, "splitAtMut");
+        let slice = borrowPlace(c, elements, mutable, targetSpan)?;
+        return checkSliceAlgorithm(c, member, arguments, slice, targetSpan, span);
     }
     if (sameText(text, "view") || sameText(text, "bytes") || sameText(text, "viewMut")) {
         let s = c.spanOf(vector);
@@ -380,9 +386,7 @@ fn checkSliceMethod(
     let text = textBytes.view();
     if (sameText(text, "sortBy") || sameText(text, "forEach") || sameText(text, "any") || sameText(text, "all") ||
         sameText(text, "swap") || sameText(text, "splitAt") || sameText(text, "splitAtMut")) {
-        c.notPorted(span.start, span.end, "a slice method that calls lib/core", "S5/S6")?;
-        checkArgumentsLoosely(c, arguments)?;
-        return c.errorResult(span.start, span.end);
+        return checkSliceAlgorithm(c, member, arguments, slice, targetSpan, span);
     }
     let sliceType = c.typeOf(slice);
     if (!sameText(text, "copyFrom") && !sameText(text, "fill")) {

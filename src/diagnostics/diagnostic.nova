@@ -180,6 +180,22 @@ struct Diagnostics {
         return Ok();
     }
 
+    /// Removes the diagnostics in the files `remove` marks, keeping the others' order.
+    fn removeFiles(borrow mut this, remove: Slice<bool>) {
+        var kept: usize = 0;
+        for (i in 0..this.items.length) {
+            let file = this.items[i].file;
+            if ((file as usize) < remove.length && remove[file as usize]) {
+                continue;
+            }
+            if (kept != i) {
+                this.items.swap(kept, i);
+            }
+            kept += 1;
+        }
+        this.items.truncate(kept);
+    }
+
     /// Whether any diagnostic so far is in `file`.
     fn anyIn(borrow this, file: u32) -> bool {
         for (i in 0..this.items.length) {

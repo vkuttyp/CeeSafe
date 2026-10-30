@@ -173,20 +173,8 @@ fn checkProgram(
         for (k in 0..items.count) {
             let item = c.front.ast.at(items, k);
             match (c.front.ast.items[item as usize].kind) {
-                ItemKind.Struct(_) => {
-                    if (isLibraryFile(c)) {
-                        declareTypeItem(mut c, item, "a struct", "S5")?;
-                    } else {
-                        declareStruct(mut c, item)?;
-                    }
-                }
-                ItemKind.Enum(_, _, _) => {
-                    if (isLibraryFile(c)) {
-                        declareTypeItem(mut c, item, "an enum", "S5")?;
-                    } else {
-                        declareEnum(mut c, item)?;
-                    }
-                }
+                ItemKind.Struct(_) => { declareStruct(mut c, item)?; }
+                ItemKind.Enum(_, _, _) => { declareEnum(mut c, item)?; }
                 ItemKind.Extern(_, _, structs) => {
                     for (s in 0..structs.count) {
                         let imported = c.front.ast.at(structs, s);
@@ -221,10 +209,10 @@ fn checkProgram(
         evaluateConstant(mut c, truncate<u32>(k))?;
     }
 
-    // The body pass: every function in creation order; library bodies wait for S5.
+    // The body pass: every function in creation order, the libraries' included.
     var f: usize = 0;
     while (f < c.hir.functions.length) {
-        if (!c.hir.functions[f].library && c.hir.functions[f].registered) {
+        if (c.hir.functions[f].registered) {
             let function = truncate<u32>(f);
             if (functionIsInstantiation(c, function)) {
                 // Its generic version reports (§20.3); a scoped type argument the body cannot take is N0274.
@@ -317,17 +305,10 @@ fn ownItem(c: borrow mut Checker, symbol: u32, entity: Entity) -> Result<void, A
     return Ok();
 }
 
-/// A struct, enum, interface or imported C struct. A library one is recorded by name only (S5); a user one is a gap
-/// until its slice, but its name is declared so later uses are not "cannot find".
+/// An imported C struct: a gap until S7, but its name is declared so later uses are not "cannot find".
 fn declareTypeItem(c: borrow mut Checker, item: u32, what: StringView, slice: StringView) -> Result<void, AllocError> {
     let name = c.front.ast.items[item as usize].name;
     let symbol = c.front.ast.idents[name as usize].symbol;
-    if (isLibraryFile(c)) {
-        if (c.coreItems.find(Word { value: symbol as u64 }) == null) {
-            ownItem(c, symbol, Entity.LibraryItem(item))?;
-        }
-        return Ok();
-    }
     let id = c.front.ast.idents[name as usize];
     c.notPorted(id.start, id.end, what, slice)?;
     if (!isDeclared(c, symbol)) {
@@ -336,37 +317,24 @@ fn declareTypeItem(c: borrow mut Checker, item: u32, what: StringView, slice: St
     return Ok();
 }
 
-/// Declare(item) for the items S1a supports; the others are gaps (in the library: names only).
+/// Declare(item), for user and library units alike; unported items are gaps.
 fn declare(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
     let entry = c.front.ast.items[item as usize];
-    if (isLibraryFile(c)) {
-        match (entry.kind) {
-            ItemKind.Impl(_, _, _) => {}
-            ItemKind.Extern(_, functions, _) => {
-                for (k in 0..functions.count) {
-                    let f = c.front.ast.at(functions, k);
-                    let symbol = c.front.ast.idents[c.front.ast.functions[f as usize].name as usize].symbol;
-                    if (c.coreItems.find(Word { value: symbol as u64 }) == null) {
-                        ownItem(c, symbol, Entity.LibraryItem(item))?;
-                    }
-                }
-            }
-            _ => {
-                let symbol = c.front.ast.idents[entry.name as usize].symbol;
-                if (c.coreItems.find(Word { value: symbol as u64 }) == null) {
-                    ownItem(c, symbol, Entity.LibraryItem(item))?;
-                }
-            }
-        }
-        return Ok();
-    }
     match (entry.kind) {
         ItemKind.Impl(_, _, _) => {
             c.impls.push(ImplRef { item: item, file: c.file })?; // processed once every item is declared (§21.1)
             return Ok();
         }
-        ItemKind.Extern(_, _, _) => {
+        ItemKind.Extern(_, functions, _) => {
             c.notPorted(entry.start, entry.end, "an extern block", "S7")?;
+            // Its functions' names, so uses of them are gaps rather than "cannot find".
+            for (k in 0..functions.count) {
+                let f = c.front.ast.at(functions, k);
+                let symbol = c.front.ast.idents[c.front.ast.functions[f as usize].name as usize].symbol;
+                if (!isDeclared(c, symbol)) {
+                    ownItem(c, symbol, Entity.LibraryItem(item))?;
+                }
+            }
             return Ok();
         }
         _ => {}

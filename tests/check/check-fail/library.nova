@@ -1,0 +1,19 @@
+struct Layout { a: i32; }
+enum Ordering { A }
+fn Environment() {}
+
+fn main() {
+    let p = PhysAddr.of(true);
+    let q = PhysAddr { raw: 1 };
+    let r = VirtAddr.make(1);
+    let xs = [1, 2];
+    xs[..].swap(0, 1);
+    let ys = xs[..];
+    ys.swap(0);
+    var v = Vector<u8>.create();
+    v.swap(0, true);
+    let k = File.kind(5);
+    let c = Process.capture("x");
+    let h = xs[..].splitAt(true);
+    let o: LoadOrdering = StoreOrdering.Relaxed;
+}

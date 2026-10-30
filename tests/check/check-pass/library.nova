@@ -1,0 +1,34 @@
+fn main() {
+    let p = PhysAddr.of(4096).offset(8);
+    let v = VirtAddr.of(1);
+    let bits = p.bits() + v.bits();
+    let layout = Layout { size: 16, align: 8 };
+    let total = layout.size + layout.align;
+    let order = LoadOrdering.Acquire;
+    let rmw = Ordering.AcquireRelease;
+    match (StoreOrdering.Release) {
+        StoreOrdering.Relaxed => {}
+        StoreOrdering.Release => {}
+        StoreOrdering.SequentiallyConsistent => {}
+    }
+    let home = Environment.variable("HOME");
+    match (Directory.create("out")) {
+        Ok() => {}
+        Err(e) => { Console.writeLine(e.message()); }
+    }
+    let here = Directory.current();
+    let kind = File.kind("x");
+    var args = Vector<StringView>.create();
+    args.push("-l")!;
+    let captured = Process.capture("ls", args, null);
+    var xs = [3, 1, 2];
+    xs[..].swap(0, 2);
+    let s = borrow mut xs[..];
+    s.swap(1, 2);
+    var v2 = Vector<i32>.create();
+    v2.push(1)!;
+    v2.push(2)!;
+    v2.swap(0, 1);
+    let halves = xs[..].splitAt(1);
+    let left = halves.left;
+}

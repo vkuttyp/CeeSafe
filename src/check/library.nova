@@ -1,0 +1,143 @@
+// Calls into the libraries (the reference's LibraryFunction, CheckLibraryCall, CheckSliceAlgorithm, CheckHostService and
+// the `retain` case of CheckVectorMethod): P3 S5 (type-system.md §36.4, §26.7, §26.8). Methods of built-in types that
+// are written in Nova are static functions of a lib/core or lib/std struct, instantiated with the element type.
+
+/// The static function `name` of the library struct `holder`, instantiated with `arguments` (LibraryFunction); none if
+/// the libraries have no such struct (the reference throws: it cannot happen with its libraries).
+fn libraryFunction(
+    c: borrow mut Checker,
+    holder: StringView,
+    arguments: Slice<u32>,
+    name: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let symbol = c.intern(holder)?;
+    let template = match (foundEntity(c.coreItems, Word { value: symbol as u64 })) {
+        Entity.Struct(index) => index,
+        _ => none(),
+    };
+    if (template == none() || c.structs[template as usize].item == none()) {
+        return Ok(none());
+    }
+    let entry = instantiateStruct(c, template, arguments, span)?;
+    let definition = c.types.info(c.structs[entry as usize].typ).structDef;
+    return Ok(findStructFunction(c, definition, name));
+}
+
+/// `s.swap(i, j)`, and the slice methods written in lib/core (CheckSliceAlgorithm): `sortBy`, `forEach`, `any`, `all`
+/// (SliceAlgorithms<T>), `splitAt`, `splitAtMut` (SliceSplitting<r, T>). `slice` is the receiver, already borrowed.
+fn checkSliceAlgorithm(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    slice: u32,
+    targetSpan: Span,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let ident = c.front.ast.idents[member as usize];
+    var textBytes = Vector<u8>.create();
+    appendBytes(mut textBytes, c.name(ident.symbol))?;
+    let text = textBytes.view();
+    if (c.isBottom(slice)) {
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let sliceType = c.typeOf(slice);
+    let element = c.types.info(c.types.info(sliceType).pointee).element;
+    let mutable = c.types.info(sliceType).mutableReference;
+    if ((sameText(text, "sortBy") || sameText(text, "swap") || sameText(text, "splitAtMut")) && !mutable) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, text)?;
+        appendText(mut message, "' moves elements of the slice, which is a ")?;
+        appendQuotedType(mut message, c, sliceType)?;
+        appendText(mut message, "; it needs a 'SliceMut<")?;
+        appendBytes(mut message, c.typeName(element))?;
+        appendText(mut message, ">'")?;
+        c.error(assignToImmutable(), targetSpan.start, targetSpan.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (sameText(text, "swap")) {
+        if (arguments.count != 2) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "'swap' takes two indices: 's.swap(i, j)'")?;
+            c.error(argumentCount(), span.start, span.end, message)?;
+            checkArgumentsLoosely(c, arguments)?;
+            return c.errorResult(span.start, span.end);
+        }
+        let usize = c.types.usize;
+        let first = c.front.ast.at(arguments, 0);
+        let second = c.front.ast.at(arguments, 1);
+        let i = checkExpr(c, first, usize)?;
+        let j = checkExpr(c, second, usize)?;
+        if (c.isBottom(i) || c.isBottom(j)) {
+            return c.errorResult(span.start, span.end);
+        }
+        let values = [slice, i, j];
+        let list = c.hir.list(values[..])?;
+        let voidType = c.types.voidType;
+        return c.expr(HirExpr.BuiltinCall(bfSliceSwap(), list), voidType, span.start, span.end);
+    }
+    var receiver = slice;
+    if (!sameText(text, "sortBy") && !sameText(text, "splitAtMut") && mutable) {
+        let shared = c.types.sliceOf(element, false)?;
+        receiver = coerce(c, slice, shared, targetSpan)?;
+    }
+    let holder = if (sameText(text, "splitAt") || sameText(text, "splitAtMut")) "SliceSplitting" else "SliceAlgorithms";
+    let elements = [element];
+    let function = libraryFunction(c, holder, elements[..], ident.symbol, span)?;
+    if (function == none()) {
+        c.notPorted(span.start, span.end, "this library method", "S5")?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    return checkUserCallWith(c, function, arguments, span, receiver);
+}
+
+/// `v.retain(keep)` (§36.4): lib/core's retain on the elements, then a truncation, as one builtin so `v` is evaluated
+/// once.
+fn checkVectorRetain(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    vector: u32,
+    targetSpan: Span,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let place = borrowPlace(c, vector, true, targetSpan)?;
+    let element = c.types.info(c.types.info(c.typeOf(vector)).pointee).element;
+    let symbol = c.front.ast.idents[member as usize].symbol;
+    let elements = [element];
+    let retain = libraryFunction(c, "SliceAlgorithms", elements[..], symbol, span)?;
+    if (retain == none()) {
+        c.notPorted(span.start, span.end, "this library method", "S5")?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let keepType = c.hir.locals[c.hir.functions[retain as usize].parameters[1] as usize].typ;
+    let argument = c.front.ast.at(arguments, 0);
+    let keep = checkArgument(c, argument, keepType)?;
+    if (c.isBottom(place) || c.isBottom(keep)) {
+        return c.errorResult(span.start, span.end);
+    }
+    let voidType = c.types.voidType;
+    let address = c.expr(HirExpr.FunctionAddress(retain), voidType, span.start, span.end)?;
+    let values = [place, keep, address];
+    let list = c.hir.list(values[..])?;
+    return c.expr(HirExpr.BuiltinCall(bfVectorRetain(), list), voidType, span.start, span.end);
+}
+
+/// `Process.capture` and `File.kind` (CheckHostService, §26.7, §26.8): calls of lib/std's HostServices function of that
+/// name, in the hosted profile.
+fn checkHostService(c: borrow mut Checker, member: u32, arguments: Range, span: Span) -> Result<u32, AllocError> {
+    let symbol = c.front.ast.idents[member as usize].symbol;
+    let none0 = Vector<u32>.create();
+    let function = libraryFunction(c, "HostServices", none0.view(), symbol, span)?;
+    if (function == none()) {
+        c.notPorted(span.start, span.end, "this host service", "S5")?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    return checkUserCall(c, function, arguments, span);
+}

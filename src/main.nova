@@ -43,6 +43,9 @@ struct Options {
     dumpAst: bool;
     dumpHir: bool;
     noFloat: bool;
+    libraryDiagnostics: bool; // report diagnostics in the libraries' files too (porting gaps there; novac has none)
+    freestanding: bool;       // --profile freestanding (cosmoos/profiles.md §4)
+    kernel: bool;             // --kernel cosmoos: lib/kernel, in the freestanding profile (ADR 0025)
     files: Vector<String>;
 }
 
@@ -87,6 +90,41 @@ fn readOptions(options: borrow mut Options) -> i32 {
             options.dumpHir = true;
         } else if (arg == "--no-float") {
             options.noFloat = true;
+        } else if (arg == "--library-diagnostics") {
+            options.libraryDiagnostics = true;
+        } else if (arg == "--profile" || arg == "--kernel") {
+            let value = match (Process.argument(a)) {
+                Some(v) => v,
+                null => {
+                    var message = String.create();
+                    message.append("option '")!;
+                    message.append(arg)!;
+                    message.append("' needs a value")!;
+                    return fail(message.view());
+                }
+            };
+            a += 1;
+            if (arg == "--kernel") {
+                // lib/kernel, for a kernel with CosmoOS's C API (ADR 0025); the only kernel so far.
+                if (value != "cosmoos") {
+                    var message = String.create();
+                    message.append("--kernel must be 'cosmoos', not '")!;
+                    message.append(value)!;
+                    message.append("'")!;
+                    return fail(message.view());
+                }
+                options.kernel = true;
+            } else if (value == "hosted") {
+                options.freestanding = false;
+            } else if (value == "freestanding") {
+                options.freestanding = true;
+            } else {
+                var message = String.create();
+                message.append("--profile must be 'hosted' or 'freestanding', not '")!;
+                message.append(value)!;
+                message.append("'")!;
+                return fail(message.view());
+            }
         } else if (arg == "--dump-tokens") {
             options.dumpTokens = true;
         } else if (arg.length > 0 && arg[0] == '-') {
@@ -218,6 +256,9 @@ fn parseCommand() -> i32 {
         dumpAst: false,
         dumpHir: false,
         noFloat: false,
+        libraryDiagnostics: false,
+        freestanding: false,
+        kernel: false,
         files: Vector<String>.create(),
     };
     let status = readOptions(mut options);
@@ -295,6 +336,9 @@ fn checkCommand() -> i32 {
         dumpAst: false,
         dumpHir: false,
         noFloat: false,
+        libraryDiagnostics: false,
+        freestanding: false,
+        kernel: false,
         files: Vector<String>.create(),
     };
     let status = readOptions(mut options);
@@ -306,9 +350,12 @@ fn checkCommand() -> i32 {
     }
     var sources = Vector<SourceText>.create();
     var fileIsLibrary = Vector<bool>.create();
-    // lib/core, then lib/std (hosted): library files come first (CoreLibrary.SourcesFor).
+    // lib/core, then lib/std (hosted) or lib/kernel (freestanding with --kernel): library files come first
+    // (CoreLibrary.SourcesFor).
     for (k in 0..libraryFileCount()) {
-        if (libraryGroup(k) <= 1) {
+        let group = libraryGroup(k);
+        if (group == 0 || (group == 1 && !options.freestanding) ||
+            (group == 2 && options.freestanding && options.kernel)) {
             let text = libraryText(k)!;
             sources.push(SourceText.create(libraryPath(k).bytes(), text.view())!)!;
             fileIsLibrary.push(true)!;
@@ -337,7 +384,11 @@ fn checkCommand() -> i32 {
         texts.push(copyBytes(sources[i].text.view())!)!;
         paths.push(copyBytes(sources[i].path.view())!)!;
     }
-    let checker = checkProgram(front, fileIsLibrary, texts, paths, options.noFloat)!;
+    var checker = checkProgram(front, fileIsLibrary, texts, paths, options.noFloat)!;
+    if (!options.libraryDiagnostics) {
+        // The reference's libraries check cleanly: what is reported in them here is a porting gap (docs/p3-plan.md S5).
+        checker.front.diagnostics.removeFiles(checker.fileIsLibrary.view());
+    }
     if (options.dumpHir) {
         var printer = HirPrinter.create();
         printer.printProgram(checker.hir, checker.types, checker.front.symbols)!;
