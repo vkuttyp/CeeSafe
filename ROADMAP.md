@@ -1,6 +1,6 @@
 # CeeSafe roadmap: port the Nova compiler to Nova, as CeeSafe
 
-Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P3 complete (P3 gate passed 2026-10-30; pinned to novac 0.6.0, the gate rerun on it); next: P4**.
+Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P4 complete (P4 gate passed 2026-10-30, novac 0.6.0); next: P5**.
 The probes, `src/support/`, the limits, the fault sweep and the skeleton exist (`docs/p1-probes.md`). No compiler code has been ported.
 Repository: `~/dev/CeeSafe`. Reference: `vkuttyp/Nova` (C#/.NET 10), pinned in `bootstrap/reference.md`.
 
@@ -386,21 +386,32 @@ as pending P4. This is not yet a full `check`. **Passed (2026-10-30, novac 0.5.0
 
 Dependencies: P3.
 
-- [ ] Port NIR (`Nir.cs`, `NirBuilder.cs`, `NirPrinter.cs`) and `--dump-nir`.
-- [ ] Port `MovePaths`, `MoveChecker`, `InPlaceChecker`, `BorrowChecker`, `FlowAnalysis`, `DropElaborator`, and then
-  `EffectChecker`, in the pipeline order of §2.3.
-- [ ] Cover:
+- [x] Port NIR (`Nir.cs`, `NirBuilder.cs`, `NirPrinter.cs`) and `--dump-nir`.
+- [x] Port `MovePaths`, `MoveChecker`, `InPlaceChecker`, `BorrowChecker`, `DropElaborator`, and then `EffectChecker`,
+  in the pipeline order of §2.3. v0.6.0 has no `FlowAnalysis` pass: flows are the checker's `ResolveFlows`, which is
+  P3's.
+- [x] Cover:
   - field and index precision;
   - optional references;
   - captures and `dyn`;
   - threads and `Thread.both`;
   - kernel guards;
   - the sticky shared-deref soundness fix (N0248, Nova `3a99b4a`).
-- [ ] Port the mutation and fault-injection expectations (`MutationTests.cs`, `FaultInjectionTests.cs`).
+- [x] Port the mutation expectations (`MutationTests.cs` as `tools/mutation_suite.py`). The fault-injection sweep
+  (`FaultInjectionTests.cs`) builds and runs programs, so it moved to P5's gate.
 
 Gate: all 128 check-fail and 27 check-pass fixtures and the mutation expectations pass. NIR before and after drops
 agrees with the reference. Every invariant in `docs/ownership.md` has mapped positive and negative evidence. `check`
-now means the full pipeline.
+now means the full pipeline. **Passed (2026-10-30, novac 0.6.0)**: `docs/p4-plan.md` (slices S0–S6) and
+`docs/p4-evidence.md`. The results:
+
+- **Fixtures:** all 136 check-fail and 27 check-pass fixtures give the reference's diagnostics. Of the 322 check
+  programs, 318 are identical in text, JSON and `--dump-hir`. The other four are recorded divergences:
+  - `enums`, `optionals` and `results`: novac's `--dump-hir` crashes on them;
+  - `offset-of`: Nova #6.
+- **Mutations:** all 1,152 mutants match the oracle.
+- **NIR:** the 284 programs novac builds have identical NIR after drop elaboration. novac prints NIR only after
+  elaboration, so the comparison is made there.
 
 ### P5 — Flat C backend and the native build
 
@@ -413,7 +424,8 @@ Dependencies: P4, N4 (process capture).
 - [ ] Add `build --emit c|exe|obj` with flat C. Flags not yet supported fail with an explicit error.
 
 Gate: run-pass (153), run-fail (40), ffi and freestanding pass under clang -O0/-O2, the overflow fallback and
-ASan+UBSan, with GCC where available. `emit-c` snapshots match, or each difference is reviewed. Objects for both
+ASan+UBSan, with GCC where available. The M3 fault-injection sweep (`FaultInjectionTests.cs`, moved from P4) passes on
+every run-pass program that allocates, which shows O4 at run time. `emit-c` snapshots match, or each difference is reviewed. Objects for both
 CosmoOS architectures pass.
 
 ### P6 — First verified fixed point
@@ -577,8 +589,8 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
    track has no open blocking item.
 2. Alongside: the rest of the runner's C matrix (`-O0`, the overflow fallback, `--split`, TSan) and the package
    fixtures (`docs/parity.md` §3).
-3. P2 and P3 are done (`docs/p2-frontend.md`, `docs/p3-plan.md`), pinned to novac 0.6.0. Next: P4, NIR and the
-   safety passes, whose diagnostics are all that the remaining check-fail differences need.
+3. P2, P3 and P4 are done (`docs/p2-frontend.md`, `docs/p3-plan.md`, `docs/p4-plan.md`), pinned to novac 0.6.0.
+   Next: P5, the flat C backend, whose gate also carries the fault-injection sweep.
 4. Upstream (Nova #6, filed 2026-10-30): novac 0.6.0's `offsetOf<T>(field)` is 0 unless `T`'s layout was computed before (CheckOffsetOf reads
    `member.Offset` without `TypeTable.LayoutOf(measured)`); ceesafec gives the true offset.
 5. Owner's call: propose upstream that N0110 count `else if` links and `?` suffixes. novac's `--dump-ast` aborts on a
@@ -606,6 +618,7 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 | 2026-10-30 | P2: lexer, diagnostics and JSON, AST tables, parser and `--dump-ast` (`src/syntax/`, `src/diagnostics/`); token-dump oracle from the reference's `Lexer`; `compare_tokens.py`, `compare_parse.py`, `lexer_fuzz.py`, `parser_fuzz.py`, `gen_catalog.py` | gate passed on macOS and Linux (`docs/p2-frontend.md` §4): parse families 68/68 with no reference difference, 540/540 reference files identical, 5,000 mutated and 3,000 random inputs identical, sanitizers clean, `live=0` |
 | 2026-10-30 | P3: the type checker (`src/check/`, `src/hir/`), slices S0–S8 (`docs/p3-plan.md`), and package mode for `check` (`src/host/packages.nova`, path dependencies) | P3 gate passed: check-pass 27/27 and the 27 HIR snapshots identical; check programs 265/320, the other 55 differ only by P4's diagnostics or novac's printer crashes; `ffi`, `freestanding`, `emit-c`, `placement`, `bounds-checks`, `overflow-checks`, `closure-calls`, `run-fail` 83/83; package fixtures 7/7; `ceesafec check` of CeeSafe itself identical to novac (HIR dump, 35,150 lines); ASan+UBSan clean |
 | 2026-10-30 | Re-pinned to novac 0.6.0 (`93e0a46`, ADR 0030) after P3; `offsetOf`/`callerAddress` ported; every completed gate rerun (`bootstrap/reference.md`) | all pass; one upstream bug found (`offsetOf` before layout is 0) |
+| 2026-10-30 | P4: NIR (`src/nir/`: model, printer, builder, move paths, drop elaboration, move/in-place/borrow/effect checkers, `passes.nova`), `build --dump-nir`, diagnostic notes, `tools/compare_nir.py`, `tools/mutation_suite.py`, `docs/p4-evidence.md`; P3 gaps found and fixed (type-parameter flow names, `Box.create`'s `@placed` methods, HIR's dead `isGeneric`) | P4 gate passed: check programs 318/322, the 4 recorded divergences; other families 84/84; NIR 284/284 and CeeSafe's own package identical; mutations 1,152/1,152 against the oracle, as with novac; `check --dump-hir` identical on 186/186 check-pass and run-pass programs; packages 7/7; `ceesafec check` of CeeSafe clean (0.77 s) |
 
 **Tests run for the skeleton** (2026-10-30, novac 0.3.1, Apple clang 21.0.0):
 - `novac check` and `novac fmt --check`: clean.
@@ -650,4 +663,4 @@ under GCC 12, clang 18 and Apple clang, with and without ASan+UBSan. All passed.
   - the fault sweep under clang ASan+LSan: 573/573.
 - The earlier gate run found the missing-drop bug as a LeakSanitizer report.
 
-Not yet run: P4 or later.
+Not yet run: P5 or later.
