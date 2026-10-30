@@ -106,7 +106,7 @@ fn checkStmt(c: borrow mut Checker, stmt: u32) -> Result<u32, AllocError> {
             let value = checkExpressionStatement(c, e)?;
             return c.hir.addStmt(HirStmt.Expression(value), span.start, span.end);
         }
-        StmtNode.Match(_, _) => { c.notPorted(span.start, span.end, "a 'match' statement", "S2")?; }
+        StmtNode.Match(scrutinee, arms) => { return checkMatchStmt(c, scrutinee, arms, span); }
         StmtNode.Unsafe(_) => { c.notPorted(span.start, span.end, "an 'unsafe' block", "S7")?; }
         StmtNode.Defer(_) => { c.notPorted(span.start, span.end, "a 'defer' statement", "S2")?; }
     }

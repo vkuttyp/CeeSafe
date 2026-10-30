@@ -1,0 +1,313 @@
+// Exhaustiveness and unreachable arms for nested patterns (the reference's PatternUsefulness, M11, type-system.md
+// §15.2): the usefulness algorithm of Maranget, "Warnings for pattern matching" (2007). A pattern vector is useful
+// against a matrix of earlier rows when some value matches it and no earlier row. The constructors of a type are its
+// enum's variants, `true`/`false`, or, for an integer, its literals, which never cover the type. Patterns are ids in
+// the HIR's pattern table; a matrix is its rows' cells, row after row.
+
+/// A constructor: a variant, or an integer or bool literal (0 and 1 for bool).
+struct Constructor {
+    isVariant: bool;
+    variant: u32;
+    value: IntValue;
+    arity: usize;
+}
+
+struct Matrix {
+    cells: Vector<u32>;
+    rows: usize;
+    width: usize;
+}
+
+fn sameConstructor(a: Constructor, b: Constructor) -> bool =>
+    a.isVariant == b.isVariant && (if (a.isVariant) a.variant == b.variant else sameInt(a.value, b.value));
+
+fn containsConstructor(list: borrow Vector<Constructor>, k: Constructor) -> bool {
+    for (x in list.view()) {
+        if (sameConstructor(x, k)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// A value that matches `pattern` and none of `earlier`, written as a pattern into `out`; false if there is none
+/// (Witness).
+fn patternWitness(
+    c: borrow mut Checker,
+    earlier: Slice<u32>,
+    pattern: u32,
+    typ: u32,
+    out: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    let wildcard = c.hir.addPattern(HirPattern.Wildcard)?;
+    var rows = Matrix { cells: Vector<u32>.create(), rows: earlier.length, width: 1 };
+    for (p in earlier) {
+        rows.cells.push(p)?;
+    }
+    var q = Vector<u32>.create();
+    q.push(pattern)?;
+    var types = Vector<u32>.create();
+    types.push(typ)?;
+    var witness = Vector<Vector<u8>>.create();
+    if (!useful(c, wildcard, rows, q.view(), types.view(), mut witness)?) {
+        return Ok(false);
+    }
+    appendBytes(out, witness[0].view())?;
+    return Ok(true);
+}
+
+/// The constructor a pattern names, or false for `_` and bindings (ConstructorOf).
+fn constructorOf(c: borrow Checker, pattern: u32, found: borrow mut Constructor) -> bool {
+    match (c.hir.patterns[pattern as usize]) {
+        HirPattern.Variant(variant, _, _) => {
+            found = Constructor {
+                isVariant: true,
+                variant: variant,
+                value: intValue(0),
+                arity: payloadCount(c, variant),
+            };
+            return true;
+        }
+        HirPattern.Literal(value) => {
+            found = Constructor { isVariant: false, variant: none(), value: value, arity: 0 };
+            return true;
+        }
+        _ => { return false; }
+    }
+}
+
+fn noConstructor() -> Constructor => Constructor { isVariant: false, variant: none(), value: intValue(0), arity: 0 };
+
+/// A pattern's arguments for its constructor: its payload patterns, or `_` for each without a list (Arguments).
+fn pushArguments(
+    c: borrow Checker,
+    wildcard: u32,
+    pattern: u32,
+    k: Constructor,
+    out: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    match (c.hir.patterns[pattern as usize]) {
+        HirPattern.Variant(_, hasPayload, payload) => {
+            if (hasPayload) {
+                for (i in 0..payload.count) {
+                    out.push(c.hir.at(payload, i))?;
+                }
+                return Ok();
+            }
+        }
+        _ => {}
+    }
+    return pushWildcards(wildcard, k.arity, out);
+}
+
+fn pushWildcards(wildcard: u32, count: usize, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    for (unused in 0..count) {
+        out.push(wildcard)?;
+    }
+    return Ok();
+}
+
+/// The payload types of a constructor (ArgumentTypes).
+fn pushArgumentTypes(c: borrow Checker, k: Constructor, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    if (k.isVariant) {
+        for (i in 0..k.arity) {
+            out.push(payloadType(c, k.variant, i))?;
+        }
+    }
+    return Ok();
+}
+
+/// Every constructor of the type when there are finitely many; false for integers and other types (AllConstructors).
+fn allConstructors(c: borrow Checker, typ: u32, out: borrow mut Vector<Constructor>) -> Result<bool, AllocError> {
+    if (c.types.is(typ, TypeKind.Enum)) {
+        let definition = c.types.info(typ).enumDef;
+        let count = c.types.enums[definition as usize].variants.length;
+        for (k in 0..count) {
+            let v = variantAt(c, typ, k);
+            out.push(Constructor { isVariant: true, variant: v, value: intValue(0), arity: payloadCount(c, v) })?;
+        }
+        return Ok(true);
+    }
+    if (c.types.is(typ, TypeKind.Bool)) {
+        out.push(Constructor { isVariant: false, variant: none(), value: intValue(0), arity: 0 })?;
+        out.push(Constructor { isVariant: false, variant: none(), value: intValue(1), arity: 0 })?;
+        return Ok(true);
+    }
+    return Ok(false);
+}
+
+/// The rows whose first pattern can match `k`, with that pattern replaced by its arguments (Specialize).
+fn specialize(c: borrow Checker, wildcard: u32, rows: borrow Matrix, k: Constructor) -> Result<Matrix, AllocError> {
+    var result = Matrix { cells: Vector<u32>.create(), rows: 0, width: k.arity + rows.width - 1 };
+    for (r in 0..rows.rows) {
+        let first = rows.cells[r * rows.width];
+        var firstConstructor = noConstructor();
+        if (!constructorOf(c, first, mut firstConstructor)) {
+            pushWildcards(wildcard, k.arity, mut result.cells)?;
+        } else if (sameConstructor(firstConstructor, k)) {
+            pushArguments(c, wildcard, first, firstConstructor, mut result.cells)?;
+        } else {
+            continue;
+        }
+        for (i in 1..rows.width) {
+            result.cells.push(rows.cells[r * rows.width + i])?;
+        }
+        result.rows += 1;
+    }
+    return Ok(result);
+}
+
+/// Useful: is `q` useful against `rows`? If so, `witness` gets a value per column that shows it.
+fn useful(
+    c: borrow Checker,
+    wildcard: u32,
+    rows: borrow Matrix,
+    q: Slice<u32>,
+    types: Slice<u32>,
+    witness: borrow mut Vector<Vector<u8>>,
+) -> Result<bool, AllocError> {
+    if (q.length == 0) {
+        return Ok(rows.rows == 0);
+    }
+    let typ = types[0];
+    var head = noConstructor();
+    if (constructorOf(c, q[0], mut head)) {
+        var nq = Vector<u32>.create();
+        pushArguments(c, wildcard, q[0], head, mut nq)?;
+        appendU32s(mut nq, q[1..])?;
+        var nt = Vector<u32>.create();
+        pushArgumentTypes(c, head, mut nt)?;
+        appendU32s(mut nt, types[1..])?;
+        let specialized = specialize(c, wildcard, rows, head)?;
+        var inner = Vector<Vector<u8>>.create();
+        if (!useful(c, wildcard, specialized, nq.view(), nt.view(), mut inner)?) {
+            return Ok(false);
+        }
+        rebuild(c, head, typ, inner, witness)?;
+        return Ok(true);
+    }
+    var used = Vector<Constructor>.create();
+    for (r in 0..rows.rows) {
+        var k = noConstructor();
+        if (constructorOf(c, rows.cells[r * rows.width], mut k) && !containsConstructor(used, k)) {
+            used.push(k)?;
+        }
+    }
+    var all = Vector<Constructor>.create();
+    let finite = allConstructors(c, typ, mut all)?;
+    var complete = finite;
+    for (k in all.view()) {
+        if (!containsConstructor(used, k)) {
+            complete = false;
+        }
+    }
+    if (complete) {
+        for (k in all.view()) {
+            var nq = Vector<u32>.create();
+            pushWildcards(wildcard, k.arity, mut nq)?;
+            appendU32s(mut nq, q[1..])?;
+            var nt = Vector<u32>.create();
+            pushArgumentTypes(c, k, mut nt)?;
+            appendU32s(mut nt, types[1..])?;
+            let specialized = specialize(c, wildcard, rows, k)?;
+            var inner = Vector<Vector<u8>>.create();
+            if (useful(c, wildcard, specialized, nq.view(), nt.view(), mut inner)?) {
+                rebuild(c, k, typ, inner, witness)?;
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    // The rows that match anything here, without their first column.
+    var rest = Matrix { cells: Vector<u32>.create(), rows: 0, width: rows.width - 1 };
+    for (r in 0..rows.rows) {
+        var k = noConstructor();
+        if (!constructorOf(c, rows.cells[r * rows.width], mut k)) {
+            for (i in 1..rows.width) {
+                rest.cells.push(rows.cells[r * rows.width + i])?;
+            }
+            rest.rows += 1;
+        }
+    }
+    var inner = Vector<Vector<u8>>.create();
+    if (!useful(c, wildcard, rest, q[1..], types[1..], mut inner)?) {
+        return Ok(false);
+    }
+    // A constructor no row names, if the type has a finite set; otherwise any value.
+    var first = Vector<u8>.create();
+    var missing = false;
+    for (k in all.view()) {
+        if (!missing && !containsConstructor(used, k)) {
+            var arguments = Vector<Vector<u8>>.create();
+            for (unused in 0..k.arity) {
+                var underscore = Vector<u8>.create();
+                underscore.push('_')?;
+                arguments.push(underscore)?;
+            }
+            renderConstructor(c, k, typ, arguments, 0, k.arity, mut first)?;
+            missing = true;
+        }
+    }
+    if (!missing) {
+        first.push('_')?;
+    }
+    witness.push(first)?;
+    for (i in 0..inner.length) {
+        witness.push(copyBytes(inner[i].view())?)?;
+    }
+    return Ok(true);
+}
+
+fn appendU32s(out: borrow mut Vector<u32>, values: Slice<u32>) -> Result<void, AllocError> {
+    for (v in values) {
+        out.push(v)?;
+    }
+    return Ok();
+}
+
+/// The constructor applied to the witness's first `arity` values, then the rest (Rebuild).
+fn rebuild(
+    c: borrow Checker,
+    k: Constructor,
+    typ: u32,
+    inner: borrow Vector<Vector<u8>>,
+    witness: borrow mut Vector<Vector<u8>>,
+) -> Result<void, AllocError> {
+    var first = Vector<u8>.create();
+    renderConstructor(c, k, typ, inner, 0, k.arity, mut first)?;
+    witness.push(first)?;
+    for (i in k.arity..inner.length) {
+        witness.push(copyBytes(inner[i].view())?)?;
+    }
+    return Ok();
+}
+
+/// A constructor with the arguments `arguments[from..to]`, as a pattern writes it (Render).
+fn renderConstructor(
+    c: borrow Checker,
+    k: Constructor,
+    typ: u32,
+    arguments: borrow Vector<Vector<u8>>,
+    from: usize,
+    to: usize,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    if (k.isVariant) {
+        appendVariantText(out, c, k.variant, typ)?;
+        if (to > from) {
+            out.push('(')?;
+            for (i in from..to) {
+                if (i > from) {
+                    appendText(out, ", ")?;
+                }
+                appendBytes(out, arguments[i].view())?;
+            }
+            out.push(')')?;
+        }
+        return Ok();
+    }
+    if (c.types.is(typ, TypeKind.Bool)) {
+        return appendText(out, if (k.value.magnitude != 0) "true" else "false");
+    }
+    return appendIntValue(out, k.value);
+}

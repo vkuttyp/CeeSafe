@@ -289,6 +289,11 @@ struct HirProgram {
 
     fn typeOf(borrow this, expr: u32) -> u32 => this.exprTypes[expr as usize];
 
+    fn addPattern(borrow mut this, pattern: HirPattern) -> Result<u32, AllocError> {
+        this.patterns.push(pattern)?;
+        return Ok(truncate<u32>(this.patterns.length - 1));
+    }
+
     /// A new local of `function` (HirFunction.AddLocal): its id is the function's local count.
     fn addLocal(
         borrow mut this,

@@ -1,0 +1,62 @@
+enum Color { Red, Green, Blue }
+enum Shape { Circle(i32), Rect(i32, i32), Tinted(Color, Shape2) }
+enum Shape2 { Dot, Line(Color) }
+struct Box2 { s: Shape2; }
+
+fn area(s: Shape) -> i32 {
+    match (s) {
+        Shape.Circle(r) => { return r * r * 3; }
+        Shape.Rect(w, var h) => {
+            h += 1;
+            return w * h;
+        }
+        Shape.Tinted(_, _) => { return 0; }
+    }
+}
+
+fn nested(s: Shape) -> i32 => match (s) {
+    Shape.Tinted(Color.Red, Shape2.Dot) => 1,
+    Shape.Tinted(Color.Red, Shape2.Line(c)) => match (c) {
+        Color.Red => 2,
+        _ => 3,
+    },
+    Shape.Tinted(_, Shape2.Line(Color.Blue)) => 4,
+    Shape.Tinted(_, _) => 5,
+    Shape.Circle(0) => 6,
+    Shape.Circle(n) => n,
+    Shape.Rect(_, _) => 7,
+};
+
+fn pick(b: bool, n: u8) -> u8 {
+    let x = if (b) 1 else 2;
+    let y = match (n) {
+        0 => 10,
+        1 => { return 5; }
+        _ => n,
+    };
+    let z: u64 = if (b) 3 else 4;
+    let f = if (b) 1.5 else 2;
+    let g = match (b) { true => 1, false => 0 };
+    return x + y + truncate<u8>(z) + truncate<u8>(g);
+}
+
+fn colors(c: Color) -> i64 {
+    var total: i64 = 0;
+    match (c) {
+        Color.Red => { total += 1; }
+        Color.Green => { total += 2; }
+        Color.Blue => {}
+    }
+    let k = Color.Green;
+    let s = Shape.Rect(1, 2);
+    let t = Shape.Tinted(Color.Blue, Shape2.Line(k));
+    return total;
+}
+
+fn main() {
+    let s = Shape.Circle(2);
+    let a = area(s);
+    if (a > 1) {
+        Console.writeLine("ok");
+    }
+}

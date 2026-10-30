@@ -40,7 +40,9 @@ fn isFlexible(c: borrow Checker, e: u32) -> bool => match (c.front.ast.exprs[e a
     },
     ExprNode.Binary(left, op, right) => (isArithmetic(op) || isBitwise(op) || isShift(op)) && isFlexible(c, left) &&
         isFlexible(c, right),
-    _ => false, // `if` and `match` expressions are flexible by their branches: S1b
+    ExprNode.If(_, _, _) => flexibleBranches(c, e), // M11: when their value branches are all flexible (§15.3)
+    ExprNode.Match(_, _) => flexibleBranches(c, e),
+    _ => false,
 };
 
 /// The integer type a literal takes from `expected`, looking through an optional (IntegerHint).
@@ -67,14 +69,8 @@ fn numericHint(c: borrow Checker, expected: u32) -> u32 {
 fn checkExpr(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError> {
     let span = c.front.ast.exprSpans[e as usize];
     match (c.front.ast.exprs[e as usize]) {
-        ExprNode.If(_, _, _) => {
-            c.notPorted(span.start, span.end, "an 'if' expression", "S1b")?;
-            return c.errorResult(span.start, span.end);
-        }
-        ExprNode.Match(_, _) => {
-            c.notPorted(span.start, span.end, "a 'match' expression", "S2")?;
-            return c.errorResult(span.start, span.end);
-        }
+        ExprNode.If(_, _, _) => { return checkBranching(c, e, expected); }
+        ExprNode.Match(_, _) => { return checkBranching(c, e, expected); }
         ExprNode.Closure(_) => {
             c.notPorted(span.start, span.end, "a closure", "S6")?;
             return c.errorResult(span.start, span.end);
@@ -124,6 +120,8 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
         ExprNode.Unary(op, operand) => { return synthUnary(c, op, operand, expected, span); }
         ExprNode.Binary(left, op, right) => { return synthBinary(c, left, op, right, expected, span); }
         ExprNode.Call(callee, arguments) => { return synthCall(c, callee, arguments, expected, span); }
+        ExprNode.If(_, _, _) => { return checkBranching(c, e, none()); }
+        ExprNode.Match(_, _) => { return checkBranching(c, e, none()); }
         ExprNode.This => {
             let receiver = c.lookupLocal(c.thisSymbol);
             if (receiver != none()) {
@@ -634,9 +632,9 @@ fn synthCall(
                             Entity.Struct(index) => {
                                 return checkStaticCall(c, index, member, arguments, calleeSpan, span);
                             }
-                            Entity.Enum(_) => {
-                                c.notPorted(span.start, span.end, "an enum variant", "S2b")?;
-                                return c.errorResult(span.start, span.end);
+                            Entity.Enum(index) => {
+                                let targetSpan = c.front.ast.exprSpans[target as usize];
+                                return checkEnumValue(c, index, member, arguments, 0, targetSpan, span);
                             }
                             Entity.LibraryItem(_) => {
                                 c.notPorted(span.start, span.end, "calling this item", "S2-S5")?;
@@ -881,8 +879,19 @@ fn hasFloatLiteral(c: borrow Checker, e: u32) -> bool => match (c.front.ast.expr
     ExprNode.Paren(inner) => hasFloatLiteral(c, inner),
     ExprNode.Unary(_, operand) => hasFloatLiteral(c, operand),
     ExprNode.Binary(left, _, right) => hasFloatLiteral(c, left) || hasFloatLiteral(c, right),
+    ExprNode.If(_, then, otherwise) => hasFloatLiteral(c, then) || hasFloatLiteral(c, otherwise),
+    ExprNode.Match(_, arms) => anyArmHasFloatLiteral(c, arms),
     _ => false,
 };
+
+fn anyArmHasFloatLiteral(c: borrow Checker, arms: Range) -> bool {
+    for (k in 0..arms.count) {
+        if (hasFloatLiteral(c, c.front.ast.valueArms[c.front.ast.at(arms, k) as usize].value)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 /// `e as T` (SynthCast): only conversions that never lose information (§7).
 fn synthCast(c: borrow mut Checker, operandSyntax: u32, typeSyntax: u32, span: Span) -> Result<u32, AllocError> {
@@ -1030,9 +1039,9 @@ fn synthMember(c: borrow mut Checker, target: u32, member: u32, span: Span) -> R
             if (typeArguments.count == 0) {
                 let symbol = c.front.ast.idents[name as usize].symbol;
                 match (c.lookup(symbol)) {
-                    Entity.Enum(_) => {
-                        c.notPorted(span.start, span.end, "an enum variant", "S2b")?;
-                        return c.errorResult(span.start, span.end);
+                    Entity.Enum(index) => {
+                        let targetSpan = c.front.ast.exprSpans[target as usize];
+                        return checkEnumValue(c, index, member, emptyRange(), 0, targetSpan, span);
                     }
                     Entity.Builtin(_) => {
                         return notAValue(c, symbol, member, span);

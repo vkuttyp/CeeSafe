@@ -1,0 +1,889 @@
+// Enums, `match` and branching (the reference's CheckEnumValue, CheckMatch, CheckNestedMatch, CheckPattern,
+// CheckVariantPattern, DeclareBinding, ResolvePatternVariant, VariantText, CheckBranching, CheckBranch and
+// FinishBranches): P3 S2b. Pattern usefulness is in src/check/usefulness.nova.
+
+fn branchCompletes() -> u32 => 235;
+fn nonExhaustiveMatch() -> u32 => 256;
+fn unreachableArm() -> u32 => 257;
+
+/// Is the enum a `Result` or an optional, whose variants are written without a type prefix?
+fn isOptionOrResult(c: borrow Checker, typ: u32) -> bool {
+    let definition = c.types.info(typ).enumDef;
+    let d = borrow c.types.enums[definition as usize];
+    return d.optionType != none() || d.resultOk != none();
+}
+
+/// The variant as a pattern writes it: `null`, `Some`, `Ok`, `Err`, or `E.V` (VariantText).
+fn appendVariantText(
+    out: borrow mut Vector<u8>,
+    c: borrow Checker,
+    variant: u32,
+    typ: u32,
+) -> Result<void, AllocError> {
+    if (!isOptionOrResult(c, typ)) {
+        appendBytes(out, c.typeName(typ))?;
+        out.push('.')?;
+    }
+    return appendBytes(out, c.name(c.types.variants[variant as usize].name));
+}
+
+fn variantAt(c: borrow Checker, typ: u32, k: usize) -> u32 {
+    let definition = c.types.info(typ).enumDef;
+    return c.types.enums[definition as usize].variants[k];
+}
+
+fn payloadType(c: borrow Checker, variant: u32, k: usize) -> u32 {
+    let field = c.types.variants[variant as usize].payload[k];
+    return c.types.fields[field as usize].typ;
+}
+
+fn payloadCount(c: borrow Checker, variant: u32) -> usize => c.types.variants[variant as usize].payload.length;
+
+/// `E.V` or `E.V(a, b)` (CheckEnumValue) for a non-generic enum.
+fn checkEnumValue(
+    c: borrow mut Checker,
+    index: u32,
+    member: u32,
+    arguments: Range,
+    typeArgumentCount: u32,
+    targetSpan: Span,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let typ = c.enums[index as usize].typ;
+    if (typeArgumentCount > 0) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, " is not generic; write it without type arguments")?;
+        c.error(unknownType(), targetSpan.start, targetSpan.end, message)?;
+    }
+    let definition = c.types.info(typ).enumDef;
+    let ident = c.front.ast.idents[member as usize];
+    let variant = findVariant(c, definition, ident.symbol);
+    if (variant == none()) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, " has no variant named ")?;
+        appendQuotedName(mut message, c, ident.symbol)?;
+        c.error(undefinedName(), ident.start, ident.end, message)?;
+        synthAll(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let count = payloadCount(c, variant);
+    if (arguments.count as usize != count) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendVariantName(mut message, c, typ, variant)?;
+        appendText(mut message, "' has ")?;
+        appendDecimal(mut message, count as u64)?;
+        appendText(mut message, " payload value(s) but ")?;
+        appendDecimal(mut message, arguments.count as u64)?;
+        appendText(mut message, " were given")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        synthAll(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var payload = Vector<u32>.create();
+    for (k in 0..count) {
+        let t = payloadType(c, variant, k);
+        let argument = c.front.ast.at(arguments, truncate<u32>(k));
+        payload.push(checkExpr(c, argument, t)?)?;
+    }
+    let list = c.hir.list(payload.view())?;
+    return c.expr(HirExpr.EnumValue(variant, list), typ, span.start, span.end);
+}
+
+/// `{type}.{V}`, as messages name a variant.
+fn appendVariantName(
+    out: borrow mut Vector<u8>,
+    c: borrow Checker,
+    typ: u32,
+    variant: u32,
+) -> Result<void, AllocError> {
+    appendBytes(out, c.typeName(typ))?;
+    out.push('.')?;
+    return appendBytes(out, c.name(c.types.variants[variant as usize].name));
+}
+
+fn synthAll(c: borrow mut Checker, arguments: Range) -> Result<void, AllocError> {
+    for (k in 0..arguments.count) {
+        let argument = c.front.ast.at(arguments, k);
+        synth(c, argument, none())?;
+    }
+    return Ok();
+}
+
+// ---- match ----
+
+/// The type of an `if` or `match` expression, found as its branches are checked in order (BranchType, §15.3).
+struct BranchType {
+    typ: u32; // or none
+    deferred: Vector<DeferredBranch>;
+}
+
+/// A flexible or `null` branch met before the type was known.
+struct DeferredBranch {
+    index: u32;
+    value: u32; // an expression
+}
+
+fn branchType(expected: u32) -> BranchType => BranchType { typ: expected, deferred: Vector<DeferredBranch>.create() };
+
+fn armPattern(c: borrow Checker, arms: Range, k: u32, isValue: bool) -> u32 {
+    let arm = c.front.ast.at(arms, k);
+    return if (isValue) c.front.ast.valueArms[arm as usize].pattern else c.front.ast.matchArms[arm as usize].pattern;
+}
+
+fn armSpan(c: borrow Checker, arms: Range, k: u32, isValue: bool) -> Span {
+    let arm = c.front.ast.at(arms, k);
+    if (isValue) {
+        let a = c.front.ast.valueArms[arm as usize];
+        return Span { start: a.start, end: a.end };
+    }
+    let a = c.front.ast.matchArms[arm as usize];
+    return Span { start: a.start, end: a.end };
+}
+
+/// An arm's body: a block of a `match` statement, or a branch of a `match` expression.
+fn checkArmBody(
+    c: borrow mut Checker,
+    arms: Range,
+    k: u32,
+    isValue: bool,
+    branches: borrow mut BranchType,
+) -> Result<u32, AllocError> {
+    let arm = c.front.ast.at(arms, k);
+    if (isValue) {
+        let value = c.front.ast.valueArms[arm as usize].value;
+        return checkBranch(c, value, branches, k);
+    }
+    let body = c.front.ast.matchArms[arm as usize].body;
+    return checkBlock(c, body);
+}
+
+fn hasNested(c: borrow Checker, pattern: u32) -> bool {
+    match (c.front.ast.patterns[pattern as usize]) {
+        PatternNode.Variant(_, _, bindings) => {
+            for (k in 0..bindings.count) {
+                if (c.front.ast.bindings[c.front.ast.at(bindings, k) as usize].nested != none()) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        _ => { return false; }
+    }
+}
+
+fn listsPayloads(c: borrow Checker, pattern: u32) -> bool => match (c.front.ast.patterns[pattern as usize]) {
+    PatternNode.Variant(_, hasBindings, _) => hasBindings,
+    _ => false,
+};
+
+fn sameInt(a: IntValue, b: IntValue) -> bool => a.negative == b.negative && a.magnitude == b.magnitude;
+
+fn containsInt(values: borrow Vector<IntValue>, v: IntValue) -> bool {
+    for (w in values.view()) {
+        if (sameInt(w, v)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn containsU32(values: borrow Vector<u32>, v: u32) -> bool {
+    for (w in values.view()) {
+        if (w == v) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn checkMatchStmt(c: borrow mut Checker, scrutinee: u32, arms: Range, span: Span) -> Result<u32, AllocError> {
+    var branches = branchType(none());
+    return checkMatch(c, scrutinee, arms, false, mut branches, span);
+}
+
+/// A match on `scrutineeSyntax` (CheckMatch, §15.2): a statement's arms, or an expression's (`isValue`).
+fn checkMatch(
+    c: borrow mut Checker,
+    scrutineeSyntax: u32,
+    arms: Range,
+    isValue: bool,
+    branches: borrow mut BranchType,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let scrutinee = synth(c, scrutineeSyntax, none())?;
+    let scrutineeType = c.typeOf(scrutinee);
+    let reference = if (c.types.is(scrutineeType, TypeKind.Reference)) scrutineeType else none();
+    let typ = if (reference != none()) c.types.info(reference).pointee else scrutineeType;
+    let scrutineeSpan = c.front.ast.exprSpans[scrutineeSyntax as usize];
+    var ok = !c.types.isBottom(typ);
+    if (ok && !c.types.is(
+        typ,
+        TypeKind.Enum,
+    ) && !c.types.is(typ, TypeKind.Integer) && !c.types.is(typ, TypeKind.Bool)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "cannot match on a value of type ")?;
+        appendQuotedType(mut message, c, typ)?;
+        c.error(invalidOperandTypes(), scrutineeSpan.start, scrutineeSpan.end, message)?;
+        ok = false;
+    }
+    if (ok) {
+        for (k in 0..arms.count) {
+            if (hasNested(c, armPattern(c, arms, k, isValue))) {
+                return checkNestedMatch(c, scrutineeSyntax, arms, isValue, branches, span, scrutinee, typ, reference);
+            }
+        }
+    }
+    var armIds = Vector<u32>.create();
+    var seenVariants = Vector<u32>.create();
+    var seenValues = Vector<IntValue>.create();
+    var wildcard = false;
+    var patternFailed = false; // an invalid pattern already reported: exhaustiveness would only add noise
+    var consumes = false;
+    for (index in 0..arms.count) {
+        let pattern = armPattern(c, arms, index, isValue);
+        let patternSpan = c.front.ast.patternSpans[pattern as usize];
+        if (wildcard) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "this arm can never match: an earlier '_' matches everything")?;
+            c.error(unreachableArm(), patternSpan.start, patternSpan.end, message)?;
+        }
+        var kind = HirPatternKind.Wildcard;
+        var variant = none();
+        var value = intValue(0);
+        var bindings = Vector<HirArmBinding>.create();
+        c.pushScope()?;
+        match (c.front.ast.patterns[pattern as usize]) {
+            PatternNode.Wildcard => { wildcard = true; }
+            PatternNode.Literal(literal) => {
+                if (ok) {
+                    let hir = checkExpr(c, literal, typ)?;
+                    var isConstant = true;
+                    match (c.hir.exprs[hir as usize]) {
+                        HirExpr.IntConst(v) => {
+                            kind = HirPatternKind.IntegerLiteral;
+                            value = v;
+                        }
+                        HirExpr.BoolConst(b) => {
+                            kind = HirPatternKind.Bool;
+                            value = intValue(if (b) 1 else 0);
+                        }
+                        _ => { isConstant = false; }
+                    }
+                    if (isConstant) {
+                        if (containsInt(seenValues, value)) {
+                            var message = Vector<u8>.create();
+                            appendText(mut message, "this value is already matched by an earlier arm")?;
+                            c.error(unreachableArm(), patternSpan.start, patternSpan.end, message)?;
+                        } else {
+                            seenValues.push(value)?;
+                        }
+                    }
+                }
+            }
+            PatternNode.Null => {
+                if (ok) {
+                    if (c.types.optionType(typ) == none()) {
+                        var message = Vector<u8>.create();
+                        appendText(mut message, "a 'null' pattern needs an optional, but the value has type ")?;
+                        appendQuotedType(mut message, c, typ)?;
+                        c.error(typeMismatch(), patternSpan.start, patternSpan.end, message)?;
+                        patternFailed = true;
+                    } else {
+                        kind = HirPatternKind.Variant;
+                        variant = variantAt(c, typ, 0);
+                        if (containsU32(seenVariants, variant)) {
+                            var message = Vector<u8>.create();
+                            appendText(mut message, "'null' is already matched by an earlier arm")?;
+                            c.error(unreachableArm(), patternSpan.start, patternSpan.end, message)?;
+                        } else {
+                            seenVariants.push(variant)?;
+                        }
+                    }
+                }
+            }
+            PatternNode.Variant(path, hasBindings, payload) => {
+                if (ok) {
+                    kind = HirPatternKind.Variant;
+                    variant = checkVariantPattern(
+                        c,
+                        path,
+                        hasBindings,
+                        payload,
+                        patternSpan,
+                        typ,
+                        reference,
+                        mut bindings,
+                    )?;
+                    if (variant == none()) {
+                        patternFailed = true;
+                    } else if (containsU32(seenVariants, variant)) {
+                        var message = Vector<u8>.create();
+                        appendText(mut message, "variant '")?;
+                        appendBytes(mut message, c.name(c.types.variants[variant as usize].name))?;
+                        appendText(mut message, "' is already matched by an earlier arm")?;
+                        c.error(unreachableArm(), patternSpan.start, patternSpan.end, message)?;
+                    } else {
+                        seenVariants.push(variant)?;
+                    }
+                }
+            }
+        }
+        // The bindings go into the table before the body, whose own matches add theirs after.
+        let bindingStart = truncate<u32>(c.hir.armBindings.length);
+        for (b in bindings.view()) {
+            c.hir.armBindings.push(b)?;
+            if (!c.types.isCopy(c.hir.locals[b.local as usize].typ)) {
+                consumes = true;
+            }
+        }
+        let bindingRange = Range { start: bindingStart, count: truncate<u32>(bindings.length) };
+        let body = checkArmBody(c, arms, index, isValue, branches)?;
+        c.popScope();
+        let armSpanValue = armSpan(c, arms, index, isValue);
+        c.hir.arms.push(HirArm {
+            kind: kind,
+            variant: variant,
+            value: value,
+            bindings: bindingRange,
+            body: body,
+            start: armSpanValue.start,
+            end: armSpanValue.end,
+            listsPayloads: listsPayloads(c, pattern),
+            pattern: none(),
+        })?;
+        armIds.push(truncate<u32>(c.hir.arms.length - 1))?;
+    }
+
+    if (ok && !wildcard && !patternFailed) {
+        var missing = Vector<u8>.create();
+        var any = false;
+        if (c.types.is(typ, TypeKind.Enum)) {
+            let definition = c.types.info(typ).enumDef;
+            let count = c.types.enums[definition as usize].variants.length;
+            for (k in 0..count) {
+                let v = variantAt(c, typ, k);
+                if (!containsU32(seenVariants, v)) {
+                    if (any) {
+                        appendText(mut missing, ", ")?;
+                    }
+                    appendVariantText(mut missing, c, v, typ)?;
+                    any = true;
+                }
+            }
+        } else if (c.types.is(typ, TypeKind.Bool)) {
+            for (k in 0..2u64) {
+                if (!containsInt(seenValues, intValue(truncate<i64>(k)))) {
+                    if (any) {
+                        appendText(mut missing, ", ")?;
+                    }
+                    appendText(mut missing, if (k == 1) "true" else "false")?;
+                    any = true;
+                }
+            }
+        } else {
+            appendText(mut missing, "_")?;
+            any = true;
+        }
+        if (any) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "this match does not cover ")?;
+            appendBytes(mut message, missing.view())?;
+            appendText(mut message, "; add the missing arms or a '_' arm")?;
+            c.error(nonExhaustiveMatch(), scrutineeSpan.start, scrutineeSpan.end, message)?;
+        }
+    }
+    if (!ok) {
+        let error = c.errorResult(span.start, span.end)?;
+        return c.hir.addStmt(HirStmt.Expression(error), span.start, span.end);
+    }
+    // A value scrutinee with a non-Copy payload bound by name is consumed (§18.4).
+    let list = c.hir.list(armIds.view())?;
+    return c.hir.addStmt(HirStmt.Match(scrutinee, list, reference == none() && consumes, false), span.start, span.end);
+}
+
+/// A `match` with nested patterns (CheckNestedMatch, M11): each arm's pattern as a tree, exhaustiveness and unreachable
+/// arms by usefulness.
+fn checkNestedMatch(
+    c: borrow mut Checker,
+    scrutineeSyntax: u32,
+    arms: Range,
+    isValue: bool,
+    branches: borrow mut BranchType,
+    span: Span,
+    scrutinee: u32,
+    typ: u32,
+    reference: u32,
+) -> Result<u32, AllocError> {
+    var armIds = Vector<u32>.create();
+    var earlier = Vector<u32>.create();
+    var failed = false;
+    for (index in 0..arms.count) {
+        let pattern = armPattern(c, arms, index, isValue);
+        let patternSpan = c.front.ast.patternSpans[pattern as usize];
+        c.pushScope()?;
+        let tree = checkPattern(c, pattern, typ, reference, mut failed)?;
+        let body = checkArmBody(c, arms, index, isValue, branches)?;
+        c.popScope();
+        if (!failed) {
+            var witness = Vector<u8>.create();
+            if (!patternWitness(c, earlier.view(), tree, typ, mut witness)?) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "this arm can never match: earlier arms match every value it does")?;
+                c.error(unreachableArm(), patternSpan.start, patternSpan.end, message)?;
+            }
+        }
+        earlier.push(tree)?;
+        let armSpanValue = armSpan(c, arms, index, isValue);
+        c.hir.arms.push(HirArm {
+            kind: HirPatternKind.Wildcard,
+            variant: none(),
+            value: intValue(0),
+            bindings: emptyRange(),
+            body: body,
+            start: armSpanValue.start,
+            end: armSpanValue.end,
+            listsPayloads: listsPayloads(c, pattern),
+            pattern: tree,
+        })?;
+        armIds.push(truncate<u32>(c.hir.arms.length - 1))?;
+    }
+    if (!failed) {
+        let wildcardPattern = c.hir.addPattern(HirPattern.Wildcard)?;
+        var witness = Vector<u8>.create();
+        if (patternWitness(c, earlier.view(), wildcardPattern, typ, mut witness)?) {
+            let scrutineeSpan = c.front.ast.exprSpans[scrutineeSyntax as usize];
+            var message = Vector<u8>.create();
+            appendText(mut message, "this match does not cover ")?;
+            appendBytes(mut message, witness.view())?;
+            appendText(mut message, "; add the missing arms or a '_' arm")?;
+            c.error(nonExhaustiveMatch(), scrutineeSpan.start, scrutineeSpan.end, message)?;
+        }
+    }
+    // A value scrutinee with a non-Copy payload bound by name, at any depth, is consumed (§18.4).
+    var consumes = false;
+    if (reference == none()) {
+        for (tree in earlier.view()) {
+            if (bindsNonCopy(c, tree)) {
+                consumes = true;
+            }
+        }
+    }
+    let list = c.hir.list(armIds.view())?;
+    return c.hir.addStmt(HirStmt.Match(scrutinee, list, consumes, true), span.start, span.end);
+}
+
+fn bindsNonCopy(c: borrow Checker, pattern: u32) -> bool {
+    match (c.hir.patterns[pattern as usize]) {
+        HirPattern.Binding(local) => { return !c.types.isCopy(c.hir.locals[local as usize].typ); }
+        HirPattern.Variant(_, hasPayload, payload) => {
+            if (hasPayload) {
+                for (k in 0..payload.count) {
+                    if (bindsNonCopy(c, c.hir.at(payload, k))) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        _ => { return false; }
+    }
+}
+
+/// A pattern for a value of `typ` (CheckPattern, §15.2); a failure is reported and becomes `_`.
+fn checkPattern(
+    c: borrow mut Checker,
+    pattern: u32,
+    typ: u32,
+    reference: u32,
+    failed: borrow mut bool,
+) -> Result<u32, AllocError> {
+    let span = c.front.ast.patternSpans[pattern as usize];
+    match (c.front.ast.patterns[pattern as usize]) {
+        PatternNode.Wildcard => { return c.hir.addPattern(HirPattern.Wildcard); }
+        PatternNode.Null => {
+            if (c.types.optionType(typ) == none()) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "a 'null' pattern needs an optional, but the value has type ")?;
+                appendQuotedType(mut message, c, typ)?;
+                c.error(typeMismatch(), span.start, span.end, message)?;
+                failed = true;
+                return c.hir.addPattern(HirPattern.Wildcard);
+            }
+            return c.hir.addPattern(HirPattern.Variant(variantAt(c, typ, 0), false, emptyRange()));
+        }
+        PatternNode.Literal(literal) => {
+            if (!c.types.is(typ, TypeKind.Integer) && !c.types.is(typ, TypeKind.Bool)) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "a literal pattern needs an integer or 'bool', but the value has type ")?;
+                appendQuotedType(mut message, c, typ)?;
+                c.error(typeMismatch(), span.start, span.end, message)?;
+                failed = true;
+                return c.hir.addPattern(HirPattern.Wildcard);
+            }
+            let hir = checkExpr(c, literal, typ)?;
+            match (c.hir.exprs[hir as usize]) {
+                HirExpr.IntConst(v) => { return c.hir.addPattern(HirPattern.Literal(v)); }
+                HirExpr.BoolConst(b) => { return c.hir.addPattern(HirPattern.Literal(intValue(if (b) 1 else 0))); }
+                _ => {
+                    failed = true;
+                    return c.hir.addPattern(HirPattern.Wildcard);
+                }
+            }
+        }
+        PatternNode.Variant(path, hasBindings, bindings) => {
+            let variant = resolvePatternVariant(c, path, span, typ)?;
+            if (variant == none()) {
+                failed = true;
+                return c.hir.addPattern(HirPattern.Wildcard);
+            }
+            if (!hasBindings) {
+                return c.hir.addPattern(HirPattern.Variant(variant, false, emptyRange()));
+            }
+            let count = payloadCount(c, variant);
+            if (bindings.count as usize != count) {
+                payloadArityError(c, typ, variant, bindings.count, span)?;
+                failed = true;
+                return c.hir.addPattern(HirPattern.Wildcard);
+            }
+            var payload = Vector<u32>.create();
+            for (i in 0..count) {
+                let t = payloadType(c, variant, i);
+                let binding = c.front.ast.bindings[c.front.ast.at(bindings, truncate<u32>(i)) as usize];
+                if (binding.nested != none()) {
+                    if (c.types.is(t, TypeKind.Reference)) {
+                        let nestedSpan = c.front.ast.patternSpans[binding.nested as usize];
+                        var message = Vector<u8>.create();
+                        appendText(mut message, "this payload is a reference (")?;
+                        appendQuotedType(mut message, c, t)?;
+                        appendText(
+                            mut message,
+                            "): bind it and match on it separately (type-system.md §15.2)",
+                        )?;
+                        c.error(typeMismatch(), nestedSpan.start, nestedSpan.end, message)?;
+                        failed = true;
+                        payload.push(c.hir.addPattern(HirPattern.Wildcard)?)?;
+                        continue;
+                    }
+                    payload.push(checkPattern(c, binding.nested, t, reference, failed)?)?;
+                } else if (binding.name != none()) {
+                    let local = declareBinding(c, binding.name, binding.mutable, t, reference)?;
+                    payload.push(c.hir.addPattern(HirPattern.Binding(local))?)?;
+                } else {
+                    payload.push(c.hir.addPattern(HirPattern.Wildcard)?)?;
+                }
+            }
+            let list = c.hir.list(payload.view())?;
+            return c.hir.addPattern(HirPattern.Variant(variant, true, list));
+        }
+    }
+}
+
+fn payloadArityError(
+    c: borrow mut Checker,
+    typ: u32,
+    variant: u32,
+    binds: u32,
+    span: Span,
+) -> Result<void, AllocError> {
+    var message = Vector<u8>.create();
+    appendText(mut message, "'")?;
+    appendVariantName(mut message, c, typ, variant)?;
+    appendText(mut message, "' has ")?;
+    appendDecimal(mut message, payloadCount(c, variant) as u64)?;
+    appendText(mut message, " payload value(s), but the pattern binds ")?;
+    appendDecimal(mut message, binds as u64)?;
+    return c.error(argumentCount(), span.start, span.end, message);
+}
+
+/// CheckVariantPattern: a simple match's variant and its bindings, or none (reported).
+fn checkVariantPattern(
+    c: borrow mut Checker,
+    path: QualifiedName,
+    hasBindings: bool,
+    bindings: Range,
+    span: Span,
+    typ: u32,
+    reference: u32,
+    out: borrow mut Vector<HirArmBinding>,
+) -> Result<u32, AllocError> {
+    let variant = resolvePatternVariant(c, path, span, typ)?;
+    if (variant == none() || !hasBindings) {
+        return Ok(variant); // `E.V` ignores the payload
+    }
+    if (bindings.count as usize != payloadCount(c, variant)) {
+        payloadArityError(c, typ, variant, bindings.count, span)?;
+        return Ok(variant);
+    }
+    for (i in 0..bindings.count) {
+        let binding = c.front.ast.bindings[c.front.ast.at(bindings, i) as usize];
+        if (binding.name != none()) {
+            let t = payloadType(c, variant, i as usize);
+            let local = declareBinding(c, binding.name, binding.mutable, t, reference)?;
+            out.push(HirArmBinding { local: local, payloadIndex: i })?;
+        }
+    }
+    return Ok(variant);
+}
+
+/// A binding of a payload (DeclareBinding, §15.2, §18.4): a copy or a move, or a reference when the scrutinee is one.
+fn declareBinding(
+    c: borrow mut Checker,
+    name: u32,
+    mutable: bool,
+    payload: u32,
+    reference: u32,
+) -> Result<u32, AllocError> {
+    let ident = c.front.ast.idents[name as usize];
+    var isMutable = mutable;
+    if (isMutable && reference != none()) {
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, ident.symbol)?;
+        appendText(mut message, " is bound by reference (the match is on a reference), so it cannot be 'var'")?;
+        c.error(referenceNotAllowed(), ident.start, ident.end, message)?;
+        isMutable = false;
+    }
+    if (c.lookupLocal(ident.symbol) != none()) {
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, ident.symbol)?;
+        appendText(mut message, " is already declared in this function; locals cannot be shadowed")?;
+        c.error(localRedeclared(), ident.start, ident.end, message)?;
+    }
+    let bindingType = if (reference == none()) payload else c.types.referenceTo(
+        payload,
+        c.types.info(reference).mutableReference,
+    )?;
+    let local = c.hir.addLocal(c.function, ident.symbol, bindingType, isMutable, false, ident.start, ident.end)?;
+    c.bind(ident.symbol, local)?;
+    return Ok(local);
+}
+
+/// The variant a variant pattern names for a value of `typ`, or none (reported) (ResolvePatternVariant).
+fn resolvePatternVariant(c: borrow mut Checker, path: QualifiedName, span: Span, typ: u32) -> Result<u32, AllocError> {
+    if (!c.types.is(typ, TypeKind.Enum)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "a variant pattern needs an enum, but the value has type ")?;
+        appendQuotedType(mut message, c, typ)?;
+        c.error(typeMismatch(), span.start, span.end, message)?;
+        return Ok(none());
+    }
+    let definition = c.types.info(typ).enumDef;
+    let parts = path.parts;
+    let first = c.front.ast.idents[c.front.ast.at(parts, 0) as usize];
+    if (c.types.enums[definition as usize].resultOk != none()) {
+        // Result patterns have no type prefix: Ok(x), Err(e) (§17.3).
+        let found = if (parts.count == 1) findVariant(c, definition, first.symbol) else none();
+        if (found == none()) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "expected 'Ok(…)' or 'Err(…)' for a value of type ")?;
+            appendQuotedType(mut message, c, typ)?;
+            c.error(typeMismatch(), path.start, path.end, message)?;
+        }
+        return Ok(found);
+    }
+    if (c.types.enums[definition as usize].optionType != none()) {
+        // Optional patterns: Some(x) and null (§22.1).
+        if (parts.count != 1 || !sameBytes(c.name(first.symbol), "Some".bytes())) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "expected 'Some(…)' or 'null' for a value of type ")?;
+            appendQuotedType(mut message, c, typ)?;
+            c.error(typeMismatch(), path.start, path.end, message)?;
+            return Ok(none());
+        }
+        return Ok(variantAt(c, typ, 1));
+    }
+    if (parts.count != 2 || !namesEnum(c, first.symbol, typ)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "expected a variant of ")?;
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, ", written '")?;
+        appendBytes(mut message, c.typeName(typ))?;
+        appendText(mut message, ".Variant'")?;
+        c.error(typeMismatch(), path.start, path.end, message)?;
+        return Ok(none());
+    }
+    let second = c.front.ast.idents[c.front.ast.at(parts, 1) as usize];
+    let found = findVariant(c, definition, second.symbol);
+    if (found == none()) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, " has no variant named ")?;
+        appendQuotedName(mut message, c, second.symbol)?;
+        c.error(undefinedName(), second.start, second.end, message)?;
+    }
+    return Ok(found);
+}
+
+/// Does `symbol` name the enum: its own name, or an item that is that enum (`geometry.Shape`, §2)?
+fn namesEnum(c: borrow Checker, symbol: u32, typ: u32) -> bool {
+    if (sameBytes(c.name(symbol), c.typeName(typ))) {
+        return true;
+    }
+    match (c.item(symbol)) {
+        Entity.Enum(index) => { return c.enums[index as usize].typ == typ; }
+        _ => { return false; }
+    }
+}
+
+// ---- if and match expressions ----
+
+/// An `if` or `match` expression (CheckBranching, §15.3): the statement form, whose expression branches end in a yield
+/// of a value of one type, and whose block branches cannot complete (N0235).
+fn checkBranching(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError> {
+    let span = c.front.ast.exprSpans[e as usize];
+    var branches = branchType(expected);
+    var statement = none();
+    match (c.front.ast.exprs[e as usize]) {
+        ExprNode.If(conditionSyntax, thenSyntax, elseSyntax) => {
+            let boolType = c.types.boolType;
+            let condition = checkExpr(c, conditionSyntax, boolType)?;
+            var then = checkBranch(c, thenSyntax, mut branches, 0)?;
+            var otherwise = checkBranch(c, elseSyntax, mut branches, 1)?;
+            var finished = Vector<DeferredBranch>.create();
+            finishBranches(c, mut branches, mut finished)?;
+            for (f in finished.view()) {
+                if (f.index == 0) {
+                    then = f.value;
+                } else {
+                    otherwise = f.value;
+                }
+            }
+            statement = c.hir.addStmt(HirStmt.If(condition, then, otherwise), span.start, span.end)?;
+        }
+        ExprNode.Match(scrutinee, arms) => {
+            statement = checkMatch(c, scrutinee, arms, true, mut branches, span)?;
+            var finished = Vector<DeferredBranch>.create();
+            finishBranches(c, mut branches, mut finished)?;
+            let armList = match (c.hir.stmts[statement as usize]) {
+                HirStmt.Match(_, list, _, _) => list,
+                _ => { return c.errorResult(span.start, span.end); }
+            };
+            for (f in finished.view()) {
+                let arm = c.hir.at(armList, f.index);
+                c.hir.arms[arm as usize].body = f.value;
+            }
+        }
+        _ => { return c.errorResult(span.start, span.end); }
+    }
+    let typ = if (branches.typ != none()) branches.typ else c.types.never;
+    return c.expr(HirExpr.StmtValue(statement), typ, span.start, span.end);
+}
+
+/// One branch (CheckBranch, §15.3): a block that cannot complete, or an expression whose value the whole yields.
+fn checkBranch(
+    c: borrow mut Checker,
+    value: u32,
+    branches: borrow mut BranchType,
+    index: u32,
+) -> Result<u32, AllocError> {
+    let span = c.front.ast.exprSpans[value as usize];
+    match (c.front.ast.exprs[value as usize]) {
+        ExprNode.Block(block) => {
+            let body = checkBlock(c, block)?;
+            var loopExits = Vector<bool>.create();
+            if (completes(c, body, mut loopExits)?) {
+                var message = Vector<u8>.create();
+                appendText(
+                    mut message,
+                    "this block can complete, but it has no value: end it with 'return', 'break' or 'continue', or write the value without braces",
+                )?;
+                c.error(branchCompletes(), span.start, span.end, message)?;
+            }
+            return Ok(body);
+        }
+        _ => {}
+    }
+    let isNull = match (c.front.ast.exprs[unparenthesized(c, value) as usize]) {
+        ExprNode.NullLiteral => true,
+        _ => false,
+    };
+    if (branches.typ == none() && (isFlexible(c, value) || isNull)) {
+        branches.deferred.push(DeferredBranch { index: index, value: value })?; // checked once a later branch fixes it
+        return c.hir.addStmt(HirStmt.Block(emptyRange()), span.start, span.end);
+    }
+    let hir = checkExpr(c, value, branches.typ)?;
+    if (branches.typ == none() && !c.types.is(c.typeOf(hir), TypeKind.Never)) {
+        branches.typ = c.typeOf(hir);
+    }
+    return yieldBlock(c, hir, span);
+}
+
+fn yieldBlock(c: borrow mut Checker, hir: u32, span: Span) -> Result<u32, AllocError> {
+    let yielded = c.hir.addStmt(HirStmt.Yield(hir), span.start, span.end)?;
+    var statements = Vector<u32>.create();
+    statements.push(yielded)?;
+    let list = c.hir.list(statements.view())?;
+    return c.hir.addStmt(HirStmt.Block(list), span.start, span.end);
+}
+
+/// The deferred branches, checked now that the type is known (FinishBranches); if they alone have values, their
+/// literals' default type: f64 if one is a float literal, else i32 (§5, §35.2). Each result's `value` is its block.
+fn finishBranches(
+    c: borrow mut Checker,
+    branches: borrow mut BranchType,
+    finished: borrow mut Vector<DeferredBranch>,
+) -> Result<void, AllocError> {
+    if (branches.typ == none()) {
+        var flexible = false;
+        var float = false;
+        for (d in branches.deferred.view()) {
+            if (isFlexible(c, d.value)) {
+                flexible = true;
+            }
+            if (hasFloatLiteral(c, d.value)) {
+                float = true;
+            }
+        }
+        if (flexible) {
+            branches.typ = if (float) c.types.f64 else c.types.i32;
+        }
+    }
+    for (k in 0..branches.deferred.length) {
+        let d = branches.deferred[k];
+        let hir = checkExpr(c, d.value, branches.typ)?;
+        if (branches.typ == none()) {
+            branches.typ = c.typeOf(hir);
+        }
+        let span = c.front.ast.exprSpans[d.value as usize];
+        finished.push(DeferredBranch { index: d.index, value: yieldBlock(c, hir, span)? })?;
+    }
+    return Ok();
+}
+
+/// Are the value branches of an `if` or `match` expression all flexible (FlexibleBranches)? Blocks do not count, but
+/// there must be a value branch.
+fn flexibleBranches(c: borrow Checker, e: u32) -> bool {
+    var anyValue = false;
+    match (c.front.ast.exprs[e as usize]) {
+        ExprNode.If(_, then, otherwise) => {
+            for (b in [then, otherwise]) {
+                if (!isBlockExpr(c, b)) {
+                    if (!isFlexible(c, b)) {
+                        return false;
+                    }
+                    anyValue = true;
+                }
+            }
+        }
+        ExprNode.Match(_, arms) => {
+            for (k in 0..arms.count) {
+                let b = c.front.ast.valueArms[c.front.ast.at(arms, k) as usize].value;
+                if (!isBlockExpr(c, b)) {
+                    if (!isFlexible(c, b)) {
+                        return false;
+                    }
+                    anyValue = true;
+                }
+            }
+        }
+        _ => { return false; }
+    }
+    return anyValue;
+}
+
+fn isBlockExpr(c: borrow Checker, e: u32) -> bool => match (c.front.ast.exprs[e as usize]) {
+    ExprNode.Block(_) => true,
+    _ => false,
+};

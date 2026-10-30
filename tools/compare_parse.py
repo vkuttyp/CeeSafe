@@ -84,6 +84,7 @@ def main():
     parser.add_argument("--root", default=".")
     parser.add_argument("--command", choices=("parse", "check"), default="parse")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
+    parser.add_argument("--list", metavar="FILE", help="write every differing file's path to FILE, one per line")
     parser.add_argument("paths", nargs="+")
     args = parser.parse_args()
     args.ceesafec = os.path.abspath(os.path.expanduser(args.ceesafec))
@@ -94,6 +95,10 @@ def main():
     problems = [p for r in results for p in r]
     for p in problems[:15]:
         print(p)
+    if args.list:
+        with open(args.list, "w") as out:
+            for p in problems:
+                out.write(p.split(": ", 1)[0] + "\n")
     print(f"compare_parse ({args.command}): {len(files)} files, {len(files) - len(problems)} identical, {len(problems)} differ")
     sys.exit(1 if problems else 0)
 

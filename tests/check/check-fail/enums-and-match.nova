@@ -1,0 +1,67 @@
+enum Color { Red, Green, Blue }
+enum Shape { Circle(i32), Rect(i32, i32), Tinted(Color, Shape2) }
+enum Shape2 { Dot, Line(Color) }
+
+fn a(c: Color) {
+    match (c) {
+        Color.Red => {}
+        _ => {}
+        Color.Blue => {}
+    }
+    match (c) {
+        Color.Red => {}
+        Color.Red => {}
+    }
+    match (c) {
+        Red => {}
+        Shape.Circle => {}
+        Color.Purple => {}
+        Color.Green(x) => {}
+        null => {}
+        1 => {}
+    }
+}
+
+fn b(n: i32, f: bool) {
+    match (n) {
+        1 => {}
+        1 => {}
+    }
+    match (f) {
+        true => {}
+    }
+    match (f) { false => {} true => {} }
+}
+
+fn c2(s: Shape) -> i32 {
+    match (s) {
+        Shape.Tinted(Color.Red, Shape2.Dot) => { return 1; }
+        Shape.Circle(_) => { return 2; }
+    }
+    match (s) {
+        Shape.Tinted(_, Shape2.Line(_)) => { return 1; }
+        Shape.Tinted(Color.Red, Shape2.Line(Color.Red)) => { return 3; }
+        _ => { return 0; }
+    }
+    let n = match (s) {
+        Shape.Circle(r) => r,
+        Shape.Rect(1, h) => h,
+        Shape.Tinted(x, y, z) => 0,
+        _ => { }
+    };
+    let m = if (n > 0) 1 else true;
+    let k = match (n) { 3 => 1, _ => 2 };
+    match (n) { 3 => {} }
+    let e = Color.Red(1);
+    let g = Shape.Circle;
+    let h = Shape.Rect(1, 2, 3);
+    let p = Shape.Nope(1);
+    let w = match (s) {
+        Shape.Circle(var r) => r,
+        Shape.Circle(r) => r,
+        _ => 0,
+    };
+    return n;
+}
+
+fn main() {}
