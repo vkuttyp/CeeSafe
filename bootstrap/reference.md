@@ -47,3 +47,13 @@ Nova keeps evolving (decision 0001 §4). A rebaseline is its own change:
 | 2026-10-30 | novac 0.4.1 (`80d8d8c`) | the point release for N7: 0.4.0's lib/std reserved the names of its helpers (`pathIn`, `fromAlloc`, …), so the probes had to avoid them |
 | 2026-10-30 | novac 0.5.0 (`af071d4`) | ADR 0029 (`@repr(C)` structs holding C state and arrays); taken at P3 S2b, before any S2b code, as planned after S1. lib/ is unchanged from 0.4.1 and the checker change is 9 lines in `IsFfiSafe` (S7) |
 | 2026-10-30 | novac 0.6.0 (`93e0a46`) | ADR 0030 (`offsetOf<T>(field)`, `callerAddress()`, lib/kernel's `List`, one definition per C name); taken after P3. The checker change is two builtins (`TypeChecker.cs` +78 lines), which shift the reference's Builtin numbering; lib/ gains `lib/kernel/list.nova`; two diagnostics (N0339, N0340). One reference bug found: `offsetOf` reads a field's offset before the struct is laid out, so it is 0 unless the layout was computed earlier; ceesafec gives the true offset (`docs/p3-plan.md`). Gates rerun: P1 probes 16/16, support 8/8 and the type table 1/1 with no leaks, fault sweep 573/573; parse 487/487; check 266/322 (the rest P4, novac's printer crashes, and `offset-of`), the other families 84/84, check-pass and HIR snapshots 27/27, package fixtures 7/7, CeeSafe's own check identical; ASan+UBSan clean |
+
+## Fixed points
+
+Each verified fixed point (ROADMAP P6) archives its manifest in `bootstrap/fixed-point/`: the commit, the stage-0
+binary's hash, the C compiler, every output's sha256 and the subprocess audit. Rerun with
+`python3 tools/fixed_point.py --novac <stage 0> --commit <commit> --work <dir> --manifest <file>`; the C hashes must
+equal the archived ones.
+
+- 2026-10-30, `1b1aae4`, novac 0.6.0: macOS arm64 (Apple clang 21) and Linux x86-64 (GCC 12), same C
+  (`main.c` `40374dbf…`).
