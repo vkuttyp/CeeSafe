@@ -41,6 +41,10 @@ struct Diagnostic {
     fixStart: u32;
     fixEnd: u32;
     fixText: Vector<u8>;
+    hasSecondEdit: bool; // a fix of two edits in the same file, applied together
+    secondStart: u32;
+    secondEnd: u32;
+    secondText: Vector<u8>;
 }
 
 /// Diagnostics in the order they are reported (DiagnosticBag).
@@ -69,6 +73,10 @@ struct Diagnostics {
             fixStart: 0,
             fixEnd: 0,
             fixText: Vector<u8>.create(),
+            hasSecondEdit: false,
+            secondStart: 0,
+            secondEnd: 0,
+            secondText: Vector<u8>.create(),
         })?;
         return Ok();
     }
@@ -96,6 +104,10 @@ struct Diagnostics {
             fixStart: start,
             fixEnd: end,
             fixText: fixText,
+            hasSecondEdit: false,
+            secondStart: 0,
+            secondEnd: 0,
+            secondText: Vector<u8>.create(),
         })?;
         return Ok();
     }
@@ -125,6 +137,45 @@ struct Diagnostics {
             fixStart: fixStart,
             fixEnd: fixEnd,
             fixText: fixText,
+            hasSecondEdit: false,
+            secondStart: 0,
+            secondEnd: 0,
+            secondText: Vector<u8>.create(),
+        })?;
+        return Ok();
+    }
+
+    /// An error with a fix of two edits: [fixStart, fixEnd) and [secondStart, secondEnd) replaced.
+    fn errorWithTwoEdits(
+        borrow mut this,
+        code: u32,
+        file: u32,
+        start: u32,
+        end: u32,
+        message: Vector<u8>,
+        fixTitle: Vector<u8>,
+        fixStart: u32,
+        fixText: Vector<u8>,
+        secondStart: u32,
+        secondEnd: u32,
+        secondText: Vector<u8>,
+    ) -> Result<void, AllocError> {
+        this.items.push(Diagnostic {
+            code: code,
+            isError: true,
+            file: file,
+            start: start,
+            end: end,
+            message: message,
+            hasFix: true,
+            fixTitle: fixTitle,
+            fixStart: fixStart,
+            fixEnd: fixStart,
+            fixText: fixText,
+            hasSecondEdit: true,
+            secondStart: secondStart,
+            secondEnd: secondEnd,
+            secondText: secondText,
         })?;
         return Ok();
     }
@@ -240,6 +291,16 @@ fn diagnosticsJson(
             json.name("newText")?;
             json.stringBytes(d.fixText.view())?;
             json.endObject()?;
+            if (d.hasSecondEdit) {
+                json.startObject()?;
+                json.name("file")?;
+                json.stringBytes(source.path.view())?;
+                writePosition(mut json, "start", source, d.secondStart)?;
+                writePosition(mut json, "end", source, d.secondEnd)?;
+                json.name("newText")?;
+                json.stringBytes(d.secondText.view())?;
+                json.endObject()?;
+            }
             json.endArray()?;
             json.endObject()?;
         }

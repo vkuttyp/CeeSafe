@@ -1,0 +1,501 @@
+// References (the reference's ResolveTypeCore ReferenceType case, the BorrowExpr, MoveExpr and MutArgExpr cases of
+// Synth, CheckArgument, MutArgumentFix, ResolveFlows and ResolveReturnSources): P3 S2d. Regions (S3), type parameters
+// (S4), closures (S6) and `dyn` (S4) come later; without them a signature has no mutable flows.
+
+fn returnSourceMismatch() -> u32 => 245;
+fn mutArgumentMismatch() -> u32 => 249;
+
+/// `borrow T`, `borrow mut T` and `borrow(a, b) T` (a source list only in a return type, `allowSources`).
+fn resolveReferenceType(
+    c: borrow mut Checker,
+    mutable: bool,
+    hasSources: bool,
+    sources: Range,
+    pointeeSyntax: u32,
+    allowSources: bool,
+    span: Span,
+) -> Result<u32, AllocError> {
+    if (hasSources && !allowSources) {
+        // Outside a return type, the list names regions (§25.2), which are erased.
+        var namesStatic = false;
+        for (k in 0..sources.count) {
+            let ident = c.front.ast.idents[c.front.ast.at(sources, k) as usize];
+            if (sameText(c.name(ident.symbol), "static")) {
+                namesStatic = true;
+            }
+        }
+        if (namesStatic) {
+            c.notPorted(span.start, span.end, "a region argument", "S3")?;
+        } else {
+            var message = Vector<u8>.create();
+            appendText(
+                mut message,
+                "a source list 'borrow(...)' is only allowed in a function's return type, or naming regions (type-system.md §25.2)",
+            )?;
+            c.error(referenceNotAllowed(), span.start, span.end, message)?;
+        }
+    }
+    let isFunction = match (c.front.ast.types[pointeeSyntax as usize]) {
+        TypeNode.Function(_, _, _) => true,
+        _ => false,
+    };
+    if (isFunction) {
+        // `borrow fn(…) -> R` is a closure type (§36.2).
+        c.notPorted(span.start, span.end, "a closure type", "S6")?;
+        return Ok(c.types.error);
+    }
+    let pointee = c.resolveType(pointeeSyntax, false)?;
+    if (c.types.is(pointee, TypeKind.Reference)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "references to references are not supported")?;
+        c.error(referenceNotAllowed(), span.start, span.end, message)?;
+        return Ok(c.types.error);
+    }
+    if (c.types.isBottom(pointee)) {
+        return Ok(c.types.error);
+    }
+    return c.types.referenceTo(pointee, mutable);
+}
+
+/// `borrow e` and `borrow mut e` (Synth's BorrowExpr case).
+fn synthBorrow(c: borrow mut Checker, mutable: bool, operandSyntax: u32, span: Span) -> Result<u32, AllocError> {
+    let isSlice = match (c.front.ast.exprs[operandSyntax as usize]) {
+        ExprNode.Slice(_, _, _) => true,
+        _ => false,
+    };
+    if (isSlice) {
+        c.notPorted(span.start, span.end, "a slice expression", "S2e")?;
+        return c.errorResult(span.start, span.end);
+    }
+    let operand = synth(c, operandSyntax, none())?;
+    if (c.isBottom(operand)) {
+        return Ok(operand);
+    }
+    if (c.types.is(c.typeOf(operand), TypeKind.Reference)) {
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            "this is already a reference; use it directly (references to references are not supported)",
+        )?;
+        c.error(referenceNotAllowed(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    return borrowPlace(c, operand, mutable, span);
+}
+
+/// `move e` (Synth's MoveExpr case).
+fn synthMove(c: borrow mut Checker, operandSyntax: u32, span: Span) -> Result<u32, AllocError> {
+    let operand = synth(c, operandSyntax, none())?;
+    if (c.isBottom(operand)) {
+        return Ok(operand);
+    }
+    let place = toPlace(c, operand)?;
+    if (place == none()) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "only a variable or a field can be moved out of with 'move'")?;
+        c.error(borrowOfNonPlace(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let t = c.typeOf(operand);
+    return c.expr(HirExpr.Move(place), t, span.start, span.end);
+}
+
+/// `mut e` outside an argument list.
+fn misplacedMutArgument(c: borrow mut Checker, span: Span) -> Result<u32, AllocError> {
+    var message = Vector<u8>.create();
+    appendText(mut message, "'mut' marks an argument for a 'borrow mut' parameter; it is not an expression")?;
+    c.error(mutArgumentMismatch(), span.start, span.end, message)?;
+    return c.errorResult(span.start, span.end);
+}
+
+/// A box's contents or a vector's elements, lent where the parameter wants its pointee.
+fn contentsFor(c: borrow mut Checker, value: u32, parameterType: u32) -> Result<u32, AllocError> {
+    let t = c.typeOf(value);
+    let lendsContents = c.types.is(t, TypeKind.Box) || c.types.is(t, TypeKind.Vector);
+    let pointee = c.types.info(t).pointee;
+    if (lendsContents && pointee == c.types.info(parameterType).pointee) {
+        let s = c.spanOf(value);
+        return c.expr(HirExpr.Deref(value), pointee, s.start, s.end);
+    }
+    return Ok(value);
+}
+
+/// An argument for a parameter of type `parameterType` (CheckArgument, §13.2).
+fn checkArgument(c: borrow mut Checker, argument: u32, parameterType: u32) -> Result<u32, AllocError> {
+    let span = c.front.ast.exprSpans[argument as usize];
+    let mutOperand = match (c.front.ast.exprs[argument as usize]) {
+        ExprNode.MutArg(operand) => operand,
+        _ => none(),
+    };
+    if (parameterType == none()) {
+        synth(c, if (mutOperand != none()) mutOperand else argument, none())?;
+        return c.errorResult(span.start, span.end);
+    }
+    // A closure parameter takes a closure (or a function value), never a borrow of the argument (§36.2).
+    if (c.types.isClosure(parameterType) && mutOperand == none()) {
+        return checkExpr(c, argument, parameterType);
+    }
+    let pointee = c.types.info(parameterType).pointee;
+    if (mutOperand != none()) {
+        let operandSpan = c.front.ast.exprSpans[mutOperand as usize];
+        if (!c.types.info(parameterType).mutableReference) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "'mut' is only for arguments passed to a 'borrow mut' parameter")?;
+            var title = Vector<u8>.create();
+            appendText(mut title, "remove 'mut'")?;
+            c.errorWithFix(
+                mutArgumentMismatch(),
+                span.start,
+                span.end,
+                message,
+                title,
+                span.start,
+                operandSpan.start,
+                Vector<u8>.create(),
+            )?;
+            synth(c, mutOperand, none())?;
+            return c.errorResult(span.start, span.end);
+        }
+        let isSlice = match (c.front.ast.exprs[mutOperand as usize]) {
+            ExprNode.Slice(_, _, _) => true,
+            _ => false,
+        };
+        if (isSlice && c.types.isSlice(parameterType)) {
+            c.notPorted(span.start, span.end, "a slice expression", "S2e")?;
+            return c.errorResult(span.start, span.end);
+        }
+        let hint = integerHint(c, pointee);
+        var target = synth(c, mutOperand, hint)?;
+        target = contentsFor(c, target, parameterType)?;
+        if (c.types.isDynReference(parameterType) && !c.isBottom(target) && !c.types.is(
+            c.typeOf(target),
+            TypeKind.Reference,
+        )) {
+            c.notPorted(span.start, span.end, "a 'dyn' argument", "S4")?;
+            return c.errorResult(span.start, span.end);
+        }
+        let targetType = c.typeOf(target);
+        if (c.types.isBottom(targetType) || c.types.is(targetType, TypeKind.Reference)) {
+            return coerce(c, target, parameterType, span);
+        }
+        if (targetType != pointee) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "expected ")?;
+            appendQuotedType(mut message, c, pointee)?;
+            appendText(mut message, ", found ")?;
+            appendQuotedType(mut message, c, targetType)?;
+            c.error(typeMismatch(), operandSpan.start, operandSpan.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+        return borrowPlace(c, target, true, span);
+    }
+    if (!c.types.is(parameterType, TypeKind.Reference)) {
+        return checkExpr(c, argument, parameterType);
+    }
+    let hint = integerHint(c, pointee);
+    var value = synth(c, argument, hint)?;
+    value = contentsFor(c, value, parameterType)?;
+    let valueType = c.typeOf(value);
+    if (c.types.isDynReference(parameterType) && !c.types.isBottom(valueType) && !c.types.is(
+        valueType,
+        TypeKind.Reference,
+    ) && !c.types.isDyn(valueType)) {
+        c.notPorted(span.start, span.end, "a 'dyn' argument", "S4")?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (c.types.isBottom(valueType) || c.types.is(valueType, TypeKind.Reference)) {
+        return coerce(c, value, parameterType, span);
+    }
+    if (valueType != pointee) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "expected ")?;
+        appendQuotedType(mut message, c, parameterType)?;
+        appendText(mut message, ", found ")?;
+        appendQuotedType(mut message, c, valueType)?;
+        c.error(typeMismatch(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (c.types.info(parameterType).mutableReference) {
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            "this parameter is 'borrow mut': write 'mut' before the argument to let the call modify it",
+        )?;
+        mutArgumentError(c, value, span, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let isDynDeref = c.types.isDyn(valueType) && match (c.hir.exprs[value as usize]) {
+        HirExpr.Deref(_) => true,
+        _ => false,
+    };
+    if (isDynDeref) {
+        c.notPorted(span.start, span.end, "a 'dyn' argument", "S4")?;
+        return c.errorResult(span.start, span.end);
+    }
+    // Implicit shared borrow: of the place itself, or of a temporary holding the value (lifetimes.md §6).
+    let place = toPlace(c, value)?;
+    if (place != none()) {
+        return c.expr(HirExpr.Borrow(false, place), parameterType, span.start, span.end);
+    }
+    return c.expr(HirExpr.BorrowTemp(false, value), parameterType, span.start, span.end);
+}
+
+/// N0249 for a value passed to a `borrow mut` parameter without `mut`, with MutArgumentFix's fix: insert `mut`, and
+/// turn the root's `let` into `var` when that is why the place is immutable.
+fn mutArgumentError(c: borrow mut Checker, value: u32, span: Span, message: Vector<u8>) -> Result<void, AllocError> {
+    let place = toPlace(c, value)?;
+    if (place == none()) {
+        return c.error(mutArgumentMismatch(), span.start, span.end, message);
+    }
+    var insert = Vector<u8>.create();
+    appendText(mut insert, "mut ")?;
+    var reason = Vector<u8>.create();
+    mutabilityError(c, place, mut reason)?;
+    if (reason.length == 0) {
+        var title = Vector<u8>.create();
+        appendText(mut title, "write 'mut' before the argument")?;
+        return c.errorWithFix(
+            mutArgumentMismatch(),
+            span.start,
+            span.end,
+            message,
+            title,
+            span.start,
+            span.start,
+            insert,
+        );
+    }
+    let letStart = letToVarStart(c, place, reason.view());
+    if (letStart == none()) {
+        return c.error(mutArgumentMismatch(), span.start, span.end, message);
+    }
+    let root = c.hir.places[place as usize].root;
+    var title = Vector<u8>.create();
+    appendText(mut title, "write 'mut' before the argument, and declare ")?;
+    appendQuotedName(mut title, c, c.hir.locals[root as usize].name)?;
+    appendText(mut title, " with 'var'")?;
+    var text = Vector<u8>.create();
+    appendText(mut text, "var")?;
+    let file = c.file;
+    return c.front.diagnostics.errorWithTwoEdits(
+        mutArgumentMismatch(),
+        file,
+        span.start,
+        span.end,
+        message,
+        title,
+        span.start,
+        insert,
+        letStart,
+        letStart + 3,
+        text,
+    );
+}
+
+// ---- flows ----
+
+/// ResolveFlows for a signature without regions or type parameters: the parameters the result may borrow from (its
+/// return sources, §13.5, lifetimes.md §7), as parameter indexes. Each scoped parameter has a region of its own.
+fn resolveFlows(c: borrow mut Checker, f: u32, function: u32) -> Result<void, AllocError> {
+    let returnType = c.hir.functions[function as usize].returnType;
+    if (!c.types.isScoped(returnType)) {
+        return Ok();
+    }
+    let decl = c.front.ast.functions[f as usize];
+    let parameterCount = c.hir.functions[function as usize].parameters.length;
+    let receiverOffset = parameterCount - decl.parameters.count as usize;
+    // The result's names: the parameters a `borrow(p)` in it names, when they are scoped.
+    var named = Vector<u32>.create();
+    collectSourceParameters(c, decl.returnType, function, receiverOffset, mut named)?;
+    let hasSources = match (c.front.ast.types[decl.returnType as usize]) {
+        TypeNode.Reference(_, hasSourceList, _, _) => hasSourceList,
+        _ => false,
+    };
+    var sources = Vector<u32>.create();
+    for (i in named.view()) {
+        if (!containsU32(sources, i)) {
+            sources.push(i)?;
+        }
+    }
+    if (hasSources || named.length == 0) {
+        var resolved = Vector<u32>.create();
+        resolveReturnSources(c, f, function, mut resolved)?;
+        for (i in resolved.view()) {
+            if (!containsU32(sources, i)) {
+                sources.push(i)?;
+            }
+        }
+    }
+    sortU32(mut sources);
+    c.hir.functions[function as usize].returnSources = sources;
+    return Ok();
+}
+
+/// CollectFlowNames over a result type: each scoped parameter a source list names (`#i` in the reference).
+fn collectSourceParameters(
+    c: borrow Checker,
+    syntax: u32,
+    function: u32,
+    receiverOffset: usize,
+    out: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    match (c.front.ast.types[syntax as usize]) {
+        TypeNode.Optional(inner) => { return collectSourceParameters(c, inner, function, receiverOffset, out); }
+        TypeNode.Array(element, _) => { return collectSourceParameters(c, element, function, receiverOffset, out); }
+        TypeNode.Reference(_, _, sources, pointee) => {
+            for (k in 0..sources.count) {
+                let symbol = c.front.ast.idents[c.front.ast.at(sources, k) as usize].symbol;
+                let i = parameterIndex(c, function, symbol);
+                if (i != none() && c.types.isScoped(
+                    c.hir.locals[c.hir.functions[function as usize].parameters[i as usize] as usize].typ,
+                )) {
+                    out.push(i)?;
+                }
+            }
+            return collectSourceParameters(c, pointee, function, receiverOffset, out);
+        }
+        TypeNode.Generic(_, arguments) => {
+            for (k in 0..arguments.count) {
+                collectSourceParameters(c, c.front.ast.at(arguments, k), function, receiverOffset, out)?;
+            }
+            return Ok();
+        }
+        _ => { return Ok(); }
+    }
+}
+
+/// The index of the parameter named `symbol`, or none.
+fn parameterIndex(c: borrow Checker, function: u32, symbol: u32) -> u32 {
+    let parameters = borrow c.hir.functions[function as usize].parameters;
+    for (i in 0..parameters.length) {
+        if (c.hir.locals[parameters[i] as usize].name == symbol) {
+            return truncate<u32>(i);
+        }
+    }
+    return none();
+}
+
+/// The parameters a returned reference may be derived from (ResolveReturnSources, §13.5): its source list, or the
+/// only reference parameter.
+fn resolveReturnSources(
+    c: borrow mut Checker,
+    f: u32,
+    function: u32,
+    out: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    let decl = c.front.ast.functions[f as usize];
+    let returnSpan = c.front.ast.typeSpans[decl.returnType as usize];
+    let returnType = c.hir.functions[function as usize].returnType;
+    let returnsMutable = c.types.is(returnType, TypeKind.Reference) && c.types.info(returnType).mutableReference;
+    let parameterCount = c.hir.functions[function as usize].parameters.length;
+    var referenceParameters = Vector<u32>.create();
+    for (i in 0..parameterCount) {
+        let local = c.hir.functions[function as usize].parameters[i];
+        if (c.types.isScoped(c.hir.locals[local as usize].typ)) {
+            referenceParameters.push(truncate<u32>(i))?;
+        }
+    }
+    let sourceList = match (c.front.ast.types[decl.returnType as usize]) {
+        TypeNode.Reference(_, hasSourceList, sources, _) => if (hasSourceList) sources else emptyRange(),
+        _ => emptyRange(),
+    };
+    let hasSourceList = match (c.front.ast.types[decl.returnType as usize]) {
+        TypeNode.Reference(_, hasSourceList, _, _) => hasSourceList,
+        _ => false,
+    };
+    if (!hasSourceList) {
+        if (referenceParameters.length == 0 && onlyViews(c, returnType)) {
+            return Ok(); // string views of static text (§22.2); the return check still rejects local loans
+        }
+        if (referenceParameters.length == 1) {
+            let i = referenceParameters[0];
+            let local = c.hir.functions[function as usize].parameters[i as usize];
+            let onlyType = c.hir.locals[local as usize].typ;
+            if (returnsMutable && !c.types.info(onlyType).mutableReference) {
+                var message = Vector<u8>.create();
+                appendText(
+                    mut message,
+                    "a 'borrow mut' result cannot be derived from the shared reference parameter ",
+                )?;
+                appendQuotedName(mut message, c, c.hir.locals[local as usize].name)?;
+                c.error(returnSourceMismatch(), returnSpan.start, returnSpan.end, message)?;
+            }
+            out.push(i)?;
+            return Ok();
+        }
+        var message = Vector<u8>.create();
+        if (referenceParameters.length == 0) {
+            appendText(
+                mut message,
+                "a function without reference parameters cannot return a reference: there is nothing it could borrow from",
+            )?;
+        } else {
+            appendText(
+                mut message,
+                "this function has several reference parameters: name the ones the result is borrowed from, e.g. 'borrow(a, b) T'",
+            )?;
+        }
+        return c.error(returnSourceMismatch(), returnSpan.start, returnSpan.end, message);
+    }
+    for (k in 0..sourceList.count) {
+        let ident = c.front.ast.idents[c.front.ast.at(sourceList, k) as usize];
+        if (sameText(c.name(ident.symbol), "static")) {
+            continue; // a region: its parameters were found by name (§25.6)
+        }
+        let i = parameterIndex(c, function, ident.symbol);
+        let local = if (i == none()) none() else c.hir.functions[function as usize].parameters[i as usize];
+        if (local == none() || !c.types.isScoped(c.hir.locals[local as usize].typ)) {
+            var message = Vector<u8>.create();
+            appendQuotedName(mut message, c, ident.symbol)?;
+            if (local == none()) {
+                appendText(mut message, " is not a parameter of ")?;
+                appendQuotedName(mut message, c, c.front.ast.idents[decl.name as usize].symbol)?;
+            } else {
+                appendText(mut message, " is not a reference parameter, so the result cannot borrow from it")?;
+            }
+            c.error(returnSourceMismatch(), ident.start, ident.end, message)?;
+            continue;
+        }
+        if (returnsMutable && !c.types.info(c.hir.locals[local as usize].typ).mutableReference) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "a 'borrow mut' result cannot be derived from the shared reference parameter ")?;
+            appendQuotedName(mut message, c, ident.symbol)?;
+            c.error(returnSourceMismatch(), ident.start, ident.end, message)?;
+            continue;
+        }
+        out.push(i)?;
+    }
+    return Ok();
+}
+
+/// Is every scoped value in the type a `StringView` (OnlyViews, §22.2)?
+fn onlyViews(c: borrow Checker, typ: u32) -> bool {
+    if (c.types.isStringView(typ)) {
+        return true;
+    }
+    if (c.types.is(typ, TypeKind.Reference)) {
+        return false;
+    }
+    if (isResultType(c, typ)) {
+        let ok = resultOk(c, typ);
+        let err = resultErr(c, typ);
+        return (!c.types.isScoped(ok) || onlyViews(c, ok)) && (!c.types.isScoped(err) || onlyViews(c, err));
+    }
+    let option = c.types.optionType(typ);
+    if (option != none()) {
+        return onlyViews(c, option);
+    }
+    return false;
+}
+
+fn sortU32(values: borrow mut Vector<u32>) {
+    for (i in 1..values.length) {
+        var j = i;
+        while (j > 0 && values[j - 1] > values[j]) {
+            let t = values[j];
+            values[j] = values[j - 1];
+            values[j - 1] = t;
+            j -= 1;
+        }
+    }
+}

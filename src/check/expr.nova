@@ -142,6 +142,9 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
             return synthCall(c, callee, arguments, expected, span);
         }
         ExprNode.NullLiteral => { return checkNull(c, expected, span); }
+        ExprNode.Borrow(mutable, operand) => { return synthBorrow(c, mutable, operand, span); }
+        ExprNode.Move(operand) => { return synthMove(c, operand, span); }
+        ExprNode.MutArg(_) => { return misplacedMutArgument(c, span); }
         ExprNode.Try(operand) => { return checkTry(c, operand, span); }
         ExprNode.Unwrap(operand) => { return checkUnwrap(c, operand, span); }
         ExprNode.If(_, _, _) => { return checkBranching(c, e, none()); }
@@ -742,34 +745,6 @@ fn checkUserCallWith(
     }
     let list = c.hir.list(values.view())?;
     return c.expr(HirExpr.Call(function, list), returnType, span.start, span.end);
-}
-
-/// CheckArgument for a parameter of `parameterType` (§13.2): by value here; references come with S2.
-fn checkArgument(c: borrow mut Checker, argument: u32, parameterType: u32) -> Result<u32, AllocError> {
-    let span = c.front.ast.exprSpans[argument as usize];
-    let isMutArg = match (c.front.ast.exprs[argument as usize]) {
-        ExprNode.MutArg(_) => true,
-        _ => false,
-    };
-    if (parameterType == none()) {
-        var inner = argument;
-        match (c.front.ast.exprs[argument as usize]) {
-            ExprNode.MutArg(operand) => { inner = operand; }
-            _ => {}
-        }
-        synth(c, inner, none())?;
-        return c.errorResult(span.start, span.end);
-    }
-    if (isMutArg || c.types.is(parameterType, TypeKind.Reference)) {
-        if (c.types.isStringView(parameterType) && !isMutArg) {
-            // A view is a reference to text; a view argument coerces as a value does.
-            let value = synth(c, argument, none())?;
-            return coerce(c, value, parameterType, span);
-        }
-        c.notPorted(span.start, span.end, "a reference argument", "S2")?;
-        return c.errorResult(span.start, span.end);
-    }
-    return checkExpr(c, argument, parameterType);
 }
 
 /// CheckBuiltinMemberCall: Console, Process, Cpu and Target.

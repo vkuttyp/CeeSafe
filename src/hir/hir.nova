@@ -194,6 +194,7 @@ struct HirFunction {
     isCallback: bool;
     hasInstanceError: bool;
     instanceError: Vector<u8>;
+    returnSources: Vector<u32>; // the parameters (by index) a scoped result may borrow from
 }
 
 struct HirConstant {
@@ -354,6 +355,7 @@ struct HirProgram {
             isCallback: false,
             hasInstanceError: false,
             instanceError: Vector<u8>.create(),
+            returnSources: Vector<u32>.create(),
         })?;
         return Ok(id);
     }

@@ -222,8 +222,12 @@ struct Checker {
     }
 
     /// ResolveType: the core, then the checks every resolution makes (here, --no-float).
-    fn resolveType(borrow mut this, typ: u32, allowVoid: bool) -> Result<u32, AllocError> {
-        let resolved = this.resolveTypeCore(typ, allowVoid)?;
+    fn resolveType(borrow mut this, typ: u32, allowVoid: bool) -> Result<u32, AllocError> =>
+        this.resolveTypeWith(typ, allowVoid, false);
+
+    /// ResolveType with `allowSources`: a source list `borrow(a, b) T` is allowed (a function's return type).
+    fn resolveTypeWith(borrow mut this, typ: u32, allowVoid: bool, allowSources: bool) -> Result<u32, AllocError> {
+        let resolved = this.resolveTypeCore(typ, allowVoid, allowSources)?;
         if (this.noFloat && this.types.is(resolved, TypeKind.Float)) {
             let span = this.front.ast.typeSpans[typ as usize];
             var what = Vector<u8>.create();
@@ -271,7 +275,7 @@ struct Checker {
 
     /// ResolveTypeCore for what S1 supports: built-in named types and function types. Other forms are N0216
     /// "not ported yet".
-    fn resolveTypeCore(borrow mut this, typ: u32, allowVoid: bool) -> Result<u32, AllocError> {
+    fn resolveTypeCore(borrow mut this, typ: u32, allowVoid: bool, allowSources: bool) -> Result<u32, AllocError> {
         let span = this.front.ast.typeSpans[typ as usize];
         match (this.front.ast.types[typ as usize]) {
             TypeNode.Named(q) => {
@@ -329,7 +333,10 @@ struct Checker {
             TypeNode.Function(attributes, parameters, result) => {
                 return this.resolveFunctionType(attributes, parameters, result, span);
             }
-            TypeNode.Optional(inner) => { return resolveOptionalType(this, inner); }
+            TypeNode.Optional(inner) => { return resolveOptionalType(this, inner, allowSources); }
+            TypeNode.Reference(mutable, hasSources, sources, pointee) => {
+                return resolveReferenceType(this, mutable, hasSources, sources, pointee, allowSources, span);
+            }
             TypeNode.Generic(name, arguments) => { return resolveGenericType(this, name, arguments, span); }
             _ => {
                 this.notPorted(span.start, span.end, "this kind of type", "S2-S7")?;

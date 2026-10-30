@@ -415,7 +415,11 @@ fn receiverIndex(kind: ReceiverKind) -> u32 => match (kind) {
 /// DeclareFunction for a top-level function without type parameters: its signature, and its parameters as locals.
 fn declareFunction(c: borrow mut Checker, f: u32, owner: u32) -> Result<u32, AllocError> {
     let decl = c.front.ast.functions[f as usize];
-    let returnType = if (decl.returnType == none()) c.types.voidType else c.resolveType(decl.returnType, true)?;
+    let returnType = if (decl.returnType == none()) c.types.voidType else c.resolveTypeWith(
+        decl.returnType,
+        true,
+        true,
+    )?;
     let name = c.front.ast.idents[decl.name as usize].symbol;
     let library = isLibraryFile(c);
     let function = c.hir.addFunction(name, owner, returnType, c.file, f, library)?;
@@ -457,6 +461,7 @@ fn declareFunction(c: borrow mut Checker, f: u32, owner: u32) -> Result<u32, All
         let local = c.hir.addLocal(function, id.symbol, t, false, true, id.start, id.end)?;
         c.hir.functions[function as usize].parameters.push(local)?;
     }
+    resolveFlows(c, f, function)?;
     return Ok(function);
 }
 

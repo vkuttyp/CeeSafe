@@ -1,0 +1,58 @@
+struct Point { x: i32; y: i32; }
+struct Holder { p: Point; name: i32; }
+enum Slot { Empty, Full(Point) }
+
+fn bump(p: borrow mut Point) {
+    p.x += 1;
+}
+
+fn sum(p: borrow Point) -> i32 => p.x + p.y;
+
+fn pick(a: borrow Point, b: borrow Point, first: bool) -> borrow(a, b) Point {
+    if (first) {
+        return a;
+    }
+    return b;
+}
+
+fn only(a: borrow mut Point, n: i32) -> borrow mut Point {
+    a.y = n;
+    return a;
+}
+
+fn maybe(h: borrow Holder) -> borrow Point? {
+    if (h.p.x > 0) {
+        return borrow h.p;
+    }
+    return null;
+}
+
+fn view(s: StringView) -> StringView => s;
+
+fn take(s: Slot) -> i32 => match (s) {
+    Slot.Full(p) => p.x,
+    Slot.Empty => 0,
+};
+
+fn peek(s: borrow Slot) -> i32 => match (s) {
+    Slot.Full(p) => p.x,
+    Slot.Empty => 0,
+};
+
+fn main() {
+    var p = Point { x: 1, y: 2 };
+    bump(mut p);
+    let r = borrow p;
+    let total = sum(r) + sum(p) + sum(Point { x: 3, y: 4 });
+    var h = Holder { p: p, name: 1 };
+    bump(mut h.p);
+    let m = borrow mut h;
+    bump(mut m.p);
+    let q = Point { x: 5, y: 6 };
+    let chosen = pick(borrow q, q, true);
+    let s = Slot.Full(q);
+    let n = peek(borrow s) + peek(s);
+    let t = take(move s);
+    let v = view("text");
+    let w = maybe(h);
+}

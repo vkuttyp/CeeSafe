@@ -1,0 +1,32 @@
+struct Point { x: i32; y: i32; }
+
+fn bump(p: borrow mut Point) {}
+fn look(p: borrow Point) {}
+fn number(n: i32) {}
+
+fn none1() -> borrow Point {}
+fn two(a: borrow Point, b: borrow Point) -> borrow Point => a;
+fn wrongSource(a: borrow Point, n: i32) -> borrow(n, z) Point => a;
+fn sharedToMut(a: borrow Point) -> borrow mut Point {}
+fn sharedToMut2(a: borrow Point, b: borrow mut Point) -> borrow mut(a, b) Point {}
+fn local(x: borrow(y) i32) {}
+fn refref(x: borrow borrow i32) {}
+
+fn main() {
+    let p = Point { x: 1, y: 2 };
+    var q = Point { x: 1, y: 2 };
+    bump(p);
+    bump(q);
+    bump(Point { x: 0, y: 0 });
+    look(mut q);
+    number(mut 3);
+    bump(mut p);
+    bump(mut 5);
+    look(7);
+    let r = borrow q;
+    let rr = borrow r;
+    let b = borrow mut p;
+    let c = borrow 3;
+    let d = move 3;
+    let f = move q;
+}

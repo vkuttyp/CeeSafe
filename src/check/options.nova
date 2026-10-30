@@ -27,8 +27,8 @@ fn resultOk(c: borrow Checker, typ: u32) -> u32 => c.types.enums[c.types.info(ty
 fn resultErr(c: borrow Checker, typ: u32) -> u32 => c.types.enums[c.types.info(typ).enumDef as usize].resultErr;
 
 /// `T?` (ResolveTypeCore's OptionalType case).
-fn resolveOptionalType(c: borrow mut Checker, inner: u32) -> Result<u32, AllocError> {
-    let value = c.resolveType(inner, false)?;
+fn resolveOptionalType(c: borrow mut Checker, inner: u32, allowSources: bool) -> Result<u32, AllocError> {
+    let value = c.resolveTypeWith(inner, false, allowSources)?;
     if (c.types.isBottom(value)) {
         return Ok(c.types.error);
     }
