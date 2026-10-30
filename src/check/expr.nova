@@ -144,6 +144,10 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
         ExprNode.NullLiteral => { return checkNull(c, expected, span); }
         ExprNode.Borrow(mutable, operand) => { return synthBorrow(c, mutable, operand, span); }
         ExprNode.Move(operand) => { return synthMove(c, operand, span); }
+        ExprNode.ArrayLiteral(elements) => { return synthArrayLiteral(c, elements, expected, span); }
+        ExprNode.ArrayRepeat(value, count) => { return synthArrayRepeat(c, value, count, expected, span); }
+        ExprNode.Index(target, index) => { return synthIndex(c, target, index, span); }
+        ExprNode.Slice(target, low, high) => { return synthSlice(c, target, low, high, false, span); }
         ExprNode.MutArg(_) => { return misplacedMutArgument(c, span); }
         ExprNode.Try(operand) => { return checkTry(c, operand, span); }
         ExprNode.Unwrap(operand) => { return checkUnwrap(c, operand, span); }
@@ -241,6 +245,14 @@ fn synthName(c: borrow mut Checker, name: u32, span: Span) -> Result<u32, AllocE
         }
         Entity.Constant(k) => {
             let value = evaluateConstant(c, k)?;
+            let isArray = match (c.hir.exprs[value as usize]) {
+                HirExpr.ArrayLiteral(_) => true,
+                HirExpr.ArrayRepeat(_) => true,
+                _ => false,
+            };
+            if (isArray) {
+                return constantArrayAt(c, value, span); // the whole array's value (§10)
+            }
             let t = c.hir.constants[c.constants[k as usize].hir as usize].typ;
             match (c.hir.exprs[value as usize]) {
                 HirExpr.IntConst(i) => { return c.expr(HirExpr.IntConst(i), t, span.start, span.end); }
@@ -1080,9 +1092,9 @@ fn synthMember(c: borrow mut Checker, target: u32, member: u32, span: Span) -> R
     }
     let value = autoDeref(c, synthesized)?;
     let valueType = c.typeOf(value);
-    if (c.types.is(valueType, TypeKind.Array)) {
-        c.notPorted(span.start, span.end, "an array's or slice's length", "S2e")?;
-        return c.errorResult(span.start, span.end);
+    let arrayValue = arrayMember(c, value, through, member, span)?;
+    if (arrayValue != none()) {
+        return Ok(arrayValue);
     }
     let field = resolveField(c, valueType, member)?;
     if (field == none()) {

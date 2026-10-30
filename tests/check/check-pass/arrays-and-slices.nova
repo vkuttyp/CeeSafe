@@ -1,0 +1,52 @@
+const PRIMES: [u32; 4] = [2, 3, 5, 7];
+const ZEROS: [u8; 3] = [0; 3];
+
+struct Point { x: i32; y: i32; }
+struct Grid { cells: [[u8; 3]; 2]; }
+
+fn total(xs: Slice<u32>) -> u32 {
+    var sum: u32 = 0;
+    for (x in xs) {
+        sum += x;
+    }
+    return sum + truncate<u32>(xs.length);
+}
+
+fn clear(xs: SliceMut<u8>) {
+    for (i in 0..xs.length) {
+        xs[i] = 0;
+    }
+}
+
+fn firstX(ps: Slice<Point>) -> i32 => ps[0].x;
+
+fn staticView(s: StringView<static>, xs: Slice<static, u8>, r: borrow(static) i32) -> usize => s.length + xs.length;
+
+fn main() {
+    var a = [1u32, 2, 3, 4];
+    let b: [u8; 4] = [9; 4];
+    var g = Grid { cells: [[1, 2, 3], [4, 5, 6]] };
+    g.cells[1][2] = 7;
+    let zeros = ZEROS;
+    let primes = PRIMES;
+    a[0] = PRIMES[3] + truncate<u32>(zeros.length);
+    let n = a.length + b.length;
+    let s = total(a[1..3]) + total(a[..]) + total(primes[..2]);
+    let t = total(borrow a[2..]);
+    var bytes = [0u8; 8];
+    clear(mut bytes[2..4]);
+    let hello = "hello";
+    let view = hello[1..3];
+    let points = [Point { x: 1, y: 2 }, Point { x: 3, y: 4 }];
+    let p = firstX(points[..]);
+    for (q in points) {
+        let z = q.x;
+    }
+    for (row in g.cells) {
+        let r = row[0];
+    }
+    let five = 5;
+    let sv = staticView("abc", bytes[..], five);
+    let m = borrow mut a[1..2];
+    m[0] = 3;
+}

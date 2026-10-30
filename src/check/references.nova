@@ -25,7 +25,13 @@ fn resolveReferenceType(
             }
         }
         if (namesStatic) {
-            c.notPorted(span.start, span.end, "a region argument", "S3")?;
+            // Each must name a region (CheckRegionArgument); declared regions come with S3.
+            for (k in 0..sources.count) {
+                let ident = c.front.ast.idents[c.front.ast.at(sources, k) as usize];
+                if (!sameText(c.name(ident.symbol), "static")) {
+                    unknownRegionError(c, ident)?;
+                }
+            }
         } else {
             var message = Vector<u8>.create();
             appendText(
@@ -59,13 +65,9 @@ fn resolveReferenceType(
 
 /// `borrow e` and `borrow mut e` (Synth's BorrowExpr case).
 fn synthBorrow(c: borrow mut Checker, mutable: bool, operandSyntax: u32, span: Span) -> Result<u32, AllocError> {
-    let isSlice = match (c.front.ast.exprs[operandSyntax as usize]) {
-        ExprNode.Slice(_, _, _) => true,
-        _ => false,
-    };
-    if (isSlice) {
-        c.notPorted(span.start, span.end, "a slice expression", "S2e")?;
-        return c.errorResult(span.start, span.end);
+    match (c.front.ast.exprs[operandSyntax as usize]) {
+        ExprNode.Slice(target, low, high) => { return synthSlice(c, target, low, high, mutable, span); }
+        _ => {}
     }
     let operand = synth(c, operandSyntax, none())?;
     if (c.isBottom(operand)) {
@@ -156,13 +158,14 @@ fn checkArgument(c: borrow mut Checker, argument: u32, parameterType: u32) -> Re
             synth(c, mutOperand, none())?;
             return c.errorResult(span.start, span.end);
         }
-        let isSlice = match (c.front.ast.exprs[mutOperand as usize]) {
-            ExprNode.Slice(_, _, _) => true,
-            _ => false,
-        };
-        if (isSlice && c.types.isSlice(parameterType)) {
-            c.notPorted(span.start, span.end, "a slice expression", "S2e")?;
-            return c.errorResult(span.start, span.end);
+        match (c.front.ast.exprs[mutOperand as usize]) {
+            ExprNode.Slice(target, low, high) => {
+                if (c.types.isSlice(parameterType)) {
+                    let slice = synthSlice(c, target, low, high, true, span)?;
+                    return coerce(c, slice, parameterType, span);
+                }
+            }
+            _ => {}
         }
         let hint = integerHint(c, pointee);
         var target = synth(c, mutOperand, hint)?;
@@ -498,4 +501,16 @@ fn sortU32(values: borrow mut Vector<u32>) {
             j -= 1;
         }
     }
+}
+
+fn unknownRegion() -> u32 => 273;
+
+/// N0273 for a name that is not a region in scope (CheckRegionArgument).
+fn unknownRegionError(c: borrow mut Checker, ident: Ident) -> Result<void, AllocError> {
+    var message = Vector<u8>.create();
+    appendQuotedName(mut message, c, ident.symbol)?;
+    appendText(mut message, " is not a region in scope; declare it with 'region ")?;
+    appendBytes(mut message, c.name(ident.symbol))?;
+    appendText(mut message, "' or use 'static'")?;
+    return c.error(unknownRegion(), ident.start, ident.end, message);
 }

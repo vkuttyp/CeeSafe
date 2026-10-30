@@ -114,6 +114,8 @@ fn checkProgram(
         scopeStarts: Vector<usize>.create(),
         loopDepth: 0,
         deferDepth: 0,
+        copyKnown: false,
+        pendingElements: Vector<PendingElement>.create(),
         letKeywords: Vector<LetKeyword>.create(),
     };
     // The constructor: the builtins' names, `this`, and a scratch frame's two parts.
@@ -189,6 +191,7 @@ fn checkProgram(
     resolveAllMembers(mut c)?;
     checkStructRecursion(mut c)?;
     computeCopyAndDrop(mut c)?;
+    checkPendingElements(mut c)?;
 
     for (k in 0..c.constants.length) {
         evaluateConstant(mut c, truncate<u32>(k))?;

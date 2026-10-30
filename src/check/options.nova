@@ -75,10 +75,30 @@ fn resolveGenericType(
         }
         return resultOf(c, ok, err);
     }
+    if ((sameText(n, "Slice") || sameText(n, "SliceMut")) && arguments.count == 2 && namesStaticRegion(
+        c,
+        c.front.ast.at(arguments, 0),
+    )) {
+        // `Slice<static, T>`: the region is erased (§25.5); declared regions come with S3.
+        let element = c.front.ast.at(arguments, 1);
+        let mutable = sameText(n, "SliceMut");
+        return resolveSliceType(c, element, mutable);
+    }
+    if (sameText(n, "StringView") && arguments.count == 1 && namesStaticRegion(c, c.front.ast.at(arguments, 0))) {
+        return Ok(c.types.stringView);
+    }
+    if ((sameText(n, "Slice") || sameText(n, "SliceMut")) && arguments.count == 1) {
+        let element = c.front.ast.at(arguments, 0);
+        let mutable = sameText(n, "SliceMut");
+        return resolveSliceType(c, element, mutable);
+    }
     let one = arguments.count == 1;
     let oneOrTwo = arguments.count == 1 || arguments.count == 2;
-    let known = (sameText(n, "StringView") && one) || ((sameText(n, "Slice") || sameText(n, "SliceMut")) && (one ||
-        arguments.count == 2)) || (sameText(
+    let known = (sameText(
+        n,
+        "StringView",
+    ) && one) || ((sameText(n, "Slice") || sameText(n, "SliceMut")) && arguments.count == 2 &&
+        namesRegionCandidate(c, c.front.ast.at(arguments, 0))) || (sameText(
         n,
         "Box",
     ) && oneOrTwo) || ((sameText(n, "Pool") || sameText(n, "PoolBox")) &&
@@ -473,3 +493,25 @@ fn findJump(c: borrow Checker, stmt: u32) -> u32 {
         _ => { return none(); }
     }
 }
+
+/// Is the type syntax the region name `static` (IsRegionName; declared regions come with S3)?
+fn namesStaticRegion(c: borrow Checker, typ: u32) -> bool {
+    match (c.front.ast.types[typ as usize]) {
+        TypeNode.Named(q) => {
+            if (q.parts.count != 1) {
+                return false;
+            }
+            return sameText(c.name(c.front.ast.idents[c.front.ast.at(q.parts, 0) as usize].symbol), "static");
+        }
+        _ => { return false; }
+    }
+}
+
+/// A single name that could be a declared region (S3 knows them); `static` is handled before.
+fn namesRegionCandidate(c: borrow Checker, typ: u32) -> bool => match (c.front.ast.types[typ as usize]) {
+    TypeNode.Named(q) => q.parts.count == 1 && c.types.lookup(c.name(c.front.ast.idents[c.front.ast.at(
+        q.parts,
+        0,
+    ) as usize].symbol)) == none(),
+    _ => false,
+};

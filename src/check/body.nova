@@ -435,35 +435,35 @@ fn checkFor(
     body: u32,
     span: Span,
 ) -> Result<u32, AllocError> {
-    if (endSyntax == none()) {
-        c.notPorted(span.start, span.end, "'for' over an array, slice or vector", "S2")?;
-        let error = c.errorResult(span.start, span.end)?;
-        return c.hir.addStmt(HirStmt.Expression(error), span.start, span.end);
-    }
     var start: u32 = 0;
-    var end: u32 = 0;
-    // The bounds have one integer type; a flexible literal takes the other bound's type.
-    if (isFlexible(c, startSyntax) && !isFlexible(c, endSyntax)) {
-        let e = synth(c, endSyntax, none())?;
-        end = autoDeref(c, e)?;
-        let endType = c.typeOf(end);
-        let startHint = if (c.types.is(endType, TypeKind.Integer)) endType else none();
-        start = checkExpr(c, startSyntax, startHint)?;
+    var end = none();
+    var variableType = c.types.error;
+    if (endSyntax == none()) {
+        start = forSequence(c, startSyntax, mut variableType)?;
     } else {
-        let s = synth(c, startSyntax, none())?;
-        start = autoDeref(c, s)?;
+        // The bounds have one integer type; a flexible literal takes the other bound's type.
+        if (isFlexible(c, startSyntax) && !isFlexible(c, endSyntax)) {
+            let e = synth(c, endSyntax, none())?;
+            end = autoDeref(c, e)?;
+            let endType = c.typeOf(end);
+            let startHint = if (c.types.is(endType, TypeKind.Integer)) endType else none();
+            start = checkExpr(c, startSyntax, startHint)?;
+        } else {
+            let s = synth(c, startSyntax, none())?;
+            start = autoDeref(c, s)?;
+            let startType = c.typeOf(start);
+            let endHint = if (c.types.is(startType, TypeKind.Integer)) startType else none();
+            end = checkExpr(c, endSyntax, endHint)?;
+        }
         let startType = c.typeOf(start);
-        let endHint = if (c.types.is(startType, TypeKind.Integer)) startType else none();
-        end = checkExpr(c, endSyntax, endHint)?;
-    }
-    let startType = c.typeOf(start);
-    let variableType = if (c.types.is(startType, TypeKind.Integer)) startType else c.types.error;
-    if (!c.types.isBottom(startType) && !c.types.is(startType, TypeKind.Integer)) {
-        let s = c.front.ast.exprSpans[startSyntax as usize];
-        var message = Vector<u8>.create();
-        appendText(mut message, "a range in 'for' needs integer bounds; found ")?;
-        appendQuotedType(mut message, c, startType)?;
-        c.error(typeMismatch(), s.start, s.end, message)?;
+        variableType = if (c.types.is(startType, TypeKind.Integer)) startType else c.types.error;
+        if (!c.types.isBottom(startType) && !c.types.is(startType, TypeKind.Integer)) {
+            let s = c.front.ast.exprSpans[startSyntax as usize];
+            var message = Vector<u8>.create();
+            appendText(mut message, "a range in 'for' needs integer bounds; found ")?;
+            appendQuotedType(mut message, c, startType)?;
+            c.error(typeMismatch(), s.start, s.end, message)?;
+        }
     }
     let id = c.front.ast.idents[variable as usize];
     if (c.lookupLocal(id.symbol) != none()) {

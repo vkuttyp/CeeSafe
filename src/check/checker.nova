@@ -77,6 +77,8 @@ struct Checker {
     scopeStarts: Vector<usize>;
     loopDepth: u32;
     deferDepth: u32;
+    copyKnown: bool;
+    pendingElements: Vector<PendingElement>;
     letKeywords: Vector<LetKeyword>;
 
     fn letKeywordOf(borrow this, local: u32) -> u32 {
@@ -334,6 +336,7 @@ struct Checker {
                 return this.resolveFunctionType(attributes, parameters, result, span);
             }
             TypeNode.Optional(inner) => { return resolveOptionalType(this, inner, allowSources); }
+            TypeNode.Array(element, length) => { return resolveArrayType(this, element, length); }
             TypeNode.Reference(mutable, hasSources, sources, pointee) => {
                 return resolveReferenceType(this, mutable, hasSources, sources, pointee, allowSources, span);
             }

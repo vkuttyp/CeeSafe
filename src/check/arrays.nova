@@ -1,0 +1,483 @@
+// Arrays and slices (the reference's ArrayType, CheckElement, CheckElementCopy, HasLayout, ArrayElement, SynthSlice,
+// the ArrayLiteral, ArrayRepeat, Index and Slice cases of Synth, `length` in SynthMember, `for` over an array or
+// slice in CheckFor, and constant arrays in Fold): P3 S2e. Vectors come with S3.
+
+fn invalidArray() -> u32 => 259;
+
+/// Lengths fit in 48 bits, like every size in memory-model.md §7.
+fn maxArrayLength() -> u64 => 0xFFFFFFFFFFFF;
+
+/// An element whose Copy-ness is checked once it is known (the reference's _pendingElements).
+struct PendingElement {
+    element: u32;
+    length: i64;
+    start: u32;
+    end: u32;
+    file: u32;
+}
+
+/// `[T; N]`.
+fn resolveArrayType(c: borrow mut Checker, elementSyntax: u32, lengthSyntax: u32) -> Result<u32, AllocError> {
+    // An array of C state is C-laid-out (C9, §33.1) and allowed where its element is: S7.
+    let element = c.resolveType(elementSyntax, false)?;
+    let length = arrayLength(c, lengthSyntax);
+    if (length == 0) {
+        let span = c.front.ast.exprSpans[lengthSyntax as usize];
+        arrayLengthError(c, span)?;
+        return Ok(c.types.error);
+    }
+    let elementSpan = c.front.ast.typeSpans[elementSyntax as usize];
+    return arrayType(c, element, truncate<i64>(length), elementSpan);
+}
+
+/// The length an integer literal (no suffix or `usize`) gives, or 0 if it is not one or out of range.
+fn arrayLength(c: borrow Checker, e: u32) -> u64 => match (c.front.ast.exprs[e as usize]) {
+    ExprNode.IntLiteral(value, suffix) => match (suffix) {
+        IntSuffix.None => if (value > maxArrayLength()) 0 else value,
+        IntSuffix.USize => if (value > maxArrayLength()) 0 else value,
+        _ => 0,
+    },
+    _ => 0,
+};
+
+fn arrayLengthError(c: borrow mut Checker, span: Span) -> Result<void, AllocError> {
+    var message = Vector<u8>.create();
+    appendText(mut message, "an array length must be an integer literal from 1 to ")?;
+    appendDecimal(mut message, maxArrayLength())?;
+    return c.error(invalidArray(), span.start, span.end, message);
+}
+
+/// `[element; length]` after checking the element type, or the error type (ArrayType).
+fn arrayType(c: borrow mut Checker, element: u32, length: i64, elementSpan: Span) -> Result<u32, AllocError> {
+    if (!checkElement(c, element, length, elementSpan)?) {
+        return Ok(c.types.error);
+    }
+    return c.types.arrayOf(element, length);
+}
+
+/// Can `element` be an array or slice element (CheckElement, §16.1)? References never; non-Copy types are reported
+/// once Copy-ness is known (N0259).
+fn checkElement(c: borrow mut Checker, element: u32, length: i64, span: Span) -> Result<bool, AllocError> {
+    if (c.types.isBottom(element)) {
+        return Ok(false);
+    }
+    if (c.types.isScoped(element)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "array and slice elements cannot be references in v0")?;
+        c.error(referenceNotAllowed(), span.start, span.end, message)?;
+        return Ok(false);
+    }
+    if (c.copyKnown) {
+        checkElementCopy(c, element, length, span)?;
+    } else {
+        c.pendingElements.push(
+            PendingElement { element: element, length: length, start: span.start, end: span.end, file: c.file },
+        )?;
+    }
+    return Ok(true);
+}
+
+/// The pending elements, now that Copy-ness is known.
+fn checkPendingElements(c: borrow mut Checker) -> Result<void, AllocError> {
+    c.copyKnown = true;
+    let saved = c.file;
+    for (k in 0..c.pendingElements.length) {
+        let p = c.pendingElements[k];
+        c.file = p.file;
+        checkElementCopy(c, p.element, p.length, Span { start: p.start, end: p.end })?;
+    }
+    c.file = saved;
+    return Ok();
+}
+
+fn checkElementCopy(c: borrow mut Checker, element: u32, length: i64, span: Span) -> Result<void, AllocError> {
+    // Arrays own their elements and v0 tracks no per-element moves; slices only view them (§21.3).
+    if (length >= 0 && !c.types.isCopy(element) && !c.types.isCLaidOut(element, 0)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "array and slice elements must be Copy types in v0; ")?;
+        appendQuotedType(mut message, c, element)?;
+        appendText(mut message, " is not Copy (it has a drop block or contains a move type)")?;
+        return c.error(invalidArray(), span.start, span.end, message);
+    }
+    if (length > 0 && elementHasLayout(c, element)?) {
+        let size = c.types.layoutOf(element).size;
+        // size × length > int.MaxValue, without overflow: both are below 2^63 / 2^48.
+        if (size > 0 && length > 2147483647 / size) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "an array of ")?;
+            appendDecimal(mut message, truncate<u64>(length))?;
+            appendText(mut message, " ")?;
+            appendQuotedType(mut message, c, element)?;
+            appendText(mut message, " values is larger than 2147483647 bytes")?;
+            return c.error(invalidArray(), span.start, span.end, message);
+        }
+    }
+    return Ok();
+}
+
+/// Can LayoutOf lay the type out (HasLayout)? Not if any part of it is an error or a recursive aggregate.
+fn elementHasLayout(c: borrow Checker, typ: u32) -> Result<bool, AllocError> {
+    if (c.types.isGeneric(typ) || c.types.isCLaidOut(typ, 0)) {
+        return Ok(false);
+    }
+    var inner = Vector<u32>.create();
+    var fields = Vector<u32>.create();
+    flatten(c, typ, none(), mut inner, mut fields)?;
+    for (t in inner.view()) {
+        if (c.types.is(t, TypeKind.Error)) {
+            return Ok(false);
+        }
+        let info = c.types.info(t);
+        if (info.structDef != none() && c.types.structs[info.structDef as usize].isRecursive) {
+            return Ok(false);
+        }
+        if (info.enumDef != none() && c.types.enums[info.enumDef as usize].isRecursive) {
+            return Ok(false);
+        }
+        var contained = Vector<u32>.create();
+        var containedFields = Vector<u32>.create();
+        containedTypes(c, t, mut contained, mut containedFields)?;
+        for (u in contained.view()) {
+            if (!elementHasLayout(c, u)?) {
+                return Ok(false);
+            }
+        }
+    }
+    return Ok(true);
+}
+
+/// `Slice<T>` and `SliceMut<T>`.
+fn resolveSliceType(c: borrow mut Checker, elementSyntax: u32, mutable: bool) -> Result<u32, AllocError> {
+    let element = c.resolveType(elementSyntax, false)?;
+    let elementSpan = c.front.ast.typeSpans[elementSyntax as usize];
+    if (!checkElement(c, element, -1, elementSpan)?) {
+        return Ok(c.types.error);
+    }
+    return c.types.sliceOf(element, mutable);
+}
+
+/// An array element (ArrayElement): checked against the expected element type, or its own type, auto-dereferenced.
+fn arrayElement(c: borrow mut Checker, element: u32, expected: u32) -> Result<u32, AllocError> {
+    if (expected != none()) {
+        return checkExpr(c, element, expected);
+    }
+    var value = synth(c, element, none())?;
+    // References are read through; boxes are values (§18.2). Slices and string views are not: their elements are
+    // unsized, so `["a", "b"]` has string-view elements, which CheckElement reports (N0246).
+    loop {
+        let t = c.typeOf(value);
+        if (!c.types.is(t, TypeKind.Reference) || c.types.isUnsized(c.types.info(t).pointee)) {
+            break;
+        }
+        let s = c.spanOf(value);
+        value = c.expr(HirExpr.Deref(value), c.types.info(t).pointee, s.start, s.end)?;
+    }
+    let t = c.typeOf(value);
+    if (c.types.is(t, TypeKind.Void) || c.types.is(t, TypeKind.Never)) {
+        let span = c.front.ast.exprSpans[element as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "this expression has no value (its type is ")?;
+        appendQuotedType(mut message, c, t)?;
+        appendText(mut message, ")")?;
+        c.error(voidValue(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    return Ok(value);
+}
+
+/// The element type an expected sized array gives, or none.
+fn expectedElement(c: borrow Checker, expected: u32) -> u32 {
+    if (expected == none() || !c.types.is(expected, TypeKind.Array) || c.types.isUnsized(expected)) {
+        return none();
+    }
+    return c.types.info(expected).element;
+}
+
+/// `[a, b, c]`.
+fn synthArrayLiteral(c: borrow mut Checker, elements: Range, expected: u32, span: Span) -> Result<u32, AllocError> {
+    let elementExpected = expectedElement(c, expected);
+    let firstSyntax = c.front.ast.at(elements, 0);
+    let first = arrayElement(c, firstSyntax, elementExpected)?;
+    let elementType = if (elementExpected != none()) elementExpected else c.typeOf(first);
+    var checked = Vector<u32>.create();
+    checked.push(first)?;
+    for (k in 1..elements.count) {
+        let element = c.front.ast.at(elements, k);
+        checked.push(checkExpr(c, element, elementType)?)?;
+    }
+    let firstSpan = c.front.ast.exprSpans[firstSyntax as usize];
+    let typ = arrayType(c, elementType, elements.count as i64, firstSpan)?;
+    if (c.types.isBottom(typ)) {
+        return c.errorResult(span.start, span.end);
+    }
+    let list = c.hir.list(checked.view())?;
+    return c.expr(HirExpr.ArrayLiteral(list), typ, span.start, span.end);
+}
+
+/// `[v; N]`.
+fn synthArrayRepeat(
+    c: borrow mut Checker,
+    valueSyntax: u32,
+    countSyntax: u32,
+    expected: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let elementExpected = expectedElement(c, expected);
+    let value = arrayElement(c, valueSyntax, elementExpected)?;
+    let count = arrayLength(c, countSyntax);
+    if (count == 0) {
+        let countSpan = c.front.ast.exprSpans[countSyntax as usize];
+        arrayLengthError(c, countSpan)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let elementType = if (elementExpected != none()) elementExpected else c.typeOf(value);
+    let valueSpan = c.front.ast.exprSpans[valueSyntax as usize];
+    let typ = arrayType(c, elementType, truncate<i64>(count), valueSpan)?;
+    if (c.types.isBottom(typ)) {
+        return c.errorResult(span.start, span.end);
+    }
+    return c.expr(HirExpr.ArrayRepeat(value), typ, span.start, span.end);
+}
+
+/// `a[i]`.
+fn synthIndex(c: borrow mut Checker, targetSyntax: u32, indexSyntax: u32, span: Span) -> Result<u32, AllocError> {
+    let synthesized = synth(c, targetSyntax, none())?;
+    let target = autoDeref(c, synthesized)?;
+    let usize = c.types.usize;
+    let position = checkExpr(c, indexSyntax, usize)?;
+    if (c.isBottom(target)) {
+        return Ok(target);
+    }
+    let t = c.typeOf(target);
+    if (!c.types.is(t, TypeKind.Array)) {
+        let targetSpan = c.front.ast.exprSpans[targetSyntax as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "only arrays and slices can be indexed; found ")?;
+        appendQuotedType(mut message, c, t)?;
+        c.error(typeMismatch(), targetSpan.start, targetSpan.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let element = c.types.info(t).element;
+    return c.expr(HirExpr.Index(target, position), element, span.start, span.end);
+}
+
+/// `a[lo..hi]` or `borrow mut a[lo..hi]` (SynthSlice, §16.3): a slice of an array or slice place.
+fn synthSlice(
+    c: borrow mut Checker,
+    targetSyntax: u32,
+    lowSyntax: u32,
+    highSyntax: u32,
+    mutable: bool,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let synthesized = synth(c, targetSyntax, none())?;
+    let target = autoDeref(c, synthesized)?;
+    let usize = c.types.usize;
+    let low = if (lowSyntax == none()) none() else checkExpr(c, lowSyntax, usize)?;
+    let high = if (highSyntax == none()) none() else checkExpr(c, highSyntax, usize)?;
+    if (c.isBottom(target)) {
+        return Ok(target);
+    }
+    let t = c.typeOf(target);
+    if (!c.types.is(t, TypeKind.Array)) {
+        let targetSpan = c.front.ast.exprSpans[targetSyntax as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "only arrays and slices can be sliced; found ")?;
+        appendQuotedType(mut message, c, t)?;
+        c.error(typeMismatch(), targetSpan.start, targetSpan.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let place = toPlace(c, target)?;
+    if (place == none()) {
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            "only a variable, a field, or a place reached through a reference can be sliced; bind the value to a local first",
+        )?;
+        c.error(borrowOfNonPlace(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (c.types.info(t).isStr) {
+        if (mutable) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "a 'StringView' is read-only; it cannot be sliced as mutable")?;
+            c.error(borrowMutOfImmutable(), span.start, span.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+        let view = c.types.stringView;
+        return c.expr(HirExpr.Slice(false, place, low, high), view, span.start, span.end); // checks boundaries too
+    }
+    if (mutable) {
+        var reason = Vector<u8>.create();
+        mutabilityError(c, place, mut reason)?;
+        if (reason.length > 0) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "cannot borrow ")?;
+            describePlace(c, place, mut message)?;
+            appendText(mut message, " as mutable: ")?;
+            appendBytes(mut message, reason.view())?;
+            errorWithLetToVar(c, borrowMutOfImmutable(), span.start, span.end, message, place, reason)?;
+            return c.errorResult(span.start, span.end);
+        }
+    }
+    let slice = c.types.sliceOf(c.types.info(t).element, mutable)?;
+    return c.expr(HirExpr.Slice(mutable, place, low, high), slice, span.start, span.end);
+}
+
+/// `a.length` and `s.length` (SynthMember's array case), or none when `value` is not an array or slice.
+fn arrayMember(c: borrow mut Checker, value: u32, through: u32, member: u32, span: Span) -> Result<u32, AllocError> {
+    let t = c.typeOf(value);
+    let ident = c.front.ast.idents[member as usize];
+    let isDerefOfReference = match (c.hir.exprs[value as usize]) {
+        HirExpr.Deref(reference) => c.types.is(c.typeOf(reference), TypeKind.Reference),
+        _ => false,
+    };
+    if (c.types.isUnsized(t) && isDerefOfReference && sameText(c.name(ident.symbol), "ptr")) {
+        c.notPorted(span.start, span.end, "a slice's 'ptr'", "S7")?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (!c.types.is(t, TypeKind.Array)) {
+        return Ok(none());
+    }
+    if (!sameText(c.name(ident.symbol), "length")) {
+        var message = Vector<u8>.create();
+        let throughType = c.typeOf(through);
+        if (c.types.is(throughType, TypeKind.Vector) || c.types.is(throughType, TypeKind.StableVector)) {
+            appendQuotedType(mut message, c, throughType)?;
+            appendText(mut message, " has no field ")?;
+            appendQuotedName(mut message, c, ident.symbol)?;
+            appendText(mut message, "; it has 'length'")?;
+            if (c.types.is(throughType, TypeKind.Vector)) {
+                appendText(mut message, " and 'capacity'")?;
+            }
+        } else {
+            appendQuotedType(mut message, c, t)?;
+            appendText(mut message, " has no member ")?;
+            appendQuotedName(mut message, c, ident.symbol)?;
+            appendText(mut message, "; arrays and slices only have 'length'")?;
+        }
+        c.error(unknownField(), ident.start, ident.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let usize = c.types.usize;
+    if (c.types.isUnsized(t)) {
+        let reference = match (c.hir.exprs[value as usize]) {
+            HirExpr.Deref(r) => r,
+            _ => value,
+        };
+        return c.expr(HirExpr.SliceLength(reference), usize, span.start, span.end);
+    }
+    if (toPlace(c, value)? == none()) {
+        // The constant would skip evaluating the array (and any calls in it).
+        var message = Vector<u8>.create();
+        appendText(mut message, "'length' needs an array variable or field; bind the value to a local first")?;
+        c.error(unsupported(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let length = c.types.info(t).arrayLength;
+    return c.expr(
+        HirExpr.IntConst(IntValue { negative: false, magnitude: truncate<u64>(length) }),
+        usize,
+        span.start,
+        span.end,
+    );
+}
+
+/// `for (x in a)` over an array or slice (CheckFor's sequence case): the start, and the variable's type.
+fn forSequence(c: borrow mut Checker, startSyntax: u32, variableType: borrow mut u32) -> Result<u32, AllocError> {
+    let span = c.front.ast.exprSpans[startSyntax as usize];
+    let sequence = synth(c, startSyntax, none())?;
+    var vector = sequence;
+    loop {
+        let t = c.typeOf(vector);
+        if (!c.types.is(t, TypeKind.Reference)) {
+            break;
+        }
+        let s = c.spanOf(vector);
+        vector = c.expr(HirExpr.Deref(vector), c.types.info(t).pointee, s.start, s.end)?;
+    }
+    var start = none();
+    let vt = c.typeOf(vector);
+    if (c.types.is(vt, TypeKind.StableVector)) {
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            "'for' does not iterate over a 'StableVector' (its elements are not contiguous); use 'for (i in 0..sv.length)'",
+        )?;
+        c.error(typeMismatch(), span.start, span.end, message)?;
+        start = c.errorResult(span.start, span.end)?;
+    } else if (c.types.is(vt, TypeKind.Vector) && !c.types.isString(vt)) {
+        c.notPorted(span.start, span.end, "'for' over a vector", "S3")?;
+        start = c.errorResult(span.start, span.end)?;
+    } else {
+        start = autoDeref(c, sequence)?;
+    }
+    let st = c.typeOf(start);
+    let isStr = c.types.info(st).isStr;
+    var element = if (c.types.is(st, TypeKind.Array) && !isStr) c.types.info(st).element else c.types.error;
+    if (!c.types.isBottom(element) && !c.types.isCopy(element)) {
+        element = c.types.referenceTo(element, false)?; // a non-Copy element is borrowed (§16.4, M11)
+    }
+    variableType = element;
+    if (isStr) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'for' does not iterate over a 'StringView'; iterate over its bytes with 's.bytes()'")?;
+        c.error(typeMismatch(), span.start, span.end, message)?;
+    } else if (!c.types.isBottom(st) && !c.types.is(st, TypeKind.Array)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'for' iterates over an array, a slice or a range 'a..b'; found ")?;
+        appendQuotedType(mut message, c, st)?;
+        c.error(typeMismatch(), span.start, span.end, message)?;
+    }
+    return Ok(start);
+}
+
+/// A constant array's elements, folded (Fold's array cases, §10).
+fn foldArray(c: borrow mut Checker, e: u32) -> Result<u32, AllocError> {
+    let typ = c.typeOf(e);
+    let span = c.spanOf(e);
+    match (c.hir.exprs[e as usize]) {
+        HirExpr.ArrayLiteral(elements) => {
+            var folded = Vector<u32>.create();
+            var failed = false;
+            for (k in 0..elements.count) {
+                let element = c.hir.at(elements, k);
+                let value = fold(c, element)?;
+                if (isErrorExpr(c, value)) {
+                    failed = true;
+                }
+                folded.push(value)?;
+            }
+            if (failed) {
+                return c.errorResult(span.start, span.end);
+            }
+            let list = c.hir.list(folded.view())?;
+            return c.expr(HirExpr.ArrayLiteral(list), typ, span.start, span.end);
+        }
+        HirExpr.ArrayRepeat(value) => {
+            let folded = fold(c, value)?;
+            if (isErrorExpr(c, folded)) {
+                return c.errorResult(span.start, span.end);
+            }
+            return c.expr(HirExpr.ArrayRepeat(folded), typ, span.start, span.end);
+        }
+        _ => { return Ok(e); }
+    }
+}
+
+fn isErrorExpr(c: borrow Checker, e: u32) -> bool => match (c.hir.exprs[e as usize]) {
+    HirExpr.Error => true,
+    _ => false,
+};
+
+/// A constant array's value where its name is used, with the name's span (§10).
+fn constantArrayAt(c: borrow mut Checker, value: u32, span: Span) -> Result<u32, AllocError> {
+    let typ = c.typeOf(value);
+    match (c.hir.exprs[value as usize]) {
+        HirExpr.ArrayLiteral(elements) => {
+            return c.expr(HirExpr.ArrayLiteral(elements), typ, span.start, span.end);
+        }
+        HirExpr.ArrayRepeat(element) => { return c.expr(HirExpr.ArrayRepeat(element), typ, span.start, span.end); }
+        _ => { return c.errorResult(span.start, span.end); }
+    }
+}

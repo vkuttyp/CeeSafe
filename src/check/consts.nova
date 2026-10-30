@@ -141,14 +141,8 @@ fn fold(c: borrow mut Checker, e: u32) -> Result<u32, AllocError> {
                 _ => { return Ok(folded); }
             }
         }
-        HirExpr.ArrayLiteral(_) => {
-            c.notPorted(span.start, span.end, "a constant array", "S2")?;
-            return c.errorResult(span.start, span.end);
-        }
-        HirExpr.ArrayRepeat(_) => {
-            c.notPorted(span.start, span.end, "a constant array", "S2")?;
-            return c.errorResult(span.start, span.end);
-        }
+        HirExpr.ArrayLiteral(_) => { return foldArray(c, e); } // a constant array (§10)
+        HirExpr.ArrayRepeat(_) => { return foldArray(c, e); }
         HirExpr.Call(_, _) => {
             var message = Vector<u8>.create();
             appendText(mut message, "constant expressions cannot contain calls")?;

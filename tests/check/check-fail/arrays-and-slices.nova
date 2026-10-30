@@ -1,0 +1,43 @@
+struct Res { n: i32; drop { } }
+struct Big { data: [u64; 1000]; }
+
+const BAD: [u8; 2] = [1, 300];
+const ZEROS: [u8; 3] = [0; 3];
+
+fn f(xs: Slice<borrow i32>) {}
+fn g(xs: [Res; 2]) {}
+fn h(xs: Slice<Res>) {}
+fn k(xs: [u8; 0]) {}
+fn l(xs: [u8; 3u8]) {}
+fn m(xs: Slice<i32, i32>) {}
+fn n(xs: Slice<static, i32>) {}
+fn o(xs: [[Big; 1000]; 1000]) {}
+fn p() -> [u8; 2] => [1, 2];
+fn mixed(r: borrow(static, q) i32) {}
+
+fn main() {
+    let a = [1, 2, 3];
+    let x = 5;
+    let i = x[0];
+    let j = x[0..1];
+    let s = p()[0..1];
+    let q = [1, 2][1];
+    let w = p().length;
+    let v = a.size;
+    let ss = a[..];
+    let t = ss.width;
+    let u = borrow mut a[0..1];
+    let sv = "abc";
+    let sm = borrow mut sv[0..1];
+    for (c in sv) {}
+    for (e in x) {}
+    let e = [main()];
+    let r = [Console.writeLine("a"); 2];
+    let z = [1; 0];
+    let views = ["a", "b"];
+    let bad = [1, true];
+    let idx = a[true];
+    let zl = ZEROS.length;
+    let zs = ZEROS[..2];
+    let view = "hello"[1..3];
+}
