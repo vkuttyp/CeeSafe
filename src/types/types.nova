@@ -1,0 +1,1884 @@
+// Types (the reference's Semantics/Types.cs). A type is an index into `TypeTable.types`. The reference compares types
+// by reference, so here a type's identity is its index, and `TypeTable` interns structural types as the reference's
+// dictionaries do. A type's name is fixed when it is created, as in the reference (its `ToString`), because the HIR
+// dump prints it. Struct and enum definitions, fields and variants live in their own tables; a definition's
+// syntax is the index of its AST item.
+
+enum TypeKind {
+    Integer,
+    Float,
+    Bool,
+    Void,
+    Never,
+    Error,
+    Struct,
+    Enum,
+    Reference,
+    Array,
+    Box,
+    Region,
+    Vector,
+    StableVector,
+    SlotMap,
+    Handle,
+    Resource,
+    TypeParameter,
+    RawPointer,
+    CChar,
+    FunctionPointer,
+    Function,
+    Closure,
+    Thread,
+    Dyn,
+}
+
+fn typeKindIndex(kind: TypeKind) -> u32 => match (kind) {
+    TypeKind.Integer => 0,
+    TypeKind.Float => 1,
+    TypeKind.Bool => 2,
+    TypeKind.Void => 3,
+    TypeKind.Never => 4,
+    TypeKind.Error => 5,
+    TypeKind.Struct => 6,
+    TypeKind.Enum => 7,
+    TypeKind.Reference => 8,
+    TypeKind.Array => 9,
+    TypeKind.Box => 10,
+    TypeKind.Region => 11,
+    TypeKind.Vector => 12,
+    TypeKind.StableVector => 13,
+    TypeKind.SlotMap => 14,
+    TypeKind.Handle => 15,
+    TypeKind.Resource => 16,
+    TypeKind.TypeParameter => 17,
+    TypeKind.RawPointer => 18,
+    TypeKind.CChar => 19,
+    TypeKind.FunctionPointer => 20,
+    TypeKind.Function => 21,
+    TypeKind.Closure => 22,
+    TypeKind.Thread => 23,
+    TypeKind.Dyn => 24,
+};
+
+fn isKind(a: TypeKind, b: TypeKind) -> bool => typeKindIndex(a) == typeKindIndex(b);
+
+enum RegionKind {
+    None,
+    Arena,
+    FixedBuffer,
+    ScratchFrame,
+    Pool,
+}
+
+fn regionIndex(region: RegionKind) -> u32 => match (region) {
+    RegionKind.None => 0,
+    RegionKind.Arena => 1,
+    RegionKind.FixedBuffer => 2,
+    RegionKind.ScratchFrame => 3,
+    RegionKind.Pool => 4,
+};
+
+enum ResourceKind {
+    None,
+    File,
+    TcpListener,
+    TcpStream,
+}
+
+/// The effect flags of a function or closure type (Hir.cs `Effects`): sleep is 1, alloc 2.
+fn allEffects() -> u32 => 3;
+
+/// One type. Which fields mean something depends on `kind`, as for the reference's NovaType properties; an unused
+/// index is none().
+struct TypeInfo {
+    kind: TypeKind;
+    name: Range; // in TypeTable.names
+    bits: u32;   // integers and floats
+    signed: bool;
+    pointee: u32;     // references, raw pointers, boxes; for vectors and stable vectors, the unsized [T] or str
+    element: u32;     // arrays, regions (Pool), slot maps, handles, threads
+    allocator: u32;   // boxes and containers
+    arrayLength: i64; // -1 for the unsized [T]
+    isStr: bool;
+    mutableReference: bool;
+    mutablePointer: bool;
+    region: RegionKind;
+    resource: ResourceKind;
+    parameters: Range; // function pointer, function, closure and dyn fn types: parameter types, in TypeTable.lists
+    result: u32;
+    effects: u32;
+    dynInterface: u32; // an index into TypeTable.bounds for `dyn I`; none for `dyn fn`
+    sendDyn: bool;
+    mutableDynFunction: bool;
+    structDef: u32;     // TypeTable.structs
+    enumDef: u32;       // TypeTable.enums
+    typeParameter: u32; // TypeTable.typeParameters
+    libraryUse: bool;
+    usedOutsideHostedLibrary: bool;
+}
+
+/// An interface bound `I<Args>` (InterfaceBound): the checker's interface entry and the arguments.
+struct InterfaceBound {
+    interfaceEntry: u32;
+    name: Range;      // the interface's name, in TypeTable.names
+    arguments: Range; // types, in TypeTable.lists
+}
+
+/// A type parameter's bounds and marker bounds.
+struct TypeParameterInfo {
+    bounds: Vector<u32>; // TypeTable.bounds
+    copyBound: bool;
+    sendBound: bool;
+    shareBound: bool;
+}
+
+struct StructField {
+    name: u32; // a symbol
+    typ: u32;
+    index: u32;
+    start: u32;
+    end: u32;
+    offset: u32;
+    hasNovaCName: bool;
+    hasCName: bool;
+    cName: Range; // in TypeTable.names
+    isPrivate: bool;
+    isPublic: bool;
+    isRegionPart: bool;
+}
+
+struct StructDefinition {
+    item: u32; // the AST item, or none
+    file: u32;
+    fields: Vector<u32>;        // TypeTable.fields
+    functions: Vector<u32>;     // HIR functions, in insertion order (the reference's Functions dictionary)
+    functionNames: Vector<u32>; // their symbols, parallel
+    typeArguments: Range;
+    hasRegionParameters: bool;
+    isRecursive: bool;
+    isReprC: bool;
+    isThreadSafe: bool;
+    isClosureEnvironment: bool;
+    isMoveEnvironment: bool;
+    closureId: u32;
+    allocateMethod: u32;
+    deallocateMethod: u32;
+    isImported: bool;
+    placedMethod: u32;
+    hasCSpelling: bool;
+    cSpelling: Range;
+    isAtomicContext: bool;
+    isNonCopy: bool;
+    explicitAlign: u32;
+    dropFunction: u32;
+    isCopy: bool;
+    needsDrop: bool;
+    hasLayout: bool;
+    size: u32;
+    align: u32;
+}
+
+struct EnumVariant {
+    name: u32; // a symbol
+    index: u32;
+    start: u32;
+    end: u32;
+    payload: Vector<u32>; // TypeTable.fields
+}
+
+struct EnumDefinition {
+    item: u32; // the AST item; none for Result and optionals
+    file: u32;
+    resultOk: u32; // Result<T, E>: T and E; none otherwise
+    resultErr: u32;
+    typeArguments: Range;
+    optionType: u32; // T?: T; none otherwise
+    hasRegionParameters: bool;
+    variants: Vector<u32>; // TypeTable.variants
+    isCopy: bool;
+    needsDrop: bool;
+    isRecursive: bool;
+    repr: u32; // the integer type of @repr(uN), or none
+    hasLayout: bool;
+    size: u32;
+    align: u32;
+    tagSize: u32;
+    unionOffset: i64;
+}
+
+/// A key of two numbers, for interning by identity.
+struct PairKey {
+    a: u64;
+    b: u64;
+}
+
+impl Key<PairKey> for PairKey {
+    fn hashCode(borrow this) -> u64 => this.a.wrappingMul(0x9E3779B97F4A7C15) ^ this.b.wrappingAdd(0x632BE59BD9B4E019);
+
+    fn sameAs(borrow this, other: borrow PairKey) -> bool => this.a == other.a && this.b == other.b;
+}
+
+fn pairKey(a: u64, b: u64) -> PairKey => PairKey { a: a, b: b };
+
+/// Layout facts that depend on the target (TargetInfo): only `isize`/`usize`.
+struct TargetInfo {
+    pointerBits: u32;
+}
+
+fn lp64() -> TargetInfo => TargetInfo { pointerBits: 64 };
+
+struct SizeAlign {
+    size: i64; // -1 for the unsized [T], as the reference computes it
+    align: u32;
+}
+
+fn sizeAlign(size: u32, align: u32) -> SizeAlign => SizeAlign { size: size as i64, align: align };
+
+struct TypeTable {
+    types: Vector<TypeInfo>;
+    names: Vector<u8>;
+    lists: Vector<u32>;
+    bounds: Vector<InterfaceBound>;
+    typeParameters: Vector<TypeParameterInfo>;
+    fields: Vector<StructField>;
+    variants: Vector<EnumVariant>;
+    structs: Vector<StructDefinition>;
+    enums: Vector<EnumDefinition>;
+
+    i8: u32;
+    i16: u32;
+    i32: u32;
+    i64: u32;
+    isize: u32;
+    u8: u32;
+    u16: u32;
+    u32: u32;
+    u64: u32;
+    usize: u32;
+    f32: u32;
+    f64: u32;
+    boolType: u32;
+    voidType: u32;
+    never: u32;
+    str: u32;
+    error: u32;
+    arena: u32;
+    fixedBufferAllocator: u32;
+    scratchFrame: u32;
+    file: u32;
+    cchar: u32;
+    tcpListener: u32;
+    tcpStream: u32;
+    stringView: u32;
+
+    byName: Map<Bytes, u32>;
+    references: Map<PairKey, u32>;
+    arrays: Map<PairKey, u32>;
+    pointers: Map<PairKey, u32>;
+    results: Map<PairKey, u32>;
+    boxes: Map<PairKey, u32>;
+    options: Map<PairKey, u32>;
+    pools: Map<PairKey, u32>;
+    vectors: Map<PairKey, u32>;
+    containers: Map<Bytes, u32>;
+    functionPointers: Map<Bytes, u32>;
+    functionTypes: Map<Bytes, u32>;
+    closures: Map<Bytes, u32>;
+    dyns: Map<Bytes, u32>;
+
+    // Creation-order lists for the C backend (deterministic because checking order is).
+    composites: Vector<u32>;
+    functionPointerList: Vector<u32>;
+    functionList: Vector<u32>;
+    closureList: Vector<u32>;
+    dynList: Vector<u32>;
+    threadList: Vector<u32>;
+
+    /// Set while the checker checks lib/std (§38.5): composites asked for only then are emitted only where used.
+    inHostedLibrary: bool;
+
+    fn info(borrow this, id: u32) -> TypeInfo => this.types[id as usize];
+
+    fn name(borrow this, id: u32) -> Slice<u8> {
+        let r = this.types[id as usize].name;
+        return this.names[(r.start as usize)..((r.start + r.count) as usize)];
+    }
+
+    fn rangeText(borrow this, r: Range) -> Slice<u8> =>
+        this.names[(r.start as usize)..((r.start + r.count) as usize)];
+
+    fn listAt(borrow this, r: Range, k: u32) -> u32 => this.lists[(r.start + k) as usize];
+
+    fn addName(borrow mut this, text: borrow Vector<u8>) -> Result<Range, AllocError> {
+        let start = truncate<u32>(this.names.length);
+        appendBytes(mut this.names, text.view())?;
+        return Ok(Range { start: start, count: truncate<u32>(text.length) });
+    }
+
+    fn addList(borrow mut this, ids: Slice<u32>) -> Result<Range, AllocError> {
+        let start = truncate<u32>(this.lists.length);
+        for (id in ids) {
+            this.lists.push(id)?;
+        }
+        return Ok(Range { start: start, count: truncate<u32>(ids.length) });
+    }
+
+    fn add(borrow mut this, info: TypeInfo) -> Result<u32, AllocError> {
+        this.types.push(info)?;
+        return Ok(truncate<u32>(this.types.length - 1));
+    }
+
+    /// Marks a composite as asked for outside lib/std (TypeTable.Touch).
+    fn touch(borrow mut this, id: u32) -> u32 {
+        if (!this.inHostedLibrary) {
+            this.types[id as usize].usedOutsideHostedLibrary = true;
+        }
+        return id;
+    }
+
+    // ---- Queries (NovaType's properties) ----
+
+    fn kindOf(borrow this, id: u32) -> TypeKind => this.types[id as usize].kind;
+
+    fn is(borrow this, id: u32, kind: TypeKind) -> bool => isKind(this.types[id as usize].kind, kind);
+
+    fn isUnsized(borrow this, id: u32) -> bool =>
+        this.is(id, TypeKind.Array) && this.types[id as usize].arrayLength < 0;
+
+    fn isSlice(borrow this, id: u32) -> bool =>
+        this.is(id, TypeKind.Reference) && this.isUnsized(this.types[id as usize].pointee);
+
+    fn isStringView(borrow this, id: u32) -> bool =>
+        this.is(id, TypeKind.Reference) && this.types[this.types[id as usize].pointee as usize].isStr;
+
+    fn isString(borrow this, id: u32) -> bool =>
+        this.is(id, TypeKind.Vector) && this.types[this.types[id as usize].pointee as usize].isStr;
+
+    fn isDyn(borrow this, id: u32) -> bool => this.is(id, TypeKind.Dyn);
+
+    fn isDynReference(borrow this, id: u32) -> bool =>
+        this.is(id, TypeKind.Reference) && this.isDyn(this.types[id as usize].pointee);
+
+    fn isDynBox(borrow this, id: u32) -> bool =>
+        this.is(id, TypeKind.Box) && this.isDyn(this.types[id as usize].pointee);
+
+    fn isClosure(borrow this, id: u32) -> bool =>
+        this.is(id, TypeKind.Reference) && this.is(this.types[id as usize].pointee, TypeKind.Closure);
+
+    fn isPoolBox(borrow this, id: u32) -> bool {
+        let t = this.types[id as usize];
+        return isKind(t.kind, TypeKind.Box) && regionIndex(
+            this.types[t.allocator as usize].region,
+        ) == regionIndex(RegionKind.Pool);
+    }
+
+    fn isBottom(borrow this, id: u32) -> bool => this.is(id, TypeKind.Error) || this.is(id, TypeKind.Never);
+
+    fn optionType(borrow this, id: u32) -> u32 {
+        let e = this.types[id as usize].enumDef;
+        return if (e == none()) none() else this.enums[e as usize].optionType;
+    }
+
+    /// Does the type mention a type parameter (§20.3)?
+    fn isGeneric(borrow this, id: u32) -> bool {
+        let t = this.types[id as usize];
+        if (isKind(t.kind, TypeKind.TypeParameter)) {
+            return true;
+        }
+        if ((t.pointee != none() && this.isGeneric(t.pointee)) || (t.element != none() && this.isGeneric(t.element))) {
+            return true;
+        }
+        if (t.structDef != none() && this.anyGeneric(this.structs[t.structDef as usize].typeArguments)) {
+            return true;
+        }
+        if (t.enumDef != none()) {
+            let e = borrow this.enums[t.enumDef as usize];
+            if (this.anyGeneric(e.typeArguments)) {
+                return true;
+            }
+            if (e.resultOk != none() && (this.isGeneric(e.resultOk) || this.isGeneric(e.resultErr))) {
+                return true;
+            }
+            if (e.optionType != none() && this.isGeneric(e.optionType)) {
+                return true;
+            }
+        }
+        if (t.dynInterface != none() && this.anyGeneric(this.bounds[t.dynInterface as usize].arguments)) {
+            return true;
+        }
+        return this.anyGeneric(t.parameters) || (t.result != none() && this.isGeneric(t.result));
+    }
+
+    fn anyGeneric(borrow this, r: Range) -> bool {
+        for (k in 0..r.count) {
+            if (this.isGeneric(this.listAt(r, k))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// `value >= Min && value <= Max` for an integer type.
+    fn fits(borrow this, id: u32, value: borrow BigInt) -> bool {
+        let t = this.types[id as usize];
+        return value.fits(t.bits as usize, t.signed);
+    }
+
+    fn lookup(borrow this, name: Slice<u8>) -> u32 {
+        let key = Bytes.from(name);
+        match (key) {
+            Ok(k) => {
+                match (this.byName.get(k)) {
+                    Some(id) => { return id; }
+                    null => { return none(); }
+                }
+            }
+            Err(_) => { return none(); }
+        }
+    }
+
+    // ---- Creation and interning (TypeTable's constructor and factories) ----
+
+    fn create(target: TargetInfo) -> Result<TypeTable, AllocError> {
+        var table = TypeTable {
+            types: Vector<TypeInfo>.create(),
+            names: Vector<u8>.create(),
+            lists: Vector<u32>.create(),
+            bounds: Vector<InterfaceBound>.create(),
+            typeParameters: Vector<TypeParameterInfo>.create(),
+            fields: Vector<StructField>.create(),
+            variants: Vector<EnumVariant>.create(),
+            structs: Vector<StructDefinition>.create(),
+            enums: Vector<EnumDefinition>.create(),
+            i8: 0,
+            i16: 0,
+            i32: 0,
+            i64: 0,
+            isize: 0,
+            u8: 0,
+            u16: 0,
+            u32: 0,
+            u64: 0,
+            usize: 0,
+            f32: 0,
+            f64: 0,
+            boolType: 0,
+            voidType: 0,
+            never: 0,
+            str: 0,
+            error: 0,
+            arena: 0,
+            fixedBufferAllocator: 0,
+            scratchFrame: 0,
+            file: 0,
+            cchar: 0,
+            tcpListener: 0,
+            tcpStream: 0,
+            stringView: 0,
+            byName: Map<Bytes, u32>.create(),
+            references: Map<PairKey, u32>.create(),
+            arrays: Map<PairKey, u32>.create(),
+            pointers: Map<PairKey, u32>.create(),
+            results: Map<PairKey, u32>.create(),
+            boxes: Map<PairKey, u32>.create(),
+            options: Map<PairKey, u32>.create(),
+            pools: Map<PairKey, u32>.create(),
+            vectors: Map<PairKey, u32>.create(),
+            containers: Map<Bytes, u32>.create(),
+            functionPointers: Map<Bytes, u32>.create(),
+            functionTypes: Map<Bytes, u32>.create(),
+            closures: Map<Bytes, u32>.create(),
+            dyns: Map<Bytes, u32>.create(),
+            composites: Vector<u32>.create(),
+            functionPointerList: Vector<u32>.create(),
+            functionList: Vector<u32>.create(),
+            closureList: Vector<u32>.create(),
+            dynList: Vector<u32>.create(),
+            threadList: Vector<u32>.create(),
+            inHostedLibrary: false,
+        };
+        table.i8 = table.integer("i8", 8, true)?;
+        table.i16 = table.integer("i16", 16, true)?;
+        table.i32 = table.integer("i32", 32, true)?;
+        table.i64 = table.integer("i64", 64, true)?;
+        table.isize = table.integer("isize", target.pointerBits, true)?;
+        table.u8 = table.integer("u8", 8, false)?;
+        table.u16 = table.integer("u16", 16, false)?;
+        table.u32 = table.integer("u32", 32, false)?;
+        table.u64 = table.integer("u64", 64, false)?;
+        table.usize = table.integer("usize", target.pointerBits, false)?;
+        table.f32 = table.simple(TypeKind.Float, "f32", 32)?;
+        table.f64 = table.simple(TypeKind.Float, "f64", 64)?;
+        table.boolType = table.simple(TypeKind.Bool, "bool", 0)?;
+        table.voidType = table.simple(TypeKind.Void, "void", 0)?;
+        table.never = table.simple(TypeKind.Never, "never", 0)?;
+        let strName = table.nameOf("str")?;
+        var strInfo = blankType(TypeKind.Array, strName);
+        strInfo.element = table.u8;
+        strInfo.arrayLength = -1;
+        strInfo.isStr = true;
+        table.str = table.add(strInfo)?;
+        table.error = table.simple(TypeKind.Error, "<error>", 0)?;
+        table.arena = table.regionType(RegionKind.Arena, "Arena")?;
+        table.fixedBufferAllocator = table.regionType(RegionKind.FixedBuffer, "FixedBufferAllocator")?;
+        table.scratchFrame = table.regionType(RegionKind.ScratchFrame, "ScratchFrame")?;
+        table.file = table.resourceType(ResourceKind.File, "File")?;
+        table.cchar = table.simple(TypeKind.CChar, "CChar", 0)?;
+        table.tcpListener = table.resourceType(ResourceKind.TcpListener, "TcpListener")?;
+        table.tcpStream = table.resourceType(ResourceKind.TcpStream, "TcpStream")?;
+        let named: [u32; 21] = [
+            table.i8,
+            table.i16,
+            table.i32,
+            table.i64,
+            table.isize,
+            table.u8,
+            table.u16,
+            table.u32,
+            table.u64,
+            table.usize,
+            table.f32,
+            table.f64,
+            table.boolType,
+            table.voidType,
+            table.cchar,
+            table.arena,
+            table.fixedBufferAllocator,
+            table.scratchFrame,
+            table.file,
+            table.tcpListener,
+            table.tcpStream,
+        ];
+        for (id in named) {
+            let key = Bytes.from(table.name(id))?;
+            table.byName.put(key, id)?;
+        }
+        let str = table.str;
+        let view = table.referenceTo(str, false)?;
+        table.stringView = view;
+        let viewName = Bytes.from(table.name(view))?;
+        table.byName.put(viewName, view)?;
+        return Ok(table);
+    }
+
+    fn nameOf(borrow mut this, text: StringView) -> Result<Range, AllocError> {
+        var bytes = Vector<u8>.create();
+        appendText(mut bytes, text)?;
+        return this.addName(bytes);
+    }
+
+    fn integer(borrow mut this, text: StringView, bits: u32, signed: bool) -> Result<u32, AllocError> {
+        var info = blankType(TypeKind.Integer, this.nameOf(text)?);
+        info.bits = bits;
+        info.signed = signed;
+        return this.add(info);
+    }
+
+    fn simple(borrow mut this, kind: TypeKind, text: StringView, bits: u32) -> Result<u32, AllocError> {
+        var info = blankType(kind, this.nameOf(text)?);
+        info.bits = bits;
+        return this.add(info);
+    }
+
+    fn regionType(borrow mut this, region: RegionKind, text: StringView) -> Result<u32, AllocError> {
+        var info = blankType(TypeKind.Region, this.nameOf(text)?);
+        info.region = region;
+        return this.add(info);
+    }
+
+    fn resourceType(borrow mut this, resource: ResourceKind, text: StringView) -> Result<u32, AllocError> {
+        var info = blankType(TypeKind.Resource, this.nameOf(text)?);
+        info.resource = resource;
+        return this.add(info);
+    }
+
+    /// Appends a type's name.
+    fn appendName(borrow this, out: borrow mut Vector<u8>, id: u32) -> Result<void, AllocError> =>
+        appendBytes(out, this.name(id));
+
+    /// `a, b, c`: the names of a list of types.
+    fn appendNames(borrow this, out: borrow mut Vector<u8>, ids: Slice<u32>) -> Result<void, AllocError> {
+        for (k in 0..ids.length) {
+            if (k > 0) {
+                appendText(out, ", ")?;
+            }
+            this.appendName(out, ids[k])?;
+        }
+        return Ok();
+    }
+
+    /// The unique reference type to `pointee` (ReferenceTo). Its name is `StringView`, `Slice<T>`, `SliceMut<T>`,
+    /// `borrow T`, `borrow mut T`, or `borrow (T?)` for a reference to an optional.
+    fn referenceTo(borrow mut this, pointee: u32, mutable: bool) -> Result<u32, AllocError> {
+        let key = pairKey(pointee as u64, if (mutable) 1 else 0);
+        let found = foundIn(this.references, key);
+        if (found != none()) {
+            return Ok(this.touch(found));
+        }
+        var name = Vector<u8>.create();
+        let target = this.types[pointee as usize];
+        if (target.isStr) {
+            appendText(mut name, "StringView")?;
+        } else if (this.isUnsized(pointee)) {
+            appendText(mut name, if (mutable) "SliceMut<" else "Slice<")?;
+            this.appendName(mut name, target.element)?;
+            appendText(mut name, ">")?;
+        } else {
+            appendText(mut name, if (mutable) "borrow mut " else "borrow ")?;
+            if (this.optionType(pointee) != none()) {
+                appendText(mut name, "(")?;
+                this.appendName(mut name, pointee)?;
+                appendText(mut name, ")")?;
+            } else {
+                this.appendName(mut name, pointee)?;
+            }
+        }
+        var info = blankType(TypeKind.Reference, this.addName(name)?);
+        info.pointee = pointee;
+        info.mutableReference = mutable;
+        let id = this.add(info)?;
+        this.references.put(key, id)?;
+        if (this.isUnsized(pointee)) {
+            this.composites.push(id)?;
+        }
+        return Ok(this.touch(id));
+    }
+
+    /// The unique `*T` or `*mut T` (PointerTo).
+    fn pointerTo(borrow mut this, pointee: u32, mutable: bool) -> Result<u32, AllocError> {
+        let key = pairKey(pointee as u64, if (mutable) 1 else 0);
+        let found = foundIn(this.pointers, key);
+        if (found != none()) {
+            return Ok(found);
+        }
+        var name = Vector<u8>.create();
+        appendText(mut name, if (mutable) "*mut " else "*")?;
+        this.appendName(mut name, pointee)?;
+        var info = blankType(TypeKind.RawPointer, this.addName(name)?);
+        info.pointee = pointee;
+        info.mutablePointer = mutable;
+        let id = this.add(info)?;
+        this.pointers.put(key, id)?;
+        return Ok(id);
+    }
+
+    /// The unique `[T; N]`, or `[T]` when `length` is -1 (ArrayOf).
+    fn arrayOf(borrow mut this, element: u32, length: i64) -> Result<u32, AllocError> {
+        let key = pairKey(element as u64, truncate<u64>(length));
+        let found = foundIn(this.arrays, key);
+        if (found != none()) {
+            return Ok(this.touch(found));
+        }
+        var name = Vector<u8>.create();
+        appendText(mut name, "[")?;
+        this.appendName(mut name, element)?;
+        if (length >= 0) {
+            appendText(mut name, "; ")?;
+            appendDecimal(mut name, truncate<u64>(length))?;
+        }
+        appendText(mut name, "]")?;
+        var info = blankType(TypeKind.Array, this.addName(name)?);
+        info.element = element;
+        info.arrayLength = length;
+        let id = this.add(info)?;
+        this.arrays.put(key, id)?;
+        if (length >= 0) {
+            this.composites.push(id)?;
+        }
+        return Ok(this.touch(id));
+    }
+
+    /// `Slice<T>` or `SliceMut<T>`.
+    fn sliceOf(borrow mut this, element: u32, mutable: bool) -> Result<u32, AllocError> {
+        let unsized = this.arrayOf(element, -1)?;
+        return this.referenceTo(unsized, mutable);
+    }
+
+    fn addEnum(borrow mut this, definition: EnumDefinition, name: borrow Vector<u8>) -> Result<u32, AllocError> {
+        this.enums.push(definition)?;
+        var info = blankType(TypeKind.Enum, this.addName(name)?);
+        info.enumDef = truncate<u32>(this.enums.length - 1);
+        return this.add(info);
+    }
+
+    fn addVariant(borrow mut this, name: u32, index: u32, payload: u32, payloadName: u32) -> Result<u32, AllocError> {
+        var fields = Vector<u32>.create();
+        if (payload != none()) {
+            this.fields.push(StructField {
+                name: payloadName,
+                typ: payload,
+                index: 0,
+                start: 0,
+                end: 0,
+                offset: 0,
+                hasNovaCName: false,
+                hasCName: false,
+                cName: emptyRange(),
+                isPrivate: false,
+                isPublic: false,
+                isRegionPart: false,
+            })?;
+            fields.push(truncate<u32>(this.fields.length - 1))?;
+        }
+        this.variants.push(EnumVariant { name: name, index: index, start: 0, end: 0, payload: fields })?;
+        return Ok(truncate<u32>(this.variants.length - 1));
+    }
+
+    /// The unique optional `value?` (OptionOf): an enum with variants `null` (0) and `Some(value)` (1).
+    fn optionOf(
+        borrow mut this,
+        value: u32,
+        nullName: u32,
+        someName: u32,
+        payloadName: u32,
+    ) -> Result<u32, AllocError> {
+        let key = pairKey(value as u64, 0);
+        let found = foundIn(this.options, key);
+        if (found != none()) {
+            return Ok(this.touch(found));
+        }
+        var variants = Vector<u32>.create();
+        variants.push(this.addVariant(nullName, 0, none(), 0)?)?;
+        variants.push(this.addVariant(someName, 1, value, payloadName)?)?;
+        var name = Vector<u8>.create();
+        this.appendName(mut name, value)?;
+        appendText(mut name, "?")?;
+        var definition = blankEnum(none(), none());
+        definition.optionType = value;
+        definition.variants = variants;
+        let id = this.addEnum(definition, name)?;
+        this.options.put(key, id)?;
+        this.composites.push(id)?;
+        return Ok(this.touch(id));
+    }
+
+    /// The unique `Result<ok, err>` (ResultOf): variants `Ok(ok)` (no payload for void) and `Err(err)`.
+    fn resultOf(
+        borrow mut this,
+        ok: u32,
+        err: u32,
+        okName: u32,
+        errName: u32,
+        payloadName: u32,
+    ) -> Result<u32, AllocError> {
+        let key = pairKey(ok as u64, err as u64);
+        let found = foundIn(this.results, key);
+        if (found != none()) {
+            return Ok(this.touch(found));
+        }
+        var variants = Vector<u32>.create();
+        let okPayload = if (this.is(ok, TypeKind.Void)) none() else ok;
+        variants.push(this.addVariant(okName, 0, okPayload, payloadName)?)?;
+        variants.push(this.addVariant(errName, 1, err, payloadName)?)?;
+        var name = Vector<u8>.create();
+        appendText(mut name, "Result<")?;
+        this.appendName(mut name, ok)?;
+        appendText(mut name, ", ")?;
+        this.appendName(mut name, err)?;
+        appendText(mut name, ">")?;
+        var definition = blankEnum(none(), none());
+        definition.resultOk = ok;
+        definition.resultErr = err;
+        definition.variants = variants;
+        let id = this.addEnum(definition, name)?;
+        this.results.put(key, id)?;
+        this.composites.push(id)?;
+        return Ok(this.touch(id));
+    }
+
+    /// The unique `Pool<T>` (PoolOf).
+    fn poolOf(borrow mut this, element: u32) -> Result<u32, AllocError> {
+        let key = pairKey(element as u64, 0);
+        let found = foundIn(this.pools, key);
+        if (found != none()) {
+            return Ok(found);
+        }
+        var name = Vector<u8>.create();
+        appendText(mut name, "Pool<")?;
+        this.appendName(mut name, element)?;
+        appendText(mut name, ">")?;
+        var info = blankType(TypeKind.Region, this.addName(name)?);
+        info.region = RegionKind.Pool;
+        info.element = element;
+        let id = this.add(info)?;
+        this.pools.put(key, id)?;
+        return Ok(id);
+    }
+
+    /// The unique `Box<contents, allocator>` (BoxOf); `PoolBox<T>` for a pool's.
+    fn boxOf(borrow mut this, contents: u32, allocator: u32, isDefault: bool) -> Result<u32, AllocError> {
+        let key = pairKey(contents as u64, allocator as u64);
+        let found = foundIn(this.boxes, key);
+        if (found != none()) {
+            return Ok(this.touch(found));
+        }
+        var name = Vector<u8>.create();
+        if (regionIndex(this.types[allocator as usize].region) == regionIndex(RegionKind.Pool)) {
+            appendText(mut name, "PoolBox<")?;
+            this.appendName(mut name, contents)?;
+        } else {
+            appendText(mut name, "Box<")?;
+            this.appendName(mut name, contents)?;
+            if (!isDefault) {
+                appendText(mut name, ", ")?;
+                this.appendName(mut name, allocator)?;
+            }
+        }
+        appendText(mut name, ">")?;
+        var info = blankType(TypeKind.Box, this.addName(name)?);
+        info.pointee = contents;
+        info.allocator = allocator;
+        let id = this.add(info)?;
+        this.boxes.put(key, id)?;
+        this.composites.push(id)?;
+        return Ok(this.touch(id));
+    }
+
+    fn poolBoxOf(borrow mut this, element: u32) -> Result<u32, AllocError> {
+        let pool = this.poolOf(element)?;
+        return this.boxOf(element, pool, false);
+    }
+
+    /// The unique `Vector<T, A>`, or `String<A>` when `element` is none (VectorOf).
+    fn vectorOf(borrow mut this, element: u32, allocator: u32, isDefault: bool) -> Result<u32, AllocError> {
+        let elements = if (element == none()) this.str else this.arrayOf(element, -1)?;
+        let key = pairKey(elements as u64, allocator as u64);
+        let found = foundIn(this.vectors, key);
+        if (found != none()) {
+            return Ok(this.touch(found));
+        }
+        var name = Vector<u8>.create();
+        if (element == none()) {
+            appendText(mut name, "String")?;
+            if (!isDefault) {
+                appendText(mut name, "<")?;
+                this.appendName(mut name, allocator)?;
+                appendText(mut name, ">")?;
+            }
+        } else {
+            appendText(mut name, "Vector<")?;
+            this.appendName(mut name, element)?;
+            if (!isDefault) {
+                appendText(mut name, ", ")?;
+                this.appendName(mut name, allocator)?;
+            }
+            appendText(mut name, ">")?;
+        }
+        var info = blankType(TypeKind.Vector, this.addName(name)?);
+        info.pointee = elements;
+        info.allocator = allocator;
+        let id = this.add(info)?;
+        this.vectors.put(key, id)?;
+        this.composites.push(id)?;
+        return Ok(this.touch(id));
+    }
+
+    /// A Bytes key from numbers.
+    fn numbersKey(borrow this, numbers: Slice<u64>) -> Result<Bytes, AllocError> {
+        var bytes = Vector<u8>.create();
+        for (n in numbers) {
+            var v = n;
+            for (k in 0..8) {
+                bytes.push(truncate<u8>(v))?;
+                v >>= 8;
+            }
+        }
+        return Ok(Bytes { data: bytes });
+    }
+
+    /// The unique `StableVector<T, A>` or `SlotMap<T, A>` (ContainerOf).
+    fn containerOf(
+        borrow mut this,
+        kind: TypeKind,
+        element: u32,
+        allocator: u32,
+        isDefault: bool,
+    ) -> Result<u32, AllocError> {
+        let numbers: [u64; 3] = [typeKindIndex(kind) as u64, element as u64, allocator as u64];
+        let key = this.numbersKey(numbers[..])?;
+        let found = foundIn(this.containers, key);
+        if (found != none()) {
+            return Ok(this.touch(found));
+        }
+        let slotMap = isKind(kind, TypeKind.SlotMap);
+        var name = Vector<u8>.create();
+        appendText(mut name, if (slotMap) "SlotMap<" else "StableVector<")?;
+        this.appendName(mut name, element)?;
+        if (!isDefault) {
+            appendText(mut name, ", ")?;
+            this.appendName(mut name, allocator)?;
+        }
+        appendText(mut name, ">")?;
+        var info = blankType(kind, this.addName(name)?);
+        if (slotMap) {
+            info.element = element;
+        } else {
+            info.pointee = this.arrayOf(element, -1)?;
+        }
+        info.allocator = allocator;
+        let id = this.add(info)?;
+        this.containers.put(key, id)?;
+        this.composites.push(id)?;
+        return Ok(this.touch(id));
+    }
+
+    /// `Handle<T>` (kind Handle) or `Thread<T>` (kind Thread), kept with the containers as in the reference.
+    fn elementTypeOf(borrow mut this, kind: TypeKind, element: u32, prefix: StringView) -> Result<u32, AllocError> {
+        let numbers: [u64; 3] = [typeKindIndex(kind) as u64, element as u64, 0xFFFFFFFF];
+        let key = this.numbersKey(numbers[..])?;
+        let found = foundIn(this.containers, key);
+        if (found != none()) {
+            return Ok(found);
+        }
+        var name = Vector<u8>.create();
+        appendText(mut name, prefix)?;
+        this.appendName(mut name, element)?;
+        appendText(mut name, ">")?;
+        var info = blankType(kind, this.addName(name)?);
+        info.element = element;
+        let id = this.add(info)?;
+        this.containers.put(key, id)?;
+        if (isKind(kind, TypeKind.Thread)) {
+            this.threadList.push(id)?;
+        }
+        return Ok(id);
+    }
+
+    fn handleOf(borrow mut this, element: u32) -> Result<u32, AllocError> =>
+        this.elementTypeOf(TypeKind.Handle, element, "Handle<");
+
+    fn threadOf(borrow mut this, result: u32) -> Result<u32, AllocError> =>
+        this.elementTypeOf(TypeKind.Thread, result, "Thread<");
+
+    /// `@effects(sleep, alloc) ` as written before `fn`, or nothing for both effects (EffectListName).
+    fn appendEffectList(borrow this, out: borrow mut Vector<u8>, effects: u32) -> Result<void, AllocError> {
+        if (effects == allEffects()) {
+            return Ok();
+        }
+        appendText(out, "@effects(")?;
+        var first = true;
+        if (effects & 1 != 0) {
+            appendText(out, "sleep")?;
+            first = false;
+        }
+        if (effects & 2 != 0) {
+            if (!first) {
+                appendText(out, ", ")?;
+            }
+            appendText(out, "alloc")?;
+        }
+        appendText(out, ") ")?;
+        return Ok();
+    }
+
+    /// `fn(A, B) -> R`, or `fn(A, B)` for a void result.
+    fn appendSignature(
+        borrow this,
+        out: borrow mut Vector<u8>,
+        parameters: Slice<u32>,
+        result: u32,
+    ) -> Result<void, AllocError> {
+        appendText(out, "fn(")?;
+        this.appendNames(out, parameters)?;
+        appendText(out, ")")?;
+        if (!this.is(result, TypeKind.Void)) {
+            appendText(out, " -> ")?;
+            this.appendName(out, result)?;
+        }
+        return Ok();
+    }
+
+    /// The key of a signature: the parameter and result identities, the effects and a tag.
+    fn signatureKey(borrow this, parameters: Slice<u32>, result: u32, extra: u64) -> Result<Bytes, AllocError> {
+        var numbers = Vector<u64>.create();
+        for (p in parameters) {
+            numbers.push(p as u64)?;
+        }
+        numbers.push(0xFFFFFFFFFFFFFFFF)?;
+        numbers.push(result as u64)?;
+        numbers.push(extra)?;
+        return this.numbersKey(numbers.view());
+    }
+
+    /// A function pointer, function or closure type (the reference's signature constructor).
+    fn signatureType(
+        borrow mut this,
+        kind: TypeKind,
+        parameters: Slice<u32>,
+        result: u32,
+        effects: u32,
+    ) -> Result<u32, AllocError> {
+        var name = Vector<u8>.create();
+        if (isKind(kind, TypeKind.FunctionPointer)) {
+            appendText(mut name, "extern \"C\" ")?;
+        }
+        this.appendEffectList(mut name, effects)?;
+        this.appendSignature(mut name, parameters, result)?;
+        var info = blankType(kind, this.addName(name)?);
+        info.parameters = this.addList(parameters)?;
+        info.result = result;
+        info.effects = effects;
+        return this.add(info);
+    }
+
+    /// The unique `extern "C" fn(…) -> R` (FunctionPointerTo).
+    fn functionPointerTo(borrow mut this, parameters: Slice<u32>, result: u32) -> Result<u32, AllocError> {
+        let key = this.signatureKey(parameters, result, 0)?;
+        let found = foundIn(this.functionPointers, key);
+        if (found != none()) {
+            return Ok(found);
+        }
+        let id = this.signatureType(TypeKind.FunctionPointer, parameters, result, allEffects())?;
+        this.functionPointers.put(key, id)?;
+        this.functionPointerList.push(id)?;
+        return Ok(id);
+    }
+
+    /// The unique `fn(…) -> R` with an effect list (FunctionTo).
+    fn functionTo(borrow mut this, parameters: Slice<u32>, result: u32, effects: u32) -> Result<u32, AllocError> {
+        let key = this.signatureKey(parameters, result, effects as u64)?;
+        let found = foundIn(this.functionTypes, key);
+        if (found != none()) {
+            return Ok(found);
+        }
+        let id = this.signatureType(TypeKind.Function, parameters, result, effects)?;
+        this.functionTypes.put(key, id)?;
+        this.functionList.push(id)?;
+        return Ok(id);
+    }
+
+    /// The unique callable object of closures `borrow fn(…) -> R` (ClosureTo).
+    fn closureTo(borrow mut this, parameters: Slice<u32>, result: u32, effects: u32) -> Result<u32, AllocError> {
+        let key = this.signatureKey(parameters, result, effects as u64)?;
+        let found = foundIn(this.closures, key);
+        if (found != none()) {
+            return Ok(found);
+        }
+        let id = this.signatureType(TypeKind.Closure, parameters, result, effects)?;
+        this.closures.put(key, id)?;
+        this.closureList.push(id)?;
+        return Ok(id);
+    }
+
+    /// `I` or `I<A, B>` (InterfaceBound.ToString).
+    fn appendBound(borrow this, out: borrow mut Vector<u8>, bound: u32) -> Result<void, AllocError> {
+        let b = this.bounds[bound as usize];
+        appendBytes(out, this.rangeText(b.name))?;
+        if (b.arguments.count > 0) {
+            appendText(out, "<")?;
+            for (k in 0..b.arguments.count) {
+                if (k > 0) {
+                    appendText(out, ", ")?;
+                }
+                this.appendName(out, this.listAt(b.arguments, k))?;
+            }
+            appendText(out, ">")?;
+        }
+        return Ok();
+    }
+
+    fn addBound(
+        borrow mut this,
+        interfaceEntry: u32,
+        name: Slice<u8>,
+        arguments: Slice<u32>,
+    ) -> Result<u32, AllocError> {
+        let start = truncate<u32>(this.names.length);
+        appendBytes(mut this.names, name)?;
+        let nameRange = Range { start: start, count: truncate<u32>(name.length) };
+        let argumentRange = this.addList(arguments)?;
+        this.bounds.push(InterfaceBound { interfaceEntry: interfaceEntry, name: nameRange, arguments: argumentRange })?;
+        return Ok(truncate<u32>(this.bounds.length - 1));
+    }
+
+    /// The unique `dyn I`, keyed by the interface entry and the arguments' identities (DynOf).
+    fn dynOf(borrow mut this, bound: u32, isSend: bool) -> Result<u32, AllocError> {
+        let b = this.bounds[bound as usize];
+        var numbers = Vector<u64>.create();
+        numbers.push(1)?;
+        numbers.push(b.interfaceEntry as u64)?;
+        for (k in 0..b.arguments.count) {
+            numbers.push(this.listAt(b.arguments, k) as u64)?;
+        }
+        numbers.push(if (isSend) 1 else 0)?;
+        let key = this.numbersKey(numbers.view())?;
+        let found = foundIn(this.dyns, key);
+        if (found != none()) {
+            return Ok(found);
+        }
+        var name = Vector<u8>.create();
+        appendText(mut name, "dyn ")?;
+        this.appendBound(mut name, bound)?;
+        if (isSend) {
+            appendText(mut name, " + Send")?;
+        }
+        var info = blankType(TypeKind.Dyn, this.addName(name)?);
+        info.dynInterface = bound;
+        info.sendDyn = isSend;
+        let id = this.add(info)?;
+        this.dyns.put(key, id)?;
+        this.dynList.push(id)?;
+        return Ok(id);
+    }
+
+    /// The unique `dyn fn(…) -> R` or `dyn mut fn(…) -> R` (DynFunctionOf).
+    fn dynFunctionOf(
+        borrow mut this,
+        parameters: Slice<u32>,
+        result: u32,
+        effects: u32,
+        mutable: bool,
+        isSend: bool,
+    ) -> Result<u32, AllocError> {
+        let extra: u64 =
+            (2 << 8) | ((effects as u64) << 2) | (if (mutable) 2u64 else 0u64) | (if (isSend) 1u64 else 0u64);
+        let key = this.signatureKey(parameters, result, extra)?;
+        let found = foundIn(this.dyns, key);
+        if (found != none()) {
+            return Ok(found);
+        }
+        var name = Vector<u8>.create();
+        appendText(mut name, "dyn ")?;
+        if (mutable) {
+            appendText(mut name, "mut ")?;
+        }
+        this.appendEffectList(mut name, effects)?;
+        this.appendSignature(mut name, parameters, result)?;
+        if (isSend) {
+            appendText(mut name, " + Send")?;
+        }
+        var info = blankType(TypeKind.Dyn, this.addName(name)?);
+        info.parameters = this.addList(parameters)?;
+        info.result = result;
+        info.effects = effects;
+        info.mutableDynFunction = mutable;
+        info.sendDyn = isSend;
+        let id = this.add(info)?;
+        this.dyns.put(key, id)?;
+        this.dynList.push(id)?;
+        return Ok(id);
+    }
+
+    /// A fresh type parameter (each declaration's parameters are distinct types).
+    fn createTypeParameter(borrow mut this, name: Slice<u8>) -> Result<u32, AllocError> {
+        let start = truncate<u32>(this.names.length);
+        appendBytes(mut this.names, name)?;
+        var info = blankType(TypeKind.TypeParameter, Range { start: start, count: truncate<u32>(name.length) });
+        this.typeParameters.push(TypeParameterInfo {
+            bounds: Vector<u32>.create(),
+            copyBound: false,
+            sendBound: false,
+            shareBound: false,
+        })?;
+        info.typeParameter = truncate<u32>(this.typeParameters.length - 1);
+        return this.add(info);
+    }
+
+    /// A new struct type (CreateStruct): once per declaration or instantiation.
+    fn createStruct(
+        borrow mut this,
+        name: Slice<u8>,
+        item: u32,
+        file: u32,
+        hasRegionParameters: bool,
+    ) -> Result<u32, AllocError> {
+        let start = truncate<u32>(this.names.length);
+        appendBytes(mut this.names, name)?;
+        this.structs.push(blankStruct(item, file, hasRegionParameters))?;
+        var info = blankType(TypeKind.Struct, Range { start: start, count: truncate<u32>(name.length) });
+        info.structDef = truncate<u32>(this.structs.length - 1);
+        return this.add(info);
+    }
+
+    /// A new enum type (CreateEnum).
+    fn createEnum(
+        borrow mut this,
+        name: Slice<u8>,
+        item: u32,
+        file: u32,
+        hasRegionParameters: bool,
+    ) -> Result<u32, AllocError> {
+        var definition = blankEnum(item, file);
+        definition.hasRegionParameters = hasRegionParameters;
+        var bytes = Vector<u8>.create();
+        appendBytes(mut bytes, name)?;
+        return this.addEnum(definition, bytes);
+    }
+
+    // ---- Layout (TypeTable.LayoutOf, EnumLayout; LP64) ----
+
+    /// Size and alignment by C's rules; field offsets are stored on the fields. An empty struct has one byte.
+    /// Asking for a recursive struct's or an imported C type's layout is a checker bug: it panics, as the reference throws.
+    fn layoutOf(borrow mut this, id: u32) -> SizeAlign {
+        let t = this.types[id as usize];
+        match (t.kind) {
+            TypeKind.Integer => { return sizeAlign(t.bits / 8, t.bits / 8); }
+            TypeKind.Float => { return sizeAlign(t.bits / 8, t.bits / 8); }
+            TypeKind.Bool => { return sizeAlign(1, 1); }
+            TypeKind.Reference => {
+                return if (this.isSlice(id) || this.isDynReference(id)) sizeAlign(16, 8) else sizeAlign(8, 8);
+            }
+            TypeKind.RawPointer => { return sizeAlign(8, 8); }
+            TypeKind.CChar => { return sizeAlign(1, 1); }
+            TypeKind.FunctionPointer => { return sizeAlign(8, 8); }
+            TypeKind.Function => { return sizeAlign(8, 8); }
+            TypeKind.Closure => { return sizeAlign(8, 8); }
+            TypeKind.Box => {
+                return if (this.isPoolBox(id) || this.isDynBox(id)) sizeAlign(16, 8) else sizeAlign(8, 8);
+            }
+            TypeKind.Vector => { return sizeAlign(24, 8); }
+            TypeKind.StableVector => { return sizeAlign(264, 8); }
+            TypeKind.SlotMap => { return sizeAlign(40, 8); }
+            TypeKind.Handle => { return sizeAlign(8, 4); }
+            TypeKind.Thread => { return sizeAlign(8, 8); }
+            TypeKind.Resource => { return sizeAlign(4, 4); }
+            TypeKind.Region => {
+                return match (t.region) {
+                    RegionKind.Arena => sizeAlign(40, 8),
+                    RegionKind.FixedBuffer => sizeAlign(24, 8),
+                    RegionKind.Pool => sizeAlign(48, 8),
+                    _ => sizeAlign(32, 8),
+                };
+            }
+            TypeKind.Array => {
+                let e = this.layoutOf(t.element);
+                return SizeAlign { size: e.size * t.arrayLength, align: e.align };
+            }
+            TypeKind.Enum => {
+                self_enumLayout(mut this, id);
+                let d = borrow this.enums[t.enumDef as usize];
+                return sizeAlign(d.size, d.align);
+            }
+            TypeKind.Struct => {
+                let index = t.structDef as usize;
+                if (this.structs[index].hasLayout) {
+                    return sizeAlign(this.structs[index].size, this.structs[index].align);
+                }
+                if (this.structs[index].isRecursive || this.structs[index].isImported) {
+                    var bad = [0u8; 1];
+                    let i = bad.length;
+                    bad[i] = 0; // the reference throws InvalidOperationException here: no layout
+                }
+                var offset: u32 = 0;
+                var align = this.structs[index].explicitAlign;
+                let count = this.structs[index].fields.length;
+                for (k in 0..count) {
+                    let f = this.structs[index].fields[k];
+                    let fieldType = this.fields[f as usize].typ;
+                    let l = this.layoutOf(fieldType);
+                    offset = (offset + l.align - 1) / l.align * l.align;
+                    this.fields[f as usize].offset = offset;
+                    offset += truncate<u32>(l.size);
+                    if (l.align > align) {
+                        align = l.align;
+                    }
+                }
+                let raw = if (count == 0) 1u32 else offset;
+                let size = (raw + align - 1) / align * align;
+                this.structs[index].hasLayout = true;
+                this.structs[index].size = size;
+                this.structs[index].align = align;
+                return sizeAlign(size, align);
+            }
+            _ => {
+                var bad = [0u8; 1];
+                let i = bad.length;
+                bad[i] = 0; // no layout: the reference throws
+                return sizeAlign(0, 1);
+            }
+        }
+    }
+
+    /// Whether layoutOf has an answer where the reference's LayoutOf does not throw.
+    fn hasLayout(borrow this, id: u32) -> bool {
+        let t = this.types[id as usize];
+        match (t.kind) {
+            TypeKind.Void => { return false; }
+            TypeKind.Never => { return false; }
+            TypeKind.Error => { return false; }
+            TypeKind.Dyn => { return false; }
+            TypeKind.TypeParameter => { return false; }
+            TypeKind.Struct => {
+                let s = borrow this.structs[t.structDef as usize];
+                return !s.isRecursive && !s.isImported;
+            }
+            TypeKind.Array => { return this.hasLayout(t.element); }
+            _ => { return true; }
+        }
+    }
+
+    /// Whether an optional is a never-null pointer laid out as that pointer alone (IsNicheOptional, §22.1).
+    fn isNicheOptional(borrow this, id: u32) -> bool {
+        let value = this.optionType(id);
+        if (value == none()) {
+            return false;
+        }
+        if (this.is(value, TypeKind.Box)) {
+            return !this.isPoolBox(value) && !this.isDynBox(value);
+        }
+        return this.is(value, TypeKind.Reference) && !this.isSlice(value) && !this.isStringView(value) &&
+            !this.isDynReference(value);
+    }
+
+    // ---- Properties (TypeTable's static predicates) ----
+
+    fn isCopy(borrow this, id: u32) -> bool {
+        let t = this.types[id as usize];
+        match (t.kind) {
+            TypeKind.TypeParameter => { return this.typeParameters[t.typeParameter as usize].copyBound; }
+            TypeKind.Struct => { return this.structs[t.structDef as usize].isCopy; }
+            TypeKind.Enum => {
+                let e = borrow this.enums[t.enumDef as usize];
+                if (e.resultOk != none()) {
+                    return this.isCopy(e.resultOk) && this.isCopy(e.resultErr);
+                }
+                if (e.optionType != none()) {
+                    return this.isCopy(e.optionType);
+                }
+                return e.isCopy;
+            }
+            TypeKind.Reference => { return !t.mutableReference; }
+            TypeKind.Box => { return false; }
+            TypeKind.Region => { return false; }
+            TypeKind.Vector => { return false; }
+            TypeKind.StableVector => { return false; }
+            TypeKind.SlotMap => { return false; }
+            TypeKind.Resource => { return false; }
+            TypeKind.Thread => { return false; }
+            _ => { return true; }
+        }
+    }
+
+    fn needsDrop(borrow this, id: u32) -> bool {
+        let t = this.types[id as usize];
+        match (t.kind) {
+            TypeKind.TypeParameter => { return !this.typeParameters[t.typeParameter as usize].copyBound; }
+            TypeKind.Box => { return true; }
+            TypeKind.Vector => { return true; }
+            TypeKind.StableVector => { return true; }
+            TypeKind.SlotMap => { return true; }
+            TypeKind.Resource => { return true; }
+            TypeKind.Thread => { return true; }
+            _ => {}
+        }
+        match (t.region) {
+            RegionKind.Arena => { return true; }
+            RegionKind.ScratchFrame => { return true; }
+            RegionKind.Pool => { return true; }
+            _ => {}
+        }
+        if (t.enumDef != none()) {
+            let e = borrow this.enums[t.enumDef as usize];
+            if (e.optionType != none()) {
+                return this.needsDrop(e.optionType);
+            }
+            if (e.resultOk != none()) {
+                return this.needsDrop(e.resultOk) || this.needsDrop(e.resultErr);
+            }
+            return e.needsDrop;
+        }
+        return t.structDef != none() && this.structs[t.structDef as usize].needsDrop;
+    }
+
+    /// May a value of this type hold loans (§19.1, §25.3)?
+    fn isScoped(borrow this, id: u32) -> bool {
+        let t = this.types[id as usize];
+        if (isKind(t.kind, TypeKind.Reference) || this.isPoolBox(id) || isKind(t.kind, TypeKind.Closure)) {
+            return true;
+        }
+        match (t.region) {
+            RegionKind.FixedBuffer => { return true; }
+            RegionKind.ScratchFrame => { return true; }
+            _ => {}
+        }
+        if (t.structDef != none()) {
+            let s = borrow this.structs[t.structDef as usize];
+            if (s.isClosureEnvironment && !s.isMoveEnvironment) {
+                return true;
+            }
+            if (s.hasRegionParameters || this.anyScoped(s.typeArguments)) {
+                return true;
+            }
+        }
+        if (t.enumDef != none()) {
+            let e = borrow this.enums[t.enumDef as usize];
+            if (e.resultOk != none() && (this.isScoped(e.resultOk) || this.isScoped(e.resultErr))) {
+                return true;
+            }
+            if (e.optionType != none() && this.isScoped(e.optionType)) {
+                return true;
+            }
+            if (e.item != none() && (e.hasRegionParameters || this.anyScoped(e.typeArguments))) {
+                return true;
+            }
+        }
+        if (isKind(t.kind, TypeKind.Vector) || isKind(t.kind, TypeKind.StableVector)) {
+            let inner = this.types[t.pointee as usize].element;
+            return inner != none() && this.isScoped(inner);
+        }
+        return isKind(t.kind, TypeKind.SlotMap) && this.isScoped(t.element);
+    }
+
+    fn anyScoped(borrow this, r: Range) -> bool {
+        for (k in 0..r.count) {
+            if (this.isScoped(this.listAt(r, k))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Does a value hold a scoped region value or a pool box (HoldsRegionValue, §25.4)?
+    fn holdsRegionValue(borrow this, id: u32) -> bool {
+        let t = this.types[id as usize];
+        match (t.region) {
+            RegionKind.FixedBuffer => { return true; }
+            RegionKind.ScratchFrame => { return true; }
+            _ => {}
+        }
+        if (this.isPoolBox(id)) {
+            return true;
+        }
+        if (t.enumDef != none()) {
+            let e = borrow this.enums[t.enumDef as usize];
+            if (e.resultOk != none() && (this.holdsRegionValue(e.resultOk) || this.holdsRegionValue(e.resultErr))) {
+                return true;
+            }
+            if (e.optionType != none() && this.holdsRegionValue(e.optionType)) {
+                return true;
+            }
+            if (this.anyHoldsRegionValue(e.typeArguments)) {
+                return true;
+            }
+        }
+        if (t.structDef != none() && this.anyHoldsRegionValue(this.structs[t.structDef as usize].typeArguments)) {
+            return true;
+        }
+        if (isKind(t.kind, TypeKind.Vector) || isKind(t.kind, TypeKind.StableVector)) {
+            let inner = this.types[t.pointee as usize].element;
+            return inner != none() && this.holdsRegionValue(inner);
+        }
+        return isKind(t.kind, TypeKind.SlotMap) && this.holdsRegionValue(t.element);
+    }
+
+    fn anyHoldsRegionValue(borrow this, r: Range) -> bool {
+        for (k in 0..r.count) {
+            if (this.holdsRegionValue(this.listAt(r, k))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Is every value of `from` representable in `to` (IsLosslessCast, §7)?
+    fn isLosslessCast(borrow this, from: u32, to: u32) -> bool {
+        if (from == to) {
+            return true;
+        }
+        let f = this.types[from as usize];
+        let t = this.types[to as usize];
+        if (isKind(f.kind, TypeKind.Bool)) {
+            return isKind(t.kind, TypeKind.Integer);
+        }
+        if (isKind(t.kind, TypeKind.Float)) {
+            let mantissa: u32 = if (t.bits == 32) 24 else 53;
+            if (isKind(f.kind, TypeKind.Float)) {
+                return f.bits < t.bits;
+            }
+            return isKind(f.kind, TypeKind.Integer) && (if (f.signed) f.bits - 1 else f.bits) <= mantissa;
+        }
+        if (!isKind(f.kind, TypeKind.Integer) || !isKind(t.kind, TypeKind.Integer)) {
+            return false;
+        }
+        // to.Min <= from.Min && to.Max >= from.Max
+        if (f.signed && !t.signed) {
+            return false;
+        }
+        if (f.signed == t.signed) {
+            return t.bits >= f.bits;
+        }
+        return t.bits > f.bits; // unsigned into signed needs a wider type
+    }
+
+    fn hasSystemAllocator(borrow this, id: u32) -> bool {
+        let allocator = this.types[id as usize].allocator;
+        if (allocator == none()) {
+            return false;
+        }
+        let n = this.name(allocator);
+        return sameText(n, "SystemHeap") || sameText(n, "FailingAllocator");
+    }
+
+    /// May a value be moved to another thread (IsSend, §38.1)? `visiting` breaks cycles: a type that reaches itself
+    /// is decided by its other parts.
+    fn isSend(borrow this, id: u32, visiting: borrow mut Vector<u32>) -> Result<bool, AllocError> {
+        for (v in visiting.view()) {
+            if (v == id) {
+                return Ok(true);
+            }
+        }
+        visiting.push(id)?;
+        let result = this.isSendCore(id, visiting);
+        visiting.truncate(visiting.length - 1);
+        return result;
+    }
+
+    fn isSendCore(borrow this, id: u32, visiting: borrow mut Vector<u32>) -> Result<bool, AllocError> {
+        let t = this.types[id as usize];
+        match (t.kind) {
+            TypeKind.TypeParameter => {
+                let p = borrow this.typeParameters[t.typeParameter as usize];
+                return Ok(p.sendBound || p.shareBound);
+            }
+            TypeKind.Integer => { return Ok(true); }
+            TypeKind.Float => { return Ok(true); }
+            TypeKind.Bool => { return Ok(true); }
+            TypeKind.Void => { return Ok(true); }
+            TypeKind.Never => { return Ok(true); }
+            TypeKind.Error => { return Ok(true); }
+            TypeKind.Function => { return Ok(true); }
+            TypeKind.Handle => { return Ok(true); }
+            TypeKind.Resource => { return Ok(true); }
+            TypeKind.Struct => {
+                let s = borrow this.structs[t.structDef as usize];
+                if (s.isThreadSafe) {
+                    return Ok(true);
+                }
+                if (s.isImported || this.isScoped(id)) {
+                    return Ok(false);
+                }
+                let skip: usize = if (s.isMoveEnvironment) 1 else 0;
+                for (k in skip..s.fields.length) {
+                    if (!this.isSend(this.fields[s.fields[k] as usize].typ, visiting)?) {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+            TypeKind.Enum => {
+                if (this.isScoped(id)) {
+                    return Ok(false);
+                }
+                let e = borrow this.enums[t.enumDef as usize];
+                if (e.resultOk != none()) {
+                    return Ok(this.isSend(e.resultOk, visiting)? && this.isSend(e.resultErr, visiting)?);
+                }
+                if (e.optionType != none()) {
+                    return this.isSend(e.optionType, visiting);
+                }
+                for (v in e.variants.view()) {
+                    for (f in this.variants[v as usize].payload.view()) {
+                        if (!this.isSend(this.fields[f as usize].typ, visiting)?) {
+                            return Ok(false);
+                        }
+                    }
+                }
+                return Ok(true);
+            }
+            TypeKind.Array => { return this.isSend(t.element, visiting); }
+            TypeKind.Box => {
+                if (this.isPoolBox(id) || !this.hasSystemAllocator(id)) {
+                    return Ok(false);
+                }
+                if (this.isDyn(t.pointee)) {
+                    return Ok(this.types[t.pointee as usize].sendDyn);
+                }
+                return this.isSend(t.pointee, visiting);
+            }
+            TypeKind.Vector => { return this.containerIsSend(id, visiting); }
+            TypeKind.StableVector => { return this.containerIsSend(id, visiting); }
+            TypeKind.SlotMap => { return Ok(this.hasSystemAllocator(id) && this.isSend(t.element, visiting)?); }
+            _ => { return Ok(false); }
+        }
+    }
+
+    /// A vector's or stable vector's elements (its unsized [T], or str's u8).
+    fn containerIsSend(borrow this, id: u32, visiting: borrow mut Vector<u32>) -> Result<bool, AllocError> {
+        if (!this.hasSystemAllocator(id)) {
+            return Ok(false);
+        }
+        let unsized = this.types[id as usize].pointee;
+        let element = this.types[unsized as usize].element;
+        return this.isSend(if (element != none()) element else unsized, visiting);
+    }
+
+    /// May shared references be used from several threads (IsShare, §38.1)? In v1, exactly the Send types.
+    fn isShare(borrow this, id: u32) -> Result<bool, AllocError> {
+        let t = this.types[id as usize];
+        if (isKind(t.kind, TypeKind.TypeParameter)) {
+            return Ok(this.typeParameters[t.typeParameter as usize].shareBound);
+        }
+        var visiting = Vector<u32>.create();
+        return this.isSend(id, mut visiting);
+    }
+
+    fn isSendType(borrow this, id: u32) -> Result<bool, AllocError> {
+        var visiting = Vector<u32>.create();
+        return this.isSend(id, mut visiting);
+    }
+
+    /// For `Thread.both` (§38.6): may a capture of this type be used `mutably`, or shared, while the other runs?
+    fn isForkSafe(borrow this, id: u32, mutably: bool) -> Result<bool, AllocError> {
+        let t = this.types[id as usize];
+        if (!isKind(t.kind, TypeKind.Reference)) {
+            return if (mutably) this.isSendType(id) else this.isShare(id);
+        }
+        if (this.isDynReference(id)) {
+            return Ok(false);
+        }
+        let pointee = this.types[t.pointee as usize];
+        if (pointee.isStr) {
+            return Ok(true); // a view's bytes
+        }
+        let referent = if (this.isUnsized(t.pointee)) pointee.element else t.pointee;
+        return if (mutably && t.mutableReference) this.isSendType(referent) else this.isShare(referent);
+    }
+
+    /// An imported C type, or a struct holding one by value (IsCLaidOut, §33.1).
+    fn isCLaidOut(borrow this, id: u32, depth: u32) -> bool {
+        let t = this.types[id as usize];
+        if (isKind(t.kind, TypeKind.Array) && t.element != none()) {
+            return this.isCLaidOut(t.element, depth + 1);
+        }
+        if (t.structDef == none() || depth >= 64) {
+            return false;
+        }
+        let s = borrow this.structs[t.structDef as usize];
+        if (s.isImported) {
+            return true;
+        }
+        for (f in s.fields.view()) {
+            if (this.isCLaidOut(this.fields[f as usize].typ, depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Does placing a value of this type run any `@placed` method (HasPlacedMethods, §33.3)?
+    fn hasPlacedMethods(borrow this, id: u32) -> bool {
+        let t = this.types[id as usize];
+        if (t.structDef == none()) {
+            return false;
+        }
+        let s = borrow this.structs[t.structDef as usize];
+        if (s.isImported || !this.isCLaidOut(id, 0)) {
+            return false;
+        }
+        if (s.placedMethod != none()) {
+            return true;
+        }
+        for (f in s.fields.view()) {
+            if (this.hasPlacedMethods(this.fields[f as usize].typ)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Can destroying a value read the loans it holds (DropReadsLoans, §25.7 rule 6)?
+    fn dropReadsLoans(borrow this, id: u32, visiting: borrow mut Vector<u32>) -> Result<bool, AllocError> {
+        if (!this.isScoped(id) || !this.needsDrop(id)) {
+            return Ok(false);
+        }
+        for (v in visiting.view()) {
+            if (v == id) {
+                return Ok(false);
+            }
+        }
+        visiting.push(id)?; // the reference never removes it: one visit per type
+        let t = this.types[id as usize];
+        if (t.structDef != none()) {
+            let s = borrow this.structs[t.structDef as usize];
+            if (s.dropFunction != none()) {
+                return Ok(true);
+            }
+            for (f in s.fields.view()) {
+                if (this.dropReadsLoans(this.fields[f as usize].typ, visiting)?) {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        if (t.enumDef != none()) {
+            for (v in this.enums[t.enumDef as usize].variants.view()) {
+                for (f in this.variants[v as usize].payload.view()) {
+                    if (this.dropReadsLoans(this.fields[f as usize].typ, visiting)?) {
+                        return Ok(true);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+        if (isKind(t.kind, TypeKind.Vector) || isKind(t.kind, TypeKind.StableVector)) {
+            return this.dropReadsLoans(this.types[t.pointee as usize].element, visiting);
+        }
+        if (isKind(t.kind, TypeKind.SlotMap)) {
+            return this.dropReadsLoans(t.element, visiting);
+        }
+        return Ok(false);
+    }
+
+    fn forSuffix(borrow this, suffix: IntSuffix) -> u32 => match (suffix) {
+        IntSuffix.I8 => this.i8,
+        IntSuffix.I16 => this.i16,
+        IntSuffix.I32 => this.i32,
+        IntSuffix.I64 => this.i64,
+        IntSuffix.ISize => this.isize,
+        IntSuffix.U8 => this.u8,
+        IntSuffix.U16 => this.u16,
+        IntSuffix.U32 => this.u32,
+        IntSuffix.U64 => this.u64,
+        IntSuffix.USize => this.usize,
+        IntSuffix.None => none(),
+    };
+}
+
+/// A TypeInfo of `kind` named `name`, with every index none.
+fn blankType(kind: TypeKind, name: Range) -> TypeInfo => TypeInfo {
+    kind: kind,
+    name: name,
+    bits: 0,
+    signed: false,
+    pointee: none(),
+    element: none(),
+    allocator: none(),
+    arrayLength: 0,
+    isStr: false,
+    mutableReference: false,
+    mutablePointer: false,
+    region: RegionKind.None,
+    resource: ResourceKind.None,
+    parameters: emptyRange(),
+    result: none(),
+    effects: 3,
+    dynInterface: none(),
+    sendDyn: false,
+    mutableDynFunction: false,
+    structDef: none(),
+    enumDef: none(),
+    typeParameter: none(),
+    libraryUse: false,
+    usedOutsideHostedLibrary: false,
+};
+
+fn blankStruct(item: u32, file: u32, hasRegionParameters: bool) -> StructDefinition => StructDefinition {
+    item: item,
+    file: file,
+    fields: Vector<u32>.create(),
+    functions: Vector<u32>.create(),
+    functionNames: Vector<u32>.create(),
+    typeArguments: emptyRange(),
+    hasRegionParameters: hasRegionParameters,
+    isRecursive: false,
+    isReprC: false,
+    isThreadSafe: false,
+    isClosureEnvironment: false,
+    isMoveEnvironment: false,
+    closureId: 0,
+    allocateMethod: none(),
+    deallocateMethod: none(),
+    isImported: false,
+    placedMethod: none(),
+    hasCSpelling: false,
+    cSpelling: emptyRange(),
+    isAtomicContext: false,
+    isNonCopy: false,
+    explicitAlign: 1,
+    dropFunction: none(),
+    isCopy: true,
+    needsDrop: false,
+    hasLayout: false,
+    size: 0,
+    align: 0,
+};
+
+fn blankEnum(item: u32, file: u32) -> EnumDefinition => EnumDefinition {
+    item: item,
+    file: file,
+    resultOk: none(),
+    resultErr: none(),
+    typeArguments: emptyRange(),
+    optionType: none(),
+    hasRegionParameters: false,
+    variants: Vector<u32>.create(),
+    isCopy: true,
+    needsDrop: false,
+    isRecursive: false,
+    repr: none(),
+    hasLayout: false,
+    size: 0,
+    align: 0,
+    tagSize: 0,
+    unionOffset: 0,
+};
+
+/// The value `map` holds for `key`, or none() (a copy, so no borrow of the map outlives the call).
+fn foundIn<K: Key<K>>(map: borrow Map<K, u32>, key: borrow K) -> u32 => match (map.get(key)) {
+    Some(id) => id,
+    null => none(),
+};
+
+/// The tagged-union layout of an enum by C's rules (EnumLayout, §15.1), cached on its definition. A niche optional is
+/// its pointer alone (tag size 0).
+fn self_enumLayout(table: borrow mut TypeTable, id: u32) {
+    let e = table.types[id as usize].enumDef as usize;
+    if (table.enums[e].hasLayout) {
+        return;
+    }
+    if (table.isNicheOptional(id)) {
+        let some = table.variants[table.enums[e].variants[1] as usize].payload[0];
+        let pointer = table.fields[some as usize].typ;
+        let l = table.layoutOf(pointer);
+        table.fields[some as usize].offset = 0;
+        table.enums[e].hasLayout = true;
+        table.enums[e].size = truncate<u32>(l.size);
+        table.enums[e].align = l.align;
+        table.enums[e].tagSize = 0;
+        table.enums[e].unionOffset = 0;
+        return;
+    }
+    let count = table.enums[e].variants.length;
+    let repr = table.enums[e].repr;
+    let tagSize: u32 =
+        if (repr !=
+            none()) table.types[repr as usize].bits / 8 else if (count <= 256) 1 else if (count <= 65536) 2 else 4;
+    var unionSize: u32 = 0;
+    var unionAlign: u32 = 1;
+    for (k in 0..count) {
+        let v = table.enums[e].variants[k] as usize;
+        let payloadCount = table.variants[v].payload.length;
+        if (payloadCount == 0) {
+            continue;
+        }
+        var offset: u32 = 0;
+        var align: u32 = 1;
+        for (p in 0..payloadCount) {
+            let f = table.variants[v].payload[p] as usize;
+            let fieldType = table.fields[f].typ;
+            let l = table.layoutOf(fieldType);
+            offset = (offset + l.align - 1) / l.align * l.align;
+            table.fields[f].offset = offset;
+            offset += truncate<u32>(l.size);
+            if (l.align > align) {
+                align = l.align;
+            }
+        }
+        let rounded = (offset + align - 1) / align * align;
+        if (rounded > unionSize) {
+            unionSize = rounded;
+        }
+        if (align > unionAlign) {
+            unionAlign = align;
+        }
+    }
+    let payloadAlign: u32 = if (unionSize == 0) 1 else unionAlign;
+    let totalAlign = if (tagSize > payloadAlign) tagSize else payloadAlign;
+    let unionOffset = (tagSize + unionAlign - 1) / unionAlign * unionAlign;
+    let end = if (unionSize == 0) tagSize else unionOffset + unionSize;
+    table.enums[e].hasLayout = true;
+    table.enums[e].size = (end + totalAlign - 1) / totalAlign * totalAlign;
+    table.enums[e].align = totalAlign;
+    table.enums[e].tagSize = tagSize;
+    table.enums[e].unionOffset = if (unionSize == 0) -1 else unionOffset as i64;
+}

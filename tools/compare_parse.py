@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Compares `ceesafec parse` with the pinned novac file by file (docs/p2-frontend.md §6).
+"""Compares `ceesafec parse` (or `check`) with the pinned novac file by file (docs/p2-frontend.md §6).
 
 For each file it runs `parse --dump-ast --diagnostics-format=json FILE` and `parse FILE` (text diagnostics on stderr)
 with both compilers, from the same working directory, and requires the same exit status, stdout and stderr. With
-`--mutate N SEED`, it also writes N broken variants of the files (tools/parser_fuzz.py) and compares those.
+`--command check` it runs `check --dump-hir --diagnostics-format=json FILE` and `check FILE` instead (P3).
 
-usage: tools/compare_parse.py --ceesafec out/ceesafe --novac ~/.nova/0.4.1/bin/novac [--root DIR] PATH...
+usage: tools/compare_parse.py --ceesafec out/ceesafe --novac ~/.nova/0.4.1/bin/novac [--command check] [--root DIR]
+       PATH...
 """
 
 import argparse
@@ -38,7 +39,8 @@ def outcome(compiler, argv, root):
 
 def compare(args, root, path):
     problems = []
-    for argv in (["parse", "--dump-ast", "--diagnostics-format=json", path], ["parse", path]):
+    dump = "--dump-ast" if args.command == "parse" else "--dump-hir"
+    for argv in ([args.command, dump, "--diagnostics-format=json", path], [args.command, path]):
         mine = outcome(args.ceesafec, argv, root)
         ref = outcome(args.novac, argv, root)
         if mine != ref:
@@ -64,6 +66,7 @@ def main():
     parser.add_argument("--ceesafec", required=True)
     parser.add_argument("--novac", required=True)
     parser.add_argument("--root", default=".")
+    parser.add_argument("--command", choices=("parse", "check"), default="parse")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     parser.add_argument("paths", nargs="+")
     args = parser.parse_args()
@@ -75,7 +78,7 @@ def main():
     problems = [p for r in results for p in r]
     for p in problems[:15]:
         print(p)
-    print(f"compare_parse: {len(files)} files, {len(files) - len(problems)} identical, {len(problems)} differ")
+    print(f"compare_parse ({args.command}): {len(files)} files, {len(files) - len(problems)} identical, {len(problems)} differ")
     sys.exit(1 if problems else 0)
 
 
