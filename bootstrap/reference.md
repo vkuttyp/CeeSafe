@@ -11,6 +11,7 @@ Recorded 2026-10-30. Updated only by an explicit rebaseline (below), never silen
 | sha256 | `81c5b5013473f9e5358560fc24c062b293ee272c7b28944ce87696c2749d0a0b` |
 | Source | Nova tag `v0.3.1` = `4481e12e3b5fa5cbe53e7b333e13afd3695989b2` (branch `release-0.3`, 2026-10-29) |
 | C compiler | Apple clang 21.0.0 (clang-2100.3.34.2) |
+| Linux x64 binary (Ryzen box) | `novac-linux-x64.tar.gz` sha256 `bbeb82c5617123556b403ab2a5e3bdf22a530fe8ed51371ed0673bacbabcbff7` (matches the release's `SHA256SUMS`); `novac` inside, sha256 `8bd8d81b9a0355453f68fe7c338a5478cf3c142c90526fffaaf1bd6b309ad973`; kept in `/root/ceesafe-p0/novac-0.3.1` |
 
 The `novac` on `PATH` (`~/.local/bin/novac`) wraps the Release build of `~/Nova`'s working tree and reports a `-dev`
 version: it is **not** the stage-0 compiler. Other hosts download the same release from

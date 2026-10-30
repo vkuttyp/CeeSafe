@@ -11,7 +11,9 @@ Normalisation is deliberately narrow and listed in NORMALISATIONS; it never remo
 panic location.
 
 usage: tools/run_corpus.py --compiler PATH [--reference PATH] [--corpus DIR] [--family F]... [--filter TEXT]
-                           [--jobs N] [--timeout S] [--cc CC] [--cflag FLAG]... [--report FILE] [-v]
+                           [--jobs N] [--timeout S] [--cc CC] [--cflag=FLAG]... [--report FILE] [-v]
+
+Write C flags as --cflag=-O2: argparse reads a separate `-O2` as an option of its own.
 """
 
 import argparse

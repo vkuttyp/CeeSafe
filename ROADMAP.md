@@ -1,7 +1,7 @@
 # CeeSafe roadmap: port the Nova compiler to Nova, as CeeSafe
 
-Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0 in progress**. The package scaffold, the stage-0 pin and
-decision 0001 exist. No compiler code has been ported.
+Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0 complete; P1 next**. The package scaffold, the stage-0 pin,
+decision 0001, the inventory, the parity ledger and the corpus runner exist. No compiler code has been ported.
 Repository: `~/dev/CeeSafe`. Reference: `vkuttyp/Nova` (C#/.NET 10), pinned in `bootstrap/reference.md`.
 
 **Identity** (decision 0001):
@@ -209,7 +209,7 @@ entry in §10. An unchecked item is planned, not done.
 
 ### P0 — Foundation: pin, identity, inventory and runner
 
-Dependencies: none. **In progress.**
+Dependencies: none. **Complete (2026-10-30)**: the gate passed on the Ryzen box (§10).
 
 - [x] Scaffold the package with the pinned novac (`novac new ceesafe --agent claude`), and write a `ceesafec` skeleton
   that handles `--version` and `--help` (2026-10-30).
@@ -225,20 +225,23 @@ Dependencies: none. **In progress.**
   families. It checks annotations, snapshots, expected output and panics, and in `--reference` mode compares status,
   stdout, stderr and emitted files. It applies two named normalisations: the generated-by banner and the program name.
   It was tested against a deliberately wrong compiler.
-- [ ] Close the runner's gaps (`docs/parity.md` §3):
-  - a C configuration matrix (clang -O0/-O2, the overflow fallback, ASan+UBSan, `--split`, TSan, GCC);
-  - freestanding symbol checks;
-  - CLI fixtures for the 20 codes the corpus does not annotate.
-
-  Most are needed by P5. The N0310–N0315 package fixtures are needed by P3.
+- [x] First C configurations (2026-10-30, Ryzen box): GCC 12 (default `cc`), clang 18 `-O2`, and clang 18 `-O1` with
+  ASan+UBSan. The rest of the matrix moved to P5 (below).
 - [x] Reference dumps (2026-10-30). The corpus's AST (40) and HIR (27) snapshots are the reference, and the runner
   reproduces them with 0.3.1. Exporting token and NIR dumps is deferred to P2 and P4, which decide how to compare them.
 - [x] Run the reference suite (2026-10-30). `dotnet test Nova.slnx` at `07d561f` on macOS arm64 passed 3,589 of 3,589
   tests, with 0 skipped, in 12 min 24 s. No real GCC was available (`gcc` is Apple clang), and no MSVC (that needs the
   Windows VM). Whether TSan ran is not shown at default verbosity. A configuration Nova's suite cannot find counts as
   missing, not as passed.
-- [ ] Gate check from a second checkout or host (the Ryzen box): reconstruct the pin, run the runner, get identical
-  results.
+- [x] Gate check (2026-10-30). On the Ryzen box (Debian 12, x86-64): the novac 0.3.1 release download matched the
+  release's `SHA256SUMS`; Nova was cloned at `07d561f`, and CeeSafe from a git bundle of `ef3e413`. Results:
+  - `tools/inventory.py` regenerated `docs/reference-inventory.md` byte-identical;
+  - the runner gave the Mac's results: 454 pass, 0 fail, 3 partial.
+
+Carried into later phases (`docs/parity.md` §3):
+- the rest of the C matrix: `-O0`, the overflow fallback, `--split`, TSan (P5);
+- freestanding symbol checks (P5);
+- CLI fixtures for the 20 codes the corpus does not annotate. N0310–N0315 are needed by P3, the rest by P8.
 
 Gate: another checkout reconstructs the pin and runs a representative fixture set with identical results, and the
 ledger has no unmapped items (inventory: 0 unmapped, 2026-10-30).
@@ -530,13 +533,12 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
 
 ## 9. Immediate work queue
 
-1. P0: finish the gate by rerunning the runner from a second host (the Ryzen box, which also has GCC).
-2. P0/P5: the runner's C configuration matrix and the package fixtures (`docs/parity.md` §3), alongside P1.
-3. P1: the probes, starting with an ID-table AST built by a hand-written lexer over a real `.nova` file. Its results
+1. P1: the probes, starting with an ID-table AST built by a hand-written lexer over a real `.nova` file. Its results
    finalise the N list.
-4. N6: draft Nova `docs/milestone-15.md` and the first ADR (strings and maps). This changes `~/Nova`, so it waits for the
+2. Alongside P1: the rest of the runner's C configuration matrix, and the package fixtures (`docs/parity.md` §3).
+3. N6: draft Nova `docs/milestone-15.md` and the first ADR (strings and maps). This changes `~/Nova`, so it waits for the
    owner's go-ahead.
-5. Only then start P2 with `SourceText`, the line index and the interner, followed by tokens and the lexer. Do not begin
+4. Only then start P2 with `SourceText`, the line index and the interner, followed by tokens and the lexer. Do not begin
    by translating `TypeChecker.cs`.
 
 Progress is measured in completed contracts and gates. There is no calendar estimate before P1 produces evidence.
@@ -564,5 +566,18 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 - Against a deliberately wrong compiler: every affected file failed, as expected.
 - `tools/inventory.py` run twice gave byte-identical output, with no host paths.
 - Nova's `dotnet test Nova.slnx` at `07d561f`: 3,589 passed, 0 failed, 0 skipped.
+
+**P0 gate on the Ryzen box** (2026-10-30, Debian 12 x86-64, Python 3.11.2; novac 0.3.1 linux-x64, sha256
+`8bd8d81b…d973`; Nova `07d561f`; CeeSafe `ef3e413`). Each run used `nice -n 15` and 6 jobs:
+
+| Run | Result |
+|---|---|
+| inventory | byte-identical to the committed file |
+| all 457 files, default `cc` (GCC 12.2.0) | 454 pass, 0 fail, 3 partial |
+| run-pass, run-fail, ffi, freestanding with clang 18.1.8 `-O2` | 199 pass, 0 fail, 3 partial |
+| run-pass, run-fail, ffi with clang 18.1.8 `-O1` and ASan+UBSan (`-fno-sanitize-recover=all`) | 199 pass, 0 fail |
+
+A probe build confirmed the flags took effect: the sanitizer runtime was linked in, and the clang build came from
+clang 18.1.8.
 
 Nothing in P1 or any later phase has been run.

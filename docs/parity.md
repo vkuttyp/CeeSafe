@@ -55,10 +55,11 @@ difference in `--reference` mode.
 
 ## 3. Known gaps in the black-box evidence
 
-- **One C configuration.** The runner builds with novac's default C compiler and flags. Nova's suite also runs clang
-  `-O0`/`-O2`, the portable overflow fallback (`-DNV_NO_BUILTIN_OVERFLOW`), ASan+UBSan, `--split`, TSan for thread
-  programs, and real GCC (testing.md §3). `--cc` and `--cflag` pass through; a configuration matrix is a P5 task.
-  There is no real GCC on the Mac (`gcc` is Apple clang); the Ryzen box or CI has one.
+- **Part of the C matrix.** These configurations have been run, one invocation each (`--cc`, `--cflag=…`): the
+  default `cc` on the Mac (Apple clang) and on the Ryzen box (GCC 12), clang 18 `-O2`, and clang 18 `-O1` with
+  ASan+UBSan (ROADMAP §10). Nova's suite also runs `-O0`, the portable overflow fallback
+  (`-DNV_NO_BUILTIN_OVERFLOW`), `--split` and TSan for thread programs (testing.md §3). These, and a one-command
+  matrix, are P5 tasks.
 - **Freestanding** is partial: the runner checks only that the object builds. `FreestandingTests` also checks
   symbols and sections with `nm`/`objdump`.
 - **20 codes have no corpus annotation** (inventory §3): N0109, N0258, N0300, N0310–N0315, N0320–N0329, N0335.
