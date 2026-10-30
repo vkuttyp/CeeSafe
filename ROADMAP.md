@@ -293,8 +293,13 @@ Each item is a Nova change approved by the owner and made under Nova's rules: sp
   (`generic-impls`, `error-layers` probes).
 - [x] ~~N5 borrow precision~~: not needed. `splitAtMut`, copy-out and separate tables are accepted
   (`aliasing-workarounds` probe).
-- [ ] N6. Draft `~/Nova/docs/milestone-15.md` citing OD-33, with N0–N0d, N1a, N4a and N4b. This is the **next Nova-side
-  task** and waits for the owner's go-ahead.
+- [x] N6. Drafted as Nova `docs/milestone-15.md` (2026-10-30, Nova `34ce40a`, proposed), citing OD-33. Its items map
+  to this list as follows:
+  - S1 is N0 (#2), S2 is N0b (#1), and S4 and S5 are N0c (#4, #5): fixes for novac 0.3.2;
+  - S3 is N0d (#3) and S6 is N1a: 0.4.0;
+  - S7 is N4a, after an ADR.
+
+  N4b dropped: framing can be buffered over `Console.read`.
 
 Gate per item: the novac release passes Nova's full suite, and CeeSafe's affected probes pass after the re-pin.
 
@@ -559,7 +564,7 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
 
 ## 9. Immediate work queue
 
-1. **Owner decision:** start Nova M15 (N6); the bugs are filed as Nova #1–#5. Its order:
+1. **Nova M15** is drafted (`~/Nova/docs/milestone-15.md`, proposed). Next, with the owner's go-ahead, implement it in Nova, in this order:
    - N0 (the crash) and N0b (the missing drop) first, since they are bugs;
    - then N1a (bytes to text) and N0d (the nesting limit), which P2 needs;
    - N4 (host services) later, before P5.
@@ -584,6 +589,7 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 | 2026-10-30 | P1 probes (`probes/`), the report (`docs/p1-probes.md`), and an upstream crash reproducer (`probes/upstream/`) | 12/12 pass; N list revised |
 | 2026-10-30 | P1 support library, oracles (`tools/oracles/`), fault sweep, limits, skeleton loading; `run_corpus.py --with` and `--check-leaks`; 4 more upstream reproducers | all pass; P1 gate passed |
 | 2026-10-30 | Filed Nova issues #1–#5 (the P1 upstream defects; each reproduced again on `origin/main` 07d561f first) | filed |
+| 2026-10-30 | Drafted Nova M15 (`docs/milestone-15.md`, Nova `34ce40a`, pushed) | proposed; awaiting the owner |
 
 **Tests run for the skeleton** (2026-10-30, novac 0.3.1, Apple clang 21.0.0):
 - `novac check` and `novac fmt --check`: clean.
