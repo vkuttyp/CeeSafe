@@ -1,6 +1,6 @@
 # P4 plan: NIR and the safety passes
 
-Status: **planned** (2026-10-30; pinned to novac 0.6.0).
+Status: **in progress**: S0–S2 done (2026-10-30; pinned to novac 0.6.0); next S3.
 
 P4 ports what runs after the type checker in `Compilation.CreateOnCompilerStack` (reference `v0.6.0`, `Compilation.cs`):
 
@@ -46,3 +46,5 @@ does (`src/hir/hir.nova`). The printer's text is the contract.
 
 | Date | Slice | Work | Result |
 |---|---|---|---|
+| 2026-10-30 | S0, S2 | `src/nir/nir.nova` (arenas), `nir_printer.nova`, `nir_builder.nova` (the whole of NirBuilder, so S2 came with S0), `build --dump-nir`, `tools/compare_nir.py`; `gen_builtins.py` emits `builtinFunctionName` | before drops: 174 of 270 built programs identical, every difference a drop |
+| 2026-10-30 | S1 | `src/nir/move_paths.nova` (MovePath, InitState as bitsets, MoveData's FIFO dataflow), `src/nir/drops.nova` (DropElaborator; flags kept in creation order, as the reference's dictionary); HIR's never-set `isGeneric`/`isInstantiation` fields removed for `functionIsGeneric` (statics' constant-function loop too) | `compare_nir.py` over every corpus family: 474 files, 284 built by novac, **284 identical**; CeeSafe's own NIR (package mode) identical, 429,006 lines, ceesafec 0.30 s, 79 MB. Unchanged: check 266/322 and 84/84, parse 487/487, packages 7/7, `fmt --check` clean |

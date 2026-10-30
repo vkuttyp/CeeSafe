@@ -49,6 +49,14 @@ def main():
     ]
     for index, name in enumerate(names):
         out.append(f"fn bf{name}() -> u32 => {index};")
+    # The members' names, as NirPrinter writes a NirBuiltin (`{b.Function}`).
+    out.append("")
+    out.append("/// The member's name, by declaration index.")
+    out.append("fn builtinFunctionName(index: u32) -> StringView => match (index) {")
+    for index, name in enumerate(names[:-1]):
+        out.append(f'    {index} => "{name}",')
+    out.append(f'    _ => "{names[-1]}",')
+    out.append("};")
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "hir", "builtins.nova")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(out) + "\n")

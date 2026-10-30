@@ -184,8 +184,6 @@ struct HirFunction {
     locals: Vector<u32>;     // every local, parameters included; locals[i] has id i
     body: u32;               // a block statement, or none
     typeArguments: Range;    // TypeTable.lists
-    isGeneric: bool;
-    isInstantiation: bool;
     isClosure: bool;
     closureEnvironment: u32;
     isDynMethod: bool;
@@ -384,8 +382,6 @@ struct HirProgram {
             locals: Vector<u32>.create(),
             body: none(),
             typeArguments: emptyRange(),
-            isGeneric: false,
-            isInstantiation: false,
             isClosure: false,
             closureEnvironment: none(),
             isDynMethod: false,

@@ -1,0 +1,444 @@
+// NIR as text (the reference's NirPrinter, `novac build --dump-nir`): a MIR-like form for debugging and review, and
+// the contract the comparison with the reference checks. Library functions are left out (§29.2).
+
+fn printNir(c: borrow Checker, n: borrow NirProgram, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    for (function in n.functions.view()) {
+        if (c.hir.functions[function.source as usize].library) {
+            continue;
+        }
+        appendText(out, "fn ")?;
+        appendBytes(out, c.name(c.hir.functions[function.source as usize].name))?;
+        appendText(out, "(")?;
+        for (k in 0..function.parameterCount) {
+            if (k > 0) {
+                appendText(out, ", ")?;
+            }
+            printNirLocal(c, function, k, out)?;
+            appendText(out, ": ")?;
+            appendBytes(out, c.types.name(function.locals[k as usize].typ))?;
+        }
+        appendText(out, ") -> ")?;
+        appendBytes(out, c.types.name(c.hir.functions[function.source as usize].returnType))?;
+        appendText(out, " {\n")?;
+        for (k in function.parameterCount..truncate<u32>(function.locals.length)) {
+            appendText(out, "    let ")?;
+            printNirLocal(c, function, k, out)?;
+            appendText(out, ": ")?;
+            appendBytes(out, c.types.name(function.locals[k as usize].typ))?;
+            appendText(out, ";\n")?;
+        }
+        for (block in function.blocks.view()) {
+            appendText(out, "  bb")?;
+            appendDecimal(out, block.id as u64)?;
+            appendText(out, ":\n")?;
+            for (s in block.statements.view()) {
+                appendText(out, "    ")?;
+                printNirStatement(c, n, function, s, out)?;
+                appendText(out, ";\n")?;
+            }
+            appendText(out, "    ")?;
+            printNirTerminator(c, n, function, block.terminator, out)?;
+            appendText(out, ";\n")?;
+        }
+        appendText(out, "}\n")?;
+    }
+    return Ok();
+}
+
+fn printNirLocal(
+    c: borrow Checker,
+    function: borrow NirFunction,
+    local: u32,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.push('_')?;
+    appendDecimal(out, local as u64)?;
+    let name = function.locals[local as usize].name;
+    if (name != none()) {
+        out.push('(')?;
+        appendBytes(out, c.name(name))?;
+        out.push(')')?;
+    }
+    return Ok();
+}
+
+fn printNirPlace(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    function: borrow NirFunction,
+    place: u32,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    let p = n.places[place as usize];
+    var text = Vector<u8>.create();
+    printNirLocal(c, function, p.local, mut text)?;
+    for (k in 0..p.projections.count) {
+        let projection = n.projections[(p.projections.start + k) as usize];
+        var next = Vector<u8>.create();
+        match (projection.kind) {
+            ProjectionKind.Deref => {
+                appendText(mut next, "(*")?;
+                appendBytes(mut next, text.view())?;
+                appendText(mut next, ")")?;
+            }
+            ProjectionKind.Field => {
+                appendBytes(mut next, text.view())?;
+                next.push('.')?;
+                appendBytes(mut next, c.name(c.types.fields[projection.field as usize].name))?;
+            }
+            ProjectionKind.Downcast => {
+                appendText(mut next, "(")?;
+                appendBytes(mut next, text.view())?;
+                appendText(mut next, " as ")?;
+                appendBytes(mut next, c.name(c.types.variants[projection.variant as usize].name))?;
+                appendText(mut next, ")")?;
+            }
+            ProjectionKind.Index => {
+                appendBytes(mut next, text.view())?;
+                next.push('[')?;
+                if (projection.index == none()) {
+                    next.push('?')?;
+                } else {
+                    printNirOperand(c, n, function, projection.index, mut next)?;
+                }
+                next.push(']')?;
+            }
+        }
+        text = next;
+    }
+    return appendBytes(out, text.view());
+}
+
+fn printNirOperand(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    function: borrow NirFunction,
+    operand: u32,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    match (n.operands[operand as usize]) {
+        NirOperand.Place(place, _) => { return printNirPlace(c, n, function, place, out); }
+        NirOperand.Const(value) => {
+            appendText(out, "const ")?;
+            appendIntValue(out, value)?;
+            out.push('_')?;
+            return appendBytes(out, c.types.name(n.operandTypes[operand as usize]));
+        }
+        NirOperand.Zero => {
+            appendText(out, "zeroed ")?;
+            return appendBytes(out, c.types.name(n.operandTypes[operand as usize]));
+        }
+        NirOperand.String(text) => {
+            appendText(out, "const \"")?;
+            appendBytes(out, n.textOf(text))?;
+            return appendText(out, "\"");
+        }
+    }
+}
+
+fn printNirOperands(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    function: borrow NirFunction,
+    operands: Range,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    for (k in 0..operands.count) {
+        if (k > 0) {
+            appendText(out, ", ")?;
+        }
+        printNirOperand(c, n, function, n.at(operands, k), out)?;
+    }
+    return Ok();
+}
+
+fn binaryOpName(op: BinaryOp) -> StringView => match (op) {
+    BinaryOp.LogicalOr => "LogicalOr",
+    BinaryOp.LogicalAnd => "LogicalAnd",
+    BinaryOp.Equal => "Equal",
+    BinaryOp.NotEqual => "NotEqual",
+    BinaryOp.Less => "Less",
+    BinaryOp.LessEqual => "LessEqual",
+    BinaryOp.Greater => "Greater",
+    BinaryOp.GreaterEqual => "GreaterEqual",
+    BinaryOp.BitOr => "BitOr",
+    BinaryOp.BitXor => "BitXor",
+    BinaryOp.BitAnd => "BitAnd",
+    BinaryOp.ShiftLeft => "ShiftLeft",
+    BinaryOp.ShiftRight => "ShiftRight",
+    BinaryOp.Add => "Add",
+    BinaryOp.Subtract => "Subtract",
+    BinaryOp.Multiply => "Multiply",
+    BinaryOp.Divide => "Divide",
+    BinaryOp.Remainder => "Remainder",
+};
+
+fn printNirRvalue(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    function: borrow NirFunction,
+    rvalue: u32,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    let typ = n.rvalueTypes[rvalue as usize];
+    match (n.rvalues[rvalue as usize]) {
+        NirRvalue.Use(operand) => { return printNirOperand(c, n, function, operand, out); }
+        NirRvalue.Binary(op, left, right) => {
+            appendText(out, binaryOpName(op))?;
+            out.push('(')?;
+            printNirOperand(c, n, function, left, out)?;
+            appendText(out, ", ")?;
+            printNirOperand(c, n, function, right, out)?;
+            return appendText(out, ")");
+        }
+        NirRvalue.Unary(op, operand) => {
+            appendText(out, match (op) {
+                UnaryOp.Negate => "Negate",
+                UnaryOp.Not => "Not",
+            })?;
+            out.push('(')?;
+            printNirOperand(c, n, function, operand, out)?;
+            return appendText(out, ")");
+        }
+        NirRvalue.Cast(operand) => {
+            printNirOperand(c, n, function, operand, out)?;
+            appendText(out, " as ")?;
+            return appendBytes(out, c.types.name(typ));
+        }
+        NirRvalue.Truncate(operand) => {
+            appendText(out, "truncate<")?;
+            appendBytes(out, c.types.name(typ))?;
+            appendText(out, ">(")?;
+            printNirOperand(c, n, function, operand, out)?;
+            return appendText(out, ")");
+        }
+        NirRvalue.FloatToInt(operand, mode) => {
+            appendText(out, match (mode) {
+                FloatToIntKind.Panic => "panic",
+                FloatToIntKind.Checked => "checked",
+                FloatToIntKind.Saturating => "saturating",
+            })?;
+            appendText(out, "-truncate<")?;
+            appendBytes(out, c.types.name(typ))?;
+            appendText(out, ">(")?;
+            printNirOperand(c, n, function, operand, out)?;
+            return appendText(out, ")");
+        }
+        NirRvalue.Call(callee, arguments) => {
+            appendBytes(out, c.name(c.hir.functions[callee as usize].name))?;
+            out.push('(')?;
+            printNirOperands(c, n, function, arguments, out)?;
+            return appendText(out, ")");
+        }
+        NirRvalue.Ref(mutable, place) => {
+            appendText(out, if (mutable) "&mut " else "&")?;
+            return printNirPlace(c, n, function, place, out);
+        }
+        NirRvalue.Discriminant(place) => {
+            appendText(out, "discriminant(")?;
+            printNirPlace(c, n, function, place, out)?;
+            return appendText(out, ")");
+        }
+        NirRvalue.EnumAggregate(variant, payload) => {
+            appendBytes(out, c.types.name(typ))?;
+            out.push('.')?;
+            appendBytes(out, c.name(c.types.variants[variant as usize].name))?;
+            out.push('(')?;
+            printNirOperands(c, n, function, payload, out)?;
+            return appendText(out, ")");
+        }
+        NirRvalue.Aggregate(fields) => {
+            appendBytes(out, c.types.name(typ))?;
+            appendText(out, " { ")?;
+            printNirOperands(c, n, function, fields, out)?;
+            return appendText(out, " }");
+        }
+        NirRvalue.Array(elements) => {
+            out.push('[')?;
+            printNirOperands(c, n, function, elements, out)?;
+            return appendText(out, "]");
+        }
+        NirRvalue.ArrayRepeat(value) => {
+            out.push('[')?;
+            printNirOperand(c, n, function, value, out)?;
+            appendText(out, "; ")?;
+            appendDecimal(out, truncate<u64>(c.types.info(typ).arrayLength))?;
+            return appendText(out, "]");
+        }
+        NirRvalue.Slice(mutable, base, low, high) => {
+            appendText(out, if (mutable) "&mut " else "&")?;
+            printNirPlace(c, n, function, base, out)?;
+            out.push('[')?;
+            printNirOperand(c, n, function, low, out)?;
+            appendText(out, "..")?;
+            printNirOperand(c, n, function, high, out)?;
+            return appendText(out, "]");
+        }
+        NirRvalue.Length(slice) => {
+            appendText(out, "length(")?;
+            printNirPlace(c, n, function, slice, out)?;
+            return appendText(out, ")");
+        }
+        NirRvalue.Builtin(builtin, arguments) => {
+            appendText(out, builtinFunctionName(builtin))?;
+            out.push('(')?;
+            printNirOperands(c, n, function, arguments, out)?;
+            return appendText(out, ")");
+        }
+        NirRvalue.FunctionAddress(f) => {
+            appendText(out, "address(")?;
+            appendBytes(out, c.name(c.hir.functions[f as usize].name))?;
+            return appendText(out, ")");
+        }
+        NirRvalue.StaticAddress(s) => {
+            appendText(out, "static(")?;
+            appendBytes(out, c.name(c.hir.statics[s as usize].name))?;
+            return appendText(out, ")");
+        }
+    }
+}
+
+fn printNirStatement(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    function: borrow NirFunction,
+    statement: u32,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    match (n.statements[statement as usize]) {
+        NirStatement.Assign(target, value) => {
+            printNirPlace(c, n, function, target, out)?;
+            appendText(out, " = ")?;
+            return printNirRvalue(c, n, function, value, out);
+        }
+        NirStatement.Eval(value) => { return printNirRvalue(c, n, function, value, out); }
+        NirStatement.Unpack(source, variant, targets) => {
+            out.push('(')?;
+            for (k in 0..targets.count) {
+                if (k > 0) {
+                    appendText(out, ", ")?;
+                }
+                let target = n.at(targets, k);
+                if (target == none()) {
+                    out.push('_')?;
+                } else {
+                    printNirLocal(c, function, target, out)?;
+                }
+            }
+            appendText(out, ") = unpack ")?;
+            printNirPlace(c, n, function, source, out)?;
+            appendText(out, " as ")?;
+            return appendBytes(out, c.name(c.types.variants[variant as usize].name));
+        }
+        NirStatement.BoxFree(box, flag) => {
+            appendText(out, "BoxFree(")?;
+            printNirPlace(c, n, function, box, out)?;
+            out.push(')')?;
+            if (flag != none()) {
+                appendText(out, " if ")?;
+                printNirLocal(c, function, flag, out)?;
+            }
+            return Ok();
+        }
+        NirStatement.BoundsCheck(index, length) => {
+            appendText(out, "BoundsCheck(")?;
+            printNirOperand(c, n, function, index, out)?;
+            appendText(out, " < ")?;
+            printNirOperand(c, n, function, length, out)?;
+            return appendText(out, ")");
+        }
+        NirStatement.RangeCheck(low, high, length, text) => {
+            appendText(out, if (text != none()) "StrRangeCheck(" else "RangeCheck(")?;
+            printNirOperand(c, n, function, low, out)?;
+            appendText(out, " <= ")?;
+            printNirOperand(c, n, function, high, out)?;
+            appendText(out, " <= ")?;
+            printNirOperand(c, n, function, length, out)?;
+            return appendText(out, ")");
+        }
+        NirStatement.LengthCheck(left, right) => {
+            appendText(out, "LengthCheck(")?;
+            printNirOperand(c, n, function, left, out)?;
+            appendText(out, " == ")?;
+            printNirOperand(c, n, function, right, out)?;
+            return appendText(out, ")");
+        }
+        NirStatement.StorageDead(local) => {
+            appendText(out, "StorageDead(")?;
+            printNirLocal(c, function, local, out)?;
+            return appendText(out, ")");
+        }
+        NirStatement.Drop(place, flag) => {
+            appendText(out, "Drop(")?;
+            printNirPlace(c, n, function, place, out)?;
+            out.push(')')?;
+            if (flag != none()) {
+                appendText(out, " if ")?;
+                printNirLocal(c, function, flag, out)?;
+            }
+            return Ok();
+        }
+    }
+}
+
+fn printNirTerminator(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    function: borrow NirFunction,
+    terminator: u32,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    match (n.terminators[terminator as usize]) {
+        NirTerminator.Goto(target) => {
+            appendText(out, "goto bb")?;
+            return appendDecimal(out, blockId(function, target) as u64);
+        }
+        NirTerminator.Branch(condition, then, otherwise) => {
+            appendText(out, "branch ")?;
+            printNirOperand(c, n, function, condition, out)?;
+            appendText(out, " ? bb")?;
+            appendDecimal(out, blockId(function, then) as u64)?;
+            appendText(out, " : bb")?;
+            return appendDecimal(out, blockId(function, otherwise) as u64);
+        }
+        NirTerminator.Switch(value, cases, otherwise) => {
+            appendText(out, "switch ")?;
+            printNirOperand(c, n, function, value, out)?;
+            appendText(out, " [")?;
+            for (k in 0..cases.count) {
+                if (k > 0) {
+                    appendText(out, ", ")?;
+                }
+                let case = n.cases[(cases.start + k) as usize];
+                appendIntValue(out, case.value)?;
+                appendText(out, " => bb")?;
+                appendDecimal(out, blockId(function, case.target) as u64)?;
+            }
+            appendText(out, ", _ => bb")?;
+            appendDecimal(out, blockId(function, otherwise) as u64)?;
+            return appendText(out, "]");
+        }
+        NirTerminator.Return(value) => {
+            appendText(out, "return")?;
+            if (value != none()) {
+                out.push(' ')?;
+                printNirOperand(c, n, function, value, out)?;
+            }
+            return Ok();
+        }
+        NirTerminator.Exit(code) => {
+            appendText(out, "exit ")?;
+            return printNirOperand(c, n, function, code, out);
+        }
+        NirTerminator.Panic(kind) => {
+            return appendText(out, match (kind) {
+                NirPanicKind.Unwrap => "panic Unwrap",
+                NirPanicKind.UnwrapNull => "panic UnwrapNull",
+            });
+        }
+        NirTerminator.Unreachable => { return appendText(out, "unreachable"); }
+    }
+}
+
+/// A block reference is the block's id: blocks are named by the id they were made with (NirBlock.Id).
+fn blockId(function: borrow NirFunction, block: u32) -> u32 => block;

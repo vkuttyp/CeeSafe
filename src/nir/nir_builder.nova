@@ -1,0 +1,2511 @@
+// Lowering checked HIR to NIR (the reference's Nir/NirBuilder.cs, intermediate-representation.md §3). Given only a
+// program without errors. `current` is the block being filled, or none when the current point is unreachable (after
+// return, break, continue or exit), in which case lowering is skipped.
+//
+// The reference shares one list of temporaries between a statement and the open-temporaries stack by reference; here
+// every such list lives in `tempLists` and both name it by index.
+
+/// The targets of `break` and `continue` in one loop (LoopTargets).
+struct LoopTarget {
+    head: u32;
+    exit: u32;
+    scopeDepth: u32; // open scopes at the loop: break and continue end the scopes above it
+    exitUsed: bool;
+}
+
+/// One entry of an open scope: a local that ends with StorageDead, or a deferred statement (§14.7).
+struct ScopeItem {
+    isDefer: bool;
+    value: u32; // a NIR local, or a HIR defer statement
+}
+
+/// Temporaries of a statement still being lowered, with the scope they belong to.
+struct OpenTemps {
+    list: u32; // tempLists
+    scope: u32;
+}
+
+/// A capture of the closure being built: where it is, through the environment parameter.
+struct CapturePlace {
+    local: u32; // a HIR local
+    field: u32; // a field-precise capture's field, or none
+    place: u32; // a NIR place
+}
+
+struct Lowering {
+    function: u32; // the HIR function
+    file: u32;
+    locals: Vector<NirLocal>;
+    blocks: Vector<NirBlock>; // every block made, by id
+    loops: Vector<LoopTarget>;
+    scopes: Vector<Vector<ScopeItem>>;
+    tempLists: Vector<Vector<u32>>;
+    statementTemps: u32; // tempLists, or none
+    openTemps: Vector<OpenTemps>;
+    captures: Vector<CapturePlace>;
+    results: Vector<u32>; // the result locals of the `if` and `match` expressions being lowered
+    current: u32;         // a block, or none
+    span: Span;
+}
+
+/// NirBuilder.Build: every function but the C functions and the compile-time-only ones, in creation order.
+fn buildNir(c: borrow mut Checker) -> Result<NirProgram, AllocError> {
+    var n = NirProgram.create();
+    for (k in 0..c.hir.functions.length) {
+        let f = truncate<u32>(k);
+        if (!c.hir.functions[k].registered || isExternFunction(c, f) || isCompileTimeOnly(c, f)) {
+            continue;
+        }
+        let function = buildNirFunction(c, mut n, f)?;
+        n.functions.push(function)?;
+    }
+    return Ok(n);
+}
+
+fn isExternFunction(c: borrow Checker, f: u32) -> bool =>
+    c.front.ast.functions[c.hir.functions[f as usize].syntax as usize].isExtern;
+
+/// A `@constant` function whose result holds C state: only at compile time, never lowered (IsCompileTimeOnly, §39.4).
+fn isCompileTimeOnly(c: borrow Checker, f: u32) -> bool =>
+    c.hir.functions[f as usize].isConstant && !isExternFunction(c, f) &&
+        c.types.isCLaidOut(c.hir.functions[f as usize].returnType, 0);
+
+fn buildNirFunction(c: borrow mut Checker, n: borrow mut NirProgram, f: u32) -> Result<NirFunction, AllocError> {
+    var b = Lowering {
+        function: f,
+        file: c.hir.functions[f as usize].file,
+        locals: Vector<NirLocal>.create(),
+        blocks: Vector<NirBlock>.create(),
+        loops: Vector<LoopTarget>.create(),
+        scopes: Vector<Vector<ScopeItem>>.create(),
+        tempLists: Vector<Vector<u32>>.create(),
+        statementTemps: none(),
+        openTemps: Vector<OpenTemps>.create(),
+        captures: Vector<CapturePlace>.create(),
+        results: Vector<u32>.create(),
+        current: none(),
+        span: Span { start: 0, end: 0 },
+    };
+    // HIR locals keep their ids; temporaries are appended after them.
+    for (local in c.hir.functions[f as usize].locals.view()) {
+        let l = c.hir.locals[local as usize];
+        b.locals.push(NirLocal { typ: l.typ, name: l.name, isUsing: l.isUsing })?;
+    }
+    let environment = c.hir.functions[f as usize].closureEnvironment;
+    if (environment != none()) {
+        // A capture is field i + 1 of *env (field 0 is the code): a reference to the variable, or a copied value.
+        let definition = c.types.info(environment).structDef;
+        let captures = c.hir.functions[f as usize].closureCaptures;
+        for (k in 0..captures.count) {
+            let capture = c.hir.captures[(captures.start + k) as usize];
+            let fieldIndex = c.types.structs[definition as usize].fields[(k + 1) as usize];
+            let env = localPlace(n, 0)?;
+            let derefEnv = projectPlace(n, env, derefProjectionN())?;
+            let field = projectPlace(n, derefEnv, fieldProjectionN(fieldIndex))?;
+            if (capture.field != none()) {
+                let through = projectPlace(n, field, derefProjectionN())?; // a field-precise capture (§36.2)
+                b.captures.push(CapturePlace { local: capture.local, field: capture.field, place: through })?;
+                continue;
+            }
+            let byValue = match (capture.mode) {
+                CaptureMode.Copy => true,
+                CaptureMode.Move => true,
+                _ => false,
+            };
+            let place = if (byValue) field else projectPlace(n, field, derefProjectionN())?;
+            b.captures.push(CapturePlace { local: capture.local, field: none(), place: place })?;
+        }
+    }
+    b.current = newBlock(mut b)?;
+    let parameterCount = truncate<u32>(c.hir.functions[f as usize].parameters.length);
+    if (c.hir.functions[f as usize].hasInstanceError) {
+        // An instance that does not check (§20.4): never compiled, since N0222 or another error stops first; it is
+        // not lowered, as it may hold errors.
+        terminate(n, mut b, NirTerminator.Unreachable)?;
+        return finishFunction(f, b, parameterCount);
+    }
+    // By-value parameters are owned by the function: the outermost scope, ended at every return.
+    var outer = Vector<ScopeItem>.create();
+    for (k in 0..parameterCount) {
+        outer.push(ScopeItem { isDefer: false, value: k })?;
+    }
+    b.scopes.push(outer)?;
+    let body = c.hir.functions[f as usize].body;
+    lowerStmt(c, n, mut b, body)?;
+    if (b.current != none()) {
+        // Flow analysis guarantees only void functions can fall off the end.
+        emitStorageDead(c, n, mut b, 0)?;
+        let isVoid = c.types.is(c.hir.functions[f as usize].returnType, TypeKind.Void);
+        terminate(n, mut b, if (isVoid) NirTerminator.Return(none()) else NirTerminator.Unreachable)?;
+    }
+    return finishFunction(f, b, parameterCount);
+}
+
+fn derefProjectionN() -> NirProjection =>
+    NirProjection { kind: ProjectionKind.Deref, field: none(), variant: none(), index: none() };
+
+fn fieldProjectionN(field: u32) -> NirProjection =>
+    NirProjection { kind: ProjectionKind.Field, field: field, variant: none(), index: none() };
+
+fn downcastProjectionN(variant: u32) -> NirProjection =>
+    NirProjection { kind: ProjectionKind.Downcast, field: none(), variant: variant, index: none() };
+
+fn indexProjectionN(index: u32) -> NirProjection =>
+    NirProjection { kind: ProjectionKind.Index, field: none(), variant: none(), index: index };
+
+/// The function with its reachable blocks only (ReachableBlocks), in the order they were made.
+fn finishFunction(f: u32, b: Lowering, parameterCount: u32) -> Result<NirFunction, AllocError> {
+    var reachable = Vector<bool>.create();
+    for (k in 0..b.blocks.length) {
+        reachable.push(false)?;
+    }
+    var work = Vector<u32>.create();
+    work.push(0)?;
+    while (work.length > 0) {
+        let block = work[work.length - 1];
+        work.truncate(work.length - 1);
+        if (reachable[block as usize]) {
+            continue;
+        }
+        reachable[block as usize] = true;
+        for (s in b.blocks[block as usize].successors.view()) {
+            work.push(s)?;
+        }
+    }
+    var blocks = Vector<NirBlock>.create();
+    var locals = b.locals;
+    var all = b.blocks;
+    while (all.length > 0) {
+        match (all.pop()) {
+            Some(block) => {
+                if (reachable[block.id as usize]) {
+                    blocks.push(block)?;
+                }
+            }
+            null => {}
+        }
+    }
+    let count = blocks.length;
+    for (i in 0..(count / 2)) {
+        blocks.swap(i, count - 1 - i);
+    }
+    return Ok(NirFunction { source: f, locals: locals, parameterCount: parameterCount, blocks: blocks });
+}
+
+fn newBlock(b: borrow mut Lowering) -> Result<u32, AllocError> {
+    let id = truncate<u32>(b.blocks.length);
+    b.blocks.push(
+        NirBlock { id: id, statements: Vector<u32>.create(), terminator: none(), successors: Vector<u32>.create() },
+    )?;
+    return Ok(id);
+}
+
+fn newTemp(b: borrow mut Lowering, typ: u32) -> Result<u32, AllocError> {
+    b.locals.push(NirLocal { typ: typ, name: none(), isUsing: false })?;
+    let local = truncate<u32>(b.locals.length - 1);
+    if (b.statementTemps != none()) {
+        b.tempLists[b.statementTemps as usize].push(local)?;
+    }
+    return Ok(local);
+}
+
+/// A compiler local no statement owns (drop flags, return values, hidden payloads).
+fn newLocal(b: borrow mut Lowering, typ: u32) -> Result<u32, AllocError> {
+    b.locals.push(NirLocal { typ: typ, name: none(), isUsing: false })?;
+    return Ok(truncate<u32>(b.locals.length - 1));
+}
+
+fn emit(n: borrow mut NirProgram, b: borrow mut Lowering, statement: NirStatement) -> Result<void, AllocError> {
+    n.statements.push(statement)?;
+    n.statementSpans.push(b.span)?;
+    let id = truncate<u32>(n.statements.length - 1);
+    return b.blocks[b.current as usize].statements.push(id);
+}
+
+fn terminate(n: borrow mut NirProgram, b: borrow mut Lowering, terminator: NirTerminator) -> Result<void, AllocError> {
+    var successors = Vector<u32>.create();
+    match (terminator) {
+        NirTerminator.Goto(target) => { successors.push(target)?; }
+        NirTerminator.Branch(_, then, otherwise) => {
+            successors.push(then)?;
+            successors.push(otherwise)?;
+        }
+        NirTerminator.Switch(_, cases, otherwise) => {
+            for (k in 0..cases.count) {
+                successors.push(n.cases[(cases.start + k) as usize].target)?;
+            }
+            successors.push(otherwise)?;
+        }
+        _ => {}
+    }
+    n.terminators.push(terminator)?;
+    n.terminatorSpans.push(b.span)?;
+    let current = b.current;
+    b.blocks[current as usize].terminator = truncate<u32>(n.terminators.length - 1);
+    b.blocks[current as usize].successors = successors;
+    b.current = none();
+    return Ok();
+}
+
+// ---- Places and operands ----
+
+/// `place` with one more projection.
+fn projectPlace(n: borrow mut NirProgram, place: u32, projection: NirProjection) -> Result<u32, AllocError> {
+    let p = n.places[place as usize];
+    var projections = Vector<NirProjection>.create();
+    for (k in 0..p.projections.count) {
+        projections.push(n.projections[(p.projections.start + k) as usize])?;
+    }
+    projections.push(projection)?;
+    return n.place(p.local, projections.view());
+}
+
+/// `place` without its last projection.
+fn parentPlace(n: borrow mut NirProgram, place: u32) -> Result<u32, AllocError> {
+    let p = n.places[place as usize];
+    var projections = Vector<NirProjection>.create();
+    for (k in 0..(p.projections.count - 1)) {
+        projections.push(n.projections[(p.projections.start + k) as usize])?;
+    }
+    return n.place(p.local, projections.view());
+}
+
+fn localPlace(n: borrow mut NirProgram, local: u32) -> Result<u32, AllocError> {
+    let none0 = Vector<NirProjection>.create();
+    return n.place(local, none0.view());
+}
+
+/// The type of a place (NirPlace.Type).
+fn nirPlaceType(c: borrow Checker, n: borrow NirProgram, locals: borrow Vector<NirLocal>, place: u32) -> u32 {
+    let p = n.places[place as usize];
+    var typ = locals[p.local as usize].typ;
+    for (k in 0..p.projections.count) {
+        typ = applyNirProjection(c, typ, n.projections[(p.projections.start + k) as usize]);
+    }
+    return typ;
+}
+
+fn applyNirProjection(c: borrow Checker, typ: u32, p: NirProjection) -> u32 => match (p.kind) {
+    ProjectionKind.Field => c.types.fields[p.field as usize].typ,
+    ProjectionKind.Deref => c.types.info(typ).pointee,
+    ProjectionKind.Downcast => typ,
+    ProjectionKind.Index => c.types.info(typ).element,
+};
+
+fn placeType(c: borrow Checker, n: borrow NirProgram, b: borrow Lowering, place: u32) -> u32 =>
+    nirPlaceType(c, n, b.locals, place);
+
+/// Using a place by value copies a Copy type and moves anything else (Read, §14.3).
+fn readPlace(c: borrow Checker, n: borrow mut NirProgram, b: borrow Lowering, place: u32) -> Result<u32, AllocError> {
+    let typ = placeType(c, n, b, place);
+    return n.operand(NirOperand.Place(place, !c.types.isCopy(typ)), typ);
+}
+
+fn placeOperand(
+    c: borrow Checker,
+    n: borrow mut NirProgram,
+    b: borrow Lowering,
+    place: u32,
+) -> Result<u32, AllocError> {
+    let typ = placeType(c, n, b, place);
+    return n.operand(NirOperand.Place(place, false), typ);
+}
+
+fn constOperand(n: borrow mut NirProgram, value: i64, typ: u32) -> Result<u32, AllocError> =>
+    n.operand(NirOperand.Const(intValue(value)), typ);
+
+/// The place of a place operand, or none.
+fn operandPlace(n: borrow NirProgram, operand: u32) -> u32 => match (n.operands[operand as usize]) {
+    NirOperand.Place(place, _) => place,
+    _ => none(),
+};
+
+fn isConstOperand(n: borrow NirProgram, operand: u32) -> bool => match (n.operands[operand as usize]) {
+    NirOperand.Const(_) => true,
+    _ => false,
+};
+
+fn useRvalue(n: borrow mut NirProgram, operand: u32) -> Result<u32, AllocError> {
+    let typ = n.operandTypes[operand as usize];
+    return n.rvalue(NirRvalue.Use(operand), typ, Span { start: 0, end: 0 });
+}
+
+fn assign(n: borrow mut NirProgram, b: borrow mut Lowering, target: u32, rvalue: u32) -> Result<void, AllocError> =>
+    emit(n, b, NirStatement.Assign(target, rvalue));
+
+// ---- Scopes ----
+
+/// Leaves the scopes at index `depth` and above, innermost first (EmitStorageDead): each local ends (StorageDead,
+/// where drop elaboration later destroys it) and each deferred statement runs (§14.5, §14.7).
+fn emitStorageDead(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    depth: u32,
+) -> Result<void, AllocError> {
+    var i = b.scopes.length;
+    while (i > depth as usize) {
+        i -= 1;
+        // Temporaries of unfinished statements in this scope end before its locals.
+        var k = b.openTemps.length;
+        while (k > 0 && b.current != none()) {
+            k -= 1;
+            if (b.openTemps[k].scope == truncate<u32>(i)) {
+                let list = b.openTemps[k].list;
+                var t = b.tempLists[list as usize].length;
+                while (t > 0) {
+                    t -= 1;
+                    let temp = b.tempLists[list as usize][t];
+                    emit(n, b, NirStatement.StorageDead(temp))?;
+                }
+            }
+        }
+        var j = b.scopes[i].length;
+        while (j > 0 && b.current != none()) {
+            j -= 1;
+            let item = b.scopes[i][j];
+            if (!item.isDefer) {
+                emit(n, b, NirStatement.StorageDead(item.value))?;
+            } else {
+                let saved = b.statementTemps;
+                let body = match (c.hir.stmts[item.value as usize]) {
+                    HirStmt.Defer(body) => body,
+                    _ => none(),
+                };
+                lowerStmt(c, n, b, body)?;
+                b.statementTemps = saved;
+            }
+        }
+    }
+    return Ok();
+}
+
+/// Starts a statement whose temporaries end with it (WithStatementTemps); returns the saved list.
+fn beginStatementTemps(b: borrow mut Lowering) -> Result<u32, AllocError> {
+    let saved = b.statementTemps;
+    b.tempLists.push(Vector<u32>.create())?;
+    b.statementTemps = truncate<u32>(b.tempLists.length - 1);
+    let list = b.statementTemps;
+    let scope = truncate<u32>(b.scopes.length - 1);
+    b.openTemps.push(OpenTemps { list: list, scope: scope })?;
+    return Ok(saved);
+}
+
+/// Ends a statement's temporaries: StorageDead at its end if it completes.
+fn endStatementTemps(n: borrow mut NirProgram, b: borrow mut Lowering, saved: u32) -> Result<void, AllocError> {
+    b.openTemps.truncate(b.openTemps.length - 1);
+    if (b.current != none()) {
+        let list = b.statementTemps;
+        var i = b.tempLists[list as usize].length;
+        while (i > 0) {
+            i -= 1;
+            let temp = b.tempLists[list as usize][i];
+            emit(n, b, NirStatement.StorageDead(temp))?;
+        }
+    }
+    b.statementTemps = saved;
+    return Ok();
+}
+
+fn addToScope(b: borrow mut Lowering, local: u32) -> Result<void, AllocError> {
+    let top = b.scopes.length - 1;
+    return b.scopes[top].push(ScopeItem { isDefer: false, value: local });
+}
+
+/// Returns from the function (EmitReturn): the value goes into a local no scope owns, then every open statement's
+/// temporaries and every scope end, then the return.
+fn emitReturn(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    value: u32,
+) -> Result<void, AllocError> {
+    var result = none();
+    if (value != none()) {
+        let local = newLocal(b, n.rvalueTypes[value as usize])?;
+        let place = localPlace(n, local)?;
+        assign(n, b, place, value)?;
+        let read = localPlace(n, local)?;
+        result = readPlace(c, n, b, read)?;
+    }
+    emitStorageDead(c, n, b, 0)?;
+    if (b.current != none()) {
+        terminate(n, b, NirTerminator.Return(result))?;
+    }
+    return Ok();
+}
+
+/// The NIR local of a HIR local.
+fn nirLocalOf(c: borrow Checker, local: u32) -> u32 => c.hir.locals[local as usize].id;
+
+/// A local's place: its NIR local, or for a capture of the closure being built, its place in the environment
+/// (LocalPlace).
+fn hirLocalPlace(
+    c: borrow Checker,
+    n: borrow mut NirProgram,
+    b: borrow Lowering,
+    local: u32,
+) -> Result<u32, AllocError> {
+    for (capture in b.captures.view()) {
+        if (capture.local == local && capture.field == none()) {
+            return Ok(capture.place);
+        }
+    }
+    return localPlace(n, nirLocalOf(c, local));
+}
+
+fn fieldCapture(b: borrow Lowering, local: u32, field: u32) -> u32 {
+    for (capture in b.captures.view()) {
+        if (capture.local == local && capture.field == field && field != none()) {
+            return capture.place;
+        }
+    }
+    return none();
+}
+
+fn binaryOpAt(index: u32) -> BinaryOp => match (index) {
+    0 => BinaryOp.LogicalOr,
+    1 => BinaryOp.LogicalAnd,
+    2 => BinaryOp.Equal,
+    3 => BinaryOp.NotEqual,
+    4 => BinaryOp.Less,
+    5 => BinaryOp.LessEqual,
+    6 => BinaryOp.Greater,
+    7 => BinaryOp.GreaterEqual,
+    8 => BinaryOp.BitOr,
+    9 => BinaryOp.BitXor,
+    10 => BinaryOp.BitAnd,
+    11 => BinaryOp.ShiftLeft,
+    12 => BinaryOp.ShiftRight,
+    13 => BinaryOp.Add,
+    14 => BinaryOp.Subtract,
+    15 => BinaryOp.Multiply,
+    16 => BinaryOp.Divide,
+    _ => BinaryOp.Remainder,
+};
+
+fn stmtSpan(c: borrow Checker, s: u32) -> Span => c.hir.stmtSpans[s as usize];
+fn exprSpan(c: borrow Checker, e: u32) -> Span => c.hir.exprSpans[e as usize];
+
+// ---- Statements ----
+
+fn lowerStmt(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    s: u32,
+) -> Result<void, AllocError> {
+    if (b.current == none()) {
+        return Ok(); // unreachable code is not lowered
+    }
+    b.span = stmtSpan(c, s);
+    match (c.hir.stmts[s as usize]) {
+        HirStmt.Block(statements) => {
+            b.scopes.push(Vector<ScopeItem>.create())?;
+            for (k in 0..statements.count) {
+                let statement = c.hir.at(statements, k);
+                lowerStmt(c, n, b, statement)?;
+            }
+            if (b.current != none()) {
+                let end = stmtSpan(c, s).end;
+                b.span = Span { start: end, end: end };
+                let depth = truncate<u32>(b.scopes.length - 1);
+                emitStorageDead(c, n, b, depth)?;
+            }
+            b.scopes.truncate(b.scopes.length - 1);
+        }
+        HirStmt.LocalDecl(local, initializer) => {
+            addToScope(b, nirLocalOf(c, local))?;
+            if (initializer != none()) {
+                let saved = beginStatementTemps(b)?;
+                let target = localPlace(n, nirLocalOf(c, local))?;
+                assignRvalue(c, n, b, target, initializer)?;
+                endStatementTemps(n, b, saved)?;
+            }
+        }
+        HirStmt.Assign(place, operator, value) => {
+            let saved = beginStatementTemps(b)?;
+            // The target's indexes are evaluated (and checked) before the value.
+            let target = lowerHirPlace(c, n, b, place)?;
+            if (target != none()) {
+                if (operator == 0) {
+                    assignRvalue(c, n, b, target, value)?;
+                } else {
+                    let right = lowerOperand(c, n, b, value)?;
+                    if (right != none()) {
+                        b.span = stmtSpan(c, s);
+                        if (needsIndexRecheck(c, n, b, target, value)) {
+                            recheckVectorIndexes(c, n, b, target)?;
+                        }
+                        let left = placeOperand(c, n, b, target)?;
+                        let typ = placeType(c, n, b, target);
+                        let binary = n.rvalue(
+                            NirRvalue.Binary(binaryOpAt(operator - 1), left, right),
+                            typ,
+                            stmtSpan(c, s),
+                        )?;
+                        assign(n, b, target, binary)?;
+                    }
+                }
+            }
+            endStatementTemps(n, b, saved)?;
+        }
+        HirStmt.If(condition, then, otherwise) => { lowerIf(c, n, b, condition, then, otherwise)?; }
+        HirStmt.While(condition, body) => {
+            let head = newBlock(b)?;
+            terminate(n, b, NirTerminator.Goto(head))?;
+            b.current = head;
+            var ending = Vector<u32>.create();
+            let test = lowerCondition(c, n, b, condition, mut ending)?;
+            if (test != none()) {
+                let bodyBlock = newBlock(b)?;
+                let exit = newBlock(b)?;
+                let thenTarget = endOnEntry(n, b, bodyBlock, ending.view())?;
+                let elseTarget = endOnEntry(n, b, exit, ending.view())?;
+                terminate(n, b, NirTerminator.Branch(test, thenTarget, elseTarget))?;
+                lowerLoopBody(c, n, b, body, head, exit, bodyBlock)?;
+                b.current = exit;
+            }
+        }
+        HirStmt.For(variable, start, end, body) => { lowerFor(c, n, b, s, variable, start, end, body)?; }
+        HirStmt.Loop(body) => {
+            let head = newBlock(b)?;
+            terminate(n, b, NirTerminator.Goto(head))?;
+            let exit = newBlock(b)?;
+            let exitUsed = lowerLoopBody(c, n, b, body, head, exit, head)?;
+            b.current = if (exitUsed) exit else none();
+        }
+        HirStmt.Break => {
+            let top = b.loops.length - 1;
+            b.loops[top].exitUsed = true;
+            let depth = b.loops[top].scopeDepth;
+            let exit = b.loops[top].exit;
+            emitStorageDead(c, n, b, depth)?;
+            terminate(n, b, NirTerminator.Goto(exit))?;
+        }
+        HirStmt.Continue => {
+            let top = b.loops.length - 1;
+            let depth = b.loops[top].scopeDepth;
+            let head = b.loops[top].head;
+            emitStorageDead(c, n, b, depth)?;
+            terminate(n, b, NirTerminator.Goto(head))?;
+        }
+        HirStmt.Return(value) => {
+            // The value is computed first and moved into a local no scope owns; then the statement's temporaries end,
+            // then every scope (drops and defers), then the return.
+            let saved = b.statementTemps;
+            b.tempLists.push(Vector<u32>.create())?;
+            b.statementTemps = truncate<u32>(b.tempLists.length - 1);
+            let list = b.statementTemps;
+            let scope = truncate<u32>(b.scopes.length - 1);
+            b.openTemps.push(OpenTemps { list: list, scope: scope })?;
+            let computed = if (value == none()) none() else lowerOperand(c, n, b, value)?;
+            if (value == none() || computed != none()) {
+                b.span = stmtSpan(c, s);
+                let rvalue = if (computed == none()) none() else useRvalue(n, computed)?;
+                emitReturn(c, n, b, rvalue)?;
+            }
+            b.openTemps.truncate(b.openTemps.length - 1);
+            b.statementTemps = saved;
+        }
+        HirStmt.Defer(_) => {
+            let top = b.scopes.length - 1;
+            b.scopes[top].push(ScopeItem { isDefer: true, value: s })?;
+        }
+        HirStmt.Match(scrutinee, arms, consumes, nested) => {
+            let saved = beginStatementTemps(b)?;
+            lowerMatch(c, n, b, s, scrutinee, arms, consumes, nested)?;
+            endStatementTemps(n, b, saved)?;
+        }
+        HirStmt.Yield(value) => {
+            // A branch's value moves into the result; the branch's temporaries end with it, as a statement's do.
+            let saved = beginStatementTemps(b)?;
+            let result = b.results[b.results.length - 1];
+            let target = localPlace(n, result)?;
+            assignRvalue(c, n, b, target, value)?;
+            endStatementTemps(n, b, saved)?;
+        }
+        HirStmt.Expression(e) => { lowerExpressionStmt(c, n, b, s, e)?; }
+    }
+    return Ok();
+}
+
+fn lowerExpressionStmt(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    s: u32,
+    e: u32,
+) -> Result<void, AllocError> {
+    let typ = c.hir.exprTypes[e as usize];
+    let isResultAccess = match (c.hir.exprs[e as usize]) {
+        HirExpr.Try(_) => true,
+        HirExpr.Unwrap(_) => true,
+        _ => false,
+    };
+    if (isResultAccess && c.types.is(typ, TypeKind.Void)) {
+        let saved = beginStatementTemps(b)?;
+        lowerResultAccess(c, n, b, e)?;
+        return endStatementTemps(n, b, saved);
+    }
+    let write = match (c.hir.exprs[e as usize]) {
+        HirExpr.BuiltinCall(function, arguments) => if (function == bfPtrWrite()) arguments else Range {
+            start: 0,
+            count: 0xFFFFFFFF,
+        },
+        _ => Range { start: 0, count: 0xFFFFFFFF },
+    };
+    if (write.count != 0xFFFFFFFF) {
+        let saved = beginStatementTemps(b)?;
+        // An assignment to the place `(*p)`; nothing is read or destroyed there (§27.5).
+        var operands = Vector<u32>.create();
+        if (lowerOperands(c, n, b, write, mut operands)?) {
+            let pointer = operandPlace(n, operands[0]);
+            if (pointer != none()) {
+                b.span = stmtSpan(c, s);
+                let target = projectPlace(n, pointer, derefProjectionN())?;
+                let value = useRvalue(n, operands[1])?;
+                assign(n, b, target, value)?;
+                // A value holding C state is placed: its @placed methods run at its address (§33.3; ADR 0027).
+                let pointee = c.types.info(placeType(c, n, b, pointer)).pointee;
+                if (c.types.hasPlacedMethods(pointee)) {
+                    let pointerOnly = [operands[0]];
+                    let list = n.list(pointerOnly[..])?;
+                    let voidType = c.types.voidType;
+                    let place = n.rvalue(NirRvalue.Builtin(bfPtrPlace(), list), voidType, b.span)?;
+                    emit(n, b, NirStatement.Eval(place))?;
+                }
+            }
+        }
+        return endStatementTemps(n, b, saved);
+    }
+    if (c.types.needsDrop(typ)) {
+        // A discarded value that needs drop is a temporary: destroyed at the end of the statement (§17.5).
+        let saved = beginStatementTemps(b)?;
+        let temp = newTemp(b, typ)?;
+        let target = localPlace(n, temp)?;
+        assignRvalue(c, n, b, target, e)?;
+        return endStatementTemps(n, b, saved);
+    }
+    let saved = beginStatementTemps(b)?;
+    let rvalue = lowerRvalue(c, n, b, e)?;
+    if (rvalue != none()) {
+        b.span = stmtSpan(c, s);
+        emit(n, b, NirStatement.Eval(rvalue))?;
+    }
+    return endStatementTemps(n, b, saved);
+}
+
+// ---- Match ----
+
+/// A match (LowerMatch, §15.2): a switch on the discriminant (or the integer or bool value), then each arm binds its
+/// payloads, as copies or as references into the scrutinee, or unpacks them in a consuming match.
+fn lowerMatch(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    s: u32,
+    scrutineeExpr: u32,
+    arms: Range,
+    consumes: bool,
+    nested: bool,
+) -> Result<void, AllocError> {
+    let scrutineeType = c.hir.exprTypes[scrutineeExpr as usize];
+    let isReference = c.types.is(scrutineeType, TypeKind.Reference);
+    let typ = if (isReference) c.types.info(scrutineeType).pointee else scrutineeType;
+    var scrutinee = none();
+    if (consumes) {
+        // The match owns the value: it is moved into a temporary, which arms unpack (§18.4).
+        let consumed = lowerOperand(c, n, b, scrutineeExpr)?;
+        if (consumed == none()) {
+            return Ok();
+        }
+        let temp = newTemp(b, n.operandTypes[consumed as usize])?;
+        scrutinee = localPlace(n, temp)?;
+        let value = useRvalue(n, consumed)?;
+        assign(n, b, scrutinee, value)?;
+    } else {
+        scrutinee = lowerPlaceExpr(c, n, b, scrutineeExpr)?;
+    }
+    if (scrutinee == none()) {
+        return Ok();
+    }
+    let place = if (isReference) projectPlace(n, scrutinee, derefProjectionN())? else scrutinee;
+    if (nested) {
+        return lowerNestedMatch(c, n, b, s, arms, consumes, place, isReference);
+    }
+    var value = none();
+    if (c.types.is(typ, TypeKind.Enum)) {
+        let u32Type = c.types.u32;
+        let tag = newTemp(b, u32Type)?;
+        let tagPlace = localPlace(n, tag)?;
+        let discriminant = n.rvalue(NirRvalue.Discriminant(place), u32Type, b.span)?;
+        assign(n, b, tagPlace, discriminant)?;
+        value = placeOperand(c, n, b, tagPlace)?;
+    } else {
+        value = placeOperand(c, n, b, place)?;
+    }
+    var cases = Vector<NirCase>.create();
+    var armBlocks = Vector<u32>.create();
+    var otherwise = none();
+    for (k in 0..arms.count) {
+        let arm = c.hir.arms[c.hir.at(arms, k) as usize];
+        let block = newBlock(b)?;
+        armBlocks.push(block)?;
+        match (arm.kind) {
+            HirPatternKind.Wildcard => {
+                if (otherwise == none()) {
+                    otherwise = block;
+                }
+            }
+            HirPatternKind.Variant => {
+                let index = c.types.variants[arm.variant as usize].index;
+                cases.push(NirCase { value: intValue(index as i64), target: block })?;
+            }
+            _ => { cases.push(NirCase { value: arm.value, target: block })?; }
+        }
+    }
+    if (otherwise == none()) {
+        // Exhaustive without `_`: no other value can occur.
+        otherwise = newBlock(b)?;
+        let saved = b.current;
+        let savedSpan = b.span;
+        b.current = otherwise;
+        b.span = stmtSpan(c, s);
+        terminate(n, b, NirTerminator.Unreachable)?;
+        b.current = saved;
+        b.span = savedSpan;
+    }
+    let start = truncate<u32>(n.cases.length);
+    for (case in cases.view()) {
+        n.cases.push(case)?;
+    }
+    terminate(
+        n,
+        b,
+        NirTerminator.Switch(value, Range { start: start, count: truncate<u32>(cases.length) }, otherwise),
+    )?;
+
+    let join = newBlock(b)?;
+    var joinReached = false;
+    for (k in 0..arms.count) {
+        let arm = c.hir.arms[c.hir.at(arms, k) as usize];
+        b.current = armBlocks[k as usize];
+        let depth = truncate<u32>(b.scopes.length);
+        b.scopes.push(Vector<ScopeItem>.create())?;
+        if (consumes && arm.listsPayloads) {
+            // Every payload moves out: into its binding, or into a hidden local of the arm. Hidden locals come last in
+            // the arm's scope, so they are destroyed first when the arm ends.
+            let payload = borrow c.types.variants[arm.variant as usize].payload;
+            var targets = Vector<u32>.create();
+            for (k2 in 0..payload.length) {
+                targets.push(none())?;
+            }
+            for (j in 0..arm.bindings.count) {
+                let binding = c.hir.armBindings[(arm.bindings.start + j) as usize];
+                targets[binding.payloadIndex as usize] = nirLocalOf(c, binding.local);
+            }
+            for (j in 0..arm.bindings.count) {
+                let binding = c.hir.armBindings[(arm.bindings.start + j) as usize];
+                addToScope(b, nirLocalOf(c, binding.local))?;
+            }
+            let payloadCount = c.types.variants[arm.variant as usize].payload.length;
+            for (i in 0..payloadCount) {
+                let field = c.types.variants[arm.variant as usize].payload[i];
+                let fieldType = c.types.fields[field as usize].typ;
+                if (targets[i] == none() && !c.types.isCopy(fieldType)) {
+                    let hidden = newLocal(b, fieldType)?;
+                    targets[i] = hidden;
+                    addToScope(b, hidden)?;
+                }
+            }
+            let list = n.list(targets.view())?;
+            emit(n, b, NirStatement.Unpack(place, arm.variant, list))?;
+            lowerStmt(c, n, b, arm.body)?;
+            if (b.current != none()) {
+                emitStorageDead(c, n, b, depth)?;
+                terminate(n, b, NirTerminator.Goto(join))?;
+                joinReached = true;
+            }
+            b.scopes.truncate(b.scopes.length - 1);
+            continue;
+        }
+        for (j in 0..arm.bindings.count) {
+            let binding = c.hir.armBindings[(arm.bindings.start + j) as usize];
+            let local = nirLocalOf(c, binding.local);
+            addToScope(b, local)?;
+            let field = c.types.variants[arm.variant as usize].payload[binding.payloadIndex as usize];
+            let payload = payloadPlace(n, place, arm.variant, field)?;
+            let target = localPlace(n, local)?;
+            let localType = c.hir.locals[binding.local as usize].typ;
+            // A match on a reference binds payloads by reference; one on a value copies them, even references.
+            var rvalue = none();
+            if (isReference) {
+                let mutable = c.types.info(localType).mutableReference;
+                rvalue = n.rvalue(NirRvalue.Ref(mutable, payload), localType, b.span)?;
+            } else {
+                let read = readPlace(c, n, b, payload)?;
+                rvalue = useRvalue(n, read)?;
+            }
+            assign(n, b, target, rvalue)?;
+        }
+        lowerStmt(c, n, b, arm.body)?;
+        if (b.current != none()) {
+            emitStorageDead(c, n, b, depth)?;
+            terminate(n, b, NirTerminator.Goto(join))?;
+            joinReached = true;
+        }
+        b.scopes.truncate(b.scopes.length - 1);
+    }
+    b.current = if (joinReached) join else none();
+    return Ok();
+}
+
+/// A payload of a variant at `place` (PayloadPlace).
+fn payloadPlace(n: borrow mut NirProgram, place: u32, variant: u32, field: u32) -> Result<u32, AllocError> {
+    let downcast = projectPlace(n, place, downcastProjectionN(variant))?;
+    return projectPlace(n, downcast, fieldProjectionN(field));
+}
+
+/// A match with nested patterns (LowerNestedMatch, M11): each arm tests its pattern in order and falls through to the
+/// next arm; the matching arm binds, or in a consuming match unpacks every payload along the pattern (§18.4).
+fn lowerNestedMatch(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    s: u32,
+    arms: Range,
+    consumes: bool,
+    place: u32,
+    byReference: bool,
+) -> Result<void, AllocError> {
+    let join = newBlock(b)?;
+    var joinReached = false;
+    for (k in 0..arms.count) {
+        if (b.current == none()) {
+            break;
+        }
+        let arm = c.hir.arms[c.hir.at(arms, k) as usize];
+        let next = newBlock(b)?;
+        b.span = Span { start: arm.start, end: arm.end };
+        testPattern(c, n, b, arm.pattern, place, next)?;
+        let depth = truncate<u32>(b.scopes.length);
+        b.scopes.push(Vector<ScopeItem>.create())?;
+        let unpacks = consumes && match (c.hir.patterns[arm.pattern as usize]) {
+            HirPattern.Variant(_, listed, _) => listed,
+            _ => false,
+        };
+        if (unpacks) {
+            unpackPattern(c, n, b, arm.pattern, place)?;
+        } else {
+            bindPattern(c, n, b, arm.pattern, place, byReference)?;
+        }
+        lowerStmt(c, n, b, arm.body)?;
+        if (b.current != none()) {
+            emitStorageDead(c, n, b, depth)?;
+            terminate(n, b, NirTerminator.Goto(join))?;
+            joinReached = true;
+        }
+        b.scopes.truncate(b.scopes.length - 1);
+        b.current = next;
+    }
+    if (b.current != none()) {
+        b.span = stmtSpan(c, s);
+        terminate(n, b, NirTerminator.Unreachable)?;
+    }
+    b.current = if (joinReached) join else none();
+    return Ok();
+}
+
+/// Branches to `fail` unless the value at `place` matches (TestPattern); continues on success.
+fn testPattern(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    pattern: u32,
+    place: u32,
+    fail: u32,
+) -> Result<void, AllocError> {
+    match (c.hir.patterns[pattern as usize]) {
+        HirPattern.Literal(value) => {
+            let left = placeOperand(c, n, b, place)?;
+            let right = n.operand(NirOperand.Const(value), placeType(c, n, b, place))?;
+            let boolType = c.types.boolType;
+            let test = n.rvalue(NirRvalue.Binary(BinaryOp.Equal, left, right), boolType, b.span)?;
+            branchOnTest(c, n, b, test, fail)?;
+        }
+        HirPattern.Variant(variant, listed, payload) => {
+            let u32Type = c.types.u32;
+            let tag = newTemp(b, u32Type)?;
+            let tagPlace = localPlace(n, tag)?;
+            let discriminant = n.rvalue(NirRvalue.Discriminant(place), u32Type, b.span)?;
+            assign(n, b, tagPlace, discriminant)?;
+            let left = placeOperand(c, n, b, tagPlace)?;
+            let index = c.types.variants[variant as usize].index;
+            let right = constOperand(n, index as i64, u32Type)?;
+            let boolType = c.types.boolType;
+            let test = n.rvalue(NirRvalue.Binary(BinaryOp.Equal, left, right), boolType, b.span)?;
+            branchOnTest(c, n, b, test, fail)?;
+            if (listed) {
+                for (i in 0..payload.count) {
+                    let field = c.types.variants[variant as usize].payload[i as usize];
+                    let inner = payloadPlace(n, place, variant, field)?;
+                    let hoisted1 = c.hir.at(payload, i);
+                    testPattern(c, n, b, hoisted1, inner, fail)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn branchOnTest(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    test: u32,
+    otherwise: u32,
+) -> Result<void, AllocError> {
+    let boolType = c.types.boolType;
+    let condition = newTemp(b, boolType)?;
+    let conditionPlace = localPlace(n, condition)?;
+    assign(n, b, conditionPlace, test)?;
+    let then = newBlock(b)?;
+    let operand = placeOperand(c, n, b, conditionPlace)?;
+    terminate(n, b, NirTerminator.Branch(operand, then, otherwise))?;
+    b.current = then;
+    return Ok();
+}
+
+/// Binds a matched pattern's names without moving (BindPattern): copies, or references on a reference.
+fn bindPattern(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    pattern: u32,
+    place: u32,
+    byReference: bool,
+) -> Result<void, AllocError> {
+    match (c.hir.patterns[pattern as usize]) {
+        HirPattern.Binding(hirLocal) => {
+            let local = nirLocalOf(c, hirLocal);
+            addToScope(b, local)?;
+            let target = localPlace(n, local)?;
+            let localType = c.hir.locals[hirLocal as usize].typ;
+            var rvalue = none();
+            if (byReference) {
+                let mutable = c.types.info(localType).mutableReference;
+                rvalue = n.rvalue(NirRvalue.Ref(mutable, place), localType, b.span)?;
+            } else {
+                let read = readPlace(c, n, b, place)?;
+                rvalue = useRvalue(n, read)?;
+            }
+            assign(n, b, target, rvalue)?;
+        }
+        HirPattern.Variant(variant, listed, payload) => {
+            if (listed) {
+                for (i in 0..payload.count) {
+                    let field = c.types.variants[variant as usize].payload[i as usize];
+                    let inner = payloadPlace(n, place, variant, field)?;
+                    let hoisted2 = c.hir.at(payload, i);
+                    bindPattern(c, n, b, hoisted2, inner, byReference)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+/// A consuming match's matched pattern (UnpackPattern, §18.4): every payload of the variant moves out, into its
+/// binding or a hidden local of the arm; a payload with a nested variant pattern that lists payloads is unpacked in
+/// turn.
+fn unpackPattern(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    pattern: u32,
+    place: u32,
+) -> Result<void, AllocError> {
+    var variant = none();
+    var payload = emptyRange();
+    match (c.hir.patterns[pattern as usize]) {
+        HirPattern.Variant(v, _, p) => {
+            variant = v;
+            payload = p;
+        }
+        _ => { return Ok(); }
+    }
+    let count = c.types.variants[variant as usize].payload.length;
+    var targets = Vector<u32>.create();
+    var holderPatterns = Vector<u32>.create();
+    var holders = Vector<u32>.create();
+    for (i in 0..count) {
+        let field = c.types.variants[variant as usize].payload[i];
+        let payloadType = c.types.fields[field as usize].typ;
+        let inner = c.hir.at(payload, truncate<u32>(i));
+        var target = none();
+        match (c.hir.patterns[inner as usize]) {
+            HirPattern.Binding(hirLocal) => {
+                target = nirLocalOf(c, hirLocal);
+                addToScope(b, target)?;
+            }
+            HirPattern.Variant(_, listed, _) => {
+                if (listed && c.types.isCopy(payloadType)) {
+                    // A Copy payload is not moved: its nested bindings are copies, read before the unpack consumes it.
+                    let innerPlace = payloadPlace(n, place, variant, field)?;
+                    bindPattern(c, n, b, inner, innerPlace, false)?;
+                } else if (listed) {
+                    target = newLocal(b, payloadType)?;
+                    addToScope(b, target)?;
+                    holderPatterns.push(inner)?;
+                    holders.push(target)?;
+                } else if (!c.types.isCopy(payloadType)) {
+                    target = newLocal(b, payloadType)?;
+                    addToScope(b, target)?;
+                }
+            }
+            _ => {
+                if (!c.types.isCopy(payloadType)) {
+                    target = newLocal(b, payloadType)?;
+                    addToScope(b, target)?;
+                }
+            }
+        }
+        targets.push(target)?;
+    }
+    let list = n.list(targets.view())?;
+    emit(n, b, NirStatement.Unpack(place, variant, list))?;
+    for (k in 0..holders.length) {
+        let holderPlace = localPlace(n, holders[k])?;
+        unpackPattern(c, n, b, holderPatterns[k], holderPlace)?;
+    }
+    return Ok();
+}
+
+// ---- Loops ----
+
+/// A `for` loop (LowerFor, §16.4): the bounds, or the sequence and its length, are evaluated once into locals that live
+/// until the loop exits; a counter runs from the start up to the end; `continue` goes to the increment.
+fn lowerFor(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    s: u32,
+    variable: u32,
+    startExpr: u32,
+    endExpr: u32,
+    body: u32,
+) -> Result<void, AllocError> {
+    let span = stmtSpan(c, s);
+    let savedTemps = b.statementTemps;
+    b.tempLists.push(Vector<u32>.create())?;
+    let headerTemps = truncate<u32>(b.tempLists.length - 1);
+    b.statementTemps = headerTemps;
+    let headerScope = truncate<u32>(b.scopes.length);
+    b.scopes.push(Vector<ScopeItem>.create())?;
+    var sequence = none();
+    var counter = none();
+    var end = none();
+    if (endExpr != none()) {
+        let exprs = [startExpr, endExpr];
+        let range = c.hir.list(exprs[..])?;
+        var bounds = Vector<u32>.create();
+        if (lowerOperands(c, n, b, range, mut bounds)?) {
+            let typ = c.hir.exprTypes[startExpr as usize];
+            counter = newTemp(b, typ)?;
+            let counterPlace = localPlace(n, counter)?;
+            let first = useRvalue(n, bounds[0])?;
+            assign(n, b, counterPlace, first)?;
+            let endLocal = newTemp(b, typ)?;
+            let endPlace = localPlace(n, endLocal)?;
+            let last = useRvalue(n, bounds[1])?;
+            assign(n, b, endPlace, last)?;
+            end = placeOperand(c, n, b, endPlace)?;
+        }
+    } else {
+        sequence = lowerPlaceExpr(c, n, b, startExpr)?;
+        if (sequence != none()) {
+            let usize = c.types.usize;
+            counter = newTemp(b, usize)?;
+            let counterPlace = localPlace(n, counter)?;
+            let zero = constOperand(n, 0, usize)?;
+            let zeroUse = useRvalue(n, zero)?;
+            assign(n, b, counterPlace, zeroUse)?;
+            end = lengthOf(c, n, b, sequence)?;
+        }
+    }
+    var condition = none();
+    if (b.current != none()) {
+        let boolType = c.types.boolType;
+        condition = newTemp(b, boolType)?;
+    }
+    b.statementTemps = savedTemps;
+    for (t in b.tempLists[headerTemps as usize].view()) {
+        b.scopes[headerScope as usize].push(ScopeItem { isDefer: false, value: t })?;
+    }
+    if (condition == none()) {
+        b.scopes.truncate(headerScope as usize); // the header never completes
+        return Ok();
+    }
+    let head = newBlock(b)?;
+    terminate(n, b, NirTerminator.Goto(head))?;
+    b.current = head;
+    b.span = span;
+    let counterPlace = localPlace(n, counter)?;
+    let counterOperand = placeOperand(c, n, b, counterPlace)?;
+    let boolType = c.types.boolType;
+    let less = n.rvalue(NirRvalue.Binary(BinaryOp.Less, counterOperand, end), boolType, span)?;
+    let conditionPlace = localPlace(n, condition)?;
+    assign(n, b, conditionPlace, less)?;
+    let bodyBlock = newBlock(b)?;
+    let step = newBlock(b)?;
+    let exit = newBlock(b)?;
+    let test = placeOperand(c, n, b, conditionPlace)?;
+    terminate(n, b, NirTerminator.Branch(test, bodyBlock, exit))?;
+
+    let depth = truncate<u32>(b.scopes.length);
+    b.loops.push(LoopTarget { head: step, exit: exit, scopeDepth: depth, exitUsed: false })?;
+    b.current = bodyBlock;
+    let variableLocal = nirLocalOf(c, variable);
+    var scope = Vector<ScopeItem>.create();
+    scope.push(ScopeItem { isDefer: false, value: variableLocal })?;
+    b.scopes.push(scope)?;
+    let variablePlace = localPlace(n, variableLocal)?;
+    var rvalue = none();
+    if (sequence != none()) {
+        let element = projectPlace(n, sequence, indexProjectionN(counterOperand))?;
+        let elementType = placeType(c, n, b, element);
+        if (!c.types.isCopy(elementType)) {
+            // A non-Copy element, borrowed in place (§16.4, M11).
+            let variableType = b.locals[variableLocal as usize].typ;
+            rvalue = n.rvalue(NirRvalue.Ref(false, element), variableType, b.span)?;
+        } else {
+            let read = readPlace(c, n, b, element)?;
+            rvalue = useRvalue(n, read)?;
+        }
+    } else {
+        rvalue = useRvalue(n, counterOperand)?;
+    }
+    assign(n, b, variablePlace, rvalue)?;
+    lowerStmt(c, n, b, body)?;
+    if (b.current != none()) {
+        let top = truncate<u32>(b.scopes.length - 1);
+        emitStorageDead(c, n, b, top)?;
+        terminate(n, b, NirTerminator.Goto(step))?;
+    }
+    b.scopes.truncate(b.scopes.length - 1);
+    b.loops.truncate(b.loops.length - 1);
+
+    // counter < end, so the increment cannot overflow.
+    b.current = step;
+    b.span = span;
+    let counterType = b.locals[counter as usize].typ;
+    let one = constOperand(n, 1, counterType)?;
+    let add = n.rvalue(NirRvalue.Binary(BinaryOp.Add, counterOperand, one), counterType, span)?;
+    assign(n, b, counterPlace, add)?;
+    terminate(n, b, NirTerminator.Goto(head))?;
+
+    b.current = exit;
+    b.span = Span { start: span.end, end: span.end };
+    emitStorageDead(c, n, b, headerScope)?;
+    b.scopes.truncate(headerScope as usize);
+    return Ok();
+}
+
+/// The length of an array (a constant) or of a deref'd slice `s.*`, read from `s` (Length).
+fn lengthOf(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    array: u32,
+) -> Result<u32, AllocError> {
+    let typ = placeType(c, n, b, array);
+    let usize = c.types.usize;
+    if (!c.types.isUnsized(typ)) {
+        return constOperand(n, c.types.info(typ).arrayLength, usize);
+    }
+    let slice = parentPlace(n, array)?;
+    let length = newTemp(b, usize)?;
+    let lengthPlace = localPlace(n, length)?;
+    let rvalue = n.rvalue(NirRvalue.Length(slice), usize, b.span)?;
+    assign(n, b, lengthPlace, rvalue)?;
+    return placeOperand(c, n, b, lengthPlace);
+}
+
+/// A slice operand as a place, spilled into a temporary unless it already is one (SlicePlace).
+fn slicePlaceOf(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    slice: u32,
+) -> Result<u32, AllocError> {
+    let place = operandPlace(n, slice);
+    if (place != none()) {
+        return Ok(place);
+    }
+    let temp = newTemp(b, n.operandTypes[slice as usize])?;
+    let tempPlace = localPlace(n, temp)?;
+    let value = useRvalue(n, slice)?;
+    assign(n, b, tempPlace, value)?;
+    return localPlace(n, temp);
+}
+
+/// Element `index` of an array or deref'd slice place (IndexPlace): the index is evaluated into a temporary (or kept as
+/// a constant) and checked against the length (§16.3).
+fn indexPlace(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    array: u32,
+    index: u32,
+) -> Result<u32, AllocError> {
+    let saved = b.span;
+    var operand = lowerOperand(c, n, b, index)?;
+    if (operand == none()) {
+        return Ok(none());
+    }
+    if (operandPlace(n, operand) != none()) {
+        let usize = c.types.usize;
+        let temp = newTemp(b, usize)?;
+        let tempPlace = localPlace(n, temp)?;
+        let value = useRvalue(n, operand)?;
+        assign(n, b, tempPlace, value)?;
+        operand = placeOperand(c, n, b, tempPlace)?;
+    }
+    b.span = exprSpan(c, index);
+    let length = lengthOf(c, n, b, array)?;
+    // A constant index below a constant length needs no check.
+    var known = false;
+    match (n.operands[operand as usize]) {
+        NirOperand.Const(i) => {
+            match (n.operands[length as usize]) {
+                NirOperand.Const(l) => { known = !i.negative && !l.negative && i.magnitude < l.magnitude; }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    if (!known) {
+        emit(n, b, NirStatement.BoundsCheck(operand, length))?;
+    }
+    b.span = saved;
+    return projectPlace(n, array, indexProjectionN(operand));
+}
+
+/// A HIR place: its projections, with each index evaluated and checked in order (LowerPlace(HirPlace)).
+fn lowerHirPlace(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    place: u32,
+) -> Result<u32, AllocError> {
+    let p = c.hir.places[place as usize];
+    var result = hirLocalPlace(c, n, b, p.root)?;
+    var skip: u32 = 0;
+    if (p.projections.count > 0) {
+        let first = c.hir.projections[p.projections.start as usize];
+        if (isFieldProjection(first) && fieldCapture(b, p.root, first.field) != none()) {
+            result = fieldCapture(b, p.root, first.field); // a field-precise capture (§36.2)
+            skip = 1;
+        } else if (p.projections.count > 1 && isDerefProjection(first)) {
+            let second = c.hir.projections[(p.projections.start + 1) as usize];
+            if (isFieldProjection(second) && fieldCapture(b, p.root, second.field) != none()) {
+                result = fieldCapture(b, p.root, second.field); // `(*this).x`, captured through the reference
+                skip = 2;
+            }
+        }
+    }
+    for (k in skip..p.projections.count) {
+        let projection = c.hir.projections[(p.projections.start + k) as usize];
+        match (projection.kind) {
+            ProjectionKind.Index => {
+                result = indexPlace(c, n, b, result, projection.index)?;
+                if (result == none()) {
+                    return Ok(none());
+                }
+            }
+            ProjectionKind.Field => { result = projectPlace(n, result, fieldProjectionN(projection.field))?; }
+            ProjectionKind.Deref => { result = projectPlace(n, result, derefProjectionN())?; }
+            ProjectionKind.Downcast => { result = projectPlace(n, result, downcastProjectionN(projection.variant))?; }
+        }
+    }
+    return Ok(result);
+}
+
+/// The place an expression denotes, without moving it (LowerPlace(HirExpr)); other values are spilled into a
+/// temporary.
+fn lowerPlaceExpr(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    e: u32,
+) -> Result<u32, AllocError> {
+    match (c.hir.exprs[e as usize]) {
+        HirExpr.LocalRef(local) => { return hirLocalPlace(c, n, b, local); }
+        HirExpr.FieldAccess(target, field) => {
+            let captured = capturedFieldPlace(c, b, target, field);
+            if (captured != none()) {
+                return Ok(captured);
+            }
+            let base = lowerPlaceExpr(c, n, b, target)?;
+            return if (base == none()) Ok(none()) else projectPlace(n, base, fieldProjectionN(field));
+        }
+        HirExpr.Deref(reference) => {
+            let base = lowerPlaceExpr(c, n, b, reference)?;
+            return if (base == none()) Ok(none()) else projectPlace(n, base, derefProjectionN());
+        }
+        HirExpr.Index(target, index) => {
+            let array = lowerPlaceExpr(c, n, b, target)?;
+            return if (array == none()) Ok(none()) else indexPlace(c, n, b, array, index);
+        }
+        _ => {}
+    }
+    let operand = lowerOperand(c, n, b, e)?;
+    if (operand == none()) {
+        return Ok(none());
+    }
+    let place = operandPlace(n, operand);
+    if (place != none()) {
+        return Ok(place);
+    }
+    let isConstant = match (n.operands[operand as usize]) {
+        NirOperand.Const(_) => true,
+        NirOperand.String(_) => true,
+        _ => false,
+    };
+    if (isConstant) {
+        let temp = newTemp(b, n.operandTypes[operand as usize])?;
+        let tempPlace = localPlace(n, temp)?;
+        let value = useRvalue(n, operand)?;
+        assign(n, b, tempPlace, value)?;
+        return localPlace(n, temp);
+    }
+    return Ok(none());
+}
+
+/// `s.f` of a captured `s`, or `this.x` captured through the reference: the capture's place, or none.
+fn capturedFieldPlace(c: borrow Checker, b: borrow Lowering, target: u32, field: u32) -> u32 {
+    match (c.hir.exprs[target as usize]) {
+        HirExpr.LocalRef(local) => { return fieldCapture(b, local, field); }
+        HirExpr.Deref(reference) => {
+            match (c.hir.exprs[reference as usize]) {
+                HirExpr.LocalRef(local) => { return fieldCapture(b, local, field); }
+                _ => { return none(); }
+            }
+        }
+        _ => { return none(); }
+    }
+}
+
+/// A loop's body (LowerLoopBody); whether its exit was used.
+fn lowerLoopBody(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    body: u32,
+    head: u32,
+    exit: u32,
+    bodyStart: u32,
+) -> Result<bool, AllocError> {
+    let depth = truncate<u32>(b.scopes.length);
+    b.loops.push(LoopTarget { head: head, exit: exit, scopeDepth: depth, exitUsed: false })?;
+    b.current = bodyStart;
+    lowerStmt(c, n, b, body)?;
+    if (b.current != none()) {
+        terminate(n, b, NirTerminator.Goto(head))?;
+    }
+    let exitUsed = b.loops[b.loops.length - 1].exitUsed;
+    b.loops.truncate(b.loops.length - 1);
+    return Ok(exitUsed);
+}
+
+/// The condition of an `if` or `while` (LowerCondition): the temporaries it makes that need drop end once it is
+/// evaluated, before the body; they are returned in `ending`. The others join the enclosing statement's.
+fn lowerCondition(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    condition: u32,
+    ending: borrow mut Vector<u32>,
+) -> Result<u32, AllocError> {
+    let saved = b.statementTemps;
+    b.tempLists.push(Vector<u32>.create())?;
+    let temps = truncate<u32>(b.tempLists.length - 1);
+    b.statementTemps = temps;
+    let scope = truncate<u32>(b.scopes.length - 1);
+    b.openTemps.push(OpenTemps { list: temps, scope: scope })?; // an early exit inside the condition ends them too
+    let result = lowerOperand(c, n, b, condition)?;
+    b.openTemps.truncate(b.openTemps.length - 1);
+    b.statementTemps = saved;
+    let count = b.tempLists[temps as usize].length;
+    for (k in 0..count) {
+        let t = b.tempLists[temps as usize][k];
+        if (c.types.needsDrop(b.locals[t as usize].typ)) {
+            ending.push(t)?;
+        } else if (saved != none()) {
+            b.tempLists[saved as usize].push(t)?;
+        }
+    }
+    return Ok(if (b.current == none()) none() else result);
+}
+
+/// The block a branch on a condition enters (EndOnEntry): `target` itself, or a block ending those temporaries.
+fn endOnEntry(
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    target: u32,
+    ending: Slice<u32>,
+) -> Result<u32, AllocError> {
+    if (ending.length == 0) {
+        return Ok(target);
+    }
+    let landing = newBlock(b)?;
+    let saved = b.current;
+    b.current = landing;
+    var i = ending.length;
+    while (i > 0) {
+        i -= 1;
+        emit(n, b, NirStatement.StorageDead(ending[i]))?;
+    }
+    terminate(n, b, NirTerminator.Goto(target))?;
+    b.current = saved;
+    return Ok(landing);
+}
+
+fn lowerIf(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    condition: u32,
+    then: u32,
+    otherwise: u32,
+) -> Result<void, AllocError> {
+    var ending = Vector<u32>.create();
+    let test = lowerCondition(c, n, b, condition, mut ending)?;
+    if (test == none()) {
+        return Ok();
+    }
+    let thenBlock = newBlock(b)?;
+    let elseBlock = if (otherwise == none()) none() else newBlock(b)?;
+    let join = newBlock(b)?;
+    let thenTarget = endOnEntry(n, b, thenBlock, ending.view())?;
+    let elseTarget = endOnEntry(n, b, if (elseBlock == none()) join else elseBlock, ending.view())?;
+    terminate(n, b, NirTerminator.Branch(test, thenTarget, elseTarget))?;
+    var joinReached = elseBlock == none();
+    b.current = thenBlock;
+    lowerStmt(c, n, b, then)?;
+    if (b.current != none()) {
+        terminate(n, b, NirTerminator.Goto(join))?;
+        joinReached = true;
+    }
+    if (elseBlock != none()) {
+        b.current = elseBlock;
+        lowerStmt(c, n, b, otherwise)?;
+        if (b.current != none()) {
+            terminate(n, b, NirTerminator.Goto(join))?;
+            joinReached = true;
+        }
+    }
+    b.current = if (joinReached) join else none();
+    return Ok();
+}
+
+// ---- Closures ----
+
+/// A closure with an environment (LowerClosure, §36.2): the environment, a local of the enclosing block, gets the code
+/// address and a reference to each capture (or the copied value); the closure is a reference to its first field.
+fn lowerClosure(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    e: u32,
+    function: u32,
+    captures: Range,
+) -> Result<u32, AllocError> {
+    let environment = c.hir.functions[function as usize].closureEnvironment;
+    let definition = c.types.info(environment).structDef;
+    var operands = Vector<u32>.create();
+    let codeField = c.types.structs[definition as usize].fields[0];
+    let codeType = c.types.fields[codeField as usize].typ;
+    let code = newTemp(b, codeType)?;
+    let codePlace = localPlace(n, code)?;
+    let address = n.rvalue(NirRvalue.FunctionAddress(function), codeType, b.span)?;
+    assign(n, b, codePlace, address)?;
+    operands.push(placeOperand(c, n, b, codePlace)?)?;
+    for (k in 0..captures.count) {
+        let capture = c.hir.captures[(captures.start + k) as usize];
+        let fieldIndex = c.types.structs[definition as usize].fields[(k + 1) as usize];
+        let fieldType = c.types.fields[fieldIndex as usize].typ;
+        let isCopy = match (capture.mode) {
+            CaptureMode.Copy => true,
+            _ => false,
+        };
+        if (isCopy) {
+            let value = lowerOperand(c, n, b, capture.value)?;
+            if (value == none()) {
+                return Ok(none());
+            }
+            operands.push(value)?;
+            continue;
+        }
+        let reference = newTemp(b, fieldType)?;
+        let base = hirLocalPlace(c, n, b, capture.local)?;
+        let root = if (capture.throughReference) projectPlace(n, base, derefProjectionN())? else base;
+        let captured = if (capture.field != none()) projectPlace(
+            n,
+            root,
+            fieldProjectionN(capture.field),
+        )? else hirLocalPlace(
+            c,
+            n,
+            b,
+            capture.local,
+        )?;
+        let mutable = match (capture.mode) {
+            CaptureMode.Mutable => true,
+            _ => false,
+        };
+        let referencePlace = localPlace(n, reference)?;
+        let borrowed = n.rvalue(NirRvalue.Ref(mutable, captured), fieldType, b.span)?;
+        assign(n, b, referencePlace, borrowed)?;
+        operands.push(readPlace(c, n, b, referencePlace)?)?;
+    }
+    let local = newLocal(b, environment)?;
+    addToScope(b, local)?; // ends with the block, not the statement: the closure may be kept in a local
+    let localPlaceIndex = localPlace(n, local)?;
+    let list = n.list(operands.view())?;
+    let aggregate = n.rvalue(NirRvalue.Aggregate(list), environment, b.span)?;
+    assign(n, b, localPlaceIndex, aggregate)?;
+    let closureType = c.hir.exprTypes[e as usize];
+    let first = projectPlace(n, localPlaceIndex, fieldProjectionN(codeField))?;
+    let mutable = c.types.info(closureType).mutableReference;
+    return n.rvalue(NirRvalue.Ref(mutable, first), closureType, b.span);
+}
+
+/// A move literal (LowerMoveLiteral, §36.5): its environment, the code address and each captured local moved (or
+/// copied) in; the value is the environment itself, which `Box.create` boxes.
+fn lowerMoveLiteral(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    function: u32,
+    captures: Range,
+) -> Result<u32, AllocError> {
+    let environment = c.hir.functions[function as usize].closureEnvironment;
+    let definition = c.types.info(environment).structDef;
+    var operands = Vector<u32>.create();
+    let codeField = c.types.structs[definition as usize].fields[0];
+    let codeType = c.types.fields[codeField as usize].typ;
+    let code = newTemp(b, codeType)?;
+    let codePlace = localPlace(n, code)?;
+    let address = n.rvalue(NirRvalue.FunctionAddress(function), codeType, b.span)?;
+    assign(n, b, codePlace, address)?;
+    operands.push(placeOperand(c, n, b, codePlace)?)?;
+    for (k in 0..captures.count) {
+        let capture = c.hir.captures[(captures.start + k) as usize];
+        let value = lowerOperand(c, n, b, capture.value)?;
+        if (value == none()) {
+            return Ok(none());
+        }
+        operands.push(value)?;
+    }
+    let list = n.list(operands.view())?;
+    return n.rvalue(NirRvalue.Aggregate(list), environment, b.span);
+}
+
+// ---- Assignment ----
+
+fn assignRvalue(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    target: u32,
+    value: u32,
+) -> Result<void, AllocError> {
+    let statementSpan = b.span;
+    if (needsIndexRecheck(c, n, b, target, value)) {
+        // The value is complete (its calls returned) before the element's index is checked again.
+        let operand = lowerOperand(c, n, b, value)?;
+        if (operand != none()) {
+            b.span = statementSpan;
+            recheckVectorIndexes(c, n, b, target)?;
+            let rvalue = useRvalue(n, operand)?;
+            assign(n, b, target, rvalue)?;
+        }
+        return Ok();
+    }
+    let isLocal = n.places[target as usize].projections.count == 0;
+    let targetType = placeType(c, n, b, target);
+    if (!isLocal && (c.types.isScoped(targetType) || c.types.isGeneric(targetType))) {
+        // A loan-carrying value stored into a field or element is made in a temporary first, so its loans are those of
+        // a local the borrow checker can follow into the target (§25.7).
+        let spilled = lowerOperand(c, n, b, value)?;
+        if (spilled != none()) {
+            b.span = statementSpan;
+            let rvalue = useRvalue(n, spilled)?;
+            assign(n, b, target, rvalue)?;
+        }
+        return Ok();
+    }
+    let rvalue = lowerRvalue(c, n, b, value)?;
+    if (rvalue != none()) {
+        b.span = statementSpan;
+        assign(n, b, target, rvalue)?;
+    }
+    return Ok();
+}
+
+/// A vector element written after a value that calls code (NeedsIndexRecheck, §23.1).
+fn needsIndexRecheck(c: borrow Checker, n: borrow NirProgram, b: borrow Lowering, target: u32, value: u32) -> bool =>
+    containsCall(c, value) && vectorIndexCount(c, n, b, target) > 0;
+
+/// The positions of the projections that index a vector's elements (VectorIndexes): an index right after a deref of a
+/// vector.
+fn vectorIndexCount(c: borrow Checker, n: borrow NirProgram, b: borrow Lowering, target: u32) -> u32 {
+    let p = n.places[target as usize];
+    var count: u32 = 0;
+    var typ = b.locals[p.local as usize].typ;
+    var previous = typ;
+    for (i in 0..p.projections.count) {
+        let projection = n.projections[(p.projections.start + i) as usize];
+        if (i > 0 && isKindIndex(projection.kind) && isKindDeref(
+            n.projections[(p.projections.start + i - 1) as usize].kind,
+        ) &&
+            c.types.is(previous, TypeKind.Vector)) {
+            count += 1;
+        }
+        previous = typ;
+        typ = applyNirProjection(c, typ, projection);
+    }
+    return count;
+}
+
+fn isKindIndex(k: ProjectionKind) -> bool => match (k) {
+    ProjectionKind.Index => true,
+    _ => false,
+};
+
+fn isKindDeref(k: ProjectionKind) -> bool => match (k) {
+    ProjectionKind.Deref => true,
+    _ => false,
+};
+
+/// Checks each vector index of `target` again (RecheckVectorIndexes).
+fn recheckVectorIndexes(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    target: u32,
+) -> Result<void, AllocError> {
+    let p = n.places[target as usize];
+    var typ = b.locals[p.local as usize].typ;
+    var previous = typ;
+    for (i in 0..p.projections.count) {
+        let projection = n.projections[(p.projections.start + i) as usize];
+        if (i > 0 && isKindIndex(projection.kind) && isKindDeref(
+            n.projections[(p.projections.start + i - 1) as usize].kind,
+        ) &&
+            c.types.is(previous, TypeKind.Vector)) {
+            // The elements: the place up to (not including) this index.
+            var projections = Vector<NirProjection>.create();
+            for (k in 0..i) {
+                projections.push(n.projections[(p.projections.start + k) as usize])?;
+            }
+            let elements = n.place(p.local, projections.view())?;
+            let length = lengthOf(c, n, b, elements)?;
+            emit(n, b, NirStatement.BoundsCheck(projection.index, length))?;
+        }
+        previous = typ;
+        typ = applyNirProjection(c, typ, projection);
+    }
+    return Ok();
+}
+
+// ---- Expressions ----
+
+/// Lowers to an operand, spilling into a temporary if needed; none if evaluation never completes (LowerOperand).
+fn lowerOperand(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    e: u32,
+) -> Result<u32, AllocError> {
+    let saved = b.span;
+    b.span = exprSpan(c, e);
+    let result = lowerOperandCore(c, n, b, e)?;
+    b.span = saved;
+    return Ok(result);
+}
+
+fn lowerOperandCore(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    e: u32,
+) -> Result<u32, AllocError> {
+    let typ = c.hir.exprTypes[e as usize];
+    match (c.hir.exprs[e as usize]) {
+        HirExpr.IntConst(value) => { return n.operand(NirOperand.Const(value), typ); }
+        HirExpr.BoolConst(value) => { return constOperand(n, if (value) 1 else 0, typ); }
+        HirExpr.FloatConst(value) => {
+            // A float constant is its bits (§35.6).
+            let bits = if (c.types.info(typ).bits == 32) round<f32>(value).bits() as u64 else value.bits();
+            return n.operand(NirOperand.Const(IntValue { negative: false, magnitude: bits }), typ);
+        }
+        HirExpr.StringConst(text) => {
+            let copy = n.addText(c.hir.textOf(text))?;
+            return n.operand(NirOperand.String(copy), typ);
+        }
+        HirExpr.LocalRef(local) => {
+            let place = hirLocalPlace(c, n, b, local)?;
+            return readPlace(c, n, b, place);
+        }
+        HirExpr.Move(place) => {
+            let moved = lowerHirPlace(c, n, b, place)?;
+            return if (moved == none()) Ok(none()) else n.operand(
+                NirOperand.Place(moved, true),
+                placeType(c, n, b, moved),
+            );
+        }
+        HirExpr.Index(_, _) => {
+            let element = lowerPlaceExpr(c, n, b, e)?;
+            return if (element == none()) Ok(none()) else readPlace(c, n, b, element);
+        }
+        HirExpr.Try(_) => { return successPayload(c, n, b, e); }
+        HirExpr.Unwrap(_) => { return successPayload(c, n, b, e); }
+        HirExpr.FieldAccess(target, field) => {
+            let captured = capturedFieldPlace(c, b, target, field);
+            if (captured != none()) {
+                return readPlace(c, n, b, captured);
+            }
+            // A field of a place is itself a place; a field of any other value reads from a temporary.
+            let base = lowerOperand(c, n, b, target)?;
+            if (base == none() || operandPlace(n, base) == none()) {
+                return Ok(none());
+            }
+            let basePlace3 = operandPlace(n, base);
+            let place = projectPlace(n, basePlace3, fieldProjectionN(field))?;
+            return readPlace(c, n, b, place);
+        }
+        HirExpr.Deref(reference) => {
+            let base = lowerOperand(c, n, b, reference)?;
+            if (base == none() || operandPlace(n, base) == none()) {
+                return Ok(none());
+            }
+            let basePlace4 = operandPlace(n, base);
+            let place = projectPlace(n, basePlace4, derefProjectionN())?;
+            return readPlace(c, n, b, place);
+        }
+        HirExpr.StmtValue(statement) => {
+            // An `if` or `match` expression (§15.3): its statement, each branch ending in an assignment to the result,
+            // a temporary of the enclosing statement.
+            let result = newTemp(b, typ)?;
+            b.results.push(result)?;
+            lowerStmt(c, n, b, statement)?;
+            b.results.truncate(b.results.length - 1);
+            if (b.current == none()) {
+                return Ok(none());
+            }
+            let place = localPlace(n, result)?;
+            return readPlace(c, n, b, place);
+        }
+        _ => {}
+    }
+    let rvalue = lowerRvalue(c, n, b, e)?;
+    if (rvalue == none()) {
+        return Ok(none());
+    }
+    let temp = newTemp(b, typ)?;
+    let place = localPlace(n, temp)?;
+    assign(n, b, place, rvalue)?;
+    let read = localPlace(n, temp)?;
+    return readPlace(c, n, b, read);
+}
+
+/// The Ok (or Some) payload of `e?` or `e!`, moved or copied out of the result (§17.4).
+fn successPayload(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    e: u32,
+) -> Result<u32, AllocError> {
+    let result = lowerResultAccess(c, n, b, e)?;
+    if (result == none()) {
+        return Ok(none());
+    }
+    let ok = successVariant(c, placeType(c, n, b, result));
+    let field = c.types.variants[ok as usize].payload[0];
+    let payload = payloadPlace(n, result, ok, field)?;
+    return readPlace(c, n, b, payload);
+}
+
+/// The variant `?` and `!` continue with (SuccessVariant): Ok of a result, Some of an optional.
+fn successVariant(c: borrow Checker, typ: u32) -> u32 {
+    let definition = c.types.info(typ).enumDef;
+    let index: usize = if (c.types.enums[definition as usize].optionType == none()) 0 else 1;
+    return c.types.enums[definition as usize].variants[index];
+}
+
+fn lowerRvalue(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    e: u32,
+) -> Result<u32, AllocError> {
+    let saved = b.span;
+    b.span = exprSpan(c, e);
+    let result = lowerRvalueCore(c, n, b, e)?;
+    b.span = saved;
+    return Ok(result);
+}
+
+fn operandRvalue(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    e: u32,
+) -> Result<u32, AllocError> {
+    let operand = lowerOperand(c, n, b, e)?;
+    return if (operand == none()) Ok(none()) else useRvalue(n, operand);
+}
+
+fn lowerRvalueCore(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    e: u32,
+) -> Result<u32, AllocError> {
+    let typ = c.hir.exprTypes[e as usize];
+    let span = exprSpan(c, e);
+    match (c.hir.exprs[e as usize]) {
+        HirExpr.IntConst(_) => { return operandRvalue(c, n, b, e); }
+        HirExpr.BoolConst(_) => { return operandRvalue(c, n, b, e); }
+        HirExpr.FloatConst(_) => { return operandRvalue(c, n, b, e); }
+        HirExpr.LocalRef(_) => { return operandRvalue(c, n, b, e); }
+        HirExpr.StringConst(_) => { return operandRvalue(c, n, b, e); }
+        HirExpr.Move(_) => { return operandRvalue(c, n, b, e); }
+        HirExpr.StmtValue(_) => { return operandRvalue(c, n, b, e); }
+        HirExpr.Borrow(mutable, place) => {
+            let borrowed = lowerHirPlace(c, n, b, place)?;
+            return if (borrowed == none()) Ok(none()) else n.rvalue(NirRvalue.Ref(mutable, borrowed), typ, span);
+        }
+        HirExpr.Slice(mutable, place, low, high) => { return lowerSlice(c, n, b, e, mutable, place, low, high); }
+        HirExpr.SliceLength(slice) => {
+            let place = lowerPlaceExpr(c, n, b, slice)?;
+            let usize = c.types.usize;
+            return if (place == none()) Ok(none()) else n.rvalue(NirRvalue.Length(place), usize, span);
+        }
+        HirExpr.ArrayLiteral(elements) => {
+            var operands = Vector<u32>.create();
+            if (!lowerOperands(c, n, b, elements, mut operands)?) {
+                return Ok(none());
+            }
+            let list = n.list(operands.view())?;
+            return n.rvalue(NirRvalue.Array(list), typ, span);
+        }
+        HirExpr.ArrayRepeat(value) => {
+            let operand = lowerOperand(c, n, b, value)?;
+            return if (operand == none()) Ok(none()) else n.rvalue(NirRvalue.ArrayRepeat(operand), typ, span);
+        }
+        HirExpr.StaticAddress(s) => { return n.rvalue(NirRvalue.StaticAddress(s), typ, span); }
+        HirExpr.FunctionAddress(f) => { return n.rvalue(NirRvalue.FunctionAddress(f), typ, span); }
+        HirExpr.Closure(function, captures) => {
+            let environment = c.hir.functions[function as usize].closureEnvironment;
+            if (environment == none()) {
+                return n.rvalue(NirRvalue.FunctionAddress(function), typ, span); // captures nothing: a plain function value
+            }
+            let definition = c.types.info(environment).structDef;
+            if (c.types.structs[definition as usize].isMoveEnvironment) {
+                return lowerMoveLiteral(c, n, b, function, captures);
+            }
+            return lowerClosure(c, n, b, e, function, captures);
+        }
+        HirExpr.BorrowPath(mutable, path) => {
+            // The reference at the root is spilled to a temporary by lowerPlaceExpr; the loan is a reborrow through it.
+            let through = lowerPlaceExpr(c, n, b, path)?;
+            return if (through == none()) Ok(none()) else n.rvalue(NirRvalue.Ref(mutable, through), typ, span);
+        }
+        HirExpr.BorrowTemp(mutable, value) => {
+            // The value lives in a temporary until the end of the statement (lifetimes.md §6).
+            let rvalue = lowerRvalue(c, n, b, value)?;
+            if (rvalue == none()) {
+                return Ok(none());
+            }
+            let storage = newTemp(b, c.hir.exprTypes[value as usize])?;
+            let storagePlace = localPlace(n, storage)?;
+            assign(n, b, storagePlace, rvalue)?;
+            let borrowed = localPlace(n, storage)?;
+            return n.rvalue(NirRvalue.Ref(mutable, borrowed), typ, span);
+        }
+        HirExpr.Reborrow(mutable, reference) => {
+            let operand = lowerOperand(c, n, b, reference)?;
+            if (operand == none() || operandPlace(n, operand) == none()) {
+                return Ok(none());
+            }
+            let basePlace5 = operandPlace(n, operand);
+            let place = projectPlace(n, basePlace5, derefProjectionN())?;
+            return n.rvalue(NirRvalue.Ref(mutable, place), typ, span);
+        }
+        HirExpr.IsNull(reference, isNull) => {
+            let operand = lowerOperand(c, n, b, reference)?;
+            if (operand == none() || operandPlace(n, operand) == none()) {
+                return Ok(none());
+            }
+            let u32Type = c.types.u32;
+            let tag = newTemp(b, u32Type)?;
+            let tagPlace = localPlace(n, tag)?;
+            let basePlace6 = operandPlace(n, operand);
+            let target = projectPlace(n, basePlace6, derefProjectionN())?;
+            let discriminant = n.rvalue(NirRvalue.Discriminant(target), u32Type, span)?;
+            assign(n, b, tagPlace, discriminant)?;
+            let left = placeOperand(c, n, b, tagPlace)?;
+            let zero = constOperand(n, 0, u32Type)?;
+            let boolType = c.types.boolType;
+            let op = if (isNull) BinaryOp.Equal else BinaryOp.NotEqual;
+            return n.rvalue(NirRvalue.Binary(op, left, zero), boolType, span);
+        }
+        HirExpr.FieldAccess(_, _) => { return operandRvalue(c, n, b, e); }
+        HirExpr.Deref(_) => { return operandRvalue(c, n, b, e); }
+        HirExpr.Index(_, _) => { return operandRvalue(c, n, b, e); }
+        HirExpr.Try(_) => { return operandRvalue(c, n, b, e); }
+        HirExpr.Unwrap(_) => { return operandRvalue(c, n, b, e); }
+        HirExpr.EnumValue(variant, payload) => {
+            var operands = Vector<u32>.create();
+            if (!lowerOperands(c, n, b, payload, mut operands)?) {
+                return Ok(none());
+            }
+            let list = n.list(operands.view())?;
+            return n.rvalue(NirRvalue.EnumAggregate(variant, list), typ, span);
+        }
+        HirExpr.StructLiteral(fields) => {
+            // Evaluate in source order, then place the values in declaration order.
+            var values = Vector<HirFieldValue>.create();
+            for (k in 0..fields.count) {
+                values.push(c.hir.fieldValues[(fields.start + k) as usize])?;
+            }
+            var exprs = Vector<u32>.create();
+            for (v in values.view()) {
+                exprs.push(v.value)?;
+            }
+            let range = c.hir.list(exprs.view())?;
+            var operands = Vector<u32>.create();
+            if (!lowerOperands(c, n, b, range, mut operands)?) {
+                return Ok(none());
+            }
+            // Fields of C state are left out of the literal and zero-filled (§33.2).
+            let definition = c.types.info(typ).structDef;
+            var ordered = Vector<u32>.create();
+            let fieldCount = c.types.structs[definition as usize].fields.length;
+            for (k in 0..fieldCount) {
+                let field = c.types.structs[definition as usize].fields[k];
+                ordered.push(n.operand(NirOperand.Zero, c.types.fields[field as usize].typ)?)?;
+            }
+            for (k in 0..values.length) {
+                let index = c.types.fields[values[k].field as usize].index;
+                ordered[index as usize] = operands[k];
+            }
+            let list = n.list(ordered.view())?;
+            return n.rvalue(NirRvalue.Aggregate(list), typ, span);
+        }
+        HirExpr.Unary(op, operand) => {
+            let value = lowerOperand(c, n, b, operand)?;
+            return if (value == none()) Ok(none()) else n.rvalue(NirRvalue.Unary(op, value), typ, span);
+        }
+        HirExpr.Binary(op, left, right) => {
+            let isLogical = match (op) {
+                BinaryOp.LogicalAnd => true,
+                BinaryOp.LogicalOr => true,
+                _ => false,
+            };
+            if (isLogical) {
+                return lowerShortCircuit(c, n, b, op, left, right);
+            }
+            let exprs = [left, right];
+            let range = c.hir.list(exprs[..])?;
+            var operands = Vector<u32>.create();
+            if (!lowerOperands(c, n, b, range, mut operands)?) {
+                return Ok(none());
+            }
+            return n.rvalue(NirRvalue.Binary(op, operands[0], operands[1]), typ, span);
+        }
+        HirExpr.Cast(operand) => {
+            let value = lowerOperand(c, n, b, operand)?;
+            return if (value == none()) Ok(none()) else n.rvalue(NirRvalue.Cast(value), typ, span);
+        }
+        HirExpr.Truncate(operand) => {
+            let value = lowerOperand(c, n, b, operand)?;
+            return if (value == none()) Ok(none()) else n.rvalue(NirRvalue.Truncate(value), typ, span);
+        }
+        HirExpr.FloatToInt(operand, mode) => {
+            let value = lowerOperand(c, n, b, operand)?;
+            let kind = match (mode) {
+                FloatToIntMode.Panic => FloatToIntKind.Panic,
+                FloatToIntMode.Checked => FloatToIntKind.Checked,
+                FloatToIntMode.Saturating => FloatToIntKind.Saturating,
+            };
+            return if (value == none()) Ok(none()) else n.rvalue(NirRvalue.FloatToInt(value, kind), typ, span);
+        }
+        HirExpr.Call(callee, arguments) => { return lowerCall(c, n, b, e, callee, arguments); }
+        HirExpr.BuiltinCall(function, arguments) => { return lowerBuiltinCall(c, n, b, e, function, arguments); }
+        _ => {}
+    }
+    var message = Vector<u8>.create();
+    appendText(mut message, "ceesafec: cannot lower this HIR expression to NIR")?;
+    return Ok(none());
+}
+
+fn lowerCall(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    e: u32,
+    callee: u32,
+    arguments: Range,
+) -> Result<u32, AllocError> {
+    let typ = c.hir.exprTypes[e as usize];
+    let span = exprSpan(c, e);
+    let syntax = c.hir.functions[callee as usize].syntax;
+    let borrowMutReceiver = receiverIndex(c.front.ast.functions[syntax as usize].receiver) == 3 && arguments.count > 0;
+    if (borrowMutReceiver) {
+        let first = c.hir.at(arguments, 0);
+        let isBorrow = match (c.hir.exprs[first as usize]) {
+            HirExpr.Borrow(_, _) => true,
+            HirExpr.Reborrow(_, reference) => match (c.hir.exprs[reference as usize]) {
+                HirExpr.LocalRef(_) => true,
+                _ => false,
+            },
+            _ => false,
+        };
+        if (isBorrow) {
+            // B5 (lifetimes.md §5): the receiver's mutable loan starts after the arguments are evaluated.
+            let rest = Range { start: arguments.start + 1, count: arguments.count - 1 };
+            var operands = Vector<u32>.create();
+            if (!lowerOperands(c, n, b, rest, mut operands)?) {
+                return Ok(none());
+            }
+            let receiver = lowerOperand(c, n, b, first)?;
+            if (receiver == none()) {
+                return Ok(none());
+            }
+            var all = Vector<u32>.create();
+            all.push(receiver)?;
+            for (o in operands.view()) {
+                all.push(o)?;
+            }
+            let list = n.list(all.view())?;
+            return n.rvalue(NirRvalue.Call(callee, list), typ, span);
+        }
+    }
+    var operands = Vector<u32>.create();
+    if (!lowerOperands(c, n, b, arguments, mut operands)?) {
+        return Ok(none());
+    }
+    let list = n.list(operands.view())?;
+    return n.rvalue(NirRvalue.Call(callee, list), typ, span);
+}
+
+fn lowerBuiltinCall(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    e: u32,
+    function: u32,
+    arguments: Range,
+) -> Result<u32, AllocError> {
+    let typ = c.hir.exprTypes[e as usize];
+    let span = exprSpan(c, e);
+    if (function == bfProcessExit()) {
+        let hoisted101 = c.hir.at(arguments, 0);
+        let code = lowerOperand(c, n, b, hoisted101)?;
+        if (code != none()) {
+            terminate(n, b, NirTerminator.Exit(code))?;
+        }
+        return Ok(none());
+    }
+    if (function == bfPtrRead()) {
+        // A copy from the place `(*p)` (§27.5).
+        let hoisted102 = c.hir.at(arguments, 0);
+        let pointer = lowerOperand(c, n, b, hoisted102)?;
+        if (pointer == none() || operandPlace(n, pointer) == none()) {
+            return Ok(none());
+        }
+        let basePlace7 = operandPlace(n, pointer);
+        let place = projectPlace(n, basePlace7, derefProjectionN())?;
+        let read = readPlace(c, n, b, place)?;
+        return useRvalue(n, read);
+    }
+    if (function == bfVectorPush() || function == bfStringAppend() || function == bfStringAppendNumber() ||
+        function == bfSlotMapInsert() || function == bfVectorTruncate()) {
+        // B5, as for a `borrow mut this` method: the receiver's loan starts after the argument (§23.1).
+        let hoisted103 = c.hir.at(arguments, 1);
+        let argument = lowerOperand(c, n, b, hoisted103)?;
+        if (argument == none()) {
+            return Ok(none());
+        }
+        let hoisted104 = c.hir.at(arguments, 0);
+        let receiver = lowerOperand(c, n, b, hoisted104)?;
+        if (receiver == none()) {
+            return Ok(none());
+        }
+        let values = [receiver, argument];
+        let list = n.list(values[..])?;
+        return n.rvalue(NirRvalue.Builtin(function, list), typ, span);
+    }
+    if (function == bfSliceCopy()) {
+        // The receiver, then the source, then their lengths, then the copy (§16.5).
+        var operands = Vector<u32>.create();
+        if (!lowerOperands(c, n, b, arguments, mut operands)?) {
+            return Ok(none());
+        }
+        let destination = slicePlaceOf(c, n, b, operands[0])?;
+        let source = slicePlaceOf(c, n, b, operands[1])?;
+        let saved = b.span;
+        b.span = span;
+        let sourceElements = projectPlace(n, source, derefProjectionN())?;
+        let sourceLength = lengthOf(c, n, b, sourceElements)?;
+        let destinationElements = projectPlace(n, destination, derefProjectionN())?;
+        let destinationLength = lengthOf(c, n, b, destinationElements)?;
+        emit(n, b, NirStatement.LengthCheck(sourceLength, destinationLength))?;
+        b.span = saved;
+        let first = if (operandPlace(n, operands[0]) != none()) operands[0] else placeOperand(c, n, b, destination)?;
+        let second = if (operandPlace(n, operands[1]) != none()) operands[1] else placeOperand(c, n, b, source)?;
+        let values = [first, second];
+        let list = n.list(values[..])?;
+        return n.rvalue(NirRvalue.Builtin(function, list), typ, span);
+    }
+    if (function == bfVectorRetain() && arguments.count == 3) {
+        let retainExpr = c.hir.at(arguments, 2);
+        let retain = match (c.hir.exprs[retainExpr as usize]) {
+            HirExpr.FunctionAddress(f) => f,
+            _ => none(),
+        };
+        if (retain != none()) {
+            // `v.retain(keep)` (§36.4): the library's retain on the elements, then a truncation.
+            let vectorArgument = c.hir.at(arguments, 0);
+            let pair = Range { start: arguments.start, count: 2 };
+            var operands = Vector<u32>.create();
+            if (!lowerOperands(c, n, b, pair, mut operands)?) {
+                return Ok(none());
+            }
+            let vector = operandPlace(n, operands[0]);
+            if (vector == none()) {
+                return Ok(none());
+            }
+            let vectorType = c.types.info(c.types.info(c.hir.exprTypes[vectorArgument as usize]).pointee).pointee;
+            let elements = c.types.sliceOf(c.types.info(vectorType).element, true)?;
+            let slice = newTemp(b, elements)?;
+            let slicePlace = localPlace(n, slice)?;
+            let derefVector = projectPlace(n, vector, derefProjectionN())?;
+            let derefElements = projectPlace(n, derefVector, derefProjectionN())?;
+            let borrowed = n.rvalue(NirRvalue.Ref(true, derefElements), elements, span)?;
+            assign(n, b, slicePlace, borrowed)?;
+            let usize = c.types.usize;
+            let kept = newTemp(b, usize)?;
+            let keptPlace = localPlace(n, kept)?;
+            let sliceRead = n.operand(NirOperand.Place(slicePlace, true), elements)?;
+            let callValues = [sliceRead, operands[1]];
+            let callList = n.list(callValues[..])?;
+            let call = n.rvalue(NirRvalue.Call(retain, callList), usize, span)?;
+            assign(n, b, keptPlace, call)?;
+            let keptRead = readPlace(c, n, b, keptPlace)?;
+            let values = [operands[0], keptRead];
+            let list = n.list(values[..])?;
+            return n.rvalue(NirRvalue.Builtin(bfVectorTruncate(), list), typ, span);
+        }
+    }
+    if (function == bfSliceSwap()) {
+        // The receiver, then both indices, then both bounds checks, then the exchange (§16.5).
+        var operands = Vector<u32>.create();
+        if (!lowerOperands(c, n, b, arguments, mut operands)?) {
+            return Ok(none());
+        }
+        let slice = slicePlaceOf(c, n, b, operands[0])?;
+        let saved = b.span;
+        b.span = span;
+        let elements = projectPlace(n, slice, derefProjectionN())?;
+        let firstLength = lengthOf(c, n, b, elements)?;
+        emit(n, b, NirStatement.BoundsCheck(operands[1], firstLength))?;
+        let secondLength = lengthOf(c, n, b, elements)?;
+        emit(n, b, NirStatement.BoundsCheck(operands[2], secondLength))?;
+        b.span = saved;
+        let first = if (operandPlace(n, operands[0]) != none()) operands[0] else placeOperand(c, n, b, slice)?;
+        let values = [first, operands[1], operands[2]];
+        let list = n.list(values[..])?;
+        return n.rvalue(NirRvalue.Builtin(function, list), typ, span);
+    }
+    var operands = Vector<u32>.create();
+    if (!lowerOperands(c, n, b, arguments, mut operands)?) {
+        return Ok(none());
+    }
+    let list = n.list(operands.view())?;
+    return n.rvalue(NirRvalue.Builtin(function, list), typ, span);
+}
+
+/// Lowers operands left to right (LowerOperands): a named local read is copied to a temporary when a later operand
+/// contains a call, so the read happens before the call. False if evaluation never completes.
+fn lowerOperands(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    exprs: Range,
+    out: borrow mut Vector<u32>,
+) -> Result<bool, AllocError> {
+    for (i in 0..exprs.count) {
+        let hoisted105 = c.hir.at(exprs, i);
+        var operand = lowerOperand(c, n, b, hoisted105)?;
+        if (operand == none()) {
+            return Ok(false);
+        }
+        let place = operandPlace(n, operand);
+        if (place != none() && b.locals[n.places[place as usize].local as usize].name != none()) {
+            var later = false;
+            for (j in (i + 1)..exprs.count) {
+                if (containsCall(c, c.hir.at(exprs, j))) {
+                    later = true;
+                }
+            }
+            if (later) {
+                let temp = newTemp(b, n.operandTypes[operand as usize])?;
+                let tempPlace = localPlace(n, temp)?;
+                let value = useRvalue(n, operand)?;
+                assign(n, b, tempPlace, value)?;
+                operand = readPlace(c, n, b, tempPlace)?;
+            }
+        }
+        out.push(operand)?;
+    }
+    return Ok(true);
+}
+
+fn containsCall(c: borrow Checker, e: u32) -> bool {
+    match (c.hir.exprs[e as usize]) {
+        HirExpr.Call(_, _) => { return true; }
+        HirExpr.BuiltinCall(_, _) => { return true; }
+        HirExpr.Unary(_, operand) => { return containsCall(c, operand); }
+        HirExpr.Binary(_, left, right) => { return containsCall(c, left) || containsCall(c, right); }
+        HirExpr.Cast(operand) => { return containsCall(c, operand); }
+        HirExpr.Truncate(operand) => { return containsCall(c, operand); }
+        HirExpr.FieldAccess(target, _) => { return containsCall(c, target); }
+        HirExpr.Deref(reference) => { return containsCall(c, reference); }
+        HirExpr.Reborrow(_, reference) => { return containsCall(c, reference); }
+        HirExpr.BorrowTemp(_, value) => { return containsCall(c, value); }
+        HirExpr.BorrowPath(_, path) => { return containsCall(c, path); }
+        HirExpr.StructLiteral(fields) => {
+            for (k in 0..fields.count) {
+                if (containsCall(c, c.hir.fieldValues[(fields.start + k) as usize].value)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        HirExpr.EnumValue(_, payload) => { return anyContainsCall(c, payload); }
+        HirExpr.ArrayLiteral(elements) => { return anyContainsCall(c, elements); }
+        HirExpr.ArrayRepeat(value) => { return containsCall(c, value); }
+        HirExpr.Index(target, index) => { return containsCall(c, target) || containsCall(c, index); }
+        HirExpr.Slice(_, place, low, high) => {
+            let p = c.hir.places[place as usize];
+            for (k in 0..p.projections.count) {
+                let index = c.hir.projections[(p.projections.start + k) as usize].index;
+                if (index != none() && containsCall(c, index)) {
+                    return true;
+                }
+            }
+            return (low != none() && containsCall(c, low)) || (high != none() && containsCall(c, high));
+        }
+        HirExpr.SliceLength(slice) => { return containsCall(c, slice); }
+        HirExpr.Try(operand) => { return containsCall(c, operand); }
+        HirExpr.Unwrap(operand) => { return containsCall(c, operand); }
+        HirExpr.IsNull(reference, _) => { return containsCall(c, reference); }
+        _ => { return false; }
+    }
+}
+
+fn anyContainsCall(c: borrow Checker, exprs: Range) -> bool {
+    for (k in 0..exprs.count) {
+        if (containsCall(c, c.hir.at(exprs, k))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// `e?` and `e!` (LowerResultAccess, §17.4, §22.1): the result moves into a temporary and the tag is switched on. On
+/// Err or null, `?` returns (every open temporary and scope ended) and `!` panics. Returns the temporary, in the
+/// success block; none if the operand never completes.
+fn lowerResultAccess(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    e: u32,
+) -> Result<u32, AllocError> {
+    var operandExpr = none();
+    var propagate = false;
+    match (c.hir.exprs[e as usize]) {
+        HirExpr.Try(o) => {
+            operandExpr = o;
+            propagate = true;
+        }
+        HirExpr.Unwrap(o) => { operandExpr = o; }
+        _ => { return Ok(none()); }
+    }
+    let operand = lowerOperand(c, n, b, operandExpr)?;
+    if (operand == none()) {
+        return Ok(none());
+    }
+    b.span = exprSpan(c, e);
+    let operandType = n.operandTypes[operand as usize];
+    let temp = newTemp(b, operandType)?;
+    let result = localPlace(n, temp)?;
+    let value = useRvalue(n, operand)?;
+    assign(n, b, result, value)?;
+    let u32Type = c.types.u32;
+    let tag = newTemp(b, u32Type)?;
+    let tagPlace = localPlace(n, tag)?;
+    let discriminant = n.rvalue(NirRvalue.Discriminant(result), u32Type, b.span)?;
+    assign(n, b, tagPlace, discriminant)?;
+    let okBlock = newBlock(b)?;
+    let errBlock = newBlock(b)?;
+    let success = successVariant(c, operandType);
+    let start = truncate<u32>(n.cases.length);
+    n.cases.push(NirCase { value: intValue(c.types.variants[success as usize].index as i64), target: okBlock })?;
+    let tagOperand = placeOperand(c, n, b, tagPlace)?;
+    terminate(n, b, NirTerminator.Switch(tagOperand, Range { start: start, count: 1 }, errBlock))?;
+
+    b.current = errBlock;
+    let returnType = c.hir.functions[b.function as usize].returnType;
+    let definition = c.types.info(operandType).enumDef;
+    let isOption = c.types.enums[definition as usize].optionType != none();
+    if (propagate && isOption) {
+        let returnDefinition = c.types.info(returnType).enumDef;
+        let nullVariant = c.types.enums[returnDefinition as usize].variants[0];
+        let none0 = Vector<u32>.create();
+        let list = n.list(none0.view())?;
+        let aggregate = n.rvalue(NirRvalue.EnumAggregate(nullVariant, list), returnType, b.span)?;
+        emitReturn(c, n, b, aggregate)?; // `null` (§22.1)
+    } else if (propagate) {
+        let err = c.types.enums[definition as usize].variants[1];
+        let errField = c.types.variants[err as usize].payload[0];
+        let payloadPlaceIndex = payloadPlace(n, result, err, errField)?;
+        let payload = readPlace(c, n, b, payloadPlaceIndex)?;
+        let returnDefinition = c.types.info(returnType).enumDef;
+        let errVariant = c.types.enums[returnDefinition as usize].variants[1];
+        let values = [payload];
+        let list = n.list(values[..])?;
+        let aggregate = n.rvalue(NirRvalue.EnumAggregate(errVariant, list), returnType, b.span)?;
+        emitReturn(c, n, b, aggregate)?;
+    } else {
+        terminate(n, b, NirTerminator.Panic(if (isOption) NirPanicKind.UnwrapNull else NirPanicKind.Unwrap))?;
+    }
+    b.current = okBlock;
+    b.span = exprSpan(c, e);
+    return Ok(result);
+}
+
+/// `a[lo..hi]` (LowerSlice): the base place, then the bounds left to right, then the range check (skipped for
+/// `a[..]`), then the slice, which borrows the whole base.
+fn lowerSlice(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    e: u32,
+    mutable: bool,
+    place: u32,
+    lowExpr: u32,
+    highExpr: u32,
+) -> Result<u32, AllocError> {
+    let typ = c.hir.exprTypes[e as usize];
+    let array = lowerHirPlace(c, n, b, place)?;
+    if (array == none()) {
+        return Ok(none());
+    }
+    var exprs = Vector<u32>.create();
+    if (lowExpr != none()) {
+        exprs.push(lowExpr)?;
+    }
+    if (highExpr != none()) {
+        exprs.push(highExpr)?;
+    }
+    let range = c.hir.list(exprs.view())?;
+    var bounds = Vector<u32>.create();
+    if (!lowerOperands(c, n, b, range, mut bounds)?) {
+        return Ok(none());
+    }
+    let length = lengthOf(c, n, b, array)?;
+    let usize = c.types.usize;
+    let low = if (lowExpr == none()) constOperand(n, 0, usize)? else bounds[0];
+    let high = if (highExpr == none()) length else bounds[bounds.length - 1];
+    var staticallyValid = false;
+    match (n.operands[low as usize]) {
+        NirOperand.Const(l) => {
+            match (n.operands[high as usize]) {
+                NirOperand.Const(h) => {
+                    match (n.operands[length as usize]) {
+                        NirOperand.Const(len) => {
+                            staticallyValid = l.magnitude <= h.magnitude && h.magnitude <= len.magnitude;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    let bounded = lowExpr != none() || highExpr != none();
+    if (c.types.isStringView(typ) && bounded) {
+        emit(n, b, NirStatement.RangeCheck(low, high, length, array))?; // the bytes decide the boundaries
+    } else if (bounded && !staticallyValid) {
+        emit(n, b, NirStatement.RangeCheck(low, high, length, none()))?;
+    }
+    return n.rvalue(NirRvalue.Slice(mutable, array, low, high), typ, b.span);
+}
+
+fn lowerShortCircuit(
+    c: borrow mut Checker,
+    n: borrow mut NirProgram,
+    b: borrow mut Lowering,
+    op: BinaryOp,
+    leftExpr: u32,
+    rightExpr: u32,
+) -> Result<u32, AllocError> {
+    let left = lowerOperand(c, n, b, leftExpr)?;
+    if (left == none()) {
+        return Ok(none());
+    }
+    let boolType = c.types.boolType;
+    let result = newTemp(b, boolType)?;
+    let evaluateRight = newBlock(b)?;
+    let shortCircuit = newBlock(b)?;
+    let join = newBlock(b)?;
+    let isAnd = match (op) {
+        BinaryOp.LogicalAnd => true,
+        _ => false,
+    };
+    terminate(
+        n,
+        b,
+        if (isAnd) NirTerminator.Branch(
+            left,
+            evaluateRight,
+            shortCircuit,
+        ) else NirTerminator.Branch(left, shortCircuit, evaluateRight),
+    )?;
+    b.current = shortCircuit;
+    let resultPlace = localPlace(n, result)?;
+    let constant = constOperand(n, if (isAnd) 0 else 1, boolType)?;
+    let constantUse = useRvalue(n, constant)?;
+    assign(n, b, resultPlace, constantUse)?;
+    terminate(n, b, NirTerminator.Goto(join))?;
+    b.current = evaluateRight;
+    let right = lowerOperand(c, n, b, rightExpr)?;
+    if (b.current != none()) {
+        let rightUse = useRvalue(n, right)?;
+        assign(n, b, resultPlace, rightUse)?;
+        terminate(n, b, NirTerminator.Goto(join))?;
+    }
+    b.current = join;
+    let read = placeOperand(c, n, b, resultPlace)?;
+    return useRvalue(n, read);
+}

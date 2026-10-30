@@ -231,7 +231,10 @@ fn foldStatics(c: borrow mut Checker) -> Result<void, AllocError> {
     }
     for (k in 0..c.hir.functions.length) {
         let f = borrow c.hir.functions[k];
-        if (!f.registered || !containsU32(c.constantFunctions, f.syntax) || f.isGeneric || functionIsInstantiation(
+        if (!f.registered || !containsU32(c.constantFunctions, f.syntax) || functionIsGeneric(
+            c,
+            truncate<u32>(k),
+        ) || functionIsInstantiation(
             c,
             truncate<u32>(k),
         )) {

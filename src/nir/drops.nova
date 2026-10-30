@@ -1,0 +1,326 @@
+// Drop elaboration (the reference's Analysis/DropElaborator.cs; type-system.md §14.5, ownership.md O4). It runs after
+// move and borrow checking succeeded, on functions that are not generic, and inserts drops where values that need
+// drop end: before a StorageDead of such a local, and before an assignment that overwrites such a place, split as
+// `t = rvalue; Drop(place); place = move t` so the new value is computed before the old one is destroyed. What is
+// dropped follows the init state there: definitely initialised, unconditionally; definitely uninitialised, nothing;
+// otherwise behind a runtime drop flag, or field by field for a partially moved struct.
+
+/// A leaf's drop flag, in the order flags were made (the reference's `_flags`, which keeps insertion order).
+struct DropFlag {
+    leaf: u32;
+    local: u32;
+}
+
+/// The statements pass 1 puts at one statement: drops before it, or its replacement.
+struct DropEdit {
+    block: u32;
+    index: u32;
+    isReplacement: bool;
+    statements: Vector<u32>;
+}
+
+struct Elaboration {
+    function: u32; // NirProgram.functions
+    flags: Vector<DropFlag>;
+}
+
+fn hasDropFunction(c: borrow Checker, typ: u32) -> bool =>
+    c.types.is(typ, TypeKind.Struct) && c.types.structs[c.types.info(typ).structDef as usize].dropFunction != none();
+
+fn addFunctionLocal(n: borrow mut NirProgram, function: u32, typ: u32) -> Result<u32, AllocError> {
+    n.functions[function as usize].locals.push(NirLocal { typ: typ, name: none(), isUsing: false })?;
+    return Ok(truncate<u32>(n.functions[function as usize].locals.length - 1));
+}
+
+fn addStatement(n: borrow mut NirProgram, statement: NirStatement, span: Span) -> Result<u32, AllocError> {
+    n.statements.push(statement)?;
+    n.statementSpans.push(span)?;
+    return Ok(truncate<u32>(n.statements.length - 1));
+}
+
+fn flagOf(e: borrow Elaboration, leaf: u32) -> u32 {
+    for (flag in e.flags.view()) {
+        if (flag.leaf == leaf) {
+            return flag.local;
+        }
+    }
+    return none();
+}
+
+/// A leaf's drop flag (FlagFor): one per leaf, and every leaf under a drop-block struct gets one, so they stay in step.
+fn flagFor(
+    c: borrow Checker,
+    n: borrow mut NirProgram,
+    d: borrow MoveData,
+    e: borrow mut Elaboration,
+    leaf: u32,
+) -> Result<u32, AllocError> {
+    let existing = flagOf(e, leaf);
+    if (existing != none()) {
+        return Ok(existing);
+    }
+    var top = leaf;
+    var ancestor = d.nodes[leaf as usize].parent;
+    while (ancestor != none()) {
+        if (hasDropFunction(c, d.nodes[ancestor as usize].typ)) {
+            top = ancestor;
+        }
+        ancestor = d.nodes[ancestor as usize].parent;
+    }
+    var siblings = Vector<u32>.create();
+    moveLeaves(d, top, mut siblings)?;
+    for (sibling in siblings.view()) {
+        if (flagOf(e, sibling) == none()) {
+            let local = addFunctionLocal(n, e.function, c.types.boolType)?;
+            e.flags.push(DropFlag { leaf: sibling, local: local })?;
+        }
+    }
+    return Ok(flagOf(e, leaf));
+}
+
+/// The drops that destroy what is still initialised under `node` (Sequence).
+fn dropSequence(
+    c: borrow Checker,
+    n: borrow mut NirProgram,
+    d: borrow MoveData,
+    e: borrow mut Elaboration,
+    node: u32,
+    state: borrow InitState,
+    span: Span,
+    out: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    let typ = d.nodes[node as usize].typ;
+    if (!c.types.needsDrop(typ) || definitelyUninit(d, state, node)?) {
+        return Ok();
+    }
+    let isInit = definitelyInit(d, state, node)?;
+    if (d.nodes[node as usize].isBoxAllocation) {
+        // Only reached for a partially moved box: its contents were handled by the sibling (§18.3).
+        let place = movePathPlace(n, d, node)?;
+        let flag = if (isInit) none() else flagFor(c, n, d, e, node)?;
+        out.push(addStatement(n, NirStatement.BoxFree(place, flag), span)?)?;
+        return Ok();
+    }
+    if (isInit) {
+        let place = movePathPlace(n, d, node)?;
+        out.push(addStatement(n, NirStatement.Drop(place, none()), span)?)?;
+        return Ok();
+    }
+    // A struct with a drop block is never partially moved (N0252): its leaves move together.
+    if (isLeafNode(d, node) || hasDropFunction(c, typ)) {
+        let place = movePathPlace(n, d, node)?;
+        var leaves = Vector<u32>.create();
+        moveLeaves(d, node, mut leaves)?;
+        let flag = flagFor(c, n, d, e, leaves[0])?;
+        out.push(addStatement(n, NirStatement.Drop(place, flag), span)?)?;
+        return Ok();
+    }
+    let count = d.nodes[node as usize].children.length;
+    for (k in 0..count) {
+        let child = d.nodes[node as usize].children[k];
+        dropSequence(c, n, d, e, child, state, span, out)?;
+    }
+    return Ok();
+}
+
+fn setFlag(n: borrow mut NirProgram, flag: u32, value: bool, typ: u32, span: Span) -> Result<u32, AllocError> {
+    let target = localPlace(n, flag)?;
+    let constant = constOperand(n, if (value) 1 else 0, typ)?;
+    let rvalue = n.rvalue(NirRvalue.Use(constant), typ, span)?;
+    return addStatement(n, NirStatement.Assign(target, rvalue), span);
+}
+
+/// A flag update, keeping the first position of each flag and the last value (the reference's Dictionary).
+fn noteUpdate(updates: borrow mut Vector<DropFlag>, flag: u32, value: bool) -> Result<void, AllocError> {
+    let v: u32 = if (value) 1 else 0;
+    for (k in 0..updates.length) {
+        if (updates[k].leaf == flag) {
+            updates[k].local = v;
+            return Ok();
+        }
+    }
+    return updates.push(DropFlag { leaf: flag, local: v });
+}
+
+fn noteLeaves(
+    d: borrow MoveData,
+    e: borrow Elaboration,
+    node: u32,
+    value: bool,
+    updates: borrow mut Vector<DropFlag>,
+) -> Result<void, AllocError> {
+    var leaves = Vector<u32>.create();
+    moveLeaves(d, node, mut leaves)?;
+    for (leaf in leaves.view()) {
+        let flag = flagOf(e, leaf);
+        if (flag != none()) {
+            noteUpdate(updates, flag, value)?;
+        }
+    }
+    return Ok();
+}
+
+/// The flag assignments that keep every flag equal to its leaf's runtime init state after a statement (FlagUpdates).
+fn flagUpdates(
+    c: borrow Checker,
+    n: borrow mut NirProgram,
+    d: borrow MoveData,
+    e: borrow Elaboration,
+    s: u32,
+    out: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    if (e.flags.length == 0) {
+        return Ok();
+    }
+    var updates = Vector<DropFlag>.create(); // flag, then 1 or 0
+    let statement = n.statements[s as usize];
+    let rvalue = match (statement) {
+        NirStatement.Assign(_, value) => value,
+        NirStatement.Eval(value) => value,
+        _ => none(),
+    };
+    if (rvalue != none()) {
+        var places = Vector<u32>.create();
+        movedPlaces(n, rvalue, mut places)?;
+        for (place in places.view()) {
+            let path = movedPath(c, n, n.functions[e.function as usize].locals, d, place);
+            if (path != none()) {
+                noteLeaves(d, e, path, false, mut updates)?;
+            }
+        }
+    }
+    match (statement) {
+        NirStatement.Assign(target, _) => {
+            let local = n.places[target as usize].local;
+            if (isMovePath(c, n, n.functions[e.function as usize].locals, target) && tracksLocal(d, local)) {
+                noteLeaves(d, e, pathFor(c, n, d, target), true, mut updates)?;
+            }
+        }
+        NirStatement.Unpack(source, _, targets) => {
+            noteLeaves(d, e, d.roots[n.places[source as usize].local as usize], false, mut updates)?;
+            for (k in 0..targets.count) {
+                let target = n.at(targets, k);
+                if (target != none()) {
+                    noteLeaves(d, e, d.roots[target as usize], true, mut updates)?;
+                }
+            }
+        }
+        NirStatement.StorageDead(local) => { noteLeaves(d, e, d.roots[local as usize], false, mut updates)?; }
+        _ => {}
+    }
+    let span = n.statementSpans[s as usize];
+    for (update in updates.view()) {
+        out.push(setFlag(n, update.leaf, update.local == 1, c.types.boolType, span)?)?;
+    }
+    return Ok();
+}
+
+/// Elaborates the drops of `n.functions[function]` (Elaborate).
+fn elaborateDrops(c: borrow Checker, n: borrow mut NirProgram, function: u32) -> Result<void, AllocError> {
+    let d = analyzeMoves(c, n, n.functions[function as usize])?;
+    var e = Elaboration { function: function, flags: Vector<DropFlag>.create() };
+    // Pass 1: decide what each drop point destroys (this may allocate drop flags).
+    var edits = Vector<DropEdit>.create();
+    let blockCount = n.functions[function as usize].blocks.length;
+    for (position in 0..blockCount) {
+        let statementCount = n.functions[function as usize].blocks[position].statements.length;
+        for (i in 0..statementCount) {
+            let s = n.functions[function as usize].blocks[position].statements[i];
+            let span = n.statementSpans[s as usize];
+            match (n.statements[s as usize]) {
+                NirStatement.StorageDead(local) => {
+                    if (c.types.needsDrop(n.functions[function as usize].locals[local as usize].typ)) {
+                        var drops = Vector<u32>.create();
+                        dropSequence(c, n, d, mut e, d.roots[local as usize], d.before[position][i], span, mut drops)?;
+                        edits.push(
+                            DropEdit {
+                                block: truncate<u32>(position),
+                                index: truncate<u32>(i),
+                                isReplacement: false,
+                                statements: drops,
+                            },
+                        )?;
+                    }
+                }
+                NirStatement.Assign(target, value) => {
+                    let targetType = nirPlaceType(c, n, n.functions[function as usize].locals, target);
+                    // `p.write(v)` (the place `*p`, `p` a raw pointer) neither reads nor destroys what was there (§27.3).
+                    if (c.types.needsDrop(targetType) && !isRawDeref(
+                        c,
+                        n,
+                        n.functions[function as usize].locals,
+                        target,
+                    )) {
+                        var afterValue = d.before[position][i].clone()?;
+                        applyMoves(c, n, n.functions[function as usize].locals, d, value, mut afterValue)?;
+                        var drops = Vector<u32>.create();
+                        if (!isMovePath(c, n, n.functions[function as usize].locals, target)) {
+                            // A referent or element is always initialised.
+                            drops.push(addStatement(n, NirStatement.Drop(target, none()), span)?)?;
+                        } else {
+                            let path = pathFor(c, n, d, target);
+                            dropSequence(c, n, d, mut e, path, afterValue, span, mut drops)?;
+                        }
+                        if (drops.length > 0) {
+                            let temp = addFunctionLocal(n, function, targetType)?;
+                            var replacement = Vector<u32>.create();
+                            let tempPlace = localPlace(n, temp)?;
+                            replacement.push(addStatement(n, NirStatement.Assign(tempPlace, value), span)?)?;
+                            for (dropped in drops.view()) {
+                                replacement.push(dropped)?;
+                            }
+                            let source = localPlace(n, temp)?;
+                            let operand = n.operand(NirOperand.Place(source, true), targetType)?;
+                            let use = n.rvalue(NirRvalue.Use(operand), targetType, span)?;
+                            replacement.push(addStatement(n, NirStatement.Assign(target, use), span)?)?;
+                            edits.push(
+                                DropEdit {
+                                    block: truncate<u32>(position),
+                                    index: truncate<u32>(i),
+                                    isReplacement: true,
+                                    statements: replacement,
+                                },
+                            )?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Pass 2: rebuild the blocks, keeping every drop flag equal to its leaf's runtime init state.
+    var cursor: usize = 0;
+    let parameterCount = n.functions[function as usize].parameterCount;
+    for (position in 0..blockCount) {
+        var rebuilt = Vector<u32>.create();
+        if (position == 0) {
+            for (flag in e.flags.view()) {
+                if (d.nodes[flag.leaf as usize].local < parameterCount) {
+                    rebuilt.push(setFlag(n, flag.local, true, c.types.boolType, Span { start: 0, end: 0 })?)?;
+                }
+            }
+        }
+        let statementCount = n.functions[function as usize].blocks[position].statements.length;
+        for (i in 0..statementCount) {
+            let s = n.functions[function as usize].blocks[position].statements[i];
+            var replaced = false;
+            while (cursor < edits.length && edits[cursor].block == truncate<u32>(
+                position,
+            ) && edits[cursor].index == truncate<u32>(i)) {
+                for (t in edits[cursor].statements.view()) {
+                    rebuilt.push(t)?;
+                }
+                if (edits[cursor].isReplacement) {
+                    replaced = true;
+                }
+                cursor += 1;
+            }
+            if (!replaced) {
+                rebuilt.push(s)?;
+            }
+            flagUpdates(c, n, d, e, s, mut rebuilt)?;
+        }
+        n.functions[function as usize].blocks[position].statements = rebuilt;
+    }
+    return Ok();
+}

@@ -47,6 +47,8 @@ struct Options {
     freestanding: bool;       // --profile freestanding (cosmoos/profiles.md §4)
     kernel: bool;             // --kernel cosmoos: lib/kernel, in the freestanding profile (ADR 0025)
     profileGiven: bool;       // --profile was given: package mode keeps it over the manifest's
+    building: bool;           // `build`: until P5, only `--dump-nir`, which prints the NIR and stops
+    dumpNir: bool;            // --dump-nir (build)
     files: Vector<String>;
 }
 
@@ -89,6 +91,13 @@ fn readOptions(options: borrow mut Options) -> i32 {
             options.dumpAst = true;
         } else if (arg == "--dump-hir") {
             options.dumpHir = true;
+        } else if (options.building && arg == "--dump-nir") {
+            options.dumpNir = true;
+        } else if (options.building && (arg == "--emit" || arg == "-o")) {
+            a += 1; // the C backend's options (P5): `--dump-nir` stops before them
+        } else if (options.building && (arg == "--no-closure-specialisation" || arg == "--no-placement" ||
+            arg == "--no-bce" || arg == "--no-oce")) {
+            // The NIR printed is before these optimisations (P7), as novac's is with them turned off.
         } else if (arg == "--no-float") {
             options.noFloat = true;
         } else if (arg == "--library-diagnostics") {
@@ -263,6 +272,8 @@ fn parseCommand() -> i32 {
         freestanding: false,
         kernel: false,
         profileGiven: false,
+        building: false,
+        dumpNir: false,
         files: Vector<String>.create(),
     };
     let status = readOptions(mut options);
@@ -415,7 +426,13 @@ fn loadPackage(
     return 0;
 }
 
-fn checkCommand() -> i32 {
+fn checkCommand() -> i32 => fileCommand(false);
+
+/// `build --dump-nir` (P4): the checks, then the NIR after drop elaboration, printed as novac prints it with the
+/// optimisations turned off. Building C is P5.
+fn buildCommand() -> i32 => fileCommand(true);
+
+fn fileCommand(building: bool) -> i32 {
     var options = Options {
         json: false,
         dumpTokens: false,
@@ -426,6 +443,8 @@ fn checkCommand() -> i32 {
         freestanding: false,
         kernel: false,
         profileGiven: false,
+        building: building,
+        dumpNir: false,
         files: Vector<String>.create(),
     };
     let status = readOptions(mut options);
@@ -529,10 +548,29 @@ fn checkCommand() -> i32 {
         // The reference's libraries check cleanly: what is reported in them here is a porting gap (docs/p3-plan.md S5).
         checker.front.diagnostics.removeFiles(checker.fileIsLibrary.view());
     }
-    if (options.dumpHir) {
+    if (options.dumpHir && !building) {
         var printer = HirPrinter.create();
         printer.printProgram(checker.hir, checker.types, checker.front.symbols)!;
         Console.writeBytes(printer.out.view());
+    }
+    if (building) {
+        if (checker.front.diagnostics.hasErrors()) {
+            return report(options.json, checker.front.diagnostics, sources);
+        }
+        if (!options.dumpNir) {
+            return fail("'build' is not implemented yet (ROADMAP P5); only 'build --dump-nir' is");
+        }
+        var nir = buildNir(mut checker)!;
+        // Destruction goes only into code that is compiled, not into generic versions (type-system.md §14.5).
+        for (k in 0..nir.functions.length) {
+            if (!functionIsGeneric(checker, nir.functions[k].source)) {
+                elaborateDrops(checker, mut nir, truncate<u32>(k))!;
+            }
+        }
+        var out = Vector<u8>.create();
+        printNir(checker, nir, mut out)!;
+        Console.writeBytes(out.view());
+        return report(options.json, checker.front.diagnostics, sources);
     }
     return report(options.json, checker.front.diagnostics, sources);
 }
@@ -557,6 +595,9 @@ fn main() -> i32 {
     }
     if (command == "check") {
         return checkCommand();
+    }
+    if (command == "build") {
+        return buildCommand();
     }
     match (phaseOf(command)) {
         Some(phase) => {

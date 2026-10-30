@@ -1,0 +1,564 @@
+// Move paths and the forward init/move dataflow of one NIR function (the reference's Analysis/MovePaths.cs: MovePath,
+// InitState, MoveData), shared by the move checker and drop elaboration. A node is a local's root or a path of fields
+// and box derefs; when one field of a struct is tracked, all its siblings are, so a node's children partition it. An
+// expanded box has two children: its contents and its allocation. Init state is kept per leaf, as bits.
+
+/// A node of a local's move-path tree (MovePath).
+struct MovePathNode {
+    local: u32;
+    parent: u32; // a node, or none for a local's root
+    field: u32;  // the field this node selects, or none (roots and box children)
+    typ: u32;
+    isBoxContents: bool;
+    isBoxAllocation: bool;
+    children: Vector<u32>;
+    leafIndex: u32; // a leaf's bit, or none for inner nodes
+}
+
+/// Init state at a program point (InitState): three sets of leaves, all "maybe", joined by union.
+struct InitState {
+    maybeInit: Vector<u64>;
+    maybeUninit: Vector<u64>;
+    maybeMoved: Vector<u64>; // may be uninitialised because of a move (N0250 rather than N0212)
+
+    fn create(leaves: u32) -> Result<InitState, AllocError> {
+        let words = (leaves as usize + 63) / 64;
+        var state = InitState {
+            maybeInit: Vector<u64>.create(),
+            maybeUninit: Vector<u64>.create(),
+            maybeMoved: Vector<u64>.create(),
+        };
+        for (k in 0..words) {
+            state.maybeInit.push(0)?;
+            state.maybeUninit.push(0)?;
+            state.maybeMoved.push(0)?;
+        }
+        return Ok(state);
+    }
+
+    fn clone(borrow this) -> Result<InitState, AllocError> {
+        var copy = InitState {
+            maybeInit: Vector<u64>.create(),
+            maybeUninit: Vector<u64>.create(),
+            maybeMoved: Vector<u64>.create(),
+        };
+        for (k in 0..this.maybeInit.length) {
+            copy.maybeInit.push(this.maybeInit[k])?;
+            copy.maybeUninit.push(this.maybeUninit[k])?;
+            copy.maybeMoved.push(this.maybeMoved[k])?;
+        }
+        return Ok(copy);
+    }
+
+    /// Union with `other`; whether anything changed (JoinFrom).
+    fn joinFrom(borrow mut this, other: borrow InitState) -> bool {
+        var changed = false;
+        for (k in 0..this.maybeInit.length) {
+            let a = this.maybeInit[k] | other.maybeInit[k];
+            let b = this.maybeUninit[k] | other.maybeUninit[k];
+            let m = this.maybeMoved[k] | other.maybeMoved[k];
+            if (a != this.maybeInit[k] || b != this.maybeUninit[k] || m != this.maybeMoved[k]) {
+                changed = true;
+            }
+            this.maybeInit[k] = a;
+            this.maybeUninit[k] = b;
+            this.maybeMoved[k] = m;
+        }
+        return changed;
+    }
+
+    fn bit(words: borrow Vector<u64>, i: u32) -> bool => (words[(i / 64) as usize] >> ((i % 64) as u64)) & 1 == 1;
+
+    fn set(words: borrow mut Vector<u64>, i: u32, value: bool) {
+        let mask = 1u64 << ((i % 64) as u64);
+        let k = (i / 64) as usize;
+        words[k] = if (value) words[k] | mask else words[k] & (0xFFFFFFFFFFFFFFFF ^ mask);
+    }
+}
+
+/// Move paths and init states of one function (MoveData).
+struct MoveData {
+    nodes: Vector<MovePathNode>;
+    roots: Vector<u32>;                // by local: its root node, for the locals there were when the analysis ran
+    leaves: Vector<u32>;               // by leaf index
+    blockOf: Vector<u32>;              // block id to its position in the function's blocks, or none
+    before: Vector<Vector<InitState>>; // by block position: the state before each statement, then before the terminator
+}
+
+fn newMoveNode(d: borrow mut MoveData, local: u32, parent: u32, field: u32, typ: u32) -> Result<u32, AllocError> {
+    d.nodes.push(
+        MovePathNode {
+            local: local,
+            parent: parent,
+            field: field,
+            typ: typ,
+            isBoxContents: false,
+            isBoxAllocation: false,
+            children: Vector<u32>.create(),
+            leafIndex: none(),
+        },
+    )?;
+    return Ok(truncate<u32>(d.nodes.length - 1));
+}
+
+fn isLeafNode(d: borrow MoveData, node: u32) -> bool => d.nodes[node as usize].children.length == 0;
+
+/// The leaves under `node`, in order (Leaves).
+fn moveLeaves(d: borrow MoveData, node: u32, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    if (isLeafNode(d, node)) {
+        return out.push(node);
+    }
+    for (child in d.nodes[node as usize].children.view()) {
+        moveLeaves(d, child, out)?;
+    }
+    return Ok();
+}
+
+fn isFieldProjectionN(p: NirProjection) -> bool => match (p.kind) {
+    ProjectionKind.Field => true,
+    _ => false,
+};
+
+fn isDerefProjectionN(p: NirProjection) -> bool => match (p.kind) {
+    ProjectionKind.Deref => true,
+    _ => false,
+};
+
+/// The child a projection selects (Child), or none for a projection that is not a move-path step.
+fn moveChild(c: borrow Checker, d: borrow MoveData, node: u32, p: NirProjection) -> u32 {
+    if (isFieldProjectionN(p)) {
+        for (child in d.nodes[node as usize].children.view()) {
+            if (d.nodes[child as usize].field == p.field) {
+                return child;
+            }
+        }
+        return none();
+    }
+    if (isDerefProjectionN(p) && c.types.is(d.nodes[node as usize].typ, TypeKind.Box)) {
+        for (child in d.nodes[node as usize].children.view()) {
+            if (d.nodes[child as usize].isBoxContents) {
+                return child;
+            }
+        }
+    }
+    return none();
+}
+
+/// Is a place a move path (NirPlace.IsMovePath): fields, and derefs of boxes; no deref of a reference, downcast or
+/// element?
+fn isMovePath(c: borrow Checker, n: borrow NirProgram, locals: borrow Vector<NirLocal>, place: u32) -> bool {
+    let p = n.places[place as usize];
+    var typ = locals[p.local as usize].typ;
+    for (k in 0..p.projections.count) {
+        let projection = n.projections[(p.projections.start + k) as usize];
+        if (!isFieldProjectionN(projection) && !(isDerefProjectionN(projection) && c.types.is(typ, TypeKind.Box))) {
+            return false;
+        }
+        typ = applyNirProjection(c, typ, projection);
+    }
+    return true;
+}
+
+/// `*p` for a raw pointer `p` (NirPlace.IsRawDeref): the memory `p.read()` and `p.write(v)` use.
+fn isRawDeref(c: borrow Checker, n: borrow NirProgram, locals: borrow Vector<NirLocal>, place: u32) -> bool {
+    let p = n.places[place as usize];
+    if (p.projections.count == 0 || !isDerefProjectionN(
+        n.projections[(p.projections.start + p.projections.count - 1) as usize],
+    )) {
+        return false;
+    }
+    var typ = locals[p.local as usize].typ;
+    for (k in 0..(p.projections.count - 1)) {
+        typ = applyNirProjection(c, typ, n.projections[(p.projections.start + k) as usize]);
+    }
+    return c.types.is(typ, TypeKind.RawPointer);
+}
+
+/// The places whose partial state matters (TrackedPlaces): assignment targets and moved operands.
+fn trackedPlaces(n: borrow NirProgram, statement: u32, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    match (n.statements[statement as usize]) {
+        NirStatement.Assign(target, value) => {
+            movedPlaces(n, value, out)?;
+            out.push(target)?;
+        }
+        NirStatement.Eval(value) => { movedPlaces(n, value, out)?; }
+        _ => {}
+    }
+    return Ok();
+}
+
+/// The places an rvalue's operands move out of (MovedPlaces).
+fn movedPlaces(n: borrow NirProgram, rvalue: u32, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    var operands = Vector<u32>.create();
+    rvalueOperands(n, rvalue, mut operands)?;
+    for (o in operands.view()) {
+        match (n.operands[o as usize]) {
+            NirOperand.Place(place, isMove) => {
+                if (isMove) {
+                    out.push(place)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    return Ok();
+}
+
+/// An rvalue's operands, in order (Operands).
+fn rvalueOperands(n: borrow NirProgram, rvalue: u32, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    match (n.rvalues[rvalue as usize]) {
+        NirRvalue.Use(o) => { out.push(o)?; }
+        NirRvalue.Binary(_, l, r) => {
+            out.push(l)?;
+            out.push(r)?;
+        }
+        NirRvalue.Unary(_, o) => { out.push(o)?; }
+        NirRvalue.Cast(o) => { out.push(o)?; }
+        NirRvalue.Truncate(o) => { out.push(o)?; }
+        NirRvalue.FloatToInt(o, _) => { out.push(o)?; }
+        NirRvalue.Aggregate(fields) => { pushRange(n, fields, out)?; }
+        NirRvalue.EnumAggregate(_, payload) => { pushRange(n, payload, out)?; }
+        NirRvalue.Array(elements) => { pushRange(n, elements, out)?; }
+        NirRvalue.ArrayRepeat(o) => { out.push(o)?; }
+        NirRvalue.Slice(_, _, low, high) => {
+            out.push(low)?;
+            out.push(high)?;
+        }
+        NirRvalue.Call(_, arguments) => { pushRange(n, arguments, out)?; }
+        NirRvalue.Builtin(_, arguments) => { pushRange(n, arguments, out)?; }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn pushRange(n: borrow NirProgram, range: Range, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    for (k in 0..range.count) {
+        out.push(n.at(range, k))?;
+    }
+    return Ok();
+}
+
+/// Expands the tree along a place's move-path prefix (Expand).
+fn expandPath(c: borrow Checker, n: borrow NirProgram, d: borrow mut MoveData, place: u32) -> Result<void, AllocError> {
+    let p = n.places[place as usize];
+    var node = d.roots[p.local as usize];
+    for (k in 0..p.projections.count) {
+        let projection = n.projections[(p.projections.start + k) as usize];
+        let typ = d.nodes[node as usize].typ;
+        let isBoxDeref = isDerefProjectionN(projection) && c.types.is(typ, TypeKind.Box);
+        if (!isFieldProjectionN(projection) && !isBoxDeref) {
+            return Ok();
+        }
+        let local = d.nodes[node as usize].local;
+        if (isLeafNode(d, node) && isBoxDeref) {
+            // Contents first, so a partially moved box destroys what is left, then frees the memory.
+            let contents = newMoveNode(d, local, node, none(), c.types.info(typ).pointee)?;
+            d.nodes[contents as usize].isBoxContents = true;
+            let allocation = newMoveNode(d, local, node, none(), typ)?;
+            d.nodes[allocation as usize].isBoxAllocation = true;
+            d.nodes[node as usize].children.push(contents)?;
+            d.nodes[node as usize].children.push(allocation)?;
+        } else if (isLeafNode(d, node)) {
+            let definition = c.types.info(typ).structDef;
+            let count = c.types.structs[definition as usize].fields.length;
+            for (j in 0..count) {
+                let field = c.types.structs[definition as usize].fields[j];
+                let child = newMoveNode(d, local, node, field, c.types.fields[field as usize].typ)?;
+                d.nodes[node as usize].children.push(child)?;
+            }
+        }
+        node = moveChild(c, d, node, projection);
+    }
+    return Ok();
+}
+
+/// MoveData's construction: the trees, the leaves' bits, then the dataflow.
+fn analyzeMoves(c: borrow Checker, n: borrow NirProgram, function: borrow NirFunction) -> Result<MoveData, AllocError> {
+    var d = MoveData {
+        nodes: Vector<MovePathNode>.create(),
+        roots: Vector<u32>.create(),
+        leaves: Vector<u32>.create(),
+        blockOf: Vector<u32>.create(),
+        before: Vector<Vector<InitState>>.create(),
+    };
+    for (k in 0..function.locals.length) {
+        let root = newMoveNode(mut d, truncate<u32>(k), none(), none(), function.locals[k].typ)?;
+        d.roots.push(root)?;
+    }
+    for (block in function.blocks.view()) {
+        for (s in block.statements.view()) {
+            var places = Vector<u32>.create();
+            trackedPlaces(n, s, mut places)?;
+            for (place in places.view()) {
+                expandPath(c, n, mut d, place)?;
+            }
+        }
+    }
+    for (k in 0..d.roots.length) {
+        var leaves = Vector<u32>.create();
+        moveLeaves(d, d.roots[k], mut leaves)?;
+        for (leaf in leaves.view()) {
+            d.nodes[leaf as usize].leafIndex = truncate<u32>(d.leaves.length);
+            d.leaves.push(leaf)?;
+        }
+    }
+    var maxId: u32 = 0;
+    for (block in function.blocks.view()) {
+        if (block.id > maxId) {
+            maxId = block.id;
+        }
+    }
+    for (k in 0..(maxId + 1)) {
+        d.blockOf.push(none())?;
+    }
+    for (k in 0..function.blocks.length) {
+        d.blockOf[function.blocks[k].id as usize] = truncate<u32>(k);
+        d.before.push(Vector<InitState>.create())?;
+    }
+    computeInit(c, n, function, mut d)?;
+    return Ok(d);
+}
+
+fn leafCount(d: borrow MoveData) -> u32 => truncate<u32>(d.leaves.length);
+
+/// Is `local` one the analysis knows (Tracks)? Locals added later (drop elaboration's) are not.
+fn tracksLocal(d: borrow MoveData, local: u32) -> bool => (local as usize) < d.roots.length;
+
+/// The deepest tracked node on a place's move-path prefix (PathFor).
+fn pathFor(c: borrow Checker, n: borrow NirProgram, d: borrow MoveData, place: u32) -> u32 {
+    let p = n.places[place as usize];
+    var node = d.roots[p.local as usize];
+    for (k in 0..p.projections.count) {
+        if (isLeafNode(d, node)) {
+            break;
+        }
+        let child = moveChild(c, d, node, n.projections[(p.projections.start + k) as usize]);
+        if (child == none()) {
+            break;
+        }
+        node = child;
+    }
+    return node;
+}
+
+/// Is this a move of a variant payload out of a local (IsPayloadOfLocal): `t as Ok .0`?
+fn isPayloadOfLocal(n: borrow NirProgram, place: u32) -> bool {
+    let p = n.places[place as usize];
+    if (p.projections.count != 2) {
+        return false;
+    }
+    let first = n.projections[p.projections.start as usize];
+    let second = n.projections[(p.projections.start + 1) as usize];
+    let isDowncast = match (first.kind) {
+        ProjectionKind.Downcast => true,
+        _ => false,
+    };
+    return isDowncast && isFieldProjectionN(second);
+}
+
+/// The path a move out of `place` uninitialises (MovedPath): the path itself for a field path, the whole local for a
+/// variant payload of a local (only `?` and `!` move out of one), otherwise none.
+fn movedPath(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    locals: borrow Vector<NirLocal>,
+    d: borrow MoveData,
+    place: u32,
+) -> u32 {
+    if (isMovePath(c, n, locals, place)) {
+        return pathFor(c, n, d, place);
+    }
+    return if (isPayloadOfLocal(n, place)) d.roots[n.places[place as usize].local as usize] else none();
+}
+
+fn initialize(d: borrow MoveData, state: borrow mut InitState, node: u32) -> Result<void, AllocError> {
+    var leaves = Vector<u32>.create();
+    moveLeaves(d, node, mut leaves)?;
+    for (leaf in leaves.view()) {
+        let i = d.nodes[leaf as usize].leafIndex;
+        InitState.set(mut state.maybeInit, i, true);
+        InitState.set(mut state.maybeUninit, i, false);
+        InitState.set(mut state.maybeMoved, i, false);
+    }
+    return Ok();
+}
+
+fn uninitialize(d: borrow MoveData, state: borrow mut InitState, node: u32, moved: bool) -> Result<void, AllocError> {
+    var leaves = Vector<u32>.create();
+    moveLeaves(d, node, mut leaves)?;
+    for (leaf in leaves.view()) {
+        let i = d.nodes[leaf as usize].leafIndex;
+        InitState.set(mut state.maybeInit, i, false);
+        InitState.set(mut state.maybeUninit, i, true);
+        InitState.set(mut state.maybeMoved, i, moved);
+    }
+    return Ok();
+}
+
+fn definitelyInit(d: borrow MoveData, state: borrow InitState, node: u32) -> Result<bool, AllocError> {
+    var leaves = Vector<u32>.create();
+    moveLeaves(d, node, mut leaves)?;
+    for (leaf in leaves.view()) {
+        if (InitState.bit(state.maybeUninit, d.nodes[leaf as usize].leafIndex)) {
+            return Ok(false);
+        }
+    }
+    return Ok(true);
+}
+
+fn definitelyUninit(d: borrow MoveData, state: borrow InitState, node: u32) -> Result<bool, AllocError> {
+    var leaves = Vector<u32>.create();
+    moveLeaves(d, node, mut leaves)?;
+    for (leaf in leaves.view()) {
+        if (InitState.bit(state.maybeInit, d.nodes[leaf as usize].leafIndex)) {
+            return Ok(false);
+        }
+    }
+    return Ok(true);
+}
+
+fn anyMaybeMoved(d: borrow MoveData, state: borrow InitState, node: u32) -> Result<bool, AllocError> {
+    var leaves = Vector<u32>.create();
+    moveLeaves(d, node, mut leaves)?;
+    for (leaf in leaves.view()) {
+        let i = d.nodes[leaf as usize].leafIndex;
+        if (InitState.bit(state.maybeUninit, i) && InitState.bit(state.maybeMoved, i)) {
+            return Ok(true);
+        }
+    }
+    return Ok(false);
+}
+
+/// The moves of an rvalue's operands (ApplyMoves).
+fn applyMoves(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    locals: borrow Vector<NirLocal>,
+    d: borrow MoveData,
+    rvalue: u32,
+    state: borrow mut InitState,
+) -> Result<void, AllocError> {
+    var places = Vector<u32>.create();
+    movedPlaces(n, rvalue, mut places)?;
+    for (place in places.view()) {
+        let path = movedPath(c, n, locals, d, place);
+        if (path != none()) {
+            uninitialize(d, state, path, true)?;
+        }
+    }
+    return Ok();
+}
+
+/// One statement's effect on the state (Apply).
+fn applyStatement(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    locals: borrow Vector<NirLocal>,
+    d: borrow MoveData,
+    s: u32,
+    state: borrow mut InitState,
+) -> Result<void, AllocError> {
+    match (n.statements[s as usize]) {
+        NirStatement.Assign(target, value) => {
+            applyMoves(c, n, locals, d, value, state)?;
+            if (isMovePath(c, n, locals, target)) {
+                initialize(d, state, pathFor(c, n, d, target))?;
+            }
+        }
+        NirStatement.Eval(value) => { applyMoves(c, n, locals, d, value, state)?; }
+        NirStatement.StorageDead(local) => { uninitialize(d, state, d.roots[local as usize], false)?; }
+        NirStatement.Drop(place, _) => { uninitialize(d, state, pathFor(c, n, d, place), false)?; }
+        NirStatement.Unpack(source, _, targets) => {
+            uninitialize(d, state, d.roots[n.places[source as usize].local as usize], true)?;
+            for (k in 0..targets.count) {
+                let target = n.at(targets, k);
+                if (target != none()) {
+                    initialize(d, state, d.roots[target as usize])?;
+                }
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+/// The forward dataflow (Compute): parameters start initialised, every other local uninitialised; a worklist of
+/// blocks in FIFO order, a block's in-state the union of its predecessors' out-states.
+fn computeInit(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    function: borrow NirFunction,
+    d: borrow mut MoveData,
+) -> Result<void, AllocError> {
+    var entry = InitState.create(leafCount(d))?;
+    for (k in 0..d.roots.length) {
+        if (k < function.parameterCount as usize) {
+            initialize(d, mut entry, d.roots[k])?;
+        } else {
+            uninitialize(d, mut entry, d.roots[k], false)?;
+        }
+    }
+    var blockIn = Vector<InitState>.create();
+    var hasIn = Vector<bool>.create();
+    for (k in 0..function.blocks.length) {
+        blockIn.push(InitState.create(leafCount(d))?)?;
+        hasIn.push(false)?;
+    }
+    blockIn[0] = entry;
+    hasIn[0] = true;
+    var work = Vector<u32>.create(); // a FIFO: `head` is its front
+    var head: usize = 0;
+    var queued = Vector<bool>.create();
+    for (k in 0..function.blocks.length) {
+        queued.push(false)?;
+    }
+    work.push(0)?;
+    queued[0] = true;
+    while (head < work.length) {
+        let position = work[head];
+        head += 1;
+        queued[position as usize] = false;
+        var state = blockIn[position as usize].clone()?;
+        var positions = Vector<InitState>.create();
+        for (s in function.blocks[position as usize].statements.view()) {
+            positions.push(state.clone()?)?;
+            applyStatement(c, n, function.locals, d, s, mut state)?;
+        }
+        positions.push(state.clone()?)?;
+        d.before[position as usize] = positions;
+        for (successor in function.blocks[position as usize].successors.view()) {
+            let next = d.blockOf[successor as usize];
+            if (!hasIn[next as usize]) {
+                blockIn[next as usize] = state.clone()?;
+                hasIn[next as usize] = true;
+            } else if (!blockIn[next as usize].joinFrom(state)) {
+                continue;
+            }
+            if (!queued[next as usize]) {
+                queued[next as usize] = true;
+                work.push(next)?;
+            }
+        }
+    }
+    return Ok();
+}
+
+/// A node's place (Place): for a box allocation, the box itself.
+fn movePathPlace(n: borrow mut NirProgram, d: borrow MoveData, node: u32) -> Result<u32, AllocError> {
+    var steps = Vector<NirProjection>.create();
+    var current = if (d.nodes[node as usize].isBoxAllocation) d.nodes[node as usize].parent else node;
+    while (d.nodes[current as usize].parent != none()) {
+        let step = if (d.nodes[current as usize].isBoxContents) derefProjectionN() else fieldProjectionN(
+            d.nodes[current as usize].field,
+        );
+        steps.push(step)?;
+        current = d.nodes[current as usize].parent;
+    }
+    var projections = Vector<NirProjection>.create();
+    var k = steps.length;
+    while (k > 0) {
+        k -= 1;
+        projections.push(steps[k])?;
+    }
+    return n.place(d.nodes[node as usize].local, projections.view());
+}

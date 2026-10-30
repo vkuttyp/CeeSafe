@@ -1,0 +1,187 @@
+// The NIR (the reference's Nir/Nir.cs): a control-flow graph per function (intermediate-representation.md §3). The
+// reference's records refer to each other by identity; here every node lives in an arena of the program and is named
+// by its index, as in the HIR (src/hir/hir.nova). A block's statements are its own vector, since blocks are filled in
+// any order, and drop elaboration inserts into them.
+
+/// A local of one function: HIR locals keep their ids, temporaries and drop flags follow.
+struct NirLocal {
+    typ: u32;
+    name: u32; // a symbol, or none for a compiler temporary
+    isUsing: bool;
+}
+
+/// One projection of a place (the reference's Projection): a field, a deref, a downcast to a variant, or an element at
+/// an index operand.
+struct NirProjection {
+    kind: ProjectionKind;
+    field: u32;   // TypeTable.fields, or none
+    variant: u32; // TypeTable.variants, or none
+    index: u32;   // NirProgram.operands, or none
+}
+
+/// A local followed by projections (NirPlace): `_3`, `_3.a.b`, `(*_2).f`.
+struct NirPlace {
+    local: u32;         // the function's locals
+    projections: Range; // NirProgram.projections
+}
+
+enum NirOperand {
+    Place(u32, bool), // NirProgram.places, moved (the printer does not show it)
+    Const(IntValue),  // an integer, a bool (0 or 1), or a float's bits
+    Zero,             // a C-state field of a struct literal, zero-filled (§33.2)
+    String(Range),    // a string literal's text, in NirProgram.text
+}
+
+enum FloatToIntKind {
+    Panic,
+    Checked,
+    Saturating,
+}
+
+enum NirRvalue {
+    Use(u32),                   // an operand
+    Binary(BinaryOp, u32, u32), // may panic at the rvalue's span
+    Unary(UnaryOp, u32),
+    Cast(u32),
+    Truncate(u32),
+    FloatToInt(u32, FloatToIntKind),
+    Ref(bool, u32),             // mutable, place: creates a loan (lifetimes.md §2)
+    Discriminant(u32),          // a place: its tag, as u32
+    EnumAggregate(u32, Range),  // variant, payload operands
+    Aggregate(Range),           // field operands in declaration order
+    Array(Range),               // element operands
+    ArrayRepeat(u32),           // the operand repeated, the array type's length times
+    Slice(bool, u32, u32, u32), // mutable, base place, low and high operands
+    Length(u32),                // a slice place
+    Call(u32, Range),           // the HIR callee, argument operands
+    Builtin(u32, Range),        // the builtin's number (Builtins), argument operands
+    FunctionAddress(u32),       // a HIR function
+    StaticAddress(u32),         // Hir.statics
+}
+
+/// One case of a switch: a value and its target block.
+struct NirCase {
+    value: IntValue;
+    target: u32;
+}
+
+enum NirPanicKind {
+    Unwrap,
+    UnwrapNull,
+}
+
+enum NirStatement {
+    StorageDead(u32),               // a local
+    Drop(u32, u32),                 // place, flag local or none (inserted by drop elaboration)
+    Assign(u32, u32),               // target place, rvalue
+    BoundsCheck(u32, u32),          // index, length operands
+    RangeCheck(u32, u32, u32, u32), // low, high, length operands; a StringView's text place or none
+    LengthCheck(u32, u32),          // left, right operands
+    Unpack(u32, u32, Range),        // source place, variant, target locals (none for an unbound payload)
+    BoxFree(u32, u32),              // box place, flag local or none
+    Eval(u32),                      // an rvalue, for its effect
+}
+
+enum NirTerminator {
+    Goto(u32),               // a block
+    Branch(u32, u32, u32),   // condition operand, then and else blocks
+    Switch(u32, Range, u32), // value operand, cases (NirProgram.cases), otherwise block
+    Return(u32),             // an operand or none
+    Exit(u32),               // the exit code operand
+    Unreachable,
+    Panic(NirPanicKind),
+}
+
+struct NirBlock {
+    id: u32;                 // its number when it was made: the printer's `bb{id}`
+    statements: Vector<u32>; // NirProgram.statements
+    terminator: u32;         // NirProgram.terminators, or none while it is being filled
+    successors: Vector<u32>; // the terminator's targets, in its order (NirTerminator.Successors)
+}
+
+struct NirFunction {
+    source: u32; // the HIR function
+    locals: Vector<NirLocal>;
+    parameterCount: u32;
+    blocks: Vector<NirBlock>; // the reachable ones, in the order they were made; blocks[0] is the entry
+}
+
+struct NirProgram {
+    functions: Vector<NirFunction>;
+    lists: Vector<u32>;
+    text: Vector<u8>;
+    operands: Vector<NirOperand>;
+    operandTypes: Vector<u32>;
+    places: Vector<NirPlace>;
+    projections: Vector<NirProjection>;
+    rvalues: Vector<NirRvalue>;
+    rvalueTypes: Vector<u32>;
+    rvalueSpans: Vector<Span>; // a Binary's, Unary's or FloatToInt's span, where it may panic
+    statements: Vector<NirStatement>;
+    statementSpans: Vector<Span>;
+    terminators: Vector<NirTerminator>;
+    terminatorSpans: Vector<Span>;
+    cases: Vector<NirCase>;
+
+    fn create() -> NirProgram => NirProgram {
+        functions: Vector<NirFunction>.create(),
+        lists: Vector<u32>.create(),
+        text: Vector<u8>.create(),
+        operands: Vector<NirOperand>.create(),
+        operandTypes: Vector<u32>.create(),
+        places: Vector<NirPlace>.create(),
+        projections: Vector<NirProjection>.create(),
+        rvalues: Vector<NirRvalue>.create(),
+        rvalueTypes: Vector<u32>.create(),
+        rvalueSpans: Vector<Span>.create(),
+        statements: Vector<NirStatement>.create(),
+        statementSpans: Vector<Span>.create(),
+        terminators: Vector<NirTerminator>.create(),
+        terminatorSpans: Vector<Span>.create(),
+        cases: Vector<NirCase>.create(),
+    };
+
+    fn list(borrow mut this, ids: Slice<u32>) -> Result<Range, AllocError> {
+        let start = truncate<u32>(this.lists.length);
+        for (id in ids) {
+            this.lists.push(id)?;
+        }
+        return Ok(Range { start: start, count: truncate<u32>(ids.length) });
+    }
+
+    fn at(borrow this, range: Range, k: u32) -> u32 => this.lists[(range.start + k) as usize];
+
+    fn operand(borrow mut this, node: NirOperand, typ: u32) -> Result<u32, AllocError> {
+        this.operands.push(node)?;
+        this.operandTypes.push(typ)?;
+        return Ok(truncate<u32>(this.operands.length - 1));
+    }
+
+    fn rvalue(borrow mut this, node: NirRvalue, typ: u32, span: Span) -> Result<u32, AllocError> {
+        this.rvalues.push(node)?;
+        this.rvalueTypes.push(typ)?;
+        this.rvalueSpans.push(span)?;
+        return Ok(truncate<u32>(this.rvalues.length - 1));
+    }
+
+    fn place(borrow mut this, local: u32, projections: Slice<NirProjection>) -> Result<u32, AllocError> {
+        let start = truncate<u32>(this.projections.length);
+        for (p in projections) {
+            this.projections.push(p)?;
+        }
+        this.places.push(
+            NirPlace { local: local, projections: Range { start: start, count: truncate<u32>(projections.length) } },
+        )?;
+        return Ok(truncate<u32>(this.places.length - 1));
+    }
+
+    fn addText(borrow mut this, bytes: Slice<u8>) -> Result<Range, AllocError> {
+        let start = truncate<u32>(this.text.length);
+        for (b in bytes) {
+            this.text.push(b)?;
+        }
+        return Ok(Range { start: start, count: truncate<u32>(bytes.length) });
+    }
+
+    fn textOf(borrow this, r: Range) -> Slice<u8> => this.text[(r.start as usize)..((r.start + r.count) as usize)];
+}
