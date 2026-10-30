@@ -564,7 +564,7 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
 
 ## 9. Immediate work queue
 
-1. **Nova M15** is drafted (`~/Nova/docs/milestone-15.md`, proposed). Next, with the owner's go-ahead, implement it in Nova, in this order:
+1. **Nova M15 S1–S6 are done on Nova `main`** (`4126457`). Next: the owner's answers on ADR 0028 (S7); a novac release with the fixes; then re-pin here, remove the workarounds and update `text-gaps`. The original order was:
    - N0 (the crash) and N0b (the missing drop) first, since they are bugs;
    - then N1a (bytes to text) and N0d (the nesting limit), which P2 needs;
    - N4 (host services) later, before P5.
@@ -590,6 +590,7 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 | 2026-10-30 | P1 support library, oracles (`tools/oracles/`), fault sweep, limits, skeleton loading; `run_corpus.py --with` and `--check-leaks`; 4 more upstream reproducers | all pass; P1 gate passed |
 | 2026-10-30 | Filed Nova issues #1–#5 (the P1 upstream defects; each reproduced again on `origin/main` 07d561f first) | filed |
 | 2026-10-30 | Drafted Nova M15 (`docs/milestone-15.md`, Nova `34ce40a`, pushed) | proposed; awaiting the owner |
+| 2026-10-30 | Nova M15 S1–S6 implemented and pushed (Nova `4126457`, CI green); issues #1–#5 closed; ADR 0028 (S7) proposed. Checked against this repository with novac at `4126457`: probes 11/12 (the 12th, `text-gaps`, expects `StringView.fromUtf8` to be missing), support tests 6/6, fault sweep 573/573 | awaiting a release (0.3.2 / 0.4.0) to re-pin |
 
 **Tests run for the skeleton** (2026-10-30, novac 0.3.1, Apple clang 21.0.0):
 - `novac check` and `novac fmt --check`: clean.
