@@ -1,0 +1,131 @@
+// The program's tables at the end of checking (the end of the reference's Check: `Used`, `Emitted` and
+// MarkLibraryUse, then HirProgram's Structs and DynSignatures), which the C backend reads (P5).
+
+/// A `dyn` type and its methods, bodiless, in slot order (DynSignature, §37.3).
+struct DynSignature {
+    dynType: u32;
+    methods: Range; // HIR functions, in Hir.lists
+}
+
+/// The built-in item a type is (AllocError 0, IoError 1, SystemHeap 2, FailingAllocator 3), or none.
+fn builtinItemIndex(c: borrow Checker, typ: u32) -> u32 {
+    if (typ == c.allocErrorType) {
+        return 0;
+    }
+    if (typ == c.ioErrorType) {
+        return 1;
+    }
+    if (typ == c.systemHeapType) {
+        return 2;
+    }
+    if (c.structs.length > 1 && typ == c.structs[1].typ) {
+        return 3;
+    }
+    return none();
+}
+
+/// `Used(entry)`: a built-in item is emitted only if code names or implies it; a use in library code counts only if
+/// that code is emitted, which the C emitter decides (§29.2, §38.5). Returns `typ`.
+fn useBuiltin(c: borrow mut Checker, typ: u32) -> u32 {
+    let k = builtinItemIndex(c, typ);
+    if (k != none()) {
+        while (c.builtinUses.length < 4) {
+            c.builtinUses.push(0)!;
+        }
+        let library = c.file != none() && c.fileIsLibrary[c.file as usize];
+        c.builtinUses[k as usize] = c.builtinUses[k as usize] | (if (library) 2u8 else 1u8);
+    }
+    return typ;
+}
+
+fn useStructEntry(c: borrow mut Checker, index: u32) -> u32 {
+    let t = c.structs[index as usize].typ;
+    return useBuiltin(c, t);
+}
+
+fn useEnumEntry(c: borrow mut Checker, index: u32) -> u32 {
+    let t = c.enums[index as usize].typ;
+    return useBuiltin(c, t);
+}
+
+fn usedAllocError(c: borrow mut Checker) -> u32 {
+    let t = c.allocErrorType;
+    return useBuiltin(c, t);
+}
+
+fn usedIoError(c: borrow mut Checker) -> u32 {
+    let t = c.ioErrorType;
+    return useBuiltin(c, t);
+}
+
+fn usedSystemHeap(c: borrow mut Checker) -> u32 {
+    let t = c.systemHeapType;
+    return useBuiltin(c, t);
+}
+
+/// Whether a struct or enum entry's type is emitted (`Emitted`): every declared one, a built-in one if used.
+fn isEmittedItem(c: borrow Checker, typ: u32) -> bool {
+    let k = builtinItemIndex(c, typ);
+    return k == none() || ((k as usize) < c.builtinUses.length && c.builtinUses[k as usize] != 0);
+}
+
+fn finishProgramTables(c: borrow mut Checker) -> Result<void, AllocError> {
+    // A built-in used only by library code is marked so; the C emitter emits it only if emitted code uses it.
+    for (k in 0..c.builtinUses.length) {
+        if (c.builtinUses[k] == 2) {
+            let typ = match (k) {
+                0 => c.allocErrorType,
+                1 => c.ioErrorType,
+                2 => c.systemHeapType,
+                _ => c.structs[1].typ,
+            };
+            c.types.types[typ as usize].libraryUse = true;
+        }
+    }
+    c.trackLibraryTypes = false;
+    c.types.inHostedLibrary = false; // later passes' types are the program's
+    // Generic types (with type parameters unsubstituted) are checked but never emitted (§20.3).
+    for (k in 0..c.structs.length) {
+        let typ = c.structs[k].typ;
+        if (isEmittedItem(c, typ) && !c.types.isGeneric(typ)) {
+            c.programStructs.push(typ)?;
+        }
+    }
+    for (k in 0..c.environments.length) {
+        let environment = c.environments[k];
+        if (!functionIsGeneric(c, environment.closure)) {
+            c.programStructs.push(environment.typ)?; // closures' environments (§36.2)
+        }
+    }
+    for (k in 0..c.enums.length) {
+        let typ = c.enums[k].typ;
+        if (isEmittedItem(c, typ) && !c.types.isGeneric(typ)) {
+            c.programStructs.push(typ)?;
+        }
+    }
+    // DynSignatures: declaring a method may create another dyn type, appended to the list.
+    var i: usize = 0;
+    while (i < c.types.dynList.length) {
+        let dyn = c.types.dynList[i];
+        i += 1;
+        if (c.types.isGeneric(dyn)) {
+            continue;
+        }
+        var methods = Vector<u32>.create();
+        let bound = c.types.info(dyn).dynInterface;
+        if (bound == none()) {
+            methods.push(dynFunctionMethod(c, dyn)?)?;
+        } else {
+            let entry = c.types.bounds[bound as usize].interfaceEntry;
+            let declared = interfaceMethods(c, entry);
+            for (k in 0..declared.count) {
+                let syntax = c.front.ast.at(declared, k);
+                let name = c.front.ast.idents[c.front.ast.functions[syntax as usize].name as usize].symbol;
+                methods.push(dynMethod(c, dyn, name)?)?;
+            }
+        }
+        let list = c.hir.list(methods.view())?;
+        c.dynSignatures.push(DynSignature { dynType: dyn, methods: list })?;
+    }
+    return Ok();
+}

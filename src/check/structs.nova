@@ -283,7 +283,10 @@ fn resolveStructMembers(c: borrow mut Checker, index: u32) -> Result<void, Alloc
         return Ok(); // a built-in allocator: no members
     }
     let savedFile = c.file;
-    c.file = entry.file;
+    {
+        let fileToSet = entry.file;
+        c.setFile(fileToSet);
+    }
     let definition = c.types.info(entry.typ).structDef;
     let item = c.front.ast.items[entry.item as usize];
     let declarationName = c.front.ast.idents[item.name as usize].symbol;
@@ -370,7 +373,7 @@ fn resolveStructMembers(c: borrow mut Checker, index: u32) -> Result<void, Alloc
     }
     swapRegions(c, savedRegions)?;
     restoreEnvironment(c, savedEnvironment);
-    c.file = savedFile;
+    c.setFile(savedFile);
     return Ok();
 }
 
@@ -470,7 +473,10 @@ fn resolveEnumVariants(c: borrow mut Checker, index: u32) -> Result<void, AllocE
         return Ok();
     }
     let savedFile = c.file;
-    c.file = entry.file;
+    {
+        let fileToSet = entry.file;
+        c.setFile(fileToSet);
+    }
     let item = c.front.ast.items[entry.item as usize];
     let declarationName = c.front.ast.idents[item.name as usize].symbol;
     let variants = match (item.kind) {
@@ -515,7 +521,7 @@ fn resolveEnumVariants(c: borrow mut Checker, index: u32) -> Result<void, AllocE
     }
     swapRegions(c, savedRegions)?;
     restoreEnvironment(c, savedEnvironment);
-    c.file = savedFile;
+    c.setFile(savedFile);
     return Ok();
 }
 
@@ -644,7 +650,10 @@ fn visitRecursion(
             }
             let field = c.types.fields[fields[k] as usize];
             let saved = c.file;
-            c.file = sourceOfAggregate(c, typ);
+            {
+                let fileToSet = sourceOfAggregate(c, typ);
+                c.setFile(fileToSet);
+            }
             var message = Vector<u8>.create();
             appendQuotedType(mut message, c, typ)?;
             appendText(mut message, " contains ")?;
@@ -653,7 +662,7 @@ fn visitRecursion(
             appendQuotedType(mut message, c, typ)?;
             appendText(mut message, ": the type would have infinite size")?;
             c.error(recursiveStruct(), field.start, field.end, message)?;
-            c.file = saved;
+            c.setFile(saved);
         }
     }
     stack.truncate(stack.length - 1);

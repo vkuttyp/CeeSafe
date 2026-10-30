@@ -566,14 +566,17 @@ fn instantiateFunction(c: borrow mut Checker, g: u32, arguments: Slice<u32>, spa
     zipEnvironment(c, decl.typeParameters, arguments, mut pairs)?;
     let env = storeEnvironment(c, pairs.view())?;
     let savedFile = c.file;
-    c.file = entry.file;
+    {
+        let fileToSet = entry.file;
+        c.setFile(fileToSet);
+    }
     // The generic version's signature was checked; the instantiation's would only repeat it (§20.3).
     var text = Vector<u8>.create();
     appendBytes(mut text, c.name(symbol))?;
     let mark = diagnosticsMark(c);
     let instance = declareFunctionIn(c, entry.syntax, none(), env)?;
     endInstance(c, mark, arguments, text.view(), savedFile, span, none())?;
-    c.file = savedFile;
+    c.setFile(savedFile);
     let list = c.types.addList(arguments)?;
     c.hir.functions[instance as usize].typeArguments = list;
     c.hir.functions[instance as usize].instantiationDepth = depth;

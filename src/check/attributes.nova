@@ -7,7 +7,10 @@
 fn processTypeAttributes(c: borrow mut Checker) -> Result<void, AllocError> {
     let saved = c.file;
     for (u in 0..c.front.ast.units.length) {
-        c.file = c.front.ast.units[u].file;
+        {
+            let fileToSet = c.front.ast.units[u].file;
+            c.setFile(fileToSet);
+        }
         let items = c.front.ast.units[u].items;
         for (k in 0..items.count) {
             let item = c.front.ast.at(items, k);
@@ -31,7 +34,7 @@ fn processTypeAttributes(c: borrow mut Checker) -> Result<void, AllocError> {
             }
         }
     }
-    c.file = saved;
+    c.setFile(saved);
     return Ok();
 }
 

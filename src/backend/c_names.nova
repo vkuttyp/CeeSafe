@@ -1,0 +1,611 @@
+// The C names of the C backend (the reference's CEmitter: CTypeName, Mangle, FunctionName, DropGlueName, LocalName,
+// Constant, CStringLiteral, CMessageLiteral). Every function appends to `out`; a name the emitter compares or reuses is
+// built in a vector of its own.
+
+/// `Id`: a Nova name as part of a C identifier, `geometry.Point` written `geometry_Point` (c-backend.md §2.1).
+fn appendId(out: borrow mut Vector<u8>, name: Slice<u8>) -> Result<void, AllocError> {
+    for (b in name) {
+        out.push(if (b == '.') '_' else b)?;
+    }
+    return Ok();
+}
+
+/// An instantiation of a generic struct or enum (IsInstance, §20.4).
+fn isInstanceType(c: borrow Checker, t: u32) -> bool {
+    let info = c.types.info(t);
+    if (info.structDef != none()) {
+        return c.types.structs[info.structDef as usize].typeArguments.count > 0;
+    }
+    if (info.enumDef != none()) {
+        return c.types.enums[info.enumDef as usize].typeArguments.count > 0;
+    }
+    return false;
+}
+
+/// The declared name of a struct or enum (an instantiation's name is `Base<Args>`), before `Id`.
+fn baseNameOf(c: borrow Checker, t: u32) -> Slice<u8> {
+    let name = c.types.name(t);
+    for (k in 0..name.length) {
+        if (name[k] == '<') {
+            return name[0..k];
+        }
+    }
+    return name;
+}
+
+fn resultOkOf(c: borrow Checker, t: u32) -> u32 => c.types.enums[c.types.info(t).enumDef as usize].resultOk;
+
+fn resultErrOf(c: borrow Checker, t: u32) -> u32 => c.types.enums[c.types.info(t).enumDef as usize].resultErr;
+
+/// `Result<X, E>` where E is named `name` (`{ Name: "AllocError" }`).
+fn isResultWithError(c: borrow Checker, t: u32, name: StringView) -> bool =>
+    isResultType(c, t) && sameText(c.types.name(resultErrOf(c, t)), name);
+
+fn isClosureEnvironmentType(c: borrow Checker, t: u32) -> bool {
+    let s = c.types.info(t).structDef;
+    return s != none() && c.types.structs[s as usize].isClosureEnvironment;
+}
+
+fn isImportedStruct(c: borrow Checker, t: u32) -> bool {
+    let s = c.types.info(t).structDef;
+    return s != none() && c.types.structs[s as usize].isImported;
+}
+
+fn isReprCStruct(c: borrow Checker, t: u32) -> bool {
+    let s = c.types.info(t).structDef;
+    return s != none() && c.types.structs[s as usize].isReprC;
+}
+
+fn isIntegerType(c: borrow Checker, t: u32) -> bool => c.types.is(t, TypeKind.Integer);
+
+fn isFloatType(c: borrow Checker, t: u32) -> bool => c.types.is(t, TypeKind.Float);
+
+/// A type's mangled arguments: their count, then each (prefix-free) code (MangledArguments).
+fn appendMangledArguments(c: borrow Checker, out: borrow mut Vector<u8>, arguments: Range) -> Result<void, AllocError> {
+    appendDecimal(out, arguments.count as u64)?;
+    for (k in 0..arguments.count) {
+        appendMangle(c, out, c.types.listAt(arguments, k))?;
+    }
+    return Ok();
+}
+
+/// A function or closure type's effect list (MangledEffects, §36.3): nothing for all effects, else `e` and its bits.
+fn appendMangledEffects(c: borrow Checker, out: borrow mut Vector<u8>, t: u32) -> Result<void, AllocError> {
+    let effects = c.types.info(t).effects;
+    if (effects != allEffects()) {
+        out.push('e')?;
+        appendDecimal(out, effects as u64)?;
+    }
+    return Ok();
+}
+
+fn appendMangledSignature(c: borrow Checker, out: borrow mut Vector<u8>, t: u32) -> Result<void, AllocError> {
+    let info = c.types.info(t);
+    appendDecimal(out, info.parameters.count as u64)?;
+    for (k in 0..info.parameters.count) {
+        appendMangle(c, out, c.types.listAt(info.parameters, k))?;
+    }
+    return appendMangle(c, out, info.result);
+}
+
+/// A type inside a C name (Mangle): struct and enum names carry their length and every other code is prefix-free.
+fn appendMangle(c: borrow Checker, out: borrow mut Vector<u8>, t: u32) -> Result<void, AllocError> {
+    let info = c.types.info(t);
+    match (info.kind) {
+        TypeKind.Struct => {
+            let s = borrow c.types.structs[info.structDef as usize];
+            if (s.isClosureEnvironment) {
+                appendText(out, "CE")?;
+                appendDecimal(out, s.closureId as u64)?;
+                out.push('_')?;
+            } else if (isInstanceType(c, t)) {
+                let base = baseNameOf(c, t);
+                out.push('S')?;
+                appendDecimal(out, base.length as u64)?;
+                appendId(out, base)?;
+                appendMangledArguments(c, out, s.typeArguments)?;
+            } else {
+                let name = c.types.name(t);
+                out.push('S')?;
+                appendDecimal(out, name.length as u64)?;
+                appendId(out, name)?;
+            }
+        }
+        TypeKind.Enum => {
+            let e = borrow c.types.enums[info.enumDef as usize];
+            if (e.resultOk != none()) {
+                out.push('R')?;
+                appendMangle(c, out, e.resultOk)?;
+                appendMangle(c, out, e.resultErr)?;
+            } else if (e.optionType != none()) {
+                out.push('O')?;
+                appendMangle(c, out, e.optionType)?;
+            } else if (isInstanceType(c, t)) {
+                let base = baseNameOf(c, t);
+                out.push('E')?;
+                appendDecimal(out, base.length as u64)?;
+                appendId(out, base)?;
+                appendMangledArguments(c, out, e.typeArguments)?;
+            } else {
+                let name = c.types.name(t);
+                out.push('E')?;
+                appendDecimal(out, name.length as u64)?;
+                appendId(out, name)?;
+            }
+        }
+        TypeKind.Array => {
+            if (info.isStr) {
+                out.push('Z')?;
+            } else if (info.arrayLength < 0) {
+                out.push('U')?;
+                appendMangle(c, out, info.element)?;
+            } else {
+                out.push('A')?;
+                appendDecimal(out, truncate<u64>(info.arrayLength))?;
+                out.push('_')?;
+                appendMangle(c, out, info.element)?;
+            }
+        }
+        TypeKind.Box => {
+            if (c.types.isPoolBox(t)) {
+                out.push('Y')?;
+                appendMangle(c, out, info.pointee)?;
+            } else {
+                out.push('X')?;
+                appendMangle(c, out, info.pointee)?;
+                appendMangle(c, out, info.allocator)?;
+            }
+        }
+        TypeKind.Vector => {
+            out.push('V')?;
+            appendMangle(c, out, info.pointee)?;
+            appendMangle(c, out, info.allocator)?;
+        }
+        TypeKind.StableVector => {
+            out.push('W')?;
+            appendMangle(c, out, c.types.info(info.pointee).element)?;
+            appendMangle(c, out, info.allocator)?;
+        }
+        TypeKind.SlotMap => {
+            out.push('K')?;
+            appendMangle(c, out, info.element)?;
+            appendMangle(c, out, info.allocator)?;
+        }
+        TypeKind.Handle => {
+            out.push('H')?;
+            appendMangle(c, out, info.element)?;
+        }
+        TypeKind.Thread => {
+            out.push('J')?;
+            appendMangle(c, out, info.element)?;
+        }
+        TypeKind.Resource => {
+            match (info.resource) {
+                ResourceKind.File => { appendText(out, "IF")?; }
+                ResourceKind.TcpListener => { appendText(out, "IL")?; }
+                _ => { appendText(out, "IS")?; }
+            }
+        }
+        TypeKind.Reference => {
+            out.push(if (info.mutableReference) 'Q' else 'P')?;
+            appendMangle(c, out, info.pointee)?;
+        }
+        TypeKind.RawPointer => {
+            out.push(if (info.mutablePointer) 'M' else 'N')?;
+            appendMangle(c, out, info.pointee)?;
+        }
+        TypeKind.FunctionPointer => {
+            out.push('F')?;
+            appendMangledSignature(c, out, t)?;
+        }
+        TypeKind.Function => {
+            out.push('N')?;
+            appendMangledEffects(c, out, t)?;
+            appendMangledSignature(c, out, t)?;
+        }
+        TypeKind.Closure => {
+            out.push('Q')?;
+            appendMangledEffects(c, out, t)?;
+            appendMangledSignature(c, out, t)?;
+        }
+        TypeKind.Dyn => {
+            if (info.dynInterface == none()) {
+                // `dyn fn`: `DF` (`DG` for `dyn mut fn`), the effect list, then the signature (§36.5).
+                appendText(out, if (info.mutableDynFunction) "DG" else "DF")?;
+                appendMangledEffects(c, out, t)?;
+                appendMangledSignature(c, out, t)?;
+            } else {
+                let bound = c.types.bounds[info.dynInterface as usize];
+                let name = c.types.rangeText(bound.name);
+                out.push('D')?;
+                appendDecimal(out, name.length as u64)?;
+                appendId(out, name)?;
+                appendMangledArguments(c, out, bound.arguments)?;
+            }
+        }
+        TypeKind.Region => {
+            if (regionIndex(info.region) == regionIndex(RegionKind.Pool)) {
+                appendText(out, "G4Pool")?;
+                appendMangle(c, out, info.element)?;
+            } else {
+                let name = c.types.name(t);
+                out.push('G')?;
+                appendDecimal(out, name.length as u64)?;
+                appendBytes(out, name)?;
+            }
+        }
+        TypeKind.Void => { out.push('v')?; }
+        _ => { appendBytes(out, c.types.name(t))?; }
+    }
+    return Ok();
+}
+
+fn mangled(c: borrow Checker, t: u32) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    appendMangle(c, mut out, t)?;
+    return Ok(out);
+}
+
+/// `Mangle(type)[1..]`: the code without its kind letter.
+fn appendMangleTail(c: borrow Checker, out: borrow mut Vector<u8>, t: u32) -> Result<void, AllocError> {
+    let m = mangled(c, t)?;
+    let code = m.view();
+    return appendBytes(out, code[1..]);
+}
+
+/// A type's C name (CTypeName).
+fn appendCTypeName(c: borrow Checker, out: borrow mut Vector<u8>, t: u32) -> Result<void, AllocError> {
+    let info = c.types.info(t);
+    match (info.kind) {
+        TypeKind.Bool => { appendText(out, "bool")?; }
+        TypeKind.Void => { appendText(out, "void")?; }
+        TypeKind.Integer => {
+            appendText(out, if (info.signed) "int" else "uint")?;
+            appendDecimal(out, info.bits as u64)?;
+            appendText(out, "_t")?;
+        }
+        TypeKind.Float => { appendText(out, if (info.bits == 32) "float" else "double")?; }
+        TypeKind.Struct => {
+            let s = borrow c.types.structs[info.structDef as usize];
+            if (s.isImported) {
+                appendBytes(out, c.types.rangeText(s.cSpelling))?; // the header's type (type-system.md §31.3)
+            } else if (s.isClosureEnvironment) {
+                appendText(out, "nvCE_")?;
+                appendDecimal(out, s.closureId as u64)?;
+            } else if (isInstanceType(c, t)) {
+                appendText(out, "nvT_")?;
+                appendMangleTail(c, out, t)?;
+            } else {
+                appendText(out, "nvT_")?;
+                appendId(out, c.types.name(t))?;
+            }
+        }
+        TypeKind.Enum => {
+            let e = borrow c.types.enums[info.enumDef as usize];
+            if (e.resultOk != none()) {
+                appendText(out, "nvR_")?;
+                appendMangleTail(c, out, t)?;
+            } else if (e.optionType != none()) {
+                appendText(out, "nvO_")?;
+                appendMangleTail(c, out, t)?;
+            } else if (isInstanceType(c, t)) {
+                appendText(out, "nvE_")?;
+                appendMangleTail(c, out, t)?;
+            } else {
+                appendText(out, "nvE_")?;
+                appendId(out, c.types.name(t))?;
+            }
+        }
+        TypeKind.Reference => {
+            let pointee = info.pointee;
+            if (c.types.isDynReference(t)) {
+                appendText(out, "nvDR_")?; // (data, table), §37.4
+                appendMangle(c, out, pointee)?;
+            } else if (c.types.isStringView(t)) {
+                appendText(out, "nv_str")?;
+            } else if (c.types.isSlice(t)) {
+                appendText(out, if (info.mutableReference) "nvSm_" else "nvSl_")?;
+                appendMangle(c, out, c.types.info(pointee).element)?;
+            } else if (c.types.is(pointee, TypeKind.Region) || c.types.is(pointee, TypeKind.StableVector)) {
+                // Region methods mutate through a shared reference (allocation is interior mutability, §19.2).
+                appendCTypeName(c, out, pointee)?;
+                appendText(out, " *")?;
+            } else if (c.types.isDynBox(pointee)) {
+                if (!info.mutableReference) {
+                    appendText(out, "const ")?;
+                }
+                appendCTypeName(c, out, pointee)?;
+                appendText(out, " *")?;
+            } else if (c.types.is(pointee, TypeKind.Box)) {
+                // A shared reference to a box is a pointer to a const pointer (`T *const *`), not to a const T.
+                appendCTypeName(c, out, pointee)?;
+                appendText(out, if (info.mutableReference) "*" else "const *")?;
+            } else {
+                var inner = Vector<u8>.create();
+                appendCTypeName(c, mut inner, pointee)?;
+                if (info.mutableReference) {
+                    appendBytes(out, inner.view())?;
+                    appendText(out, " *")?;
+                } else if (inner.length > 0 && inner[inner.length - 1] == '*') {
+                    // A shared reference to a pointer puts `const` after it: `T *const *` (§36.2).
+                    appendBytes(out, inner.view())?;
+                    appendText(out, "const *")?;
+                } else {
+                    appendText(out, "const ")?;
+                    appendBytes(out, inner.view())?;
+                    appendText(out, " *")?;
+                }
+            }
+        }
+        TypeKind.Array => {
+            appendText(out, "nvA")?;
+            appendDecimal(out, truncate<u64>(info.arrayLength))?;
+            out.push('_')?;
+            appendMangle(c, out, info.element)?;
+        }
+        TypeKind.Box => {
+            if (c.types.isDynBox(t)) {
+                appendText(out, "nvDR_")?;
+                appendMangle(c, out, info.pointee)?;
+            } else if (c.types.isPoolBox(t)) {
+                appendText(out, "nvPB_")?;
+                appendMangle(c, out, info.pointee)?;
+            } else {
+                appendCTypeName(c, out, info.pointee)?;
+                appendText(out, " *")?;
+            }
+        }
+        TypeKind.RawPointer => {
+            appendCTypeName(c, out, info.pointee)?; // no const (unsafe.md §4); `*void` is `void *`
+            appendText(out, " *")?;
+        }
+        TypeKind.CChar => { appendText(out, "char")?; }
+        TypeKind.FunctionPointer => {
+            appendText(out, "nvP_")?;
+            appendMangle(c, out, t)?;
+        }
+        TypeKind.Function => {
+            appendText(out, "nvN_")?;
+            appendMangle(c, out, t)?;
+        }
+        TypeKind.Closure => {
+            appendText(out, "nvCK_")?;
+            appendMangle(c, out, t)?;
+        }
+        TypeKind.Vector => {
+            appendText(out, "nvV_")?;
+            appendMangleTail(c, out, t)?;
+        }
+        TypeKind.StableVector => {
+            appendText(out, "nvSV_")?;
+            appendMangleTail(c, out, t)?;
+        }
+        TypeKind.SlotMap => {
+            appendText(out, "nvK_")?;
+            appendMangleTail(c, out, t)?;
+        }
+        TypeKind.Handle => { appendText(out, "nv_handle")?; }
+        TypeKind.Thread => {
+            appendText(out, "nvTB_")?; // a thread's record (type-system.md §38.2)
+            appendMangle(c, out, info.element)?;
+            appendText(out, " *")?;
+        }
+        TypeKind.Resource => { appendText(out, "int32_t")?; } // a descriptor (§26)
+        TypeKind.Region => {
+            match (info.region) {
+                RegionKind.Arena => { appendText(out, "nv_arena")?; }
+                RegionKind.FixedBuffer => { appendText(out, "nv_fba")?; }
+                RegionKind.Pool => { appendText(out, "nv_pool")?; }
+                _ => { appendText(out, "nv_scratch")?; }
+            }
+        }
+        _ => { appendText(out, "?")?; } // no C representation: the reference throws
+    }
+    return Ok();
+}
+
+fn cTypeName(c: borrow Checker, t: u32) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    appendCTypeName(c, mut out, t)?;
+    return Ok(out);
+}
+
+/// A helper's suffix (Suffix): isize and usize use the helpers of their fixed width.
+fn appendSuffix(c: borrow Checker, out: borrow mut Vector<u8>, t: u32) -> Result<void, AllocError> {
+    let info = c.types.info(t);
+    out.push(if (info.signed) 'i' else 'u')?;
+    return appendDecimal(out, info.bits as u64);
+}
+
+/// The drop glue of a type that needs drop (DropGlueName): `nvD_<length><Name>` for user structs and enums,
+/// `nvD_<mangled>` for built-in instantiations.
+fn appendDropGlueName(c: borrow Checker, out: borrow mut Vector<u8>, t: u32) -> Result<void, AllocError> {
+    let info = c.types.info(t);
+    if (c.types.is(t, TypeKind.Resource)) {
+        return appendText(out, "nova_fd_drop");
+    }
+    if (c.types.is(t, TypeKind.Region)) {
+        return appendText(out, match (info.region) {
+            RegionKind.Arena => "nova_arena_drop",
+            RegionKind.Pool => "nova_pool_drop",
+            _ => "nova_scratch_drop",
+        });
+    }
+    let builtin = isResultType(c, t) || c.types.optionType(t) != none() || c.types.is(t, TypeKind.Box) ||
+        c.types.is(t, TypeKind.Vector) || c.types.is(t, TypeKind.StableVector) || c.types.is(t, TypeKind.SlotMap) ||
+        isInstanceType(c, t) || isClosureEnvironmentType(c, t) || c.types.is(t, TypeKind.Thread);
+    appendText(out, "nvD_")?;
+    if (builtin) {
+        return appendMangle(c, out, t);
+    }
+    let name = c.types.name(t);
+    appendDecimal(out, name.length as u64)?;
+    return appendId(out, name);
+}
+
+/// A function's C name (FunctionName): `nvF_name`, members `nvM_<length><Struct>_name`, instances of generic
+/// functions `nvG_<length><name><mangled arguments>`, closure bodies `nvCB_<id>`, externs' wrappers `nvC_name`.
+fn appendCFunctionName(c: borrow Checker, out: borrow mut Vector<u8>, function: u32) -> Result<void, AllocError> {
+    let f = borrow c.hir.functions[function as usize];
+    let name = c.name(f.name);
+    if (f.isClosure) {
+        appendText(out, "nvCB_")?;
+        return appendDecimal(out, f.id as u64);
+    }
+    if (isExternFunction(c, function)) {
+        appendText(out, "nvC_")?;
+        return appendBytes(out, name);
+    }
+    if (f.owner != none()) {
+        appendText(out, "nvM_")?;
+        if (isInstanceType(c, f.owner)) {
+            appendMangle(c, out, f.owner)?;
+        } else {
+            let owner = c.types.name(f.owner);
+            appendDecimal(out, owner.length as u64)?;
+            appendId(out, owner)?;
+        }
+        out.push('_')?;
+        return appendBytes(out, name);
+    }
+    if (f.typeArguments.count == 0) {
+        appendText(out, "nvF_")?;
+        return appendId(out, name);
+    }
+    appendText(out, "nvG_")?;
+    appendDecimal(out, name.length as u64)?;
+    appendId(out, name)?;
+    return appendMangledArguments(c, out, f.typeArguments);
+}
+
+/// A local's C name (LocalName): `v_<name>_<id>`, or `t_<id>` for a temporary.
+fn appendLocalName(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    function: borrow NirFunction,
+    local: u32,
+) -> Result<void, AllocError> {
+    let name = function.locals[local as usize].name;
+    if (name == none()) {
+        appendText(out, "t_")?;
+    } else {
+        appendText(out, "v_")?;
+        appendBytes(out, c.name(name))?;
+        out.push('_')?;
+    }
+    return appendDecimal(out, local as u64);
+}
+
+/// A field's C member (FieldName): its C name, or `f_` and its Nova name (none with a Nova C name).
+fn appendFieldName(c: borrow Checker, out: borrow mut Vector<u8>, field: u32) -> Result<void, AllocError> {
+    let f = c.types.fields[field as usize];
+    if (f.hasCName) {
+        return appendBytes(out, c.types.rangeText(f.cName));
+    }
+    if (!f.hasNovaCName) {
+        appendText(out, "f_")?;
+    }
+    return appendBytes(out, c.name(f.name));
+}
+
+/// A variant's union member (VariantName): `v_<name>`.
+fn appendCVariantName(c: borrow Checker, out: borrow mut Vector<u8>, variant: u32) -> Result<void, AllocError> {
+    appendText(out, "v_")?;
+    return appendBytes(out, c.name(c.types.variants[variant as usize].name));
+}
+
+/// An integer, bool or float constant of a type (Constant): a cast literal, a float by its bits (§35.6).
+fn appendConstant(c: borrow Checker, out: borrow mut Vector<u8>, value: IntValue, t: u32) -> Result<void, AllocError> {
+    let info = c.types.info(t);
+    if (c.types.is(t, TypeKind.Bool)) {
+        return appendText(out, if (value.magnitude != 0) "true" else "false");
+    }
+    if (c.types.is(t, TypeKind.Float)) {
+        // By its bits, so the value never depends on the C compiler's decimal conversion (type-system.md §35.6).
+        appendText(out, if (info.bits == 32) "nv_f32_from_bits(UINT32_C(0x" else "nv_f64_from_bits(UINT64_C(0x")?;
+        appendHexUpper(out, value.magnitude)?;
+        return appendText(out, "))");
+    }
+    let negative = value.negative && value.magnitude != 0;
+    appendText(out, "((")?;
+    appendCTypeName(c, out, t)?;
+    out.push(')')?;
+    if (value.magnitude <= 2147483647) {
+        appendIntValue(out, value)?;
+    } else if (!info.signed) {
+        appendText(out, "UINT64_C(")?;
+        appendIntValue(out, value)?;
+        out.push(')')?;
+    } else if (negative && value.magnitude == 0x8000000000000000) {
+        // INT64_MIN cannot be written as a negated literal: its magnitude does not fit in int64_t.
+        appendText(out, "INT64_MIN")?;
+    } else {
+        appendText(out, "INT64_C(")?;
+        appendIntValue(out, value)?;
+        out.push(')')?;
+    }
+    return appendText(out, ")");
+}
+
+/// Hex digits, upper case, without leading zeros (`ToString("X")`).
+fn appendHexUpper(out: borrow mut Vector<u8>, value: u64) -> Result<void, AllocError> {
+    var digits: usize = 1;
+    while (digits < 16 && (value >> (4 * digits as u64)) != 0) {
+        digits += 1;
+    }
+    var k = digits;
+    while (k > 0) {
+        k -= 1;
+        let d = truncate<u8>((value >> (4 * k as u64)) & 15);
+        out.push(if (d < 10) '0' + d else 'A' + d - 10)?;
+    }
+    return Ok();
+}
+
+/// A C string literal of UTF-8 bytes (CStringLiteral): anything outside printable ASCII, and `"`, `\` and `?`, as
+/// octal escapes.
+fn appendCStringLiteral(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    out.push('"')?;
+    for (b in bytes) {
+        if (b >= 0x20 && b < 0x7F && b != '"' && b != '\\' && b != '?') {
+            out.push(b)?;
+        } else {
+            out.push('\\')?;
+            out.push('0' + (b >> 6))?;
+            out.push('0' + ((b >> 3) & 7))?;
+            out.push('0' + (b & 7))?;
+        }
+    }
+    return out.push('"');
+}
+
+/// A `_Static_assert` message (CMessageLiteral): `"`, `\` and `?` escaped, and each UTF-16 unit outside printable ASCII
+/// as `_` (a character beyond the BMP is two).
+fn appendCMessageLiteral(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    out.push('"')?;
+    var i: usize = 0;
+    while (i < bytes.length) {
+        let b = bytes[i];
+        if (b < 0x80) {
+            if (b == '"') {
+                appendText(out, "\\\"")?;
+            } else if (b == '\\') {
+                appendText(out, "\\\\")?;
+            } else if (b == '?') {
+                appendText(out, "\\?")?;
+            } else if (b >= 0x20 && b < 0x7F) {
+                out.push(b)?;
+            } else {
+                out.push('_')?;
+            }
+            i += 1;
+            continue;
+        }
+        let decoded = decodeUtf8(bytes, i);
+        for (unit in 0..decoded.utf16Units()) {
+            out.push('_')?;
+        }
+        i += decoded.length as usize;
+    }
+    return out.push('"');
+}

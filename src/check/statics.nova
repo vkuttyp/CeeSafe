@@ -164,7 +164,10 @@ fn checkStaticInitializers(c: borrow mut Checker) -> Result<void, AllocError> {
         let savedLoop = c.loopDepth;
         let savedScopes = c.scopes.length;
         let savedStarts = c.scopeStarts.length;
-        c.file = entry.file;
+        {
+            let fileToSet = entry.file;
+            c.setFile(fileToSet);
+        }
         c.function = none();
         c.loopDepth = 0;
         c.pushScope()?;
@@ -194,7 +197,7 @@ fn checkStaticInitializers(c: borrow mut Checker) -> Result<void, AllocError> {
         c.statics[k].checked = checked;
         c.scopes.truncate(savedScopes);
         c.scopeStarts.truncate(savedStarts);
-        c.file = savedFile;
+        c.setFile(savedFile);
         c.function = savedFunction;
         c.loopDepth = savedLoop;
     }
@@ -213,7 +216,10 @@ fn foldStatics(c: borrow mut Checker) -> Result<void, AllocError> {
     let saved = c.file;
     for (k in 0..c.statics.length) {
         let entry = c.statics[k];
-        c.file = entry.file;
+        {
+            let fileToSet = entry.file;
+            c.setFile(fileToSet);
+        }
         var value = none();
         if (entry.checked != none()) {
             let none0 = Vector<FoldBinding>.create();
@@ -244,7 +250,10 @@ fn foldStatics(c: borrow mut Checker) -> Result<void, AllocError> {
         if (c.front.ast.functions[syntax as usize].isExtern) {
             continue;
         }
-        c.file = c.hir.functions[k].file;
+        {
+            let fileToSet = c.hir.functions[k].file;
+            c.setFile(fileToSet);
+        }
         let function = truncate<u32>(k);
         let body = constantBody(c, function);
         if (body == none()) {
@@ -267,7 +276,7 @@ fn foldStatics(c: borrow mut Checker) -> Result<void, AllocError> {
         }
         staticFold(c, body, bindings.view(), true, 0)?;
     }
-    c.file = saved;
+    c.setFile(saved);
     return Ok();
 }
 

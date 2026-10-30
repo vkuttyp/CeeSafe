@@ -89,10 +89,13 @@ fn checkPendingElements(c: borrow mut Checker) -> Result<void, AllocError> {
     let saved = c.file;
     for (k in 0..c.pendingElements.length) {
         let p = c.pendingElements[k];
-        c.file = p.file;
+        {
+            let fileToSet = p.file;
+            c.setFile(fileToSet);
+        }
         checkElementCopy(c, p.element, p.length, Span { start: p.start, end: p.end })?;
     }
-    c.file = saved;
+    c.setFile(saved);
     return Ok();
 }
 

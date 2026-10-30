@@ -7,7 +7,7 @@ fn builtinTcpListener() -> u32 => 19;
 fn builtinTcpStream() -> u32 => 20;
 
 fn ioResult(c: borrow mut Checker, ok: u32) -> Result<u32, AllocError> {
-    let ioError = c.ioErrorType;
+    let ioError = usedIoError(c);
     return resultOf(c, ok, ioError);
 }
 

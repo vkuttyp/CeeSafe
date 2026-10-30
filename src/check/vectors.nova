@@ -12,7 +12,7 @@ fn builtinStringView() -> u32 => 24;
 /// vector, `T?` (VectorType, §23). `element` is none for a string.
 fn vectorType(c: borrow mut Checker, element: u32, allocator: u32) -> Result<u32, AllocError> {
     let voidType = c.types.voidType;
-    let allocError = c.allocErrorType;
+    let allocError = usedAllocError(c);
     resultOf(c, voidType, allocError)?;
     if (element != none()) {
         optionOf(c, element)?;
@@ -29,7 +29,7 @@ fn resolveVectorType(c: borrow mut Checker, isString: bool, arguments: Range) ->
         element = c.resolveType(elementSyntax, false)?;
     }
     let allocatorIndex: u32 = if (isString) 0 else 1;
-    var allocator = c.systemHeapType;
+    var allocator = usedSystemHeap(c);
     if (arguments.count > allocatorIndex) {
         let allocatorSyntax = c.front.ast.at(arguments, allocatorIndex);
         allocator = c.resolveType(allocatorSyntax, false)?;
@@ -174,7 +174,7 @@ fn checkVectorCreate(
     if (withCapacity) {
         let values = [capacity];
         let list = c.hir.list(values[..])?;
-        let allocError = c.allocErrorType;
+        let allocError = usedAllocError(c);
         let result = resultOf(c, vector, allocError)?;
         return c.expr(HirExpr.BuiltinCall(bfVectorWithCapacity(), list), result, span.start, span.end);
     }
@@ -271,7 +271,7 @@ fn checkVectorMethod(
         return c.errorResult(span.start, span.end);
     }
     let voidType = c.types.voidType;
-    let allocError = c.allocErrorType;
+    let allocError = usedAllocError(c);
     let voidResult = resultOf(c, voidType, allocError)?;
     var values = Vector<u32>.create();
     values.push(receiver)?;

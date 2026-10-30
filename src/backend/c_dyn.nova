@@ -1,0 +1,709 @@
+// `dyn` tables (§37.4) and threads (§38.2, §38.6) in C (the reference's CEmitter: EmitDynTypedefs,
+// EmitDynTableTypes, EmitDynTables, EmitThreadRecords, EmitThreadHelpers, EmitForkHelpers).
+
+/// One signature per C type (DistinctDynSignatures): `dyn I` and `dyn I + Send` share theirs (§38.4).
+fn distinctDynSignatures(c: borrow Checker, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    var names = Vector<Vector<u8>>.create();
+    for (k in 0..c.dynSignatures.length) {
+        let m = mangled(c, c.dynSignatures[k].dynType)?;
+        var seen = false;
+        for (other in names.view()) {
+            if (sameBytes(other.view(), m.view())) {
+                seen = true;
+            }
+        }
+        if (!seen) {
+            names.push(m)?;
+            out.push(truncate<u32>(k))?;
+        }
+    }
+    return Ok();
+}
+
+fn isEmittedThread(c: borrow Checker, t: u32) -> bool => !c.types.isGeneric(t);
+
+/// The C type of every dyn pointer, before the structs that may hold one (EmitDynTypedefs, §37.4).
+fn emitDynTypedefs(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    var distinct = Vector<u32>.create();
+    distinctDynSignatures(c, mut distinct)?;
+    for (k in distinct.view()) {
+        let dyn = c.dynSignatures[k as usize].dynType;
+        let m = mangled(c, dyn)?;
+        e.t("typedef struct nvDT_")?;
+        e.b(m.view())?;
+        e.t(" nvDT_")?;
+        e.b(m.view())?;
+        e.t(";")?;
+        e.emit()?;
+        e.t("typedef struct { void *data; const nvDT_")?;
+        e.b(m.view())?;
+        e.t(" *vt; } nvDR_")?;
+        e.b(m.view())?;
+        e.t("; /* ")?;
+        e.b(c.types.name(dyn))?;
+        e.t(" */")?;
+        e.emit()?;
+    }
+    var threads = false;
+    for (thread in c.types.threadList.view()) {
+        if (!isEmittedThread(c, thread)) {
+            continue;
+        }
+        threads = true;
+        let m = mangled(c, c.types.info(thread).element)?;
+        e.t("typedef struct nvTB_")?;
+        e.b(m.view())?;
+        e.t(" nvTB_")?;
+        e.b(m.view())?;
+        e.t("; /* ")?;
+        e.b(c.types.name(thread))?;
+        e.t(" */")?;
+        e.emit()?;
+    }
+    if (c.dynSignatures.length > 0 || threads) {
+        e.line("")?;
+    }
+    return Ok();
+}
+
+/// The C parameters of a table entry (DynParameters): `void *` for the receiver, then the method's others.
+fn appendDynParameters(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    method: u32,
+    withNames: bool,
+) -> Result<void, AllocError> {
+    let count = c.hir.functions[method as usize].parameters.length;
+    for (k in 0..count) {
+        if (k > 0) {
+            appendText(out, ", ")?;
+        }
+        if (k == 0) {
+            appendText(out, if (withNames) "void *self" else "void *")?;
+        } else {
+            appendCTypeName(c, out, parameterType(c, method, k))?;
+            if (withNames) {
+                appendText(out, " a")?;
+                appendDecimal(out, k as u64)?;
+            }
+        }
+    }
+    return Ok();
+}
+
+/// Each dyn type's table type (EmitDynTableTypes): the drop glue, the size and alignment, one entry per method.
+fn emitDynTableTypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    var distinct = Vector<u32>.create();
+    distinctDynSignatures(c, mut distinct)?;
+    for (k in distinct.view()) {
+        let signature = c.dynSignatures[k as usize];
+        e.t("struct nvDT_")?;
+        appendMangle(c, mut e.buf, signature.dynType)?;
+        e.t(" {")?;
+        e.emit()?;
+        e.line("    void (*drop)(void *);")?;
+        e.line("    uint64_t size;")?;
+        e.line("    uint64_t align;")?;
+        for (slot in 0..signature.methods.count) {
+            let method = c.hir.at(signature.methods, slot);
+            e.t("    ")?;
+            appendCTypeName(c, mut e.buf, c.hir.functions[method as usize].returnType)?;
+            e.t(" (*m")?;
+            e.d(slot as u64)?;
+            e.t(")(")?;
+            appendDynParameters(c, mut e.buf, method, false)?;
+            e.t(");")?;
+            e.emit()?;
+        }
+        e.line("};")?;
+        e.line("")?;
+    }
+    return Ok();
+}
+
+fn appendDynTableName(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    implementation: u32,
+    dyn: u32,
+) -> Result<void, AllocError> {
+    appendText(out, "nvVT_")?;
+    appendMangle(c, out, implementation)?;
+    out.push('_')?;
+    return appendMangle(c, out, dyn);
+}
+
+/// The table of each (T, dyn I) pair a coercion names, after the adapters it points to (EmitDynTables, §37.4).
+fn emitDynTables(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    var names = Vector<Vector<u8>>.create();
+    for (table in c.dynTables.view()) {
+        var name = Vector<u8>.create();
+        appendDynTableName(c, mut name, table.implementation, table.dynType)?;
+        var seen = false;
+        for (other in names.view()) {
+            if (sameBytes(other.view(), name.view())) {
+                seen = true;
+            }
+        }
+        if (seen) {
+            continue;
+        }
+        names.push(copyBytes(name.view())?)?;
+        let implementation = cTypeName(c, table.implementation)?;
+        var dropName = copyBytes("NULL".bytes())?;
+        if (c.types.needsDrop(table.implementation)) {
+            dropName = copyBytes(name.view())?;
+            appendText(mut dropName, "_drop")?;
+            e.t("static NV_UNUSED void ")?;
+            e.b(dropName.view())?;
+            e.t("(void *self) {")?;
+            e.emit()?;
+            e.t("    ")?;
+            appendDropGlueName(c, mut e.buf, table.implementation)?;
+            e.t("((")?;
+            e.b(implementation.view())?;
+            e.t(" *)(uintptr_t)self);")?;
+            e.emit()?;
+            e.line("}")?;
+        }
+        for (slot in 0..table.methods.count) {
+            let method = c.hir.at(table.methods, slot);
+            let returnType = c.hir.functions[method as usize].returnType;
+            e.t("static NV_UNUSED ")?;
+            appendCTypeName(c, mut e.buf, returnType)?;
+            e.t(" ")?;
+            e.b(name.view())?;
+            e.t("_")?;
+            e.d(slot as u64)?;
+            e.t("(")?;
+            appendDynParameters(c, mut e.buf, method, true)?;
+            e.t(") {")?;
+            e.emit()?;
+            e.t(if (c.types.is(returnType, TypeKind.Void)) "    " else "    return ")?;
+            appendCFunctionName(c, mut e.buf, method)?;
+            e.t("(")?;
+            let count = c.hir.functions[method as usize].parameters.length;
+            for (k in 0..count) {
+                if (k > 0) {
+                    e.t(", ")?;
+                }
+                if (k == 0) {
+                    e.t("(")?;
+                    appendCTypeName(c, mut e.buf, parameterType(c, method, 0))?;
+                    e.t(")(uintptr_t)self")?;
+                } else {
+                    e.t("a")?;
+                    e.d(k as u64)?;
+                }
+            }
+            e.t(");")?;
+            e.emit()?;
+            e.line("}")?;
+        }
+        e.t("static NV_UNUSED const nvDT_")?;
+        appendMangle(c, mut e.buf, table.dynType)?;
+        e.t(" ")?;
+        e.b(name.view())?;
+        e.t(" = {")?;
+        e.emit()?;
+        e.t("    .drop = ")?;
+        e.b(dropName.view())?;
+        e.t(",")?;
+        e.emit()?;
+        e.t("    .size = sizeof(")?;
+        e.b(implementation.view())?;
+        e.t("),")?;
+        e.emit()?;
+        e.t("    .align = _Alignof(")?;
+        e.b(implementation.view())?;
+        e.t("),")?;
+        e.emit()?;
+        for (slot in 0..table.methods.count) {
+            e.t("    .m")?;
+            e.d(slot as u64)?;
+            e.t(" = ")?;
+            e.b(name.view())?;
+            e.t("_")?;
+            e.d(slot as u64)?;
+            e.t(",")?;
+            e.emit()?;
+        }
+        e.line("};")?;
+        e.line("")?;
+    }
+    return Ok();
+}
+
+/// A thread's record (EmitThreadRecords, §38.2): the runtime's thread, its closure, and its result's slot.
+fn emitThreadRecords(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    var any = false;
+    for (thread in c.types.threadList.view()) {
+        if (!isEmittedThread(c, thread)) {
+            continue;
+        }
+        any = true;
+        let result = c.types.info(thread).element;
+        let m = mangled(c, result)?;
+        e.t("struct nvTB_")?;
+        e.b(m.view())?;
+        e.t(" {")?;
+        e.emit()?;
+        e.line("    nv_thread *thread;")?;
+        e.line("    void *data;")?;
+        e.line("    const void *vt;")?;
+        if (!c.types.is(result, TypeKind.Void)) {
+            e.t("    ")?;
+            appendCTypeName(c, mut e.buf, result)?;
+            e.t(" result;")?;
+            e.emit()?;
+        }
+        e.line("};")?;
+        e.t("static NV_UNUSED ")?;
+        appendCTypeName(c, mut e.buf, result)?;
+        e.t(" nvTJ_")?;
+        e.b(m.view())?;
+        e.t("(nvTB_")?;
+        e.b(m.view())?;
+        e.t(" *);")?;
+        e.emit()?;
+    }
+    if (any) {
+        e.line("")?;
+    }
+    return Ok();
+}
+
+/// The `dyn mut fn() -> T` of a thread's body (DynFunctionOf), if the program made it; none otherwise.
+fn threadBodyDyn(c: borrow Checker, result: u32) -> u32 {
+    let extra: u64 = (2 << 8) | ((allEffects() as u64) << 2) | 2u64;
+    let empty = Vector<u32>.create();
+    match (c.types.signatureKey(empty.view(), result, extra)) {
+        Ok(key) => { return foundIn(c.types.dyns, key); }
+        Err(_) => { return none(); }
+    }
+}
+
+/// Mangle of `dyn mut fn() -> T` whether or not the type exists.
+fn appendThreadBodyMangle(c: borrow Checker, out: borrow mut Vector<u8>, result: u32) -> Result<void, AllocError> {
+    appendText(out, "DG0")?;
+    return appendMangle(c, out, result);
+}
+
+fn hasDynSignature(c: borrow Checker, dyn: u32) -> bool {
+    if (dyn == none()) {
+        return false;
+    }
+    for (signature in c.dynSignatures.view()) {
+        if (signature.dynType == dyn) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The (environment, result) of each `Thread.spawn`, in first-use order (Spawns, §38.2).
+fn threadSpawns(c: borrow Checker, n: borrow NirProgram, out: borrow mut Vector<PairKey>) -> Result<void, AllocError> {
+    for (function in n.functions.view()) {
+        if (functionIsGeneric(c, function.source)) {
+            continue;
+        }
+        for (block in function.blocks.view()) {
+            for (s in block.statements.view()) {
+                match (n.statements[s as usize]) {
+                    NirStatement.Assign(_, r) => {
+                        if (builtinOf(n, r) == bfThreadSpawn()) {
+                            let environment = n.operandTypes[builtinArgument(n, r, 0) as usize];
+                            let key = pairKey(environment as u64, n.rvalueTypes[r as usize] as u64);
+                            var seen = false;
+                            for (other in out.view()) {
+                                if (other.a == key.a && other.b == key.b) {
+                                    seen = true;
+                                }
+                            }
+                            if (!seen) {
+                                out.push(key)?;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    return Ok();
+}
+
+/// The closure types of each `Thread.both`, as (a, b) pairs in first-use order (Forks, §38.6).
+fn threadForks(c: borrow Checker, n: borrow NirProgram, out: borrow mut Vector<PairKey>) -> Result<void, AllocError> {
+    for (function in n.functions.view()) {
+        if (functionIsGeneric(c, function.source)) {
+            continue;
+        }
+        for (block in function.blocks.view()) {
+            for (s in block.statements.view()) {
+                let r = match (n.statements[s as usize]) {
+                    NirStatement.Assign(_, r) => r,
+                    NirStatement.Eval(r) => r,
+                    _ => none(),
+                };
+                if (r == none() || builtinOf(n, r) != bfThreadBoth()) {
+                    continue;
+                }
+                let a = n.operandTypes[builtinArgument(n, r, 0) as usize];
+                let b = n.operandTypes[builtinArgument(n, r, 1) as usize];
+                var seen = false;
+                for (other in out.view()) {
+                    if (other.a == a as u64 && other.b == b as u64) {
+                        seen = true;
+                    }
+                }
+                if (!seen) {
+                    out.push(pairKey(a as u64, b as u64))?;
+                }
+            }
+        }
+    }
+    return Ok();
+}
+
+/// `Thread.both(a, b)` (EmitForkHelpers, §38.6): `nvTF_` runs a closure on the thread, `nvBOTH_` starts it, calls
+/// `b` and joins, or runs `a` then `b` here when the thread cannot start.
+fn emitForkHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirProgram) -> Result<void, AllocError> {
+    var forks = Vector<PairKey>.create();
+    threadForks(c, n, mut forks)?;
+    var firsts = Vector<u32>.create();
+    for (fork in forks.view()) {
+        let a = truncate<u32>(fork.a);
+        if (!containsU32(firsts, a)) {
+            firsts.push(a)?;
+        }
+    }
+    for (closure in firsts.view()) {
+        let name = cTypeName(c, closure)?;
+        e.t("static NV_UNUSED void *nvTF_")?;
+        appendMangle(c, mut e.buf, closure)?;
+        e.t("(void *p) {")?;
+        e.emit()?;
+        e.t("    ")?;
+        e.b(name.view())?;
+        e.t(" c = (")?;
+        e.b(name.view())?;
+        e.t(")p;")?;
+        e.emit()?;
+        e.line("    (*c)(c);")?;
+        e.line("    return NULL;")?;
+        e.line("}")?;
+    }
+    for (fork in forks.view()) {
+        let a = truncate<u32>(fork.a);
+        let b = truncate<u32>(fork.b);
+        e.t("static NV_UNUSED void nvBOTH_")?;
+        appendMangle(c, mut e.buf, a)?;
+        e.t("_")?;
+        appendMangle(c, mut e.buf, b)?;
+        e.t("(")?;
+        appendCTypeName(c, mut e.buf, a)?;
+        e.t(" a, ")?;
+        appendCTypeName(c, mut e.buf, b)?;
+        e.t(" b) {")?;
+        e.emit()?;
+        e.t("    nv_thread *t = nova_thread_start(nvTF_")?;
+        appendMangle(c, mut e.buf, a)?;
+        e.t(", (void *)a);")?;
+        e.emit()?;
+        e.line("    if (t == NULL) {")?;
+        e.line("        (*a)(a);")?;
+        e.line("    }")?;
+        e.line("    (*b)(b);")?;
+        e.line("    if (t != NULL) {")?;
+        e.line("        nova_thread_join(t);")?;
+        e.line("    }")?;
+        e.line("}")?;
+    }
+    if (forks.length > 0) {
+        e.line("")?;
+    }
+    return Ok();
+}
+
+/// The result types of each `Thread.spawn` of a boxed closure, in first-use order (BoxedSpawns, §38.2).
+fn boxedSpawns(c: borrow Checker, n: borrow NirProgram, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    for (function in n.functions.view()) {
+        if (functionIsGeneric(c, function.source)) {
+            continue;
+        }
+        for (block in function.blocks.view()) {
+            for (s in block.statements.view()) {
+                match (n.statements[s as usize]) {
+                    NirStatement.Assign(_, r) => {
+                        if (builtinOf(n, r) == bfThreadSpawnBoxed() && !containsU32(out, n.rvalueTypes[r as usize])) {
+                            out.push(n.rvalueTypes[r as usize])?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    return Ok();
+}
+
+fn emitThreadError(e: borrow mut CEmitter, error: Slice<u8>, indent: StringView) -> Result<void, AllocError> {
+    e.t(indent)?;
+    e.t("return ")?;
+    e.b(error)?;
+    e.t(";")?;
+    return e.emit();
+}
+
+/// Per thread type: the trampoline, the join and the drop glue; per spawn: `nvTS_` and `nvTSB_`
+/// (EmitThreadHelpers, §38.2).
+fn emitThreadHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirProgram) -> Result<void, AllocError> {
+    for (thread in c.types.threadList.view()) {
+        if (!isEmittedThread(c, thread)) {
+            continue;
+        }
+        let result = c.types.info(thread).element;
+        let m = mangled(c, result)?;
+        let void = c.types.is(result, TypeKind.Void);
+        var table = copyBytes("nvDT_".bytes())?;
+        appendThreadBodyMangle(c, mut table, result)?;
+        let hasTable = hasDynSignature(c, threadBodyDyn(c, result));
+        if (hasTable) {
+            e.t("static NV_UNUSED void *nvTR_")?;
+            e.b(m.view())?;
+            e.t("(void *p) {")?;
+            e.emit()?;
+            e.t("    nvTB_")?;
+            e.b(m.view())?;
+            e.t(" *b = (nvTB_")?;
+            e.b(m.view())?;
+            e.t(" *)p;")?;
+            e.emit()?;
+            e.t("    const ")?;
+            e.b(table.view())?;
+            e.t(" *vt = (const ")?;
+            e.b(table.view())?;
+            e.t(" *)b->vt;")?;
+            e.emit()?;
+            e.line(if (void) "    vt->m0(b->data);" else "    b->result = vt->m0(b->data);")?;
+            e.line("    return NULL;")?;
+            e.line("}")?;
+        }
+        e.t("static NV_UNUSED ")?;
+        appendCTypeName(c, mut e.buf, result)?;
+        e.t(" nvTJ_")?;
+        e.b(m.view())?;
+        e.t("(nvTB_")?;
+        e.b(m.view())?;
+        e.t(" *b) {")?;
+        e.emit()?;
+        e.line("    nova_thread_join(b->thread);")?;
+        if (!void) {
+            e.t("    ")?;
+            appendCTypeName(c, mut e.buf, result)?;
+            e.t(" r = b->result;")?;
+            e.emit()?;
+        }
+        if (hasTable) {
+            e.t("    const ")?;
+            e.b(table.view())?;
+            e.t(" *vt = (const ")?;
+            e.b(table.view())?;
+            e.t(" *)b->vt;")?;
+            e.emit()?;
+            e.line("    if (vt->drop != NULL) vt->drop(b->data);")?;
+        }
+        e.line("    nova_free(b->data, NV_ALLOC_SYSTEM);")?;
+        e.line("    nova_free(b, NV_ALLOC_SYSTEM);")?;
+        if (!void) {
+            e.line("    return r;")?;
+        }
+        e.line("}")?;
+        e.t("static NV_UNUSED void ")?;
+        appendDropGlueName(c, mut e.buf, thread)?;
+        e.t("(")?;
+        appendCTypeName(c, mut e.buf, thread)?;
+        e.t(" *p) {")?;
+        e.emit()?;
+        if (void) {
+            e.t("    nvTJ_")?;
+            e.b(m.view())?;
+            e.t("(*p);")?;
+            e.emit()?;
+        } else {
+            e.t("    ")?;
+            appendCTypeName(c, mut e.buf, result)?;
+            e.t(" r = nvTJ_")?;
+            e.b(m.view())?;
+            e.t("(*p);")?;
+            e.emit()?;
+            if (c.types.needsDrop(result)) {
+                e.t("    ")?;
+                appendDropGlueName(c, mut e.buf, result)?;
+                e.t("(&r);")?;
+                e.emit()?;
+            } else {
+                e.line("    (void)r;")?;
+            }
+        }
+        e.line("}")?;
+        e.line("")?;
+    }
+    var boxed = Vector<u32>.create();
+    boxedSpawns(c, n, mut boxed)?;
+    for (resultType in boxed.view()) {
+        // nvTSB_: a boxed closure, already a (data, table) pair; on failure its box is dropped.
+        let thread = resultOkOf(c, resultType);
+        let element = c.types.info(thread).element;
+        let m = mangled(c, element)?;
+        var box = none();
+        for (t in c.types.composites.view()) {
+            if (box == none() && c.types.isDynBox(t)) {
+                let d = c.types.info(c.types.info(t).pointee);
+                if (d.sendDyn && d.mutableDynFunction && d.parameters.count == 0 && d.result == element) {
+                    box = t;
+                }
+            }
+        }
+        let name = cTypeName(c, resultType)?;
+        var error = Vector<u8>.create();
+        appendAllocErrorResult(e, c, mut error, resultType)?;
+        e.t("static NV_UNUSED ")?;
+        e.b(name.view())?;
+        e.t(" nvTSB_")?;
+        e.b(m.view())?;
+        e.t("(")?;
+        appendCTypeName(c, mut e.buf, box)?;
+        e.t(" f) {")?;
+        e.emit()?;
+        e.t("    nvTB_")?;
+        e.b(m.view())?;
+        e.t(" *b = (nvTB_")?;
+        e.b(m.view())?;
+        e.t(" *)nova_alloc(sizeof *b, NV_ALLOC_SYSTEM);")?;
+        e.emit()?;
+        e.line("    if (b == NULL) {")?;
+        e.t("        ")?;
+        appendDropGlueName(c, mut e.buf, box)?;
+        e.t("(&f);")?;
+        e.emit()?;
+        emitThreadError(e, error.view(), "        ")?;
+        e.line("    }")?;
+        e.line("    b->data = f.data;")?;
+        e.line("    b->vt = f.vt;")?;
+        e.t("    b->thread = nova_thread_start(nvTR_")?;
+        e.b(m.view())?;
+        e.t(", b);")?;
+        e.emit()?;
+        e.line("    if (b->thread == NULL) {")?;
+        e.line("        nova_free(b, NV_ALLOC_SYSTEM);")?;
+        e.t("        ")?;
+        appendDropGlueName(c, mut e.buf, box)?;
+        e.t("(&f);")?;
+        e.emit()?;
+        emitThreadError(e, error.view(), "        ")?;
+        e.line("    }")?;
+        var ok = Vector<u8>.create();
+        appendOkValue(e, c, mut ok, resultType, "b".bytes())?;
+        e.t("    return ")?;
+        e.b(ok.view())?;
+        e.t(";")?;
+        e.emit()?;
+        e.line("}")?;
+        e.line("")?;
+    }
+    var spawns = Vector<PairKey>.create();
+    threadSpawns(c, n, mut spawns)?;
+    for (spawn in spawns.view()) {
+        let environment = truncate<u32>(spawn.a);
+        let resultType = truncate<u32>(spawn.b);
+        let thread = resultOkOf(c, resultType);
+        let element = c.types.info(thread).element;
+        let m = mangled(c, element)?;
+        let name = cTypeName(c, resultType)?;
+        var error = Vector<u8>.create();
+        appendAllocErrorResult(e, c, mut error, resultType)?;
+        let env = cTypeName(c, environment)?;
+        let drops = c.types.needsDrop(environment);
+        e.t("static NV_UNUSED ")?;
+        e.b(name.view())?;
+        e.t(" nvTS_")?;
+        appendMangle(c, mut e.buf, environment)?;
+        e.t("(")?;
+        e.b(env.view())?;
+        e.t(" v) {")?;
+        e.emit()?;
+        e.t("    nvTB_")?;
+        e.b(m.view())?;
+        e.t(" *b = (nvTB_")?;
+        e.b(m.view())?;
+        e.t(" *)nova_alloc(sizeof *b, NV_ALLOC_SYSTEM);")?;
+        e.emit()?;
+        e.line("    if (b == NULL) {")?;
+        emitDropOrVoid(e, c, environment, drops, "&v")?;
+        emitThreadError(e, error.view(), "        ")?;
+        e.line("    }")?;
+        e.t("    ")?;
+        e.b(env.view())?;
+        e.t(" *e = (")?;
+        e.b(env.view())?;
+        e.t(" *)nova_alloc(sizeof(*e), NV_ALLOC_SYSTEM);")?;
+        e.emit()?;
+        e.line("    if (e == NULL) {")?;
+        e.line("        nova_free(b, NV_ALLOC_SYSTEM);")?;
+        emitDropOrVoid(e, c, environment, drops, "&v")?;
+        emitThreadError(e, error.view(), "        ")?;
+        e.line("    }")?;
+        e.line("    *e = v;")?;
+        e.line("    b->data = e;")?;
+        e.t("    b->vt = &nvVT_")?;
+        appendMangle(c, mut e.buf, environment)?;
+        e.t("_")?;
+        appendThreadBodyMangle(c, mut e.buf, element)?;
+        e.t(";")?;
+        e.emit()?;
+        e.t("    b->thread = nova_thread_start(nvTR_")?;
+        e.b(m.view())?;
+        e.t(", b);")?;
+        e.emit()?;
+        e.line("    if (b->thread == NULL) {")?;
+        if (drops) {
+            e.t("        ")?;
+            appendDropGlueName(c, mut e.buf, environment)?;
+            e.t("(e);")?;
+            e.emit()?;
+        }
+        e.line("        nova_free(e, NV_ALLOC_SYSTEM);")?;
+        e.line("        nova_free(b, NV_ALLOC_SYSTEM);")?;
+        emitThreadError(e, error.view(), "        ")?;
+        e.line("    }")?;
+        var ok = Vector<u8>.create();
+        appendOkValue(e, c, mut ok, resultType, "b".bytes())?;
+        e.t("    return ")?;
+        e.b(ok.view())?;
+        e.t(";")?;
+        e.emit()?;
+        e.line("}")?;
+        e.line("")?;
+    }
+    return Ok();
+}
+
+fn emitDropOrVoid(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    t: u32,
+    drops: bool,
+    place: StringView,
+) -> Result<void, AllocError> {
+    if (!drops) {
+        return e.line("        (void)v;");
+    }
+    e.t("        ")?;
+    appendDropGlueName(c, mut e.buf, t)?;
+    e.t("(")?;
+    e.t(place)?;
+    e.t(");")?;
+    return e.emit();
+}

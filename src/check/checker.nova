@@ -131,6 +131,10 @@ struct Checker {
     coreAllowImported: bool;                         // resolveTypeWith's allowImported, for resolveTypeCore
     layoutUses: Vector<LayoutUse>;                   // struct types used by value before members are known
     headers: Vector<Vector<u8>>;                     // `@header`s of extern blocks, each once, in order (§31.3)
+    builtinUses: Vector<u8>;                         // per built-in item (AllocError, IoError, SystemHeap, FailingAllocator): 1 used, 2 by a library
+    programStructs: Vector<u32>;                     // HirProgram.Structs: the emitted struct, environment and enum types, in order
+    dynSignatures: Vector<DynSignature>;             // HirProgram.DynSignatures
+    trackLibraryTypes: bool;                         // while checking: types made in library code are not the program's (§29.2)
     statics: Vector<StaticEntry>;
     staticLocals: Vector<StaticLocal>; // each function's static-address locals (§39.2)
     freestanding: bool;                // --profile freestanding (cosmoos/profiles.md §4)
@@ -196,6 +200,13 @@ struct Checker {
     fn name(borrow this, symbol: u32) -> Slice<u8> => this.front.symbols.name(Symbol { id: symbol });
 
     fn typeName(borrow this, typ: u32) -> Slice<u8> => this.types.name(typ);
+
+    /// Makes `file` the current file (the reference's `_source`): types made in a library file are not the program's
+    /// (TypeTable.InHostedLibrary).
+    fn setFile(borrow mut this, file: u32) {
+        this.file = file;
+        this.types.inHostedLibrary = this.trackLibraryTypes && file != none() && this.fileIsLibrary[file as usize];
+    }
 
     fn intern(borrow mut this, text: StringView) -> Result<u32, AllocError> {
         let s = this.front.symbols.intern(text.bytes())?;
@@ -442,8 +453,8 @@ struct Checker {
                 var found = this.types.lookup(text.view());
                 if (found == none()) {
                     match (this.item(ident.symbol)) {
-                        Entity.Struct(s) => { found = this.structs[s as usize].typ; }
-                        Entity.Enum(e) => { found = this.enums[e as usize].typ; }
+                        Entity.Struct(s) => { found = useStructEntry(this, s); }
+                        Entity.Enum(e) => { found = useEnumEntry(this, e); }
                         _ => {}
                     }
                 }

@@ -1,0 +1,1882 @@
+// The per-type helpers of the C backend (the reference's CEmitter): drop glue, boxes and user allocators, arenas,
+// pools, vectors and strings, stable vectors and slot maps, I/O results, `@placed` initialisers, `dyn` tables, and
+// threads. Their prototypes come before the functions and their definitions after.
+
+/// The aggregate enum named `name` (`_enumsByName`): the first in Aggregates with that C name, not a niche optional.
+fn aggregateEnumNamed(e: borrow CEmitter, c: borrow Checker, name: Slice<u8>) -> Result<u32, AllocError> {
+    for (t in e.aggregates.view()) {
+        if (c.types.info(t).enumDef != none() && !c.types.isNicheOptional(t)) {
+            let candidate = cTypeName(c, t)?;
+            if (sameBytes(candidate.view(), name)) {
+                return Ok(t);
+            }
+        }
+    }
+    return Ok(none());
+}
+
+/// A value of a variant of the enum whose C name is `enumName`, with one payload field (Variant): by its constructor
+/// where UsesConstructor says so, otherwise a compound literal.
+fn appendVariantValue(
+    e: borrow CEmitter,
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    enumName: Slice<u8>,
+    variantName: StringView,
+    tag: u32,
+    payload: Slice<u8>,
+) -> Result<void, AllocError> {
+    let t = aggregateEnumNamed(e, c, enumName)?;
+    var variant = none();
+    if (t != none()) {
+        for (v in c.types.enums[c.types.info(t).enumDef as usize].variants.view()) {
+            var name = Vector<u8>.create();
+            appendCVariantName(c, mut name, v)?;
+            if (variant == none() && sameText(name.view(), variantName)) {
+                variant = v;
+            }
+        }
+    }
+    if (variant != none() && usesConstructor(c, variant)) {
+        appendEnumConstructor(out, enumName, variantName.bytes())?;
+        out.push('(')?;
+        appendBytes(out, payload)?;
+        return out.push(')');
+    }
+    appendText(out, "((")?;
+    appendBytes(out, enumName)?;
+    appendText(out, "){ .tag = ")?;
+    appendDecimal(out, tag as u64)?;
+    appendText(out, ", .u.")?;
+    appendText(out, variantName)?;
+    appendText(out, " = { .f__0 = ")?;
+    appendBytes(out, payload)?;
+    return appendText(out, " } })");
+}
+
+fn appendVariantOf(
+    e: borrow CEmitter,
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    t: u32,
+    variantName: StringView,
+    tag: u32,
+    payload: Slice<u8>,
+) -> Result<void, AllocError> {
+    let name = cTypeName(c, t)?;
+    return appendVariantValue(e, c, out, name.view(), variantName, tag, payload);
+}
+
+/// An optional value (OptionValue): `Some(payload)`, or `null` when `hasPayload` is false.
+fn appendOptionValue(
+    e: borrow CEmitter,
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    option: u32,
+    hasPayload: bool,
+    payload: Slice<u8>,
+) -> Result<void, AllocError> {
+    let name = cTypeName(c, option)?;
+    if (c.types.isNicheOptional(option)) {
+        appendText(out, "((")?;
+        appendBytes(out, name.view())?;
+        appendText(out, "){ .f__0 = ")?;
+        if (hasPayload) {
+            appendBytes(out, payload)?;
+        } else {
+            appendText(out, "NULL")?;
+        }
+        return appendText(out, " })");
+    }
+    if (!hasPayload) {
+        appendText(out, "((")?;
+        appendBytes(out, name.view())?;
+        return appendText(out, "){ .tag = 0 })");
+    }
+    return appendVariantValue(e, c, out, name.view(), "v_Some", 1, payload);
+}
+
+/// `Err(AllocError.OutOfMemory)` of a result type (AllocErrorResult).
+fn appendAllocErrorResult(
+    e: borrow CEmitter,
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    result: u32,
+) -> Result<void, AllocError> {
+    var error = Vector<u8>.create();
+    appendText(mut error, "((")?;
+    appendCTypeName(c, mut error, resultErrOf(c, result))?;
+    appendText(mut error, "){ .tag = 0 })")?;
+    return appendVariantOf(e, c, out, result, "v_Err", 1, error.view());
+}
+
+fn appendOkValue(
+    e: borrow CEmitter,
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    result: u32,
+    payload: Slice<u8>,
+) -> Result<void, AllocError> =>
+    appendVariantOf(e, c, out, result, "v_Ok", 0, payload);
+
+/// The runtime's id for an allocator type (AllocatorId).
+fn appendAllocatorId(c: borrow Checker, out: borrow mut Vector<u8>, allocator: u32) -> Result<void, AllocError> =>
+    appendText(
+        out,
+        if (sameText(c.types.name(allocator), "FailingAllocator")) "NV_ALLOC_FAILING" else "NV_ALLOC_SYSTEM",
+    );
+
+fn isUserAllocator(c: borrow Checker, allocator: u32) -> bool {
+    let s = c.types.info(allocator).structDef;
+    return s != none() && c.types.structs[s as usize].allocateMethod != none();
+}
+
+fn isAllocResult(c: borrow Checker, t: u32) -> bool => isResultWithError(c, t, "AllocError");
+
+fn isArenaResult(c: borrow Checker, t: u32) -> bool {
+    if (!isAllocResult(c, t)) {
+        return false;
+    }
+    let ok = resultOkOf(c, t);
+    return c.types.is(ok, TypeKind.Reference) && c.types.info(ok).mutableReference &&
+        !c.types.is(c.types.info(ok).pointee, TypeKind.Region);
+}
+
+fn isPoolTakeResult(c: borrow Checker, t: u32) -> bool => isAllocResult(c, t) && c.types.isPoolBox(resultOkOf(c, t));
+
+fn isBoxCreateResult(c: borrow Checker, t: u32) -> bool {
+    if (!isAllocResult(c, t)) {
+        return false;
+    }
+    let ok = resultOkOf(c, t);
+    return c.types.is(ok, TypeKind.Box) && !c.types.isPoolBox(ok) && !c.types.isDynBox(ok);
+}
+
+fn isVectorWithCapacityResult(c: borrow Checker, t: u32) -> bool =>
+    isAllocResult(c, t) && c.types.is(resultOkOf(c, t), TypeKind.Vector);
+
+fn isIoResult(c: borrow Checker, t: u32) -> bool {
+    if (!isResultWithError(c, t, "IoError")) {
+        return false;
+    }
+    let ok = resultOkOf(c, t);
+    return c.types.is(ok, TypeKind.Void) || c.types.is(ok, TypeKind.Resource) || c.types.is(ok, TypeKind.Integer);
+}
+
+/// `Result<void, AllocError>` among the composites (VoidAllocResult).
+fn voidAllocResult(e: borrow CEmitter, c: borrow Checker) -> u32 {
+    for (t in e.composites.view()) {
+        if (isAllocResult(c, t) && c.types.is(resultOkOf(c, t), TypeKind.Void)) {
+            return t;
+        }
+    }
+    return none();
+}
+
+/// `Result<ok, AllocError>` among the composites (ResultOfOk).
+fn resultOfOk(e: borrow CEmitter, c: borrow Checker, ok: u32) -> u32 {
+    for (t in e.composites.view()) {
+        if (isAllocResult(c, t) && resultOkOf(c, t) == ok) {
+            return t;
+        }
+    }
+    return none();
+}
+
+/// `value?` among all the type table's composites (OptionFor).
+fn optionFor(c: borrow Checker, value: u32) -> u32 {
+    for (t in c.types.composites.view()) {
+        if (c.types.optionType(t) == value) {
+            return t;
+        }
+    }
+    return none();
+}
+
+/// The `StringView?` emitted (OptionOfView), or none.
+fn optionOfView(e: borrow CEmitter, c: borrow Checker) -> u32 {
+    for (t in e.composites.view()) {
+        let value = c.types.optionType(t);
+        if (value != none() && c.types.isStringView(value)) {
+            return t;
+        }
+    }
+    return none();
+}
+
+/// An existing reference type (ReferenceTo, which here finds and never makes), or none.
+fn referenceTypeTo(c: borrow Checker, pointee: u32, mutable: bool) -> u32 =>
+    foundIn(c.types.references, pairKey(pointee as u64, if (mutable) 1 else 0));
+
+/// An existing `Handle<T>`, or none.
+fn handleTypeOf(c: borrow Checker, element: u32) -> u32 {
+    let numbers: [u64; 3] = [typeKindIndex(TypeKind.Handle) as u64, element as u64, 0xFFFFFFFF];
+    match (c.types.numbersKey(numbers[..])) {
+        Ok(key) => { return foundIn(c.types.containers, key); }
+        Err(_) => { return none(); }
+    }
+}
+
+// ---- Drop glue ----
+
+fn emitDropGluePrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    for (k in 0..e.aggregates.length) {
+        let t = e.aggregates[k];
+        if (c.types.needsDrop(t)) {
+            e.t("static NV_UNUSED void ")?;
+            appendDropGlueName(c, mut e.buf, t)?;
+            e.t("(")?;
+            appendCTypeName(c, mut e.buf, t)?;
+            e.t(" *);")?;
+            e.emit()?;
+        }
+    }
+    return Ok();
+}
+
+fn appendBoxFreeName(c: borrow Checker, out: borrow mut Vector<u8>, box: u32) -> Result<void, AllocError> {
+    appendText(out, "nvBF_")?;
+    return appendMangle(c, out, box);
+}
+
+/// The last field (or payload) that needs drop.
+fn lastDroppable(c: borrow Checker, fields: borrow Vector<u32>) -> u32 {
+    var last = none();
+    for (f in fields.view()) {
+        if (c.types.needsDrop(c.types.fields[f as usize].typ)) {
+            last = f;
+        }
+    }
+    return last;
+}
+
+/// Does destroying a `t` end, as its last step, in destroying a `box` (LeadsTo, §18.5)?
+fn leadsTo(c: borrow Checker, t: u32, box: u32) -> bool {
+    if (t == box) {
+        return true;
+    }
+    let info = c.types.info(t);
+    if (info.structDef != none()) {
+        let last = lastDroppable(c, c.types.structs[info.structDef as usize].fields);
+        return last != none() && leadsTo(c, c.types.fields[last as usize].typ, box);
+    }
+    if (info.enumDef != none()) {
+        for (v in c.types.enums[info.enumDef as usize].variants.view()) {
+            let last = lastDroppable(c, c.types.variants[v as usize].payload);
+            if (last != none() && leadsTo(c, c.types.fields[last as usize].typ, box)) {
+                return true;
+            }
+        }
+    }
+    return false; // another box, or a type without drop
+}
+
+/// An enum value's tag, read from the place (Tag): for a niche optional, whether its pointer is non-null (§22.1).
+fn appendTag(c: borrow Checker, out: borrow mut Vector<u8>, t: u32, place: Slice<u8>) -> Result<void, AllocError> {
+    if (c.types.isNicheOptional(t)) {
+        appendText(out, "((uint32_t)(")?;
+        appendBytes(out, place)?;
+        return appendText(out, ".f__0 != NULL))");
+    }
+    appendBytes(out, place)?;
+    return appendText(out, ".tag");
+}
+
+/// The place of a variant's payload struct (Payload): for a niche optional, the optional itself.
+fn appendPayloadPlace(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    t: u32,
+    place: Slice<u8>,
+    variant: u32,
+) -> Result<void, AllocError> {
+    appendBytes(out, place)?;
+    if (!c.types.isNicheOptional(t)) {
+        appendText(out, ".u.")?;
+        appendCVariantName(c, out, variant)?;
+    }
+    return Ok();
+}
+
+/// Destroys the value at `place` in its drop glue's order, except the tail `box`, whose pointer goes to `next`
+/// (DestroyExceptTail).
+fn emitDestroyExceptTail(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    place: Slice<u8>,
+    t: u32,
+    box: u32,
+    indent: Slice<u8>,
+) -> Result<void, AllocError> {
+    if (t == box) {
+        e.b(indent)?;
+        e.t("next = ")?;
+        e.b(place)?;
+        e.t(";")?;
+        return e.emit();
+    }
+    let info = c.types.info(t);
+    if (info.structDef != none()) {
+        let dropFunction = c.types.structs[info.structDef as usize].dropFunction;
+        if (dropFunction != none()) {
+            e.b(indent)?;
+            appendCFunctionName(c, mut e.buf, dropFunction)?;
+            e.t("(&")?;
+            e.b(place)?;
+            e.t(");")?;
+            e.emit()?;
+        }
+        let fields = borrow c.types.structs[info.structDef as usize].fields;
+        let last = lastDroppable(c, fields);
+        for (f in fields.view()) {
+            let fieldType = c.types.fields[f as usize].typ;
+            if (!c.types.needsDrop(fieldType)) {
+                continue;
+            }
+            var component = copyBytes(place)?;
+            component.push('.')?;
+            appendFieldName(c, mut component, f)?;
+            emitDestroyComponent(e, c, component.view(), fieldType, f == last, box, indent)?;
+        }
+        return Ok();
+    }
+    e.b(indent)?;
+    e.t("switch (")?;
+    appendTag(c, mut e.buf, t, place)?;
+    e.t(") {")?;
+    e.emit()?;
+    var inner = copyBytes(indent)?;
+    appendText(mut inner, "    ")?;
+    for (v in c.types.enums[info.enumDef as usize].variants.view()) {
+        let payload = borrow c.types.variants[v as usize].payload;
+        let last = lastDroppable(c, payload);
+        if (last == none()) {
+            continue;
+        }
+        e.b(indent)?;
+        e.t("case ")?;
+        e.d(c.types.variants[v as usize].index as u64)?;
+        e.t(":")?;
+        e.emit()?;
+        for (f in payload.view()) {
+            let fieldType = c.types.fields[f as usize].typ;
+            if (!c.types.needsDrop(fieldType)) {
+                continue;
+            }
+            var component = Vector<u8>.create();
+            appendPayloadPlace(c, mut component, t, place, v)?;
+            component.push('.')?;
+            appendFieldName(c, mut component, f)?;
+            emitDestroyComponent(e, c, component.view(), fieldType, f == last, box, inner.view())?;
+        }
+        e.b(indent)?;
+        e.t("    break;")?;
+        e.emit()?;
+    }
+    e.b(indent)?;
+    e.t("default:")?;
+    e.emit()?;
+    e.b(indent)?;
+    e.t("    break;")?;
+    e.emit()?;
+    e.b(indent)?;
+    e.t("}")?;
+    return e.emit();
+}
+
+fn emitDestroyComponent(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    component: Slice<u8>,
+    t: u32,
+    isTail: bool,
+    box: u32,
+    at: Slice<u8>,
+) -> Result<void, AllocError> {
+    if (isTail && leadsTo(c, t, box)) {
+        return emitDestroyExceptTail(e, c, component, t, box, at);
+    }
+    e.b(at)?;
+    appendDropGlueName(c, mut e.buf, t)?;
+    e.t("(&")?;
+    e.b(component)?;
+    e.t(");")?;
+    return e.emit();
+}
+
+/// `void nvD_…(T *p) {` with the given parameter name.
+fn emitDropGlueHead(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    t: u32,
+    parameter: StringView,
+) -> Result<void, AllocError> {
+    e.t("static void ")?;
+    appendDropGlueName(c, mut e.buf, t)?;
+    e.t("(")?;
+    appendCTypeName(c, mut e.buf, t)?;
+    e.t(" *")?;
+    e.t(parameter)?;
+    e.t(") {")?;
+    return e.emit();
+}
+
+fn emitDropGlue(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    for (k in 0..e.aggregates.length) {
+        let t = e.aggregates[k];
+        if (!c.types.needsDrop(t)) {
+            continue;
+        }
+        let info = c.types.info(t);
+        if (c.types.isPoolBox(t)) {
+            // Destroys the value, then returns its slot to the pool (§19.6).
+            emitDropGlueHead(e, c, t, "p")?;
+            if (c.types.needsDrop(info.pointee)) {
+                e.t("    ")?;
+                appendDropGlueName(c, mut e.buf, info.pointee)?;
+                e.t("(p->ptr);")?;
+                e.emit()?;
+            }
+            e.line("    nova_pool_release(p->pool, p->ptr);")?;
+            e.line("}")?;
+            e.line("")?;
+            continue;
+        }
+        if (c.types.is(t, TypeKind.Box) && leadsTo(c, info.pointee, t)) {
+            // Tail iteration (type-system.md §18.5): destroy the node except its tail, free it, continue with the tail.
+            let name = cTypeName(c, t)?;
+            emitDropGlueHead(e, c, t, "pp")?;
+            e.t("    ")?;
+            e.b(name.view())?;
+            e.t(" p = *pp;")?;
+            e.emit()?;
+            e.line("    while (p != NULL) {")?;
+            e.t("        ")?;
+            e.b(name.view())?;
+            e.t(" next = NULL;")?;
+            e.emit()?;
+            emitDestroyExceptTail(e, c, "(*p)".bytes(), info.pointee, t, "        ".bytes())?;
+            if (isUserAllocator(c, info.allocator)) {
+                e.t("        ")?;
+                appendBoxFreeName(c, mut e.buf, t)?;
+                e.t("(p);")?;
+            } else {
+                e.t("        nova_free(p, ")?;
+                appendAllocatorId(c, mut e.buf, info.allocator)?;
+                e.t(");")?;
+            }
+            e.emit()?;
+            e.line("        p = next;")?;
+            e.line("    }")?;
+            e.line("}")?;
+            e.line("")?;
+            continue;
+        }
+        if (c.types.is(t, TypeKind.StableVector)) {
+            // Destroys the elements from index 0 upward, then frees the chunks (§24.2).
+            let element = c.types.info(info.pointee).element;
+            emitDropGlueHead(e, c, t, "p")?;
+            if (c.types.needsDrop(element)) {
+                e.line("    for (uint64_t i = 0; i < p->len; i++) {")?;
+                e.t("        ")?;
+                appendDropGlueName(c, mut e.buf, element)?;
+                e.t("(nvSVE_")?;
+                appendMangle(c, mut e.buf, t)?;
+                e.t("(p, i));")?;
+                e.emit()?;
+                e.line("    }")?;
+            }
+            e.t("    nova_svec_free(p->chunks, ")?;
+            appendAllocatorId(c, mut e.buf, info.allocator)?;
+            e.t(");")?;
+            e.emit()?;
+            e.line("}")?;
+            e.line("")?;
+            continue;
+        }
+        if (c.types.is(t, TypeKind.SlotMap)) {
+            // Destroys the live values (odd generations), then frees the slots (§24.1).
+            emitDropGlueHead(e, c, t, "p")?;
+            if (c.types.needsDrop(info.element)) {
+                e.line("    for (uint64_t i = 0; i < p->len; i++) {")?;
+                e.t("        if ((p->ptr[i].gen & 1u) != 0u) ")?;
+                appendDropGlueName(c, mut e.buf, info.element)?;
+                e.t("(&p->ptr[i].value);")?;
+                e.emit()?;
+                e.line("    }")?;
+            }
+            e.t("    if (p->cap != 0u) nova_free(p->ptr, ")?;
+            appendAllocatorId(c, mut e.buf, info.allocator)?;
+            e.t(");")?;
+            e.emit()?;
+            e.line("}")?;
+            e.line("")?;
+            continue;
+        }
+        if (c.types.is(t, TypeKind.Vector)) {
+            // Destroys the elements from index 0 upward, then returns the buffer (§23.1).
+            let element = c.types.info(info.pointee).element;
+            emitDropGlueHead(e, c, t, "p")?;
+            if (element != none() && c.types.needsDrop(element)) {
+                e.line("    for (uint64_t i = 0; i < p->len; i++) {")?;
+                e.t("        ")?;
+                appendDropGlueName(c, mut e.buf, element)?;
+                e.t("(&p->ptr[i]);")?;
+                e.emit()?;
+                e.line("    }")?;
+            }
+            e.t("    if (p->cap != 0u) nova_free(p->ptr, ")?;
+            appendAllocatorId(c, mut e.buf, info.allocator)?;
+            e.t(");")?;
+            e.emit()?;
+            e.line("}")?;
+            e.line("")?;
+            continue;
+        }
+        if (c.types.isDynBox(t)) {
+            // Destroys the contents through the table, then frees them (§37.3).
+            emitDropGlueHead(e, c, t, "p")?;
+            e.line("    if (p->vt->drop != NULL) p->vt->drop(p->data);")?;
+            if (isUserAllocator(c, info.allocator)) {
+                e.t("    ")?;
+                appendBoxFreeName(c, mut e.buf, t)?;
+                e.t("(*p);")?;
+            } else {
+                e.t("    nova_free(p->data, ")?;
+                appendAllocatorId(c, mut e.buf, info.allocator)?;
+                e.t(");")?;
+            }
+            e.emit()?;
+            e.line("}")?;
+            e.line("")?;
+            continue;
+        }
+        if (c.types.is(t, TypeKind.Box)) {
+            // Destroys the contents, then returns the memory to the box's allocator (H1).
+            emitDropGlueHead(e, c, t, "p")?;
+            if (c.types.needsDrop(info.pointee)) {
+                e.t("    ")?;
+                appendDropGlueName(c, mut e.buf, info.pointee)?;
+                e.t("(*p);")?;
+                e.emit()?;
+            }
+            if (isUserAllocator(c, info.allocator)) {
+                e.t("    ")?;
+                appendBoxFreeName(c, mut e.buf, t)?;
+                e.t("(*p);")?;
+            } else {
+                e.t("    nova_free(*p, ")?;
+                appendAllocatorId(c, mut e.buf, info.allocator)?;
+                e.t(");")?;
+            }
+            e.emit()?;
+            e.line("}")?;
+            e.line("")?;
+            continue;
+        }
+        if (info.enumDef != none()) {
+            // Destroys the payloads of the active variant.
+            emitDropGlueHead(e, c, t, "p")?;
+            let niche = c.types.isNicheOptional(t);
+            if (niche) {
+                e.t("    switch (")?;
+                appendTag(c, mut e.buf, t, "p[0]".bytes())?;
+                e.t(") {")?;
+                e.emit()?;
+            } else {
+                e.line("    switch (p->tag) {")?;
+            }
+            for (v in c.types.enums[info.enumDef as usize].variants.view()) {
+                let payload = borrow c.types.variants[v as usize].payload;
+                if (lastDroppable(c, payload) == none()) {
+                    continue;
+                }
+                e.t("    case ")?;
+                e.d(c.types.variants[v as usize].index as u64)?;
+                e.t(":")?;
+                e.emit()?;
+                for (f in payload.view()) {
+                    let fieldType = c.types.fields[f as usize].typ;
+                    if (!c.types.needsDrop(fieldType)) {
+                        continue;
+                    }
+                    e.t("        ")?;
+                    appendDropGlueName(c, mut e.buf, fieldType)?;
+                    e.t("(&")?;
+                    if (niche) {
+                        e.t("p[0]")?;
+                    } else {
+                        e.t("p->u.")?;
+                        appendCVariantName(c, mut e.buf, v)?;
+                    }
+                    e.t(".")?;
+                    appendFieldName(c, mut e.buf, f)?;
+                    e.t(");")?;
+                    e.emit()?;
+                }
+                e.line("        break;")?;
+            }
+            e.line("    default:")?;
+            e.line("        break;")?;
+            e.line("    }")?;
+            e.line("}")?;
+            e.line("")?;
+            continue;
+        }
+        let definition = info.structDef;
+        emitDropGlueHead(e, c, t, "p")?;
+        let dropFunction = c.types.structs[definition as usize].dropFunction;
+        if (dropFunction != none()) {
+            e.t("    ")?;
+            appendCFunctionName(c, mut e.buf, dropFunction)?;
+            e.t("(p);")?;
+            e.emit()?;
+        }
+        for (f in c.types.structs[definition as usize].fields.view()) {
+            let fieldType = c.types.fields[f as usize].typ;
+            if (c.types.needsDrop(fieldType)) {
+                e.t("    ")?;
+                appendDropGlueName(c, mut e.buf, fieldType)?;
+                e.t("(&(*p).")?;
+                appendFieldName(c, mut e.buf, f)?;
+                e.t(");")?;
+                e.emit()?;
+            }
+        }
+        e.line("}")?;
+        e.line("")?;
+    }
+    return Ok();
+}
+
+// ---- Pools and arenas (§19) ----
+
+fn appendPoolTakeSignature(c: borrow Checker, out: borrow mut Vector<u8>, result: u32) -> Result<void, AllocError> {
+    let contents = c.types.info(resultOkOf(c, result)).pointee;
+    appendCTypeName(c, out, result)?;
+    appendText(out, " nvPT_")?;
+    appendMangle(c, out, contents)?;
+    appendText(out, "(nv_pool *p, ")?;
+    appendCTypeName(c, out, contents)?;
+    return appendText(out, " v)");
+}
+
+/// `pool.take(v)` (EmitPoolTake): a free slot, then the value moves in; on failure the value is destroyed.
+fn emitPoolTake(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    for (k in 0..e.composites.length) {
+        let result = e.composites[k];
+        if (!isPoolTakeResult(c, result)) {
+            continue;
+        }
+        let box = resultOkOf(c, result);
+        let pointee = c.types.info(box).pointee;
+        let contents = cTypeName(c, pointee)?;
+        e.t("static ")?;
+        appendPoolTakeSignature(c, mut e.buf, result)?;
+        e.t(" {")?;
+        e.emit()?;
+        e.t("    _Static_assert(_Alignof(")?;
+        e.b(contents.view())?;
+        e.t(") <= 16, \"novac: pool slots are 16-aligned\");")?;
+        e.emit()?;
+        e.t("    ")?;
+        e.b(contents.view())?;
+        e.t(" *slot = (")?;
+        e.b(contents.view())?;
+        e.t(" *)nova_pool_take(p, sizeof(")?;
+        e.b(contents.view())?;
+        e.t("));")?;
+        e.emit()?;
+        e.line("    if (slot == NULL) {")?;
+        if (c.types.needsDrop(pointee)) {
+            e.t("        ")?;
+            appendDropGlueName(c, mut e.buf, pointee)?;
+            e.t("(&v);")?;
+            e.emit()?;
+        }
+        var error = Vector<u8>.create();
+        appendAllocErrorResult(e, c, mut error, result)?;
+        e.t("        return ")?;
+        e.b(error.view())?;
+        e.t(";")?;
+        e.emit()?;
+        e.line("    }")?;
+        e.line("    *slot = v;")?;
+        var value = Vector<u8>.create();
+        appendText(mut value, "((")?;
+        appendCTypeName(c, mut value, box)?;
+        appendText(mut value, "){ .ptr = slot, .pool = p })")?;
+        var ok = Vector<u8>.create();
+        appendOkValue(e, c, mut ok, result, value.view())?;
+        e.t("    return ")?;
+        e.b(ok.view())?;
+        e.t(";")?;
+        e.emit()?;
+        e.line("}")?;
+        e.line("")?;
+    }
+    return Ok();
+}
+
+/// The runtime's id for the region a (reference to a) region value names (RegionId).
+fn appendRegionId(c: borrow Checker, out: borrow mut Vector<u8>, region: u32) -> Result<void, AllocError> {
+    let pointee = c.types.info(region).pointee;
+    let r = if (pointee != none()) pointee else region;
+    return appendText(out, match (c.types.info(r).region) {
+        RegionKind.Arena => "NV_REGION_ARENA",
+        RegionKind.FixedBuffer => "NV_REGION_FBA",
+        _ => "NV_REGION_SCRATCH",
+    });
+}
+
+fn appendArenaHelperName(c: borrow Checker, out: borrow mut Vector<u8>, result: u32) -> Result<void, AllocError> {
+    let ok = resultOkOf(c, result);
+    if (c.types.isSlice(ok)) {
+        appendText(out, "nvAR_")?;
+        return appendMangle(c, out, c.types.info(c.types.info(ok).pointee).element);
+    }
+    appendText(out, "nvAA_")?;
+    return appendMangle(c, out, c.types.info(ok).pointee);
+}
+
+fn appendArenaHelperSignature(c: borrow Checker, out: borrow mut Vector<u8>, result: u32) -> Result<void, AllocError> {
+    let ok = resultOkOf(c, result);
+    appendCTypeName(c, out, result)?;
+    out.push(' ')?;
+    appendArenaHelperName(c, out, result)?;
+    if (c.types.isSlice(ok)) {
+        appendText(out, "(void *r, uint32_t kind, uint64_t n, ")?;
+        appendCTypeName(c, out, c.types.info(c.types.info(ok).pointee).element)?;
+        return appendText(out, " fill)");
+    }
+    appendText(out, "(void *r, uint32_t kind, ")?;
+    appendCTypeName(c, out, c.types.info(ok).pointee)?;
+    return appendText(out, " v)");
+}
+
+fn emitArenaHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    for (k in 0..e.composites.length) {
+        let result = e.composites[k];
+        if (isArenaResult(c, result)) {
+            e.t("static NV_UNUSED ")?;
+            appendArenaHelperSignature(c, mut e.buf, result)?;
+            e.t(";")?;
+            e.emit()?;
+        }
+    }
+    return Ok();
+}
+
+/// Arena allocation (EmitArenaHelpers, §19.2): bump-allocate, then move the value in (or fill `n` copies).
+fn emitArenaHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    for (k in 0..e.composites.length) {
+        let result = e.composites[k];
+        if (!isArenaResult(c, result)) {
+            continue;
+        }
+        let ok = resultOkOf(c, result);
+        var error = Vector<u8>.create();
+        appendAllocErrorResult(e, c, mut error, result)?;
+        e.t("static ")?;
+        appendArenaHelperSignature(c, mut e.buf, result)?;
+        e.t(" {")?;
+        e.emit()?;
+        if (c.types.isSlice(ok)) {
+            let elementType = c.types.info(c.types.info(ok).pointee).element;
+            let element = cTypeName(c, elementType)?;
+            if (cLayout(c, elementType).size > 1) {
+                // Only for elements wider than a byte: GCC's -Wtype-limits flags `n > UINT64_MAX`.
+                e.t("    if (n > UINT64_MAX / sizeof(")?;
+                e.b(element.view())?;
+                e.t(")) return ")?;
+                e.b(error.view())?;
+                e.t(";")?;
+                e.emit()?;
+            }
+            e.t("    ")?;
+            e.b(element.view())?;
+            e.t(" *p = (")?;
+            e.b(element.view())?;
+            e.t(" *)nova_region_alloc(r, kind, n == 0u ? 1u : n * sizeof(")?;
+            e.b(element.view())?;
+            e.t("), _Alignof(")?;
+            e.b(element.view())?;
+            e.t("));")?;
+            e.emit()?;
+            e.t("    if (p == NULL) return ")?;
+            e.b(error.view())?;
+            e.t(";")?;
+            e.emit()?;
+            e.line("    for (uint64_t i = 0; i < n; i++) p[i] = fill;")?;
+            var value = Vector<u8>.create();
+            appendText(mut value, "((")?;
+            appendCTypeName(c, mut value, ok)?;
+            appendText(mut value, "){ .ptr = p, .len = n })")?;
+            var okValue = Vector<u8>.create();
+            appendOkValue(e, c, mut okValue, result, value.view())?;
+            e.t("    return ")?;
+            e.b(okValue.view())?;
+            e.t(";")?;
+            e.emit()?;
+        } else {
+            let contents = cTypeName(c, c.types.info(ok).pointee)?;
+            e.t("    ")?;
+            e.b(contents.view())?;
+            e.t(" *p = (")?;
+            e.b(contents.view())?;
+            e.t(" *)nova_region_alloc(r, kind, sizeof(")?;
+            e.b(contents.view())?;
+            e.t("), _Alignof(")?;
+            e.b(contents.view())?;
+            e.t("));")?;
+            e.emit()?;
+            e.t("    if (p == NULL) return ")?;
+            e.b(error.view())?;
+            e.t(";")?;
+            e.emit()?;
+            e.line("    *p = v;")?;
+            var okValue = Vector<u8>.create();
+            appendOkValue(e, c, mut okValue, result, "p".bytes())?;
+            e.t("    return ")?;
+            e.b(okValue.view())?;
+            e.t(";")?;
+            e.emit()?;
+        }
+        e.line("}")?;
+        e.line("")?;
+    }
+    return Ok();
+}
+
+// ---- Boxes (§18, §30) ----
+
+fn appendBoxCreateName(c: borrow Checker, out: borrow mut Vector<u8>, result: u32) -> Result<void, AllocError> {
+    appendText(out, "nvB_")?;
+    return appendMangle(c, out, resultOkOf(c, result));
+}
+
+fn appendBoxAllocateName(c: borrow Checker, out: borrow mut Vector<u8>, result: u32) -> Result<void, AllocError> {
+    appendText(out, "nvBA_")?;
+    return appendMangle(c, out, resultOkOf(c, result));
+}
+
+/// Boxes whose allocator is user-defined (UserAllocatedBoxes, §30).
+fn userAllocatedBoxes(e: borrow CEmitter, c: borrow Checker, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    var candidates = Vector<u32>.create();
+    for (t in e.aggregates.view()) {
+        candidates.push(t)?;
+    }
+    for (t in e.composites.view()) {
+        if (isBoxCreateResult(c, t)) {
+            candidates.push(resultOkOf(c, t))?;
+        }
+    }
+    for (t in candidates.view()) {
+        if (c.types.is(t, TypeKind.Box) && !c.types.isPoolBox(t) && isUserAllocator(c, c.types.info(t).allocator) &&
+            !containsU32(out, t)) {
+            out.push(t)?;
+        }
+    }
+    return Ok();
+}
+
+fn emitBoxCreatePrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    for (k in 0..e.composites.length) {
+        let result = e.composites[k];
+        if (!isBoxCreateResult(c, result)) {
+            continue;
+        }
+        let contents = c.types.info(resultOkOf(c, result)).pointee;
+        e.t("static NV_UNUSED ")?;
+        appendCTypeName(c, mut e.buf, result)?;
+        e.t(" ")?;
+        appendBoxCreateName(c, mut e.buf, result)?;
+        e.t("(")?;
+        appendCTypeName(c, mut e.buf, contents)?;
+        e.t(");")?;
+        e.emit()?;
+        if (inSet(e.inPlaceResults, result)) {
+            e.t("static NV_UNUSED ")?;
+            appendCTypeName(c, mut e.buf, contents)?;
+            e.t(" *")?;
+            appendBoxAllocateName(c, mut e.buf, result)?;
+            e.t("(void);")?;
+            e.emit()?;
+        }
+    }
+    var boxes = Vector<u32>.create();
+    userAllocatedBoxes(e, c, mut boxes)?;
+    for (box in boxes.view()) {
+        e.t("static NV_UNUSED void ")?;
+        appendBoxFreeName(c, mut e.buf, box)?;
+        e.t("(")?;
+        appendCTypeName(c, mut e.buf, box)?;
+        e.t(" p);")?;
+        e.emit()?;
+    }
+    return Ok();
+}
+
+/// The `Layout` parameter type of an allocator's `allocate` (§30.3).
+fn layoutTypeOf(c: borrow Checker, allocator: u32) -> u32 {
+    let allocate = c.types.structs[c.types.info(allocator).structDef as usize].allocateMethod;
+    return parameterType(c, allocate, 1);
+}
+
+/// The `Layout` of a box's contents, as the lib/core struct's C literal (LayoutOf, §30.3).
+fn appendContentsLayout(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    allocator: u32,
+    contents: u32,
+) -> Result<void, AllocError> {
+    let layout = layoutTypeOf(c, allocator);
+    let fields = borrow c.types.structs[c.types.info(layout).structDef as usize].fields;
+    appendText(out, "((")?;
+    appendCTypeName(c, out, layout)?;
+    appendText(out, "){ .")?;
+    appendFieldName(c, out, fields[0])?;
+    appendText(out, " = sizeof(")?;
+    appendCTypeName(c, out, contents)?;
+    appendText(out, "), .")?;
+    appendFieldName(c, out, fields[1])?;
+    appendText(out, " = _Alignof(")?;
+    appendCTypeName(c, out, contents)?;
+    return appendText(out, ") })");
+}
+
+/// The layout of a dyn box's contents for a user allocator: its table's size and alignment (DynLayout, §37.4).
+fn appendDynLayout(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    allocator: u32,
+    box: StringView,
+) -> Result<void, AllocError> {
+    let layout = layoutTypeOf(c, allocator);
+    let fields = borrow c.types.structs[c.types.info(layout).structDef as usize].fields;
+    appendText(out, "((")?;
+    appendCTypeName(c, out, layout)?;
+    appendText(out, "){ .")?;
+    appendFieldName(c, out, fields[0])?;
+    appendText(out, " = (")?;
+    appendCTypeName(c, out, c.types.fields[fields[0] as usize].typ)?;
+    appendText(out, ")")?;
+    appendText(out, box)?;
+    appendText(out, ".vt->size, .")?;
+    appendFieldName(c, out, fields[1])?;
+    appendText(out, " = (")?;
+    appendCTypeName(c, out, c.types.fields[fields[1] as usize].typ)?;
+    appendText(out, ")")?;
+    appendText(out, box)?;
+    return appendText(out, ".vt->align })");
+}
+
+/// Frees a user-allocated box's memory: its allocator's `deallocate` (EmitBoxFree, §30.3).
+fn emitBoxFree(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    var boxes = Vector<u32>.create();
+    userAllocatedBoxes(e, c, mut boxes)?;
+    for (box in boxes.view()) {
+        let allocator = c.types.info(box).allocator;
+        let deallocate = c.types.structs[c.types.info(allocator).structDef as usize].deallocateMethod;
+        e.t("static void ")?;
+        appendBoxFreeName(c, mut e.buf, box)?;
+        e.t("(")?;
+        appendCTypeName(c, mut e.buf, box)?;
+        e.t(" p) {")?;
+        e.emit()?;
+        e.t("    ")?;
+        appendCTypeName(c, mut e.buf, allocator)?;
+        e.t(" a = { 0 };")?;
+        e.emit()?;
+        e.t("    ")?;
+        appendCFunctionName(c, mut e.buf, deallocate)?;
+        if (c.types.isDynBox(box)) {
+            e.t("(&a, (uint8_t *)(uintptr_t)p.data, ")?;
+            appendDynLayout(c, mut e.buf, allocator, "p")?; // the table's size and alignment (§37.4)
+        } else {
+            e.t("(&a, (uint8_t *)(uintptr_t)p, ")?;
+            appendContentsLayout(c, mut e.buf, allocator, c.types.info(box).pointee)?;
+        }
+        e.t(");")?;
+        e.emit()?;
+        e.line("}")?;
+        e.line("")?;
+    }
+    return Ok();
+}
+
+fn appendPlacedName(c: borrow Checker, out: borrow mut Vector<u8>, t: u32) -> Result<void, AllocError> {
+    appendText(out, "nvPL_")?;
+    return appendMangle(c, out, t);
+}
+
+/// The C-laid-out types whose placement runs `@placed` methods (PlacedTypes): box contents and their fields' types.
+fn placedTypes(
+    e: borrow CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    out: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    for (result in e.composites.view()) {
+        if (isBoxCreateResult(c, result)) {
+            visitPlacedType(c, c.types.info(resultOkOf(c, result)).pointee, out)?;
+        }
+    }
+    for (k in e.compiled.view()) {
+        for (block in n.functions[k as usize].blocks.view()) {
+            for (s in block.statements.view()) {
+                match (n.statements[s as usize]) {
+                    NirStatement.Eval(r) => {
+                        if (builtinOf(n, r) == bfPtrPlace()) {
+                            let pointer = n.operandTypes[builtinArgument(n, r, 0) as usize];
+                            visitPlacedType(c, c.types.info(pointer).pointee, out)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    return Ok();
+}
+
+fn visitPlacedType(c: borrow Checker, t: u32, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    if (!c.types.hasPlacedMethods(t) || containsU32(out, t)) {
+        return Ok();
+    }
+    for (f in c.types.structs[c.types.info(t).structDef as usize].fields.view()) {
+        visitPlacedType(c, c.types.fields[f as usize].typ, out)?;
+    }
+    return out.push(t);
+}
+
+/// `nvPL_<T>(T *p)`: the fields' placement initialisers, in field order, then the type's own (EmitPlacedHelpers, §33.3).
+fn emitPlacedHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirProgram) -> Result<void, AllocError> {
+    var types = Vector<u32>.create();
+    placedTypes(e, c, n, mut types)?;
+    for (t in types.view()) {
+        e.t("static void ")?;
+        appendPlacedName(c, mut e.buf, t)?;
+        e.t("(")?;
+        appendCTypeName(c, mut e.buf, t)?;
+        e.t(" *p);")?;
+        e.emit()?;
+    }
+    for (t in types.view()) {
+        e.t("static void ")?;
+        appendPlacedName(c, mut e.buf, t)?;
+        e.t("(")?;
+        appendCTypeName(c, mut e.buf, t)?;
+        e.t(" *p) {")?;
+        e.emit()?;
+        for (f in c.types.structs[c.types.info(t).structDef as usize].fields.view()) {
+            let fieldType = c.types.fields[f as usize].typ;
+            if (c.types.hasPlacedMethods(fieldType)) {
+                e.t("    ")?;
+                appendPlacedName(c, mut e.buf, fieldType)?;
+                e.t("(&(*p).")?;
+                appendFieldName(c, mut e.buf, f)?;
+                e.t(");")?;
+                e.emit()?;
+            }
+        }
+        let placed = c.types.structs[c.types.info(t).structDef as usize].placedMethod;
+        if (placed != none()) {
+            e.t("    ")?;
+            appendCFunctionName(c, mut e.buf, placed)?;
+            e.t("(p);")?;
+            e.emit()?;
+        }
+        e.line("}")?;
+        e.line("")?;
+    }
+    return Ok();
+}
+
+/// `Box.create` (EmitBoxCreate, §18.2): allocate, then move the value in and return `Ok(box)`; on failure destroy the
+/// value and return `Err(AllocError.OutOfMemory)`.
+fn emitBoxCreate(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    for (k in 0..e.composites.length) {
+        let result = e.composites[k];
+        if (!isBoxCreateResult(c, result)) {
+            continue;
+        }
+        let box = resultOkOf(c, result);
+        let contents = c.types.info(box).pointee;
+        e.t("static ")?;
+        appendCTypeName(c, mut e.buf, result)?;
+        e.t(" ")?;
+        appendBoxCreateName(c, mut e.buf, result)?;
+        e.t("(")?;
+        appendCTypeName(c, mut e.buf, contents)?;
+        e.t(" v) {")?;
+        e.emit()?;
+        emitBoxAllocation(e, c, box, contents)?;
+        e.line("    if (p == NULL) {")?;
+        if (c.types.needsDrop(contents)) {
+            e.t("        ")?;
+            appendDropGlueName(c, mut e.buf, contents)?;
+            e.t("(&v);")?;
+            e.emit()?;
+        }
+        var error = Vector<u8>.create();
+        appendAllocErrorResult(e, c, mut error, result)?;
+        e.t("        return ")?;
+        e.b(error.view())?;
+        e.t(";")?;
+        e.emit()?;
+        e.line("    }")?;
+        e.line("    *p = v;")?;
+        if (c.types.hasPlacedMethods(contents)) {
+            e.t("    ")?;
+            appendPlacedName(c, mut e.buf, contents)?;
+            e.t("(p); /* C state is initialised at its final address (type-system.md §33.3) */")?;
+            e.emit()?;
+        }
+        var ok = Vector<u8>.create();
+        appendOkValue(e, c, mut ok, result, "p".bytes())?;
+        e.t("    return ")?;
+        e.b(ok.view())?;
+        e.t(";")?;
+        e.emit()?;
+        e.line("}")?;
+        e.line("")?;
+        if (inSet(e.inPlaceResults, result)) {
+            // The allocation alone, for a box built in place (§2): the caller constructs the contents.
+            e.t("static ")?;
+            appendCTypeName(c, mut e.buf, contents)?;
+            e.t(" *")?;
+            appendBoxAllocateName(c, mut e.buf, result)?;
+            e.t("(void) {")?;
+            e.emit()?;
+            emitBoxAllocation(e, c, box, contents)?;
+            e.line("    return p;")?;
+            e.line("}")?;
+            e.line("")?;
+        }
+    }
+    return Ok();
+}
+
+/// Declares `p`, the contents' memory from the box's allocator, or NULL if allocation fails (EmitBoxAllocation).
+fn emitBoxAllocation(e: borrow mut CEmitter, c: borrow Checker, box: u32, contents: u32) -> Result<void, AllocError> {
+    let allocator = c.types.info(box).allocator;
+    let name = cTypeName(c, contents)?;
+    if (isUserAllocator(c, allocator)) {
+        // The allocator's own `allocate` (§30.3); a field-less struct's value carries nothing.
+        let allocate = c.types.structs[c.types.info(allocator).structDef as usize].allocateMethod;
+        e.t("    ")?;
+        appendCTypeName(c, mut e.buf, allocator)?;
+        e.t(" a = { 0 };")?;
+        e.emit()?;
+        e.t("    ")?;
+        appendCTypeName(c, mut e.buf, c.hir.functions[allocate as usize].returnType)?;
+        e.t(" r = ")?;
+        appendCFunctionName(c, mut e.buf, allocate)?;
+        e.t("(&a, ")?;
+        appendContentsLayout(c, mut e.buf, allocator, contents)?;
+        e.t(");")?;
+        e.emit()?;
+        e.t("    ")?;
+        e.b(name.view())?;
+        e.t(" *p = r.tag == 0 ? (")?;
+        e.b(name.view())?;
+        e.t(" *)(uintptr_t)r.u.v_Ok.f__0 : NULL;")?;
+        return e.emit();
+    }
+    e.t("    _Static_assert(_Alignof(")?;
+    e.b(name.view())?;
+    e.t(") <= _Alignof(nv_max_align_t), \"novac: ")?;
+    e.b(c.types.name(box))?;
+    e.t(" needs over-aligned memory\");")?;
+    e.emit()?;
+    e.t("    ")?;
+    e.b(name.view())?;
+    e.t(" *p = (")?;
+    e.b(name.view())?;
+    e.t(" *)nova_alloc(sizeof(")?;
+    e.b(name.view())?;
+    e.t("), ")?;
+    appendAllocatorId(c, mut e.buf, allocator)?;
+    e.t(");")?;
+    return e.emit();
+}
+
+// ---- I/O (§26) ----
+
+fn appendIoHelper(c: borrow Checker, out: borrow mut Vector<u8>, result: u32) -> Result<void, AllocError> {
+    appendText(out, "nvIOR_")?;
+    return appendMangle(c, out, result);
+}
+
+fn emitIoHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    for (k in 0..e.composites.length) {
+        let result = e.composites[k];
+        if (isIoResult(c, result)) {
+            e.t("static NV_UNUSED ")?;
+            appendCTypeName(c, mut e.buf, result)?;
+            e.t(" ")?;
+            appendIoHelper(c, mut e.buf, result)?;
+            e.t("(nv_io_result);")?;
+            e.emit()?;
+        }
+    }
+    let option = optionOfView(e, c);
+    if (option != none()) {
+        e.t("static NV_UNUSED ")?;
+        appendCTypeName(c, mut e.buf, option)?;
+        e.t(" nvARG(uint64_t);")?;
+        e.emit()?;
+    }
+    return Ok();
+}
+
+/// The conversions from the runtime's `nv_io_result` to Nova results (EmitIoHelpers, §26).
+fn emitIoHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    for (k in 0..e.composites.length) {
+        let result = e.composites[k];
+        if (!isIoResult(c, result)) {
+            continue;
+        }
+        let ok = resultOkOf(c, result);
+        let error = resultErrOf(c, result);
+        let name = cTypeName(c, result)?;
+        let variants = borrow c.types.enums[c.types.info(error).enumDef as usize].variants;
+        let other = variants[variants.length - 1];
+        e.t("static ")?;
+        e.b(name.view())?;
+        e.t(" ")?;
+        appendIoHelper(c, mut e.buf, result)?;
+        e.t("(nv_io_result r) {")?;
+        e.emit()?;
+        e.line("    if (r.error != 0) {")?;
+        e.t("        ")?;
+        appendCTypeName(c, mut e.buf, error)?;
+        e.t(" e = { .tag = (uint")?;
+        e.d((c.types.enums[c.types.info(error).enumDef as usize].tagSize * 8) as u64)?;
+        e.t("_t)nova_io_kind(r.error) };")?;
+        e.emit()?;
+        e.t("        if (e.tag == NV_IO_OTHER) e.u.")?;
+        appendCVariantName(c, mut e.buf, other)?;
+        e.t(".")?;
+        appendFieldName(c, mut e.buf, c.types.variants[other as usize].payload[0])?;
+        e.t(" = r.error;")?;
+        e.emit()?;
+        var err = Vector<u8>.create();
+        appendVariantValue(e, c, mut err, name.view(), "v_Err", 1, "e".bytes())?;
+        e.t("        return ")?;
+        e.b(err.view())?;
+        e.t(";")?;
+        e.emit()?;
+        e.line("    }")?;
+        if (c.types.is(ok, TypeKind.Void)) {
+            e.t("    return ((")?;
+            e.b(name.view())?;
+            e.t("){ .tag = 0 });")?;
+        } else {
+            var value = Vector<u8>.create();
+            value.push('(')?;
+            appendCTypeName(c, mut value, ok)?;
+            appendText(mut value, ")r.value")?;
+            var okValue = Vector<u8>.create();
+            appendVariantValue(e, c, mut okValue, name.view(), "v_Ok", 0, value.view())?;
+            e.t("    return ")?;
+            e.b(okValue.view())?;
+            e.t(";")?;
+        }
+        e.emit()?;
+        e.line("}")?;
+        e.line("")?;
+    }
+    let option = optionOfView(e, c);
+    if (option != none()) {
+        let name = cTypeName(c, option)?;
+        e.t("static ")?;
+        e.b(name.view())?;
+        e.t(" nvARG(uint64_t index) {")?;
+        e.emit()?;
+        e.line("    nv_str text;")?;
+        e.t("    if (!nova_arg(index, &text)) return ((")?;
+        e.b(name.view())?;
+        e.t("){ .tag = 0 });")?;
+        e.emit()?;
+        var some = Vector<u8>.create();
+        appendVariantValue(e, c, mut some, name.view(), "v_Some", 1, "text".bytes())?;
+        e.t("    return ")?;
+        e.b(some.view())?;
+        e.t(";")?;
+        e.emit()?;
+        e.line("}")?;
+        e.line("")?;
+    }
+    return Ok();
+}
+
+// ---- Vectors, strings and containers (§23, §24) ----
+
+fn appendSlotName(c: borrow Checker, out: borrow mut Vector<u8>, map: u32) -> Result<void, AllocError> {
+    appendText(out, "nvKS_")?;
+    return appendMangle(c, out, map);
+}
+
+fn isContainerType(c: borrow Checker, t: u32) -> bool =>
+    c.types.is(t, TypeKind.StableVector) || c.types.is(t, TypeKind.SlotMap);
+
+fn emitContainerHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    for (k in 0..e.composites.length) {
+        let t = e.composites[k];
+        if (!isContainerType(c, t)) {
+            continue;
+        }
+        let name = cTypeName(c, t)?;
+        let m = mangled(c, t)?;
+        if (c.types.is(t, TypeKind.StableVector)) {
+            let element = cTypeName(c, c.types.info(c.types.info(t).pointee).element)?;
+            e.t("static NV_UNUSED ")?;
+            e.b(element.view())?;
+            e.t(" *nvSVE_")?;
+            e.b(m.view())?;
+            e.t("(")?;
+            e.b(name.view())?;
+            e.t(" *, uint64_t);")?;
+            e.emit()?;
+            e.t("static NV_UNUSED ")?;
+            let pushResult = resultOfOk(e, c, c.types.usize);
+            appendCTypeName(c, mut e.buf, pushResult)?;
+            e.t(" nvSVP_")?;
+            e.b(m.view())?;
+            e.t("(")?;
+            e.b(name.view())?;
+            e.t(" *, ")?;
+            e.b(element.view())?;
+            e.t(");")?;
+            e.emit()?;
+            continue;
+        }
+        let value = c.types.info(t).element;
+        e.t("static NV_UNUSED bool nvKV_")?;
+        e.b(m.view())?;
+        e.t("(const ")?;
+        e.b(name.view())?;
+        e.t(" *, nv_handle);")?;
+        e.emit()?;
+        e.t("static NV_UNUSED ")?;
+        let insertResult = resultOfOk(e, c, handleTypeOf(c, value));
+        appendCTypeName(c, mut e.buf, insertResult)?;
+        e.t(" nvKI_")?;
+        e.b(m.view())?;
+        e.t("(")?;
+        e.b(name.view())?;
+        e.t(" *, ")?;
+        appendCTypeName(c, mut e.buf, value)?;
+        e.t(");")?;
+        e.emit()?;
+        e.t("static NV_UNUSED ")?;
+        appendCTypeName(c, mut e.buf, optionFor(c, referenceTypeTo(c, value, false)))?;
+        e.t(" nvKG_")?;
+        e.b(m.view())?;
+        e.t("(const ")?;
+        e.b(name.view())?;
+        e.t(" *, nv_handle);")?;
+        e.emit()?;
+        e.t("static NV_UNUSED ")?;
+        appendCTypeName(c, mut e.buf, optionFor(c, referenceTypeTo(c, value, true)))?;
+        e.t(" nvKM_")?;
+        e.b(m.view())?;
+        e.t("(")?;
+        e.b(name.view())?;
+        e.t(" *, nv_handle);")?;
+        e.emit()?;
+        e.t("static NV_UNUSED ")?;
+        appendCTypeName(c, mut e.buf, optionFor(c, value))?;
+        e.t(" nvKR_")?;
+        e.b(m.view())?;
+        e.t("(")?;
+        e.b(name.view())?;
+        e.t(" *, nv_handle);")?;
+        e.emit()?;
+    }
+    return Ok();
+}
+
+/// Stable vectors (§24.2) and slot maps (§24.1) (EmitContainerHelpers).
+fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    for (k in 0..e.composites.length) {
+        let t = e.composites[k];
+        if (!isContainerType(c, t)) {
+            continue;
+        }
+        let name = cTypeName(c, t)?;
+        let m = mangled(c, t)?;
+        var allocator = Vector<u8>.create();
+        appendAllocatorId(c, mut allocator, c.types.info(t).allocator)?;
+        if (c.types.is(t, TypeKind.StableVector)) {
+            let elementType = c.types.info(c.types.info(t).pointee).element;
+            let element = cTypeName(c, elementType)?;
+            let result = resultOfOk(e, c, c.types.usize);
+            e.t("static ")?;
+            e.b(element.view())?;
+            e.t(" *nvSVE_")?;
+            e.b(m.view())?;
+            e.t("(")?;
+            e.b(name.view())?;
+            e.t(" *v, uint64_t i) {")?;
+            e.emit()?;
+            e.t("    return (")?;
+            e.b(element.view())?;
+            e.t(" *)nova_svec_at(v->chunks, i, sizeof(")?;
+            e.b(element.view())?;
+            e.t("));")?;
+            e.emit()?;
+            e.line("}")?;
+            e.line("")?;
+            e.t("static ")?;
+            appendCTypeName(c, mut e.buf, result)?;
+            e.t(" nvSVP_")?;
+            e.b(m.view())?;
+            e.t("(")?;
+            e.b(name.view())?;
+            e.t(" *v, ")?;
+            e.b(element.view())?;
+            e.t(" x) {")?;
+            e.emit()?;
+            e.t("    _Static_assert(_Alignof(")?;
+            e.b(element.view())?;
+            e.t(") <= _Alignof(nv_max_align_t), \"novac: ")?;
+            e.b(c.types.name(t))?;
+            e.t(" needs over-aligned memory\");")?;
+            e.emit()?;
+            e.t("    ")?;
+            e.b(element.view())?;
+            e.t(" *slot = (")?;
+            e.b(element.view())?;
+            e.t(" *)nova_svec_slot(v->chunks, v->len, sizeof(")?;
+            e.b(element.view())?;
+            e.t("), ")?;
+            e.b(allocator.view())?;
+            e.t(");")?;
+            e.emit()?;
+            e.line("    if (slot == NULL) {")?;
+            if (c.types.needsDrop(elementType)) {
+                e.t("        ")?;
+                appendDropGlueName(c, mut e.buf, elementType)?;
+                e.t("(&x);")?;
+                e.emit()?;
+            }
+            var error = Vector<u8>.create();
+            appendAllocErrorResult(e, c, mut error, result)?;
+            e.t("        return ")?;
+            e.b(error.view())?;
+            e.t(";")?;
+            e.emit()?;
+            e.line("    }")?;
+            e.line("    *slot = x;")?;
+            e.line("    v->len += 1u;")?;
+            var ok = Vector<u8>.create();
+            appendOkValue(e, c, mut ok, result, "v->len - 1u".bytes())?;
+            e.t("    return ")?;
+            e.b(ok.view())?;
+            e.t(";")?;
+            e.emit()?;
+            e.line("}")?;
+            e.line("")?;
+            continue;
+        }
+        let valueType = c.types.info(t).element;
+        let value = cTypeName(c, valueType)?;
+        var slot = Vector<u8>.create();
+        appendSlotName(c, mut slot, t)?;
+        let insertResult = resultOfOk(e, c, handleTypeOf(c, valueType));
+        e.t("static bool nvKV_")?;
+        e.b(m.view())?;
+        e.t("(const ")?;
+        e.b(name.view())?;
+        e.t(" *map, nv_handle h) {")?;
+        e.emit()?;
+        e.line("    return h.index < map->len && map->ptr[h.index].gen == h.gen;")?;
+        e.line("}")?;
+        e.line("")?;
+        e.t("static ")?;
+        appendCTypeName(c, mut e.buf, insertResult)?;
+        e.t(" nvKI_")?;
+        e.b(m.view())?;
+        e.t("(")?;
+        e.b(name.view())?;
+        e.t(" *map, ")?;
+        e.b(value.view())?;
+        e.t(" v) {")?;
+        e.emit()?;
+        e.t("    _Static_assert(_Alignof(")?;
+        e.b(slot.view())?;
+        e.t(") <= _Alignof(nv_max_align_t), \"novac: ")?;
+        e.b(c.types.name(t))?;
+        e.t(" needs over-aligned memory\");")?;
+        e.emit()?;
+        e.line("    uint32_t index;")?;
+        e.line("    if (map->free != UINT32_MAX) {")?;
+        e.line("        index = map->free;")?;
+        e.line("        map->free = map->ptr[index].next;")?;
+        e.line("    } else {")?;
+        e.t("        void *p = map->len < UINT32_MAX - 1u ? nova_vec_grow(map->ptr, map->len, &map->cap, 1u, sizeof(")?;
+        e.b(slot.view())?;
+        e.t("), ")?;
+        e.b(allocator.view())?;
+        e.t(") : NULL;")?;
+        e.emit()?;
+        e.line("        if (p == NULL) {")?;
+        if (c.types.needsDrop(valueType)) {
+            e.t("            ")?;
+            appendDropGlueName(c, mut e.buf, valueType)?;
+            e.t("(&v);")?;
+            e.emit()?;
+        }
+        var error = Vector<u8>.create();
+        appendAllocErrorResult(e, c, mut error, insertResult)?;
+        e.t("            return ")?;
+        e.b(error.view())?;
+        e.t(";")?;
+        e.emit()?;
+        e.line("        }")?;
+        e.t("        map->ptr = (")?;
+        e.b(slot.view())?;
+        e.t(" *)p;")?;
+        e.emit()?;
+        e.line("        index = (uint32_t)map->len;")?;
+        e.line("        map->ptr[index].gen = 0u;")?;
+        e.line("        map->len += 1u;")?;
+        e.line("    }")?;
+        e.line("    map->ptr[index].gen += 1u;")?;
+        e.line("    map->ptr[index].value = v;")?;
+        e.line("    map->count += 1u;")?;
+        var ok = Vector<u8>.create();
+        appendOkValue(
+            e,
+            c,
+            mut ok,
+            insertResult,
+            "((nv_handle){ .index = index, .gen = map->ptr[index].gen })".bytes(),
+        )?;
+        e.t("    return ")?;
+        e.b(ok.view())?;
+        e.t(";")?;
+        e.emit()?;
+        e.line("}")?;
+        e.line("")?;
+        for (mutable in [false, true]) {
+            let optionType = optionFor(c, referenceTypeTo(c, valueType, mutable));
+            e.t("static ")?;
+            appendCTypeName(c, mut e.buf, optionType)?;
+            e.t(if (mutable) " nvKM_" else " nvKG_")?;
+            e.b(m.view())?;
+            e.t(if (mutable) "(" else "(const ")?;
+            e.b(name.view())?;
+            e.t(" *map, nv_handle h) {")?;
+            e.emit()?;
+            var missing = Vector<u8>.create();
+            appendOptionValue(e, c, mut missing, optionType, false, "".bytes())?;
+            e.t("    if (!nvKV_")?;
+            e.b(m.view())?;
+            e.t("(map, h)) return ")?;
+            e.b(missing.view())?;
+            e.t(";")?;
+            e.emit()?;
+            var found = Vector<u8>.create();
+            appendOptionValue(e, c, mut found, optionType, true, "&map->ptr[h.index].value".bytes())?;
+            e.t("    return ")?;
+            e.b(found.view())?;
+            e.t(";")?;
+            e.emit()?;
+            e.line("}")?;
+            e.line("")?;
+        }
+        let removedType = optionFor(c, valueType);
+        e.t("static ")?;
+        appendCTypeName(c, mut e.buf, removedType)?;
+        e.t(" nvKR_")?;
+        e.b(m.view())?;
+        e.t("(")?;
+        e.b(name.view())?;
+        e.t(" *map, nv_handle h) {")?;
+        e.emit()?;
+        var missing = Vector<u8>.create();
+        appendOptionValue(e, c, mut missing, removedType, false, "".bytes())?;
+        e.t("    if (!nvKV_")?;
+        e.b(m.view())?;
+        e.t("(map, h)) return ")?;
+        e.b(missing.view())?;
+        e.t(";")?;
+        e.emit()?;
+        e.line("    map->ptr[h.index].gen += 1u;")?;
+        e.line("    map->count -= 1u;")?;
+        e.line("    if (map->ptr[h.index].gen != UINT32_MAX - 1u) {")?;
+        e.line("        map->ptr[h.index].next = map->free;")?;
+        e.line("        map->free = h.index;")?;
+        e.line("    }")?;
+        var removed = Vector<u8>.create();
+        appendOptionValue(e, c, mut removed, removedType, true, "map->ptr[h.index].value".bytes())?;
+        e.t("    return ")?;
+        e.b(removed.view())?;
+        e.t(";")?;
+        e.emit()?;
+        e.line("}")?;
+        e.line("")?;
+    }
+    return Ok();
+}
+
+fn emitVectorHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    let voidResult = voidAllocResult(e, c);
+    for (k in 0..e.composites.length) {
+        let vector = e.composites[k];
+        if (!c.types.is(vector, TypeKind.Vector)) {
+            continue;
+        }
+        let name = cTypeName(c, vector)?;
+        let m = mangled(c, vector)?;
+        let elementType = c.types.info(c.types.info(vector).pointee).element;
+        if (c.types.isString(vector)) {
+            e.t("static NV_UNUSED ")?;
+            appendCTypeName(c, mut e.buf, voidResult)?;
+            e.t(" nvVA_")?;
+            e.b(m.view())?;
+            e.t("(")?;
+            e.b(name.view())?;
+            e.t(" *, nv_str);")?;
+            e.emit()?;
+        } else {
+            e.t("static NV_UNUSED ")?;
+            appendCTypeName(c, mut e.buf, voidResult)?;
+            e.t(" nvVP_")?;
+            e.b(m.view())?;
+            e.t("(")?;
+            e.b(name.view())?;
+            e.t(" *, ")?;
+            appendCTypeName(c, mut e.buf, elementType)?;
+            e.t(");")?;
+            e.emit()?;
+            e.t("static NV_UNUSED ")?;
+            appendCTypeName(c, mut e.buf, optionFor(c, elementType))?;
+            e.t(" nvVO_")?;
+            e.b(m.view())?;
+            e.t("(")?;
+            e.b(name.view())?;
+            e.t(" *);")?;
+            e.emit()?;
+        }
+        e.t("static NV_UNUSED void nvVC_")?;
+        e.b(m.view())?;
+        e.t("(")?;
+        e.b(name.view())?;
+        e.t(" *);")?;
+        e.emit()?;
+    }
+    for (k in 0..e.composites.length) {
+        let result = e.composites[k];
+        if (isVectorWithCapacityResult(c, result)) {
+            e.t("static NV_UNUSED ")?;
+            appendCTypeName(c, mut e.buf, result)?;
+            e.t(" nvVW_")?;
+            appendMangle(c, mut e.buf, resultOkOf(c, result))?;
+            e.t("(uint64_t);")?;
+            e.emit()?;
+        }
+    }
+    return Ok();
+}
+
+/// The vector and string operations (EmitVectorHelpers, §23): grow with `nova_vec_grow` only when the buffer is full.
+fn emitVectorHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    let voidResult = voidAllocResult(e, c);
+    for (k in 0..e.composites.length) {
+        let vector = e.composites[k];
+        if (!c.types.is(vector, TypeKind.Vector)) {
+            continue;
+        }
+        let name = cTypeName(c, vector)?;
+        let m = mangled(c, vector)?;
+        let elementType = c.types.info(c.types.info(vector).pointee).element;
+        var allocator = Vector<u8>.create();
+        appendAllocatorId(c, mut allocator, c.types.info(vector).allocator)?;
+        let result = cTypeName(c, voidResult)?;
+        var error = Vector<u8>.create();
+        appendAllocErrorResult(e, c, mut error, voidResult)?;
+        if (c.types.isString(vector)) {
+            e.t("static ")?;
+            e.b(result.view())?;
+            e.t(" nvVA_")?;
+            e.b(m.view())?;
+            e.t("(")?;
+            e.b(name.view())?;
+            e.t(" *s, nv_str text) {")?;
+            e.emit()?;
+            e.line("    if (text.len > s->cap - s->len) {")?;
+            e.line("        uint64_t cap = s->cap;")?;
+            e.t("        void *p = nova_vec_grow(s->ptr, s->len, &cap, text.len, 1u, ")?;
+            e.b(allocator.view())?;
+            e.t(");")?;
+            e.emit()?;
+            e.t("        if (p == NULL) return ")?;
+            e.b(error.view())?;
+            e.t(";")?;
+            e.emit()?;
+            e.line("        s->ptr = (uint8_t *)p;")?;
+            e.line("        s->cap = cap;")?;
+            e.line("    }")?;
+            // A short text by a byte loop: gcc calls memcpy for an unknown length, even of one byte (c-backend §2).
+            e.line("    if (text.len <= 16u) {")?;
+            e.line("        for (uint64_t i = 0u; i < text.len; i++) s->ptr[s->len + i] = text.ptr[i];")?;
+            e.line("    } else {")?;
+            e.line("        nova_mem_copy(s->ptr + s->len, text.ptr, (size_t)text.len);")?;
+            e.line("    }")?;
+            e.line("    s->len += text.len;")?;
+            e.t("    return ((")?;
+            e.b(result.view())?;
+            e.t("){ .tag = 0 });")?;
+            e.emit()?;
+            e.line("}")?;
+            e.line("")?;
+        } else {
+            let element = cTypeName(c, elementType)?;
+            let optionType = optionFor(c, elementType);
+            e.t("static ")?;
+            e.b(result.view())?;
+            e.t(" nvVP_")?;
+            e.b(m.view())?;
+            e.t("(")?;
+            e.b(name.view())?;
+            e.t(" *v, ")?;
+            e.b(element.view())?;
+            e.t(" x) {")?;
+            e.emit()?;
+            e.t("    _Static_assert(_Alignof(")?;
+            e.b(element.view())?;
+            e.t(") <= _Alignof(nv_max_align_t), \"novac: ")?;
+            e.b(c.types.name(vector))?;
+            e.t(" needs over-aligned memory\");")?;
+            e.emit()?;
+            e.line("    if (v->len == v->cap) {")?;
+            e.line("        uint64_t cap = v->cap;")?;
+            e.t("        void *p = nova_vec_grow(v->ptr, v->len, &cap, 1u, sizeof(")?;
+            e.b(element.view())?;
+            e.t("), ")?;
+            e.b(allocator.view())?;
+            e.t(");")?;
+            e.emit()?;
+            e.line("        if (p == NULL) {")?;
+            if (c.types.needsDrop(elementType)) {
+                e.t("            ")?;
+                appendDropGlueName(c, mut e.buf, elementType)?;
+                e.t("(&x);")?;
+                e.emit()?;
+            }
+            e.t("            return ")?;
+            e.b(error.view())?;
+            e.t(";")?;
+            e.emit()?;
+            e.line("        }")?;
+            e.t("        v->ptr = (")?;
+            e.b(element.view())?;
+            e.t(" *)p;")?;
+            e.emit()?;
+            e.line("        v->cap = cap;")?;
+            e.line("    }")?;
+            e.line("    v->ptr[v->len] = x;")?;
+            e.line("    v->len += 1u;")?;
+            e.t("    return ((")?;
+            e.b(result.view())?;
+            e.t("){ .tag = 0 });")?;
+            e.emit()?;
+            e.line("}")?;
+            e.line("")?;
+            e.t("static ")?;
+            appendCTypeName(c, mut e.buf, optionType)?;
+            e.t(" nvVO_")?;
+            e.b(m.view())?;
+            e.t("(")?;
+            e.b(name.view())?;
+            e.t(" *v) {")?;
+            e.emit()?;
+            var missing = Vector<u8>.create();
+            appendOptionValue(e, c, mut missing, optionType, false, "".bytes())?;
+            e.t("    if (v->len == 0u) return ")?;
+            e.b(missing.view())?;
+            e.t(";")?;
+            e.emit()?;
+            e.line("    v->len -= 1u;")?;
+            var popped = Vector<u8>.create();
+            appendOptionValue(e, c, mut popped, optionType, true, "v->ptr[v->len]".bytes())?;
+            e.t("    return ")?;
+            e.b(popped.view())?;
+            e.t(";")?;
+            e.emit()?;
+            e.line("}")?;
+            e.line("")?;
+        }
+        e.t("static void nvVC_")?;
+        e.b(m.view())?;
+        e.t("(")?;
+        e.b(name.view())?;
+        e.t(" *v) {")?;
+        e.emit()?;
+        e.line("    uint64_t n = v->len;")?;
+        e.line("    v->len = 0u;")?;
+        if (elementType != none() && c.types.needsDrop(elementType)) {
+            e.line("    for (uint64_t i = 0; i < n; i++) {")?;
+            e.t("        ")?;
+            appendDropGlueName(c, mut e.buf, elementType)?;
+            e.t("(&v->ptr[i]);")?;
+            e.emit()?;
+            e.line("    }")?;
+        } else {
+            e.line("    (void)n;")?;
+        }
+        e.line("}")?;
+        e.line("")?;
+    }
+    for (k in 0..e.composites.length) {
+        let resultType = e.composites[k];
+        if (!isVectorWithCapacityResult(c, resultType)) {
+            continue;
+        }
+        let vector = resultOkOf(c, resultType);
+        let name = cTypeName(c, resultType)?;
+        let element = cTypeName(c, c.types.info(c.types.info(vector).pointee).element)?;
+        e.t("static ")?;
+        e.b(name.view())?;
+        e.t(" nvVW_")?;
+        appendMangle(c, mut e.buf, vector)?;
+        e.t("(uint64_t n) {")?;
+        e.emit()?;
+        e.t("    ")?;
+        appendCTypeName(c, mut e.buf, vector)?;
+        e.t(" v = { .ptr = (")?;
+        e.b(element.view())?;
+        e.t(" *)(void *)&nova_vec_empty, .len = 0u, .cap = 0u };")?;
+        e.emit()?;
+        e.t("    void *p = nova_vec_grow(v.ptr, 0u, &v.cap, n, sizeof(")?;
+        e.b(element.view())?;
+        e.t("), ")?;
+        appendAllocatorId(c, mut e.buf, c.types.info(vector).allocator)?;
+        e.t(");")?;
+        e.emit()?;
+        var error = Vector<u8>.create();
+        appendAllocErrorResult(e, c, mut error, resultType)?;
+        e.t("    if (p == NULL) return ")?;
+        e.b(error.view())?;
+        e.t(";")?;
+        e.emit()?;
+        e.t("    v.ptr = (")?;
+        e.b(element.view())?;
+        e.t(" *)p;")?;
+        e.emit()?;
+        var ok = Vector<u8>.create();
+        appendOkValue(e, c, mut ok, resultType, "v".bytes())?;
+        e.t("    return ")?;
+        e.b(ok.view())?;
+        e.t(";")?;
+        e.emit()?;
+        e.line("}")?;
+        e.line("")?;
+    }
+    return Ok();
+}

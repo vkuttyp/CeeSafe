@@ -29,3 +29,65 @@ fn readFile(path: StringView) -> Result<Vector<u8>, ReadError> {
     }
     return Ok(bytes);
 }
+
+/// Writes `bytes` to the file at `path`, created or truncated.
+fn writeFile(path: StringView, bytes: Slice<u8>) -> Result<void, IoError> {
+    var file = File.create(path)?;
+    return file.write(bytes);
+}
+
+/// Makes `path` and the directories above it that are missing (Directory.CreateDirectory).
+fn makeDirectories(path: Slice<u8>) -> Result<void, IoError> {
+    if (path.length == 0) {
+        return Ok();
+    }
+    let text = match (StringView.fromUtf8(path)) {
+        Some(t) => t,
+        null => { return Err(IoError.InvalidInput); }
+    };
+    match (File.kind(text)?) {
+        Some(_) => { return Ok(); }
+        null => {}
+    }
+    var parent = path.length;
+    while (parent > 0 && path[parent - 1] != '/') {
+        parent -= 1;
+    }
+    if (parent > 1) {
+        makeDirectories(path[..(parent - 1)])?;
+    }
+    match (Directory.create(text)) {
+        Ok() => { return Ok(); }
+        Err(IoError.AlreadyExists) => { return Ok(); }
+        Err(e) => { return Err(e); }
+    }
+}
+
+/// Writes generated files under `directory` (CProgram.WriteTo), making the directories their paths name.
+fn writeFilesUnder(directory: Slice<u8>, files: borrow Vector<CFile>) -> Result<void, IoError> {
+    for (file in files.view()) {
+        var path = Vector<u8>.create();
+        match (appendPath(mut path, directory, file.name.view())) {
+            Ok() => {}
+            Err(_) => { return Err(IoError.OutOfMemory); }
+        }
+        var parent = path.length;
+        while (parent > 0 && path[parent - 1] != '/') {
+            parent -= 1;
+        }
+        let pathBytes = path.view();
+        makeDirectories(pathBytes[..(parent - 1)])?;
+        let text = match (StringView.fromUtf8(path.view())) {
+            Some(t) => t,
+            null => { return Err(IoError.InvalidInput); }
+        };
+        writeFile(text, file.text.view())?;
+    }
+    return Ok();
+}
+
+fn appendPath(path: borrow mut Vector<u8>, directory: Slice<u8>, name: Slice<u8>) -> Result<void, AllocError> {
+    appendBytes(path, directory)?;
+    path.push('/')?;
+    return appendBytes(path, name);
+}

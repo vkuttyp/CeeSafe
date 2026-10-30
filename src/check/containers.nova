@@ -8,7 +8,7 @@ fn containerName(isMap: bool) -> StringView => if (isMap) "SlotMap" else "Stable
 
 /// The slot map or stable vector, with the types its built-in operations return (ContainerType, §24).
 fn containerType(c: borrow mut Checker, isMap: bool, element: u32, allocator: u32) -> Result<u32, AllocError> {
-    let allocError = c.allocErrorType;
+    let allocError = usedAllocError(c);
     if (isMap) {
         let handle = c.types.handleOf(element)?;
         resultOf(c, handle, allocError)?;
@@ -30,7 +30,7 @@ fn containerType(c: borrow mut Checker, isMap: bool, element: u32, allocator: u3
 fn resolveContainerType(c: borrow mut Checker, isMap: bool, arguments: Range) -> Result<u32, AllocError> {
     let elementSyntax = c.front.ast.at(arguments, 0);
     let element = c.resolveType(elementSyntax, false)?;
-    var allocator = c.systemHeapType;
+    var allocator = usedSystemHeap(c);
     if (arguments.count > 1) {
         let allocatorSyntax = c.front.ast.at(arguments, 1);
         allocator = c.resolveType(allocatorSyntax, false)?;
@@ -189,7 +189,7 @@ fn checkContainerMethod(
     }
     let values = [receiver, argument];
     let list = c.hir.list(values[..])?;
-    let allocError = c.allocErrorType;
+    let allocError = usedAllocError(c);
     if (sameText(text, "push")) {
         let usize = c.types.usize;
         let result = resultOf(c, usize, allocError)?;

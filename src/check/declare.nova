@@ -162,6 +162,10 @@ fn checkProgram(
         coreAllowImported: false,
         layoutUses: Vector<LayoutUse>.create(),
         headers: Vector<Vector<u8>>.create(),
+        builtinUses: Vector<u8>.create(),
+        programStructs: Vector<u32>.create(),
+        dynSignatures: Vector<DynSignature>.create(),
+        trackLibraryTypes: true,
         statics: Vector<StaticEntry>.create(),
         staticLocals: Vector<StaticLocal>.create(),
         freestanding: freestanding,
@@ -192,7 +196,10 @@ fn checkProgram(
 
     // Interfaces, then structs and enums, then every other item, unit by unit (Check()).
     for (u in 0..c.front.ast.units.length) {
-        c.file = c.front.ast.units[u].file;
+        {
+            let fileToSet = c.front.ast.units[u].file;
+            c.setFile(fileToSet);
+        }
         let items = c.front.ast.units[u].items;
         for (k in 0..items.count) {
             let item = c.front.ast.at(items, k);
@@ -203,7 +210,10 @@ fn checkProgram(
         }
     }
     for (u in 0..c.front.ast.units.length) {
-        c.file = c.front.ast.units[u].file;
+        {
+            let fileToSet = c.front.ast.units[u].file;
+            c.setFile(fileToSet);
+        }
         let items = c.front.ast.units[u].items;
         for (k in 0..items.count) {
             let item = c.front.ast.at(items, k);
@@ -224,7 +234,10 @@ fn checkProgram(
     }
     processTypeAttributes(mut c)?;
     for (u in 0..c.front.ast.units.length) {
-        c.file = c.front.ast.units[u].file;
+        {
+            let fileToSet = c.front.ast.units[u].file;
+            c.setFile(fileToSet);
+        }
         let items = c.front.ast.units[u].items;
         for (k in 0..items.count) {
             let item = c.front.ast.at(items, k);
@@ -288,6 +301,7 @@ fn checkProgram(
     foldStatics(mut c)?;
     finishFunctionFacts(mut c)?;
     finishAtomicStructs(mut c);
+    finishProgramTables(mut c)?;
     return Ok(c);
 }
 
@@ -580,7 +594,10 @@ fn checkMain(c: borrow mut Checker) -> Result<void, AllocError> {
     match (entity) {
         Entity.GenericFunction(g) => {
             let entry = c.genericFunctions[g as usize];
-            c.file = entry.file;
+            {
+                let fileToSet = entry.file;
+                c.setFile(fileToSet);
+            }
             let id = c.front.ast.idents[c.front.ast.functions[entry.syntax as usize].name as usize];
             var message = Vector<u8>.create();
             appendText(mut message, "'main' cannot be generic")?;
@@ -599,7 +616,7 @@ fn checkMain(c: borrow mut Checker) -> Result<void, AllocError> {
     let file = f.file;
     let id = c.front.ast.idents[syntax.name as usize];
     let okReturn = returnType == c.types.i32 || returnType == c.types.voidType;
-    c.file = file;
+    c.setFile(file);
     if (c.freestanding) {
         var message = Vector<u8>.create();
         appendText(

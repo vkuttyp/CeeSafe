@@ -309,7 +309,10 @@ fn appendEffectNames(out: borrow mut Vector<u8>, effects: u32) -> Result<void, A
 fn processFunctionAttributes(c: borrow mut Checker) -> Result<void, AllocError> {
     let saved = c.file;
     for (u in 0..c.front.ast.units.length) {
-        c.file = c.front.ast.units[u].file;
+        {
+            let fileToSet = c.front.ast.units[u].file;
+            c.setFile(fileToSet);
+        }
         let items = c.front.ast.units[u].items;
         for (k in 0..items.count) {
             let item = c.front.ast.at(items, k);
@@ -333,7 +336,7 @@ fn processFunctionAttributes(c: borrow mut Checker) -> Result<void, AllocError> 
             }
         }
     }
-    c.file = saved;
+    c.setFile(saved);
     return Ok();
 }
 
@@ -590,7 +593,10 @@ fn finishFunctionFacts(c: borrow mut Checker) -> Result<void, AllocError> {
         for (k in 0..c.effectsOfAttributes.length) {
             if (c.effectsOfAttributes[k].syntax == syntax) {
                 let attribute = c.effectsOfAttributes[k].attribute;
-                c.file = c.hir.functions[f].file;
+                {
+                    let fileToSet = c.hir.functions[f].file;
+                    c.setFile(fileToSet);
+                }
                 let report = !containsU32(reported, syntax);
                 if (report) {
                     reported.push(syntax)?;
@@ -601,6 +607,6 @@ fn finishFunctionFacts(c: borrow mut Checker) -> Result<void, AllocError> {
             }
         }
     }
-    c.file = saved;
+    c.setFile(saved);
     return Ok();
 }

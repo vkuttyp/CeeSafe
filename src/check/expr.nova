@@ -1220,7 +1220,7 @@ fn checkBuiltinMemberCall(
         let view = c.types.stringView;
         let programSyntax = c.front.ast.at(arguments, 0);
         let program = checkArgument(c, programSyntax, view)?;
-        let systemHeap = c.systemHeapType;
+        let systemHeap = usedSystemHeap(c);
         let vector = vectorType(c, view, systemHeap)?;
         let views = c.types.referenceTo(vector, false)?;
         let listSyntax = c.front.ast.at(arguments, 1);

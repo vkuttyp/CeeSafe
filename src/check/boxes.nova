@@ -26,7 +26,7 @@ fn resolveBoxType(c: borrow mut Checker, arguments: Range) -> Result<u32, AllocE
         return Ok(c.types.error);
     }
     let lastSyntax = c.front.ast.at(arguments, arguments.count - 1);
-    let allocator = if (arguments.count == 2) c.resolveType(lastSyntax, false)? else c.systemHeapType;
+    let allocator = if (arguments.count == 2) c.resolveType(lastSyntax, false)? else usedSystemHeap(c);
     let lastSpan = c.front.ast.typeSpans[lastSyntax as usize];
     if (!c.types.isBottom(allocator) && !checkBoxAllocator(c, allocator, lastSpan)?) {
         return Ok(c.types.error);
@@ -100,7 +100,7 @@ fn checkBoxCreate(
         return c.errorResult(span.start, span.end);
     }
     var values = Vector<u32>.create();
-    var allocator = c.systemHeapType;
+    var allocator = usedSystemHeap(c);
     let valueSyntax = c.front.ast.at(arguments, arguments.count - 1);
     if (withAllocator) {
         let allocatorSyntax = c.front.ast.at(arguments, 0);
@@ -154,7 +154,7 @@ fn checkBoxCreate(
         values.push(environment)?;
         let environmentType = c.typeOf(environment);
         let box = boxOf(c, environmentType, allocator)?;
-        let allocError = c.allocErrorType;
+        let allocError = usedAllocError(c);
         let result = resultOf(c, box, allocError)?;
         let list = c.hir.list(values.view())?;
         return c.expr(HirExpr.BuiltinCall(bfBoxCreate(), list), result, span.start, span.end);
@@ -189,7 +189,7 @@ fn checkBoxCreate(
     values.push(value)?;
     ensurePlaced(c, valueType, 0);
     let box = boxOf(c, valueType, allocator)?;
-    let allocError = c.allocErrorType;
+    let allocError = usedAllocError(c);
     let result = resultOf(c, box, allocError)?;
     let list = c.hir.list(values.view())?;
     return c.expr(HirExpr.BuiltinCall(bfBoxCreate(), list), result, span.start, span.end);

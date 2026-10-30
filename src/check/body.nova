@@ -3,7 +3,10 @@
 // CheckExpressionStatement) and the missing-return analysis (Semantics/FlowAnalysis.cs), for what S1a supports.
 
 fn checkFunctionBody(c: borrow mut Checker, function: u32) -> Result<void, AllocError> {
-    c.file = c.hir.functions[function as usize].file;
+    {
+        let fileToSet = c.hir.functions[function as usize].file;
+        c.setFile(fileToSet);
+    }
     c.function = function;
     var scope = Vector<u32>.create();
     regionScope(c, c.hir.functions[function as usize].syntax, c.hir.functions[function as usize].owner, mut scope)?;

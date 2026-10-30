@@ -1,0 +1,2533 @@
+// Function bodies in C, flat form (the reference's CEmitter: Signature, EmitFunction, PartlyWritten, InPlaceSites,
+// EmitFlatBody, EmitStatement, EmitBuiltin, EmitTerminator, Rvalue, Binary, Operand, Place and their helpers).
+
+fn nirFunctionSource(n: borrow NirProgram, f: u32) -> u32 => n.functions[f as usize].source;
+
+fn nirLocalType(n: borrow NirProgram, f: u32, local: u32) -> u32 => n.functions[f as usize].locals[local as usize].typ;
+
+fn placeTypeIn(c: borrow Checker, n: borrow NirProgram, f: u32, place: u32) -> u32 =>
+    nirPlaceType(c, n, n.functions[f as usize].locals, place);
+
+fn placeIsLocal(n: borrow NirProgram, place: u32) -> bool => n.places[place as usize].projections.count == 0;
+
+fn placeLocal(n: borrow NirProgram, place: u32) -> u32 => n.places[place as usize].local;
+
+fn appendLocalNameIn(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    out: borrow mut Vector<u8>,
+    f: u32,
+    local: u32,
+) -> Result<void, AllocError> =>
+    appendLocalName(c, out, n.functions[f as usize], local);
+
+/// A function's C declarator (Signature).
+fn appendSignature(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    f: u32,
+    withNames: bool,
+) -> Result<void, AllocError> {
+    let function = borrow n.functions[f as usize];
+    let source = borrow c.hir.functions[function.source as usize];
+    appendCTypeName(c, mut e.buf, source.returnType)?;
+    e.t(" ")?;
+    appendCFunctionName(c, mut e.buf, function.source)?;
+    e.t("(")?;
+    var count: u32 = 0;
+    for (k in 0..function.parameterCount) {
+        if (count > 0) {
+            e.t(", ")?;
+        }
+        count += 1;
+        if (k == 0 && source.closureEnvironment != none()) {
+            // A closure's environment arrives as the closure's code-pointer address (§36.2): converted on entry.
+            e.t(if (withNames) "const void *nv_env" else "const void *")?;
+        } else if (withNames) {
+            e.t("NV_UNUSED ")?;
+            appendCTypeName(c, mut e.buf, function.locals[k as usize].typ)?;
+            e.t(" ")?;
+            appendLocalName(c, mut e.buf, function, k)?;
+        } else {
+            appendCTypeName(c, mut e.buf, function.locals[k as usize].typ)?;
+        }
+    }
+    if (source.usesCallerAddress) {
+        if (count > 0) {
+            e.t(", ")?;
+        }
+        count += 1;
+        e.t(if (withNames) "uint64_t nv_caller" else "uint64_t")?;
+    }
+    if (count == 0) {
+        e.t("void")?;
+    }
+    return e.t(")");
+}
+
+/// Attributes the following C lines to the first line of a span (MapTo, §7); spanless code keeps the current line.
+fn mapTo(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    start: u32,
+    end: u32,
+) {
+    if (e.lineDirectives && e.function != none() && !(start == 0 && end == 0)) {
+        let file = c.hir.functions[nirFunctionSource(n, e.function) as usize].file;
+        e.wantedFile = file;
+        e.wantedLine = sources[file as usize].position(start as usize).line;
+    }
+}
+
+/// Ends a function's mapping (EndMapping): the following lines belong to main.c again.
+fn endMapping(e: borrow mut CEmitter) -> Result<void, AllocError> {
+    if (e.mappedFile != none()) {
+        // The directive is physical line cLines + 1, so the line after it is cLines + 2.
+        let k = e.current;
+        appendText(mut e.files[k].text, "#line ")?;
+        appendDecimal(mut e.files[k].text, e.cLines + 2)?;
+        appendText(mut e.files[k].text, " \"main.c\"\n")?;
+        e.cLines += 1;
+    }
+    e.mappedFile = none();
+    e.wantedFile = none();
+    return Ok();
+}
+
+fn emitFunction(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+) -> Result<void, AllocError> {
+    e.function = f;
+    e.inPlace.clear();
+    inPlaceSites(c, n, f, mut e.inPlace)?;
+    let source = nirFunctionSource(n, f);
+    let nameStart = functionNameStart(c, source);
+    let syntax = c.front.ast.functions[c.hir.functions[source as usize].syntax as usize];
+    mapTo(e, c, n, sources, nameStart, c.front.ast.idents[syntax.name as usize].end);
+    e.t("static ")?;
+    appendSignature(e, c, n, f, true)?;
+    e.t(" {")?;
+    e.emit()?;
+    let function = borrow n.functions[f as usize];
+    if (c.hir.functions[source as usize].closureEnvironment != none()) {
+        // The pointer to the environment's first member, back to the environment (C11 6.7.2.1p15).
+        let environment = function.locals[0].typ;
+        e.t("    NV_UNUSED ")?;
+        appendCTypeName(c, mut e.buf, environment)?;
+        e.t(" ")?;
+        appendLocalName(c, mut e.buf, function, 0)?;
+        e.t(" = (")?;
+        appendCTypeName(c, mut e.buf, environment)?;
+        e.t(")(uintptr_t)nv_env;")?;
+        e.emit()?;
+    }
+    var partly = Vector<bool>.create();
+    partlyWritten(c, n, f, mut partly)?;
+    // A temporary built in a box's memory instead (§2) is never written or read.
+    var builtInPlace = Vector<u32>.create();
+    for (pair in e.inPlace.view()) {
+        match (n.statements[pair.construction as usize]) {
+            NirStatement.Assign(target, _) => { builtInPlace.push(placeLocal(n, target))?; }
+            _ => {}
+        }
+    }
+    var declarations = Vector<Vector<u8>>.create();
+    for (k in function.parameterCount..truncate<u32>(function.locals.length)) {
+        if (containsU32(builtInPlace, k)) {
+            continue;
+        }
+        let t = function.locals[k as usize].typ;
+        // Zero-initialised: Nova's definite assignment already forbids reading it first (§5).
+        let zero = localZero(c, t);
+        var text = copyBytes("NV_UNUSED ".bytes())?;
+        appendCTypeName(c, mut text, t)?;
+        text.push(' ')?;
+        appendLocalName(c, mut text, function, k)?;
+        if (sameText(zero.bytes(), "{0}") && !inSet(partly, k)) {
+            text.push(';')?; // assigned whole before every read (§5, M9d)
+        } else {
+            appendText(mut text, " = ")?;
+            appendText(mut text, zero)?;
+            text.push(';')?;
+        }
+        declarations.push(text)?;
+    }
+    if (e.lineDirectives) {
+        // With directives, the declarations share one line, attributed to the function's name.
+        if (declarations.length > 0) {
+            e.t("   ")?;
+            for (d in declarations.view()) {
+                e.t(" ")?;
+                e.b(d.view())?;
+            }
+            e.emit()?;
+        }
+    } else {
+        for (d in declarations.view()) {
+            e.t("    ")?;
+            e.b(d.view())?;
+            e.emit()?;
+        }
+    }
+    emitFlatBody(e, c, n, sources, f)?;
+    e.line("}")?;
+    endMapping(e)?;
+    e.function = none();
+    return Ok();
+}
+
+/// A local's zero initialiser by its type.
+fn localZero(c: borrow Checker, t: u32) -> StringView {
+    let kind = c.types.kindOf(t);
+    if (isKind(kind, TypeKind.Bool)) {
+        return "false";
+    }
+    if (isKind(kind, TypeKind.Struct) || isKind(kind, TypeKind.Enum) || isKind(kind, TypeKind.Array) ||
+        isKind(kind, TypeKind.Region) || isKind(kind, TypeKind.Vector) || isKind(kind, TypeKind.StableVector) ||
+        isKind(kind, TypeKind.SlotMap) || isKind(kind, TypeKind.Handle)) {
+        return "{0}";
+    }
+    if (isKind(kind, TypeKind.Reference) && c.types.isSlice(t)) {
+        return "{0}";
+    }
+    if (isKind(kind, TypeKind.Box) && (c.types.isPoolBox(t) || c.types.isDynBox(t))) {
+        return "{0}";
+    }
+    if (isKind(kind, TypeKind.Reference) && c.types.isDynReference(t)) {
+        return "{0}";
+    }
+    if (isKind(kind, TypeKind.Reference) || isKind(kind, TypeKind.Box)) {
+        return "NULL";
+    }
+    return "0";
+}
+
+/// The rvalue of an Assign or Eval statement, or none.
+fn statementRvalue(n: borrow NirProgram, s: u32) -> u32 => match (n.statements[s as usize]) {
+    NirStatement.Assign(_, r) => r,
+    NirStatement.Eval(r) => r,
+    _ => none(),
+};
+
+/// The locals an aggregate of which keeps its zero initializer (PartlyWritten, §5).
+fn partlyWritten(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    f: u32,
+    locals: borrow mut Vector<bool>,
+) -> Result<void, AllocError> {
+    let function = borrow n.functions[f as usize];
+    for (block in function.blocks.view()) {
+        for (s in block.statements.view()) {
+            match (n.statements[s as usize]) {
+                NirStatement.Assign(target, r) => {
+                    if (!placeIsLocal(n, target)) {
+                        markType(locals, placeLocal(n, target))?;
+                    }
+                    addBorrowed(n, r, locals)?;
+                    addPayloadReads(n, r, locals)?;
+                }
+                NirStatement.Eval(r) => {
+                    addBorrowed(n, r, locals)?;
+                    addPayloadReads(n, r, locals)?;
+                }
+                NirStatement.Unpack(source, _, targets) => {
+                    for (k in 0..targets.count) {
+                        let target = n.at(targets, k);
+                        if (target != none()) {
+                            markType(locals, target)?;
+                        }
+                    }
+                    addPayloadRead(n, source, true, locals)?;
+                }
+                _ => {}
+            }
+        }
+        let operand = match (n.terminators[block.terminator as usize]) {
+            NirTerminator.Branch(condition, _, _) => condition,
+            NirTerminator.Switch(value, _, _) => value,
+            NirTerminator.Return(value) => value,
+            _ => none(),
+        };
+        if (operand != none()) {
+            let place = operandPlace(n, operand);
+            if (place != none()) {
+                addPayloadRead(n, place, false, locals)?;
+            }
+        }
+    }
+    return Ok();
+}
+
+fn addPayloadReads(n: borrow NirProgram, r: u32, locals: borrow mut Vector<bool>) -> Result<void, AllocError> {
+    var operands = Vector<u32>.create();
+    rvalueOperands(n, r, mut operands)?;
+    for (o in operands.view()) {
+        let place = operandPlace(n, o);
+        if (place != none()) {
+            addPayloadRead(n, place, false, locals)?;
+        }
+    }
+    return Ok();
+}
+
+/// A place that views the local's own storage (before any dereference) as a variant (AddPayloadRead).
+fn addPayloadRead(
+    n: borrow NirProgram,
+    place: u32,
+    unpack: bool,
+    locals: borrow mut Vector<bool>,
+) -> Result<void, AllocError> {
+    let p = n.places[place as usize];
+    var ownCount: u32 = 0;
+    var downcast = false;
+    while (ownCount < p.projections.count) {
+        let projection = n.projections[(p.projections.start + ownCount) as usize];
+        if (isNirDeref(projection)) {
+            break;
+        }
+        match (projection.kind) {
+            ProjectionKind.Downcast => { downcast = true; }
+            _ => {}
+        }
+        ownCount += 1;
+    }
+    if (if (unpack) ownCount == p.projections.count else downcast) {
+        markType(locals, p.local)?;
+    }
+    return Ok();
+}
+
+fn isNirDeref(p: NirProjection) -> bool => match (p.kind) {
+    ProjectionKind.Deref => true,
+    _ => false,
+};
+
+fn addBorrowed(n: borrow NirProgram, r: u32, locals: borrow mut Vector<bool>) -> Result<void, AllocError> {
+    match (n.rvalues[r as usize]) {
+        NirRvalue.Ref(_, place) => { markType(locals, placeLocal(n, place))?; }
+        NirRvalue.Slice(_, base, _, _) => { markType(locals, placeLocal(n, base))?; }
+        _ => {}
+    }
+    return Ok();
+}
+
+/// Every place an rvalue reads or borrows (Places).
+fn rvaluePlaces(n: borrow NirProgram, r: u32, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    match (n.rvalues[r as usize]) {
+        NirRvalue.Ref(_, place) => { return out.push(place); }
+        NirRvalue.Length(place) => { return out.push(place); }
+        NirRvalue.Discriminant(place) => { return out.push(place); }
+        NirRvalue.Slice(_, base, _, _) => { out.push(base)?; }
+        _ => {}
+    }
+    var operands = Vector<u32>.create();
+    rvalueOperands(n, r, mut operands)?;
+    for (o in operands.view()) {
+        let place = operandPlace(n, o);
+        if (place != none()) {
+            out.push(place)?;
+        }
+    }
+    return Ok();
+}
+
+fn countUse(uses: borrow mut Vector<u32>, local: u32) -> Result<void, AllocError> {
+    while (uses.length <= local as usize) {
+        uses.push(0)?;
+    }
+    uses[local as usize] = uses[local as usize] + 1;
+    return Ok();
+}
+
+fn isConstruction(n: borrow NirProgram, r: u32) -> bool => match (n.rvalues[r as usize]) {
+    NirRvalue.ArrayRepeat(_) => true,
+    NirRvalue.Array(_) => true,
+    NirRvalue.Aggregate(_) => true,
+    NirRvalue.EnumAggregate(_, _) => true,
+    _ => false,
+};
+
+/// The Box.create sites that build their value in the box's memory (InPlaceSites, c-backend.md §2).
+fn inPlaceSites(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    f: u32,
+    sites: borrow mut Vector<InPlacePair>,
+) -> Result<void, AllocError> {
+    let function = borrow n.functions[f as usize];
+    var uses = Vector<u32>.create();
+    for (block in function.blocks.view()) {
+        for (s in block.statements.view()) {
+            var places = Vector<u32>.create();
+            match (n.statements[s as usize]) {
+                NirStatement.Assign(target, r) => {
+                    countUse(mut uses, placeLocal(n, target))?;
+                    rvaluePlaces(n, r, mut places)?;
+                }
+                NirStatement.Eval(r) => { rvaluePlaces(n, r, mut places)?; }
+                NirStatement.Unpack(source, _, _) => { places.push(source)?; }
+                NirStatement.Drop(place, _) => { places.push(place)?; }
+                _ => {}
+            }
+            for (p in places.view()) {
+                countUse(mut uses, placeLocal(n, p))?;
+            }
+        }
+    }
+    for (block in function.blocks.view()) {
+        let operand = match (n.terminators[block.terminator as usize]) {
+            NirTerminator.Branch(condition, _, _) => condition,
+            NirTerminator.Switch(value, _, _) => value,
+            NirTerminator.Return(value) => value,
+            _ => none(),
+        };
+        if (operand != none() && operandPlace(n, operand) != none()) {
+            countUse(mut uses, placeLocal(n, operandPlace(n, operand)))?;
+        }
+    }
+    for (block in function.blocks.view()) {
+        for (i in 1..block.statements.length) {
+            let site = block.statements[i];
+            let before = block.statements[i - 1];
+            let siteValue = match (n.statements[site as usize]) {
+                NirStatement.Assign(_, r) => r,
+                _ => none(),
+            };
+            if (siteValue == none()) {
+                continue;
+            }
+            let arguments = match (n.rvalues[siteValue as usize]) {
+                NirRvalue.Builtin(b, arguments) => if (b == bfBoxCreate()) arguments else emptyRange(),
+                _ => emptyRange(),
+            };
+            if (arguments.count == 0) {
+                continue;
+            }
+            let argument = operandPlace(n, n.at(arguments, arguments.count - 1));
+            if (argument == none() || !placeIsLocal(n, argument)) {
+                continue;
+            }
+            let box = resultOkOf(c, n.rvalueTypes[siteValue as usize]);
+            if (c.types.isPoolBox(box)) {
+                continue;
+            }
+            let constructionTarget = match (n.statements[before as usize]) {
+                NirStatement.Assign(t, _) => t,
+                _ => none(),
+            };
+            let constructionValue = if (constructionTarget == none()) none() else statementRvalue(n, before);
+            if (constructionValue == none() || !placeIsLocal(n, constructionTarget) ||
+                !isConstruction(n, constructionValue)) {
+                continue;
+            }
+            let local = placeLocal(n, argument);
+            let pointee = c.types.info(box).pointee;
+            if (placeLocal(
+                n,
+                constructionTarget,
+            ) == local && (local as usize) < uses.length && uses[local as usize] == 2 &&
+                !c.types.needsDrop(pointee) && !c.types.isCLaidOut(pointee, 0)) {
+                sites.push(InPlacePair { site: site, construction: before })?;
+            }
+        }
+    }
+    return Ok();
+}
+
+fn inPlaceConstructionOf(e: borrow CEmitter, site: u32) -> u32 {
+    for (pair in e.inPlace.view()) {
+        if (pair.site == site) {
+            return pair.construction;
+        }
+    }
+    return none();
+}
+
+fn isInPlaceConstruction(e: borrow CEmitter, s: u32) -> bool {
+    for (pair in e.inPlace.view()) {
+        if (pair.construction == s) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The flat form (EmitFlatBody, c-backend.md §3): one label per jump target, terminators as goto, switch, return.
+fn emitFlatBody(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+) -> Result<void, AllocError> {
+    let function = borrow n.functions[f as usize];
+    var targeted = Vector<bool>.create();
+    for (block in function.blocks.view()) {
+        for (s in block.successors.view()) {
+            markType(mut targeted, s)?;
+        }
+    }
+    for (block in function.blocks.view()) {
+        if (inSet(targeted, block.id)) {
+            var label = copyBytes("bb".bytes())?;
+            appendDecimal(mut label, block.id as u64)?;
+            if (e.lineDirectives) {
+                appendText(mut label, ": ")?;
+                e.pendingLabel = label;
+                e.hasPendingLabel = true;
+            } else {
+                label.push(':')?;
+                e.writeLine(label.view(), true)?;
+            }
+        }
+        for (s in block.statements.view()) {
+            let span = n.statementSpans[s as usize];
+            mapTo(e, c, n, sources, span.start, span.end);
+            emitStatement(e, c, n, sources, f, s)?;
+        }
+        let span = n.terminatorSpans[block.terminator as usize];
+        mapTo(e, c, n, sources, span.start, span.end);
+        emitTerminator(e, c, n, sources, f, block.terminator)?;
+    }
+    return Ok();
+}
+
+/// Writes a value into `target` (EmitConstruction): an array repeat as a loop over its elements, anything else as one
+/// assignment.
+fn emitConstruction(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    r: u32,
+    target: Slice<u8>,
+    indent: StringView,
+) -> Result<void, AllocError> {
+    match (n.rvalues[r as usize]) {
+        NirRvalue.ArrayRepeat(o) => {
+            var operand = Vector<u8>.create();
+            appendOperand(e, c, n, sources, f, mut operand, o)?;
+            e.t(indent)?;
+            e.t("for (uint64_t nv_i = 0; nv_i < ")?;
+            e.d(truncate<u64>(c.types.info(n.rvalueTypes[r as usize]).arrayLength))?;
+            e.t("u; nv_i++) ")?;
+            e.b(target)?;
+            e.t(".e[nv_i] = ")?;
+            e.b(operand.view())?;
+            e.t(";")?;
+            return e.emit();
+        }
+        _ => {}
+    }
+    var value = Vector<u8>.create();
+    appendRvalue(e, c, n, sources, f, mut value, r)?;
+    e.t(indent)?;
+    e.b(target)?;
+    e.t(" = ")?;
+    e.b(value.view())?;
+    e.t(";")?;
+    e.emit()?;
+    match (n.rvalues[r as usize]) {
+        NirRvalue.Aggregate(fields) => {
+            // A C array member cannot be initialised from Nova's array struct: it is assigned as one (ADR 0029).
+            let t = n.rvalueTypes[r as usize];
+            let declared = borrow c.types.structs[c.types.info(t).structDef as usize].fields;
+            for (k in 0..fields.count) {
+                let field = declared[k as usize];
+                let o = n.at(fields, k);
+                if (!isCArrayMember(c, t, field) || isZeroOperand(n, o)) {
+                    continue;
+                }
+                var operand = Vector<u8>.create();
+                appendOperand(e, c, n, sources, f, mut operand, o)?;
+                e.t(indent)?;
+                e.t("(*(")?;
+                appendCTypeName(c, mut e.buf, c.types.fields[field as usize].typ)?;
+                e.t(" *)(uintptr_t)&")?;
+                e.b(target)?;
+                e.t(".")?;
+                appendFieldName(c, mut e.buf, field)?;
+                e.t(") = ")?;
+                e.b(operand.view())?;
+                e.t(";")?;
+                e.emit()?;
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn isZeroOperand(n: borrow NirProgram, o: u32) -> bool => match (n.operands[o as usize]) {
+    NirOperand.Zero => true,
+    _ => false,
+};
+
+fn appendPlaceIn(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    place: u32,
+) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    appendPlace(e, c, n, sources, f, mut out, place)?;
+    return Ok(out);
+}
+
+fn operandText(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    o: u32,
+) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    appendOperand(e, c, n, sources, f, mut out, o)?;
+    return Ok(out);
+}
+
+fn siteText(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    start: u32,
+) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    appendSite(e, c, n, sources, f, mut out, start)?;
+    return Ok(out);
+}
+
+fn emitStatement(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    s: u32,
+) -> Result<void, AllocError> {
+    let span = n.statementSpans[s as usize];
+    match (n.statements[s as usize]) {
+        NirStatement.Assign(target, r) => {
+            let builtin = builtinOf(n, r);
+            if (builtin == bfScratchEnter()) {
+                let place = appendPlaceIn(e, c, n, sources, f, target)?;
+                var location = Vector<u8>.create();
+                appendLocation(
+                    e,
+                    mut location,
+                    sources,
+                    c.hir.functions[nirFunctionSource(n, f) as usize].file,
+                    span.start,
+                )?;
+                e.t("    ")?;
+                e.b(place.view())?;
+                e.t(" = nova_scratch_enter_root(")?;
+                e.b(location.view())?;
+                e.t(");")?;
+                return e.emit();
+            }
+            if (isInPlaceConstruction(e, s)) {
+                return Ok(); // built in the box's memory by its Box.create (below)
+            }
+            match (n.rvalues[r as usize]) {
+                NirRvalue.ArrayRepeat(_) => {
+                    let place = appendPlaceIn(e, c, n, sources, f, target)?;
+                    return emitConstruction(e, c, n, sources, f, r, place.view(), "    ");
+                }
+                _ => {}
+            }
+            let built = inPlaceConstructionOf(e, s);
+            if (builtin == bfBoxCreate() && built != none()) {
+                // Built in place (§2): allocate first, then construct in the box's memory.
+                let resultType = n.rvalueTypes[r as usize];
+                let contents = c.types.info(resultOkOf(c, resultType)).pointee;
+                if (!inSet(e.inPlaceResults, resultType)) {
+                    markType(mut e.inPlaceResults, resultType)?;
+                }
+                let place = appendPlaceIn(e, c, n, sources, f, target)?;
+                e.line("    {")?;
+                e.t("        ")?;
+                appendCTypeName(c, mut e.buf, contents)?;
+                e.t(" *nv_p = ")?;
+                appendBoxAllocateName(c, mut e.buf, resultType)?;
+                e.t("();")?;
+                e.emit()?;
+                e.line("        if (nv_p == NULL) {")?;
+                var error = Vector<u8>.create();
+                appendAllocErrorResult(e, c, mut error, resultType)?;
+                e.t("            ")?;
+                e.b(place.view())?;
+                e.t(" = ")?;
+                e.b(error.view())?;
+                e.t(";")?;
+                e.emit()?;
+                e.line("        } else {")?;
+                let constructionValue = statementRvalue(n, built);
+                emitConstruction(e, c, n, sources, f, constructionValue, "(*nv_p)".bytes(), "            ")?;
+                var ok = Vector<u8>.create();
+                appendOkValue(e, c, mut ok, resultType, "nv_p".bytes())?;
+                e.t("            ")?;
+                e.b(place.view())?;
+                e.t(" = ")?;
+                e.b(ok.view())?;
+                e.t(";")?;
+                e.emit()?;
+                e.line("        }")?;
+                return e.line("    }");
+            }
+            match (n.rvalues[r as usize]) {
+                NirRvalue.FloatToInt(o, kind) => {
+                    match (kind) {
+                        FloatToIntKind.Checked => {
+                            // `checkedTruncate<T>(f)` (§35.4): the value if it fits, else null.
+                            let optionType = n.rvalueTypes[r as usize];
+                            let integer = c.types.optionType(optionType);
+                            let place = appendPlaceIn(e, c, n, sources, f, target)?;
+                            let operand = operandText(e, c, n, sources, f, o)?;
+                            e.t("    { ")?;
+                            appendCTypeName(c, mut e.buf, integer)?;
+                            e.t(" nv_r;")?;
+                            e.emit()?;
+                            var some = Vector<u8>.create();
+                            appendOptionValue(e, c, mut some, optionType, true, "nv_r".bytes())?;
+                            var missing = Vector<u8>.create();
+                            appendOptionValue(e, c, mut missing, optionType, false, "".bytes())?;
+                            e.t("      ")?;
+                            e.b(place.view())?;
+                            e.t(" = nv_try_ftoi_")?;
+                            appendSuffix(c, mut e.buf, integer)?;
+                            e.t("((double)")?;
+                            e.b(operand.view())?;
+                            e.t(", &nv_r) ? ")?;
+                            e.b(some.view())?;
+                            e.t(" : ")?;
+                            e.b(missing.view())?;
+                            e.t("; }")?;
+                            return e.emit();
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            if (builtin == bfCheckedAdd() || builtin == bfCheckedSub() || builtin == bfCheckedMul()) {
+                // `a.checkedAdd(b)` (type-system.md §6): the exact result if it fits, else null.
+                let optionType = n.rvalueTypes[r as usize];
+                let place = appendPlaceIn(e, c, n, sources, f, target)?;
+                var call = Vector<u8>.create();
+                appendArithmeticCall(e, c, n, sources, f, mut call, r, "&nv_r")?;
+                e.t("    { ")?;
+                appendCTypeName(c, mut e.buf, n.operandTypes[builtinArgument(n, r, 0) as usize])?;
+                e.t(" nv_r;")?;
+                e.emit()?;
+                var some = Vector<u8>.create();
+                appendOptionValue(e, c, mut some, optionType, true, "nv_r".bytes())?;
+                var missing = Vector<u8>.create();
+                appendOptionValue(e, c, mut missing, optionType, false, "".bytes())?;
+                e.t("      ")?;
+                e.b(place.view())?;
+                e.t(" = ")?;
+                e.b(call.view())?;
+                e.t(" ? ")?;
+                e.b(some.view())?;
+                e.t(" : ")?;
+                e.b(missing.view())?;
+                e.t("; }")?;
+                return e.emit();
+            }
+            match (n.rvalues[r as usize]) {
+                NirRvalue.Aggregate(_) => {
+                    let t = n.rvalueTypes[r as usize];
+                    var any = false;
+                    for (field in c.types.structs[c.types.info(t).structDef as usize].fields.view()) {
+                        if (isCArrayMember(c, t, field)) {
+                            any = true;
+                        }
+                    }
+                    if (any) {
+                        let place = appendPlaceIn(e, c, n, sources, f, target)?;
+                        return emitConstruction(e, c, n, sources, f, r, place.view(), "    ");
+                    }
+                }
+                _ => {}
+            }
+            let place = appendPlaceIn(e, c, n, sources, f, target)?;
+            var rvalue = Vector<u8>.create();
+            appendRvalue(e, c, n, sources, f, mut rvalue, r)?;
+            var value = Vector<u8>.create();
+            if (isBoundaryField(c, n, f, target)) {
+                appendToBoundary(c, mut value, placeTypeIn(c, n, f, target), rvalue.view())?;
+            } else {
+                value = rvalue;
+            }
+            // `x = x;` is a no-op in Nova; in C it trips -Wself-assign (c-backend.md §5).
+            if (!sameBytes(value.view(), place.view())) {
+                e.t("    ")?;
+                e.b(place.view())?;
+                e.t(" = ")?;
+                e.b(value.view())?;
+                e.t(";")?;
+                e.emit()?;
+            }
+            return Ok();
+        }
+        NirStatement.Unpack(source, variant, targets) => {
+            let sourceType = placeTypeIn(c, n, f, source);
+            let place = appendPlaceIn(e, c, n, sources, f, source)?;
+            let payload = borrow c.types.variants[variant as usize].payload;
+            for (k in 0..targets.count) {
+                let target = n.at(targets, k);
+                if (target == none()) {
+                    continue;
+                }
+                e.t("    ")?;
+                appendLocalNameIn(c, n, mut e.buf, f, target)?;
+                e.t(" = ")?;
+                appendPayloadPlace(c, mut e.buf, sourceType, place.view(), variant)?;
+                e.t(".")?;
+                appendFieldName(c, mut e.buf, payload[k as usize])?;
+                e.t(";")?;
+                e.emit()?;
+            }
+            return Ok();
+        }
+        NirStatement.BoxFree(box, flag) => {
+            let boxType = placeTypeIn(c, n, f, box);
+            let place = appendPlaceIn(e, c, n, sources, f, box)?;
+            var release = Vector<u8>.create();
+            if (c.types.isPoolBox(boxType)) {
+                appendText(mut release, "nova_pool_release(")?;
+                appendBytes(mut release, place.view())?;
+                appendText(mut release, ".pool, ")?;
+                appendBytes(mut release, place.view())?;
+                appendText(mut release, ".ptr);")?;
+            } else if (isUserAllocator(c, c.types.info(boxType).allocator)) {
+                appendBoxFreeName(c, mut release, boxType)?;
+                release.push('(')?;
+                appendBytes(mut release, place.view())?;
+                appendText(mut release, ");")?;
+            } else {
+                appendText(mut release, "nova_free(")?;
+                appendBytes(mut release, place.view())?;
+                appendText(mut release, ", ")?;
+                appendAllocatorId(c, mut release, c.types.info(boxType).allocator)?;
+                appendText(mut release, ");")?;
+            }
+            e.t("    ")?;
+            if (flag != none()) {
+                e.t("if (")?;
+                appendLocalNameIn(c, n, mut e.buf, f, flag)?;
+                e.t(") ")?;
+            }
+            e.b(release.view())?;
+            return e.emit();
+        }
+        NirStatement.BoundsCheck(index, length) => {
+            let i = operandText(e, c, n, sources, f, index)?;
+            let l = operandText(e, c, n, sources, f, length)?;
+            let site = siteText(e, c, n, sources, f, span.start)?;
+            e.t("    nv_check_index(")?;
+            e.b(i.view())?;
+            e.t(", ")?;
+            e.b(l.view())?;
+            e.t(", ")?;
+            e.b(site.view())?;
+            e.t(");")?;
+            return e.emit();
+        }
+        NirStatement.RangeCheck(low, high, length, text) => {
+            if (text != none()) {
+                // The text of a view or of a string: both have the bytes' (ptr, len).
+                let place = appendPlaceIn(e, c, n, sources, f, text)?;
+                let lo = operandText(e, c, n, sources, f, low)?;
+                let hi = operandText(e, c, n, sources, f, high)?;
+                let site = siteText(e, c, n, sources, f, span.start)?;
+                e.t("    nv_check_str_range(((nv_str){ .ptr = ")?;
+                e.b(place.view())?;
+                e.t(".ptr, .len = ")?;
+                e.b(place.view())?;
+                e.t(".len }), ")?;
+                e.b(lo.view())?;
+                e.t(", ")?;
+                e.b(hi.view())?;
+                e.t(", ")?;
+                e.b(site.view())?;
+                e.t(");")?;
+                return e.emit();
+            }
+            let lo = operandText(e, c, n, sources, f, low)?;
+            let hi = operandText(e, c, n, sources, f, high)?;
+            let len = operandText(e, c, n, sources, f, length)?;
+            let site = siteText(e, c, n, sources, f, span.start)?;
+            e.t("    nv_check_range(")?;
+            e.b(lo.view())?;
+            e.t(", ")?;
+            e.b(hi.view())?;
+            e.t(", ")?;
+            e.b(len.view())?;
+            e.t(", ")?;
+            e.b(site.view())?;
+            e.t(");")?;
+            return e.emit();
+        }
+        NirStatement.LengthCheck(left, right) => {
+            let l = operandText(e, c, n, sources, f, left)?;
+            let r = operandText(e, c, n, sources, f, right)?;
+            let site = siteText(e, c, n, sources, f, span.start)?;
+            e.t("    nv_check_length(")?;
+            e.b(l.view())?;
+            e.t(", ")?;
+            e.b(r.view())?;
+            e.t(", ")?;
+            e.b(site.view())?;
+            e.t(");")?;
+            return e.emit();
+        }
+        NirStatement.StorageDead(_) => { return Ok(); } // storage is the C local's; destruction is an explicit Drop
+        NirStatement.Drop(place, flag) => {
+            let t = placeTypeIn(c, n, f, place);
+            let text = appendPlaceIn(e, c, n, sources, f, place)?;
+            e.t("    ")?;
+            if (flag != none()) {
+                e.t("if (")?;
+                appendLocalNameIn(c, n, mut e.buf, f, flag)?;
+                e.t(") ")?;
+            }
+            appendDropGlueName(c, mut e.buf, t)?;
+            e.t("(&")?;
+            e.b(text.view())?;
+            e.t(");")?;
+            return e.emit();
+        }
+        NirStatement.Eval(r) => {
+            match (n.rvalues[r as usize]) {
+                NirRvalue.Builtin(_, _) => { return emitBuiltin(e, c, n, sources, f, r); }
+                NirRvalue.Use(o) => {
+                    let operand = operandText(e, c, n, sources, f, o)?;
+                    e.t("    (void)")?;
+                    e.b(operand.view())?;
+                    e.t(";")?; // e.g. the Copy payload of a discarded `e!`
+                    return e.emit();
+                }
+                _ => {
+                    var value = Vector<u8>.create();
+                    appendRvalue(e, c, n, sources, f, mut value, r)?;
+                    e.t(if (c.types.is(n.rvalueTypes[r as usize], TypeKind.Void)) "    " else "    (void)")?;
+                    e.b(value.view())?;
+                    e.t(";")?;
+                    return e.emit();
+                }
+            }
+        }
+    }
+}
+
+/// Whether a builtin evaluated for its effect is written as its rvalue (EmitBuiltin's first case).
+fn isRvalueBuiltin(b: u32) -> bool =>
+    b == bfVectorPush() || b == bfStringAppend() || b == bfStringAppendNumber() || b == bfVectorPop() ||
+        b == bfVectorClear() || b == bfVectorWithCapacity() || b == bfStableVectorPush() || b == bfSlotMapInsert() ||
+        b == bfSlotMapGet() || b == bfSlotMapRemove() || b == bfSlotMapContains() || b == bfFileOpen() ||
+        b == bfFileCreate() || b == bfFileRemove() || b == bfResourceRead() || b == bfResourceWrite() ||
+        b == bfConsoleRead() || b == bfTcpListen() || b == bfTcpConnect() || b == bfTcpPort() || b == bfTcpAccept() ||
+        b == bfTcpShutdownWrite() || b == bfArgument() || b == bfArgumentCount() || b == bfProcessRun() ||
+        b == bfIoErrorMessage() || b == bfPtrAdd() || b == bfPtrSub() || b == bfPtrOffset() || b == bfPtrIsNull() ||
+        b == bfSlicePtr() || b == bfSliceFromRaw() || b == bfPtrReadVolatile() || b == bfPtrWriteVolatile() ||
+        b == bfPtrPlace() || b == bfSpinHint() || b == bfTargetIsX8664() || b == bfTargetIsAArch64() ||
+        b == bfCallPointer() || b == bfCallFunction() || b == bfCallClosure() || b == bfFloatBits() ||
+        b == bfFloatFromBits() ||
+        b == bfFloatSqrt() || b == bfFloatAbs() || b == bfFloatFloor() || b == bfFloatCeil() ||
+        b == bfFloatMin() || b == bfFloatMax() || b == bfThreadSpawn() || b == bfThreadJoin() ||
+        b == bfThreadSpawnBoxed() || b == bfThreadBoth() || b == bfCallerAddress() || b == bfOffsetOf();
+
+fn emitBuiltin(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    r: u32,
+) -> Result<void, AllocError> {
+    let b = builtinOf(n, r);
+    let arguments = match (n.rvalues[r as usize]) {
+        NirRvalue.Builtin(_, a) => a,
+        _ => emptyRange(),
+    };
+    if (isRvalueBuiltin(b)) {
+        var value = Vector<u8>.create();
+        appendRvalue(e, c, n, sources, f, mut value, r)?;
+        e.t(if (c.types.is(n.rvalueTypes[r as usize], TypeKind.Void)) "    " else "    (void)")?;
+        e.b(value.view())?;
+        e.t(";")?;
+        return e.emit();
+    }
+    if (b == bfWrappingAdd() || b == bfWrappingSub() || b == bfWrappingMul() || b == bfSaturatingAdd() ||
+        b == bfSaturatingSub() || b == bfSaturatingMul()) {
+        var call = Vector<u8>.create();
+        appendArithmeticCall(e, c, n, sources, f, mut call, r, "")?;
+        e.t("    (void)")?;
+        e.b(call.view())?;
+        e.t(";")?;
+        return e.emit();
+    }
+    if (b == bfCheckedAdd() || b == bfCheckedSub() || b == bfCheckedMul()) {
+        var call = Vector<u8>.create();
+        appendArithmeticCall(e, c, n, sources, f, mut call, r, "&nv_r")?;
+        e.t("    { ")?;
+        appendCTypeName(c, mut e.buf, n.operandTypes[n.at(arguments, 0) as usize])?;
+        e.t(" nv_r; (void)")?;
+        e.b(call.view())?;
+        e.t("; }")?;
+        return e.emit();
+    }
+    if (b == bfSliceCopy()) {
+        let destination = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        let source = operandText(e, c, n, sources, f, n.at(arguments, 1))?;
+        e.t("    nv_slice_copy(")?;
+        e.b(destination.view())?;
+        e.t(".ptr, ")?;
+        e.b(source.view())?;
+        e.t(".ptr, ")?;
+        e.b(destination.view())?;
+        e.t(".len, sizeof *")?;
+        e.b(destination.view())?;
+        e.t(".ptr);")?;
+        return e.emit();
+    }
+    if (b == bfSliceFill()) {
+        // One-byte elements are a memset; other loops the C compiler may turn into one (c-backend.md §2).
+        let slice = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        let value = operandText(e, c, n, sources, f, n.at(arguments, 1))?;
+        let element = c.types.info(c.types.info(n.operandTypes[n.at(arguments, 0) as usize]).pointee).element;
+        let info = c.types.info(element);
+        if (c.types.is(element, TypeKind.Bool) || (c.types.is(element, TypeKind.Integer) && info.bits == 8)) {
+            e.t("    nv_slice_fill_byte(")?;
+            e.b(slice.view())?;
+            e.t(".ptr, ")?;
+            if (!(c.types.is(element, TypeKind.Integer) && !info.signed)) {
+                e.t("(uint8_t)")?;
+            }
+            e.b(value.view())?;
+            e.t(", ")?;
+            e.b(slice.view())?;
+            e.t(".len);")?;
+        } else {
+            e.t("    for (uint64_t nv_i = 0u; nv_i < ")?;
+            e.b(slice.view())?;
+            e.t(".len; nv_i++) ")?;
+            e.b(slice.view())?;
+            e.t(".ptr[nv_i] = ")?;
+            e.b(value.view())?;
+            e.t(";")?;
+        }
+        return e.emit();
+    }
+    if (b == bfVectorTruncate()) {
+        // Keeps the first n elements and destroys the rest, from the lowest index up (type-system.md §23.1).
+        let vectorType = n.operandTypes[n.at(arguments, 0) as usize];
+        let vector = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        let keep = operandText(e, c, n, sources, f, n.at(arguments, 1))?;
+        let element = c.types.info(c.types.info(c.types.info(vectorType).pointee).pointee).element;
+        e.t("    { ")?;
+        appendCTypeName(c, mut e.buf, vectorType)?;
+        e.t(" nv_v = ")?;
+        e.b(vector.view())?;
+        e.t("; uint64_t nv_n = ")?;
+        e.b(keep.view())?;
+        e.t("; if (nv_n < nv_v->len) { uint64_t nv_e = nv_v->len; nv_v->len = nv_n;")?;
+        if (element != none() && c.types.needsDrop(element)) {
+            e.t(" for (uint64_t nv_i = nv_n; nv_i < nv_e; nv_i++) ")?;
+            appendDropGlueName(c, mut e.buf, element)?;
+            e.t("(&nv_v->ptr[nv_i]);")?;
+        } else {
+            e.t(" (void)nv_e;")?;
+        }
+        e.t(" } }")?;
+        return e.emit();
+    }
+    if (b == bfSliceSwap()) {
+        // The indices were checked; the elements move, whatever their type (type-system.md §16.5).
+        let slice = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        let i = operandText(e, c, n, sources, f, n.at(arguments, 1))?;
+        let j = operandText(e, c, n, sources, f, n.at(arguments, 2))?;
+        let element = c.types.info(c.types.info(n.operandTypes[n.at(arguments, 0) as usize]).pointee).element;
+        e.t("    { ")?;
+        appendCTypeName(c, mut e.buf, element)?;
+        e.t(" nv_t = ")?;
+        e.b(slice.view())?;
+        e.t(".ptr[")?;
+        e.b(i.view())?;
+        e.t("]; ")?;
+        e.b(slice.view())?;
+        e.t(".ptr[")?;
+        e.b(i.view())?;
+        e.t("] = ")?;
+        e.b(slice.view())?;
+        e.t(".ptr[")?;
+        e.b(j.view())?;
+        e.t("]; ")?;
+        e.b(slice.view())?;
+        e.t(".ptr[")?;
+        e.b(j.view())?;
+        e.t("] = nv_t; }")?;
+        return e.emit();
+    }
+    if (b == bfFailAfter()) {
+        let count = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        e.t("    nova_fail_after(")?;
+        e.b(count.view())?;
+        e.t(");")?;
+        return e.emit();
+    }
+    if (b == bfFailReset()) {
+        return e.line("    nova_fail_reset();");
+    }
+    if (b == bfArenaReset()) {
+        let arena = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        e.t("    nova_arena_reset(")?;
+        e.b(arena.view())?;
+        e.t(");")?;
+        return e.emit();
+    }
+    if (b == bfConsoleWriteBytes()) {
+        let bytes = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        e.t("    nova_write_bytes(")?;
+        e.b(bytes.view())?;
+        e.t(".ptr, ")?;
+        e.b(bytes.view())?;
+        e.t(".len);")?;
+        return e.emit();
+    }
+    if (b == bfConsoleWriteError() || b == bfConsoleWriteErrorLine()) {
+        for (k in 0..arguments.count) {
+            let text = operandText(e, c, n, sources, f, n.at(arguments, k))?;
+            e.t("    nova_write_error(")?;
+            e.b(text.view())?;
+            e.t(");")?;
+            e.emit()?;
+        }
+        if (b == bfConsoleWriteErrorLine()) {
+            e.line("    nova_write_error(((nv_str){ .ptr = (const uint8_t *)\"\\n\", .len = 1u }));")?;
+        }
+        return Ok();
+    }
+    for (k in 0..arguments.count) {
+        let o = n.at(arguments, k);
+        let t = n.operandTypes[o as usize];
+        match (n.operands[o as usize]) {
+            NirOperand.String(text) => {
+                let bytes = n.textOf(text);
+                e.t("    nova_write_str(")?;
+                appendCStringLiteral(mut e.buf, bytes)?;
+                e.t(", ")?;
+                e.d(bytes.length as u64)?;
+                e.t("u);")?;
+                e.emit()?;
+                continue;
+            }
+            _ => {}
+        }
+        let operand = operandText(e, c, n, sources, f, o)?;
+        if (c.types.is(t, TypeKind.Bool)) {
+            e.t("    nova_write_bool(")?;
+            e.b(operand.view())?;
+            e.t(");")?;
+        } else if (c.types.is(t, TypeKind.Float)) {
+            // The shortest round-trip text, into a buffer that lives to the end of the block (§35.7).
+            e.t("    nova_write_view(nova_format_f")?;
+            e.d(c.types.info(t).bits as u64)?;
+            e.t("(")?;
+            e.b(operand.view())?;
+            e.t(", (uint8_t[NV_FLOAT_CHARS]){ 0 }));")?;
+        } else if (c.types.isStringView(t)) {
+            e.t("    nova_write_view(")?;
+            e.b(operand.view())?;
+            e.t(");")?;
+        } else if (c.types.info(t).signed) {
+            e.t("    nova_write_i64((int64_t)")?;
+            e.b(operand.view())?;
+            e.t(");")?;
+        } else {
+            e.t("    nova_write_u64((uint64_t)")?;
+            e.b(operand.view())?;
+            e.t(");")?;
+        }
+        e.emit()?;
+    }
+    if (b == bfConsoleWriteLine()) {
+        e.line("    nova_write_newline();")?;
+    }
+    return Ok();
+}
+
+fn emitTerminator(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    terminator: u32,
+) -> Result<void, AllocError> {
+    let span = n.terminatorSpans[terminator as usize];
+    let source = nirFunctionSource(n, f);
+    match (n.terminators[terminator as usize]) {
+        NirTerminator.Goto(target) => {
+            e.t("    goto bb")?;
+            e.d(target as u64)?;
+            e.t(";")?;
+        }
+        NirTerminator.Branch(condition, then, otherwise) => {
+            let operand = operandText(e, c, n, sources, f, condition)?;
+            e.t("    if (")?;
+            e.b(operand.view())?;
+            e.t(") goto bb")?;
+            e.d(then as u64)?;
+            e.t("; else goto bb")?;
+            e.d(otherwise as u64)?;
+            e.t(";")?;
+        }
+        NirTerminator.Switch(value, cases, otherwise) => {
+            // C rejects switching on a bool (-Wswitch-bool): switch on its int value instead.
+            let t = n.operandTypes[value as usize];
+            let isBool = c.types.is(t, TypeKind.Bool);
+            let operand = operandText(e, c, n, sources, f, value)?;
+            e.t(if (isBool) "    switch ((int)" else "    switch (")?;
+            e.b(operand.view())?;
+            e.t(") {")?;
+            e.emit()?;
+            for (k in 0..cases.count) {
+                let case = n.cases[(cases.start + k) as usize];
+                e.t("    case ")?;
+                if (isBool) {
+                    appendIntValue(mut e.buf, case.value)?;
+                } else {
+                    appendConstant(c, mut e.buf, case.value, t)?;
+                }
+                e.t(": goto bb")?;
+                e.d(case.target as u64)?;
+                e.t(";")?;
+                e.emit()?;
+            }
+            e.t("    default: goto bb")?;
+            e.d(otherwise as u64)?;
+            e.t(";")?;
+            e.emit()?;
+            e.t("    }")?;
+        }
+        NirTerminator.Return(value) => {
+            if (value == none()) {
+                e.t("    return;")?;
+            } else {
+                let operand = operandText(e, c, n, sources, f, value)?;
+                e.t("    return ")?;
+                e.b(operand.view())?;
+                e.t(";")?;
+            }
+        }
+        NirTerminator.Exit(code) => {
+            let operand = operandText(e, c, n, sources, f, code)?;
+            e.t("    nova_exit(")?;
+            e.b(operand.view())?;
+            e.t(");")?;
+        }
+        NirTerminator.Panic(kind) => {
+            e.t(match (kind) {
+                NirPanicKind.UnwrapNull => "    nova_panic(NV_PANIC_UNWRAP_NULL, ",
+                NirPanicKind.Unwrap => "    nova_panic(NV_PANIC_UNWRAP, ",
+            })?;
+            var location = Vector<u8>.create();
+            appendLocation(e, mut location, sources, c.hir.functions[source as usize].file, span.start)?;
+            e.b(location.view())?;
+            e.t(");")?;
+        }
+        NirTerminator.Unreachable => {
+            e.t("    nova_panic(NV_PANIC_UNREACHABLE, ")?;
+            var location = Vector<u8>.create();
+            appendLocation(
+                e,
+                mut location,
+                sources,
+                c.hir.functions[source as usize].file,
+                functionNameStart(c, source),
+            )?;
+            e.b(location.view())?;
+            e.t(");")?;
+        }
+    }
+    return e.emit();
+}
+
+/// A call of rt.h's helper for an explicit-overflow method (ArithmeticCall, §6); `result` is empty but for the
+/// checked ones.
+fn appendArithmeticCall(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    out: borrow mut Vector<u8>,
+    r: u32,
+    result: StringView,
+) -> Result<void, AllocError> {
+    let b = builtinOf(n, r);
+    let name =
+        if (b ==
+            bfWrappingAdd()) "nv_wrapping_add_" else if (b ==
+            bfWrappingSub()) "nv_wrapping_sub_" else if (b ==
+            bfWrappingMul()) "nv_wrapping_mul_" else if (b ==
+            bfCheckedAdd()) "nv_try_add_" else if (b ==
+            bfCheckedSub()) "nv_try_sub_" else if (b ==
+            bfCheckedMul()) "nv_try_mul_" else if (b ==
+            bfSaturatingAdd()) "nv_saturating_add_" else if (b ==
+            bfSaturatingSub()) "nv_saturating_sub_" else "nv_saturating_mul_";
+    let left = operandText(e, c, n, sources, f, builtinArgument(n, r, 0))?;
+    let right = operandText(e, c, n, sources, f, builtinArgument(n, r, 1))?;
+    appendText(out, name)?;
+    appendSuffix(c, out, n.operandTypes[builtinArgument(n, r, 0) as usize])?;
+    out.push('(')?;
+    appendBytes(out, left.view())?;
+    appendText(out, ", ")?;
+    appendBytes(out, right.view())?;
+    if (result.length > 0) {
+        appendText(out, ", ")?;
+        appendText(out, result)?;
+    }
+    return out.push(')');
+}
+
+/// A location a checked helper may panic with (Site, c-backend.md §6): `&nvL_<n>`, collected by the trial emission.
+fn appendSite(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    out: borrow mut Vector<u8>,
+    start: u32,
+) -> Result<void, AllocError> {
+    let file = c.hir.functions[nirFunctionSource(n, f) as usize].file;
+    let position = sources[file as usize].position(start as usize);
+    let id = e.fileIds[file as usize];
+    let key = pairKey(((id as u64) << 32) | position.line as u64, position.column as u64);
+    var site = foundIn(e.sites, key);
+    if (site == none()) {
+        // The final emission sees exactly the trial's locations; one it did not see would be a bug.
+        site = truncate<u32>(e.siteList.length);
+        e.sites.put(key, site)?;
+        e.siteList.push(CSite { file: id, line: position.line, column: position.column })?;
+    }
+    appendText(out, "&nvL_")?;
+    return appendDecimal(out, site as u64);
+}
+
+/// `p.add(n)`, `sub`, `offset`: address arithmetic modulo 2^64 (PointerStep, unsafe.md §4).
+fn appendPointerStep(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    out: borrow mut Vector<u8>,
+    r: u32,
+) -> Result<void, AllocError> {
+    let pointer = builtinArgument(n, r, 0);
+    let p = operandText(e, c, n, sources, f, pointer)?;
+    let k = operandText(e, c, n, sources, f, builtinArgument(n, r, 1))?;
+    appendText(out, "((")?;
+    appendCTypeName(c, out, n.rvalueTypes[r as usize])?;
+    appendText(out, ")((uintptr_t)")?;
+    appendBytes(out, p.view())?;
+    appendText(out, if (builtinOf(n, r) == bfPtrSub()) " - (uintptr_t)" else " + (uintptr_t)")?;
+    appendBytes(out, k.view())?;
+    appendText(out, " * sizeof(")?;
+    appendCTypeName(c, out, c.types.info(n.operandTypes[pointer as usize]).pointee)?;
+    return appendText(out, ")))");
+}
+
+/// The operands of a range, each as text, separated by ", ".
+fn appendOperandList(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    out: borrow mut Vector<u8>,
+    list: Range,
+    from: u32,
+) -> Result<void, AllocError> {
+    for (k in from..list.count) {
+        if (k > from) {
+            appendText(out, ", ")?;
+        }
+        let operand = operandText(e, c, n, sources, f, n.at(list, k))?;
+        appendBytes(out, operand.view())?;
+    }
+    return Ok();
+}
+
+/// `name(op0, op1, …)` for a builtin's arguments from `from`.
+fn appendBuiltinCall(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    out: borrow mut Vector<u8>,
+    prefix: Slice<u8>,
+    arguments: Range,
+) -> Result<void, AllocError> {
+    appendBytes(out, prefix)?;
+    out.push('(')?;
+    appendOperandList(e, c, n, sources, f, out, arguments, 0)?;
+    return out.push(')');
+}
+
+/// `nvX_<mangled pointee of argument 0>(args)`.
+fn appendHelperCall(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    out: borrow mut Vector<u8>,
+    prefix: StringView,
+    mangledType: u32,
+    arguments: Range,
+) -> Result<void, AllocError> {
+    var name = copyBytes(prefix.bytes())?;
+    appendMangle(c, mut name, mangledType)?;
+    return appendBuiltinCall(e, c, n, sources, f, out, name.view(), arguments);
+}
+
+/// An I/O helper applied to a runtime call: `nvIOR_…(call)`.
+fn appendIoCall(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    result: u32,
+    call: Slice<u8>,
+) -> Result<void, AllocError> {
+    appendIoHelper(c, out, result)?;
+    out.push('(')?;
+    appendBytes(out, call)?;
+    return out.push(')');
+}
+
+fn appendRvalue(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    out: borrow mut Vector<u8>,
+    r: u32,
+) -> Result<void, AllocError> {
+    let t = n.rvalueTypes[r as usize];
+    let span = n.rvalueSpans[r as usize];
+    match (n.rvalues[r as usize]) {
+        NirRvalue.Use(o) => { return appendOperand(e, c, n, sources, f, out, o); }
+        NirRvalue.Binary(op, left, right) => {
+            return appendBinary(e, c, n, sources, f, out, op, left, right, span.start, t);
+        }
+        NirRvalue.Unary(op, o) => {
+            let operand = operandText(e, c, n, sources, f, o)?;
+            match (op) {
+                UnaryOp.Not => {
+                    out.push('!')?;
+                    return appendBytes(out, operand.view());
+                }
+                UnaryOp.Negate => {
+                    if (c.types.is(t, TypeKind.Float)) {
+                        appendText(out, "(-")?;
+                        appendBytes(out, operand.view())?;
+                        return out.push(')');
+                    }
+                    let site = siteText(e, c, n, sources, f, span.start)?;
+                    appendText(out, "nv_neg_")?;
+                    appendSuffix(c, out, t)?;
+                    out.push('(')?;
+                    appendBytes(out, operand.view())?;
+                    appendText(out, ", ")?;
+                    appendBytes(out, site.view())?;
+                    return out.push(')');
+                }
+            }
+        }
+        NirRvalue.Cast(o) => { return appendCast(e, c, n, sources, f, out, o, t); }
+        NirRvalue.Truncate(o) => {
+            // truncate<T>: to the unsigned type of T's width, then reinterpreted as signed if T is (§7).
+            let bits = c.types.info(t).bits;
+            let operand = operandText(e, c, n, sources, f, o)?;
+            if (c.types.info(t).signed) {
+                appendText(out, "nv_as_i")?;
+                appendDecimal(out, bits as u64)?;
+                out.push('(')?;
+            }
+            appendText(out, "(uint")?;
+            appendDecimal(out, bits as u64)?;
+            appendText(out, "_t)")?;
+            appendBytes(out, operand.view())?;
+            if (c.types.info(t).signed) {
+                out.push(')')?;
+            }
+            return Ok();
+        }
+        NirRvalue.FloatToInt(o, kind) => {
+            let operand = operandText(e, c, n, sources, f, o)?;
+            match (kind) {
+                FloatToIntKind.Saturating => {
+                    appendText(out, "nv_sat_ftoi_")?;
+                    appendSuffix(c, out, t)?;
+                    appendText(out, "((double)")?;
+                    appendBytes(out, operand.view())?;
+                    return out.push(')');
+                }
+                _ => {
+                    let site = siteText(e, c, n, sources, f, span.start)?;
+                    appendText(out, "nv_ftoi_")?;
+                    appendSuffix(c, out, t)?;
+                    appendText(out, "((double)")?;
+                    appendBytes(out, operand.view())?;
+                    appendText(out, ", ")?;
+                    appendBytes(out, site.view())?;
+                    return out.push(')');
+                }
+            }
+        }
+        NirRvalue.Call(callee, arguments) => {
+            let function = borrow c.hir.functions[callee as usize];
+            if (function.isDynMethod) {
+                // A call through a dyn value's table (§37.3): the receiver's entry, with its data as `this`.
+                let receiver = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+                appendBytes(out, receiver.view())?;
+                appendText(out, ".vt->m")?;
+                appendDecimal(out, function.dynSlot as u64)?;
+                out.push('(')?;
+                appendBytes(out, receiver.view())?;
+                appendText(out, ".data")?;
+                if (arguments.count > 1) {
+                    appendText(out, ", ")?;
+                    appendOperandList(e, c, n, sources, f, out, arguments, 1)?;
+                }
+                return out.push(')');
+            }
+            if (isExternFunction(c, callee) && function.isConstant) {
+                // A C constant macro outside an initialiser is a compound literal (§39.5).
+                appendText(out, "((")?;
+                appendCTypeName(c, out, function.returnType)?;
+                out.push(')')?;
+                appendBuiltinCall(e, c, n, sources, f, out, c.name(function.name), arguments)?;
+                return out.push(')');
+            }
+            appendCFunctionName(c, out, callee)?;
+            out.push('(')?;
+            appendOperandList(e, c, n, sources, f, out, arguments, 0)?;
+            if (function.usesCallerAddress) {
+                if (arguments.count > 0) {
+                    appendText(out, ", ")?;
+                }
+                out.push('0')?;
+            }
+            return out.push(')');
+        }
+        NirRvalue.StaticAddress(item) => {
+            appendText(out, "(&")?;
+            appendStaticName(c, out, item)?;
+            return out.push(')');
+        }
+        NirRvalue.Aggregate(fields) => { return appendAggregate(e, c, n, sources, f, out, t, fields); }
+        NirRvalue.Ref(_, place) => {
+            let placeType = placeTypeIn(c, n, f, place);
+            if (c.types.isUnsized(placeType)) {
+                // A slice reborrow (or SliceMut to Slice): the place of `s.*` is the slice `s` itself.
+                let text = appendPlaceIn(e, c, n, sources, f, place)?;
+                appendText(out, "((")?;
+                appendCTypeName(c, out, t)?;
+                appendText(out, "){ .ptr = ")?;
+                appendBytes(out, text.view())?;
+                appendText(out, ".ptr, .len = ")?;
+                appendBytes(out, text.view())?;
+                return appendText(out, ".len })");
+            }
+            if (c.types.isDyn(placeType)) {
+                // A borrow of `*p` where p is a dyn reference or box is p's pair itself (§37.4).
+                let p = n.places[place as usize];
+                return appendPlaceParts(e, c, n, sources, f, out, p.local, p.projections, p.projections.count - 1);
+            }
+            out.push('&')?;
+            return appendPlace(e, c, n, sources, f, out, place);
+        }
+        NirRvalue.Slice(_, base, low, high) => {
+            let baseText = appendPlaceIn(e, c, n, sources, f, base)?;
+            let lo = operandText(e, c, n, sources, f, low)?;
+            let hi = operandText(e, c, n, sources, f, high)?;
+            appendText(out, "((")?;
+            appendCTypeName(c, out, t)?;
+            appendText(out, "){ .ptr = ")?;
+            appendBytes(out, baseText.view())?;
+            appendText(out, if (c.types.isUnsized(placeTypeIn(c, n, f, base))) ".ptr + " else ".e + ")?;
+            appendBytes(out, lo.view())?;
+            appendText(out, ", .len = ")?;
+            appendBytes(out, hi.view())?;
+            appendText(out, " - ")?;
+            appendBytes(out, lo.view())?;
+            return appendText(out, " })");
+        }
+        NirRvalue.Length(place) => {
+            appendPlace(e, c, n, sources, f, out, place)?;
+            return appendText(out, ".len");
+        }
+        NirRvalue.Builtin(b, arguments) => { return appendBuiltinRvalue(e, c, n, sources, f, out, r, b, arguments, t); }
+        NirRvalue.FunctionAddress(function) => {
+            if (c.types.is(t, TypeKind.Function) || c.types.is(t, TypeKind.Closure)) {
+                return appendCFunctionName(c, out, function); // a function value (§36.1) or a closure's code (§36.2)
+            }
+            if (isExternFunction(c, function)) {
+                return appendBytes(out, c.name(c.hir.functions[function as usize].name));
+            }
+            if (c.hir.functions[function as usize].exported) {
+                return appendBytes(out, c.hir.textOf(c.hir.functions[function as usize].exportName));
+            }
+            return appendCallbackName(c, out, function);
+        }
+        NirRvalue.Array(elements) => {
+            appendText(out, "((")?;
+            appendCTypeName(c, out, t)?;
+            appendText(out, "){ .e = { ")?;
+            appendOperandList(e, c, n, sources, f, out, elements, 0)?;
+            return appendText(out, " } })");
+        }
+        NirRvalue.Discriminant(place) => {
+            let placeType = placeTypeIn(c, n, f, place);
+            let text = appendPlaceIn(e, c, n, sources, f, place)?;
+            if (!c.types.isNicheOptional(placeType)) {
+                appendText(out, "(uint32_t)")?;
+            }
+            return appendTag(c, out, placeType, text.view());
+        }
+        NirRvalue.EnumAggregate(variant, payload) => {
+            return appendEnumAggregate(e, c, n, sources, f, out, t, variant, payload);
+        }
+        NirRvalue.ArrayRepeat(_) => { return appendText(out, "?"); } // written by EmitConstruction
+    }
+}
+
+fn appendCast(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    out: borrow mut Vector<u8>,
+    o: u32,
+    t: u32,
+) -> Result<void, AllocError> {
+    let from = n.operandTypes[o as usize];
+    let operand = operandText(e, c, n, sources, f, o)?;
+    if (c.types.isClosure(t) || c.types.is(t, TypeKind.RawPointer) || c.types.is(t, TypeKind.FunctionPointer)) {
+        // `borrow fn` to `borrow mut fn`, and pointers: through uintptr_t, no pointer-to-pointer cast (unsafe.md §4).
+        appendText(out, "((")?;
+        appendCTypeName(c, out, t)?;
+        appendText(out, ")(uintptr_t)")?;
+        appendBytes(out, operand.view())?;
+        return out.push(')');
+    }
+    if (c.types.isStringView(from)) {
+        // `s.bytes()`: the same pointer and length as a `Slice<u8>` (§22.2).
+        appendText(out, "((")?;
+        appendCTypeName(c, out, t)?;
+        appendText(out, "){ .ptr = ")?;
+        appendBytes(out, operand.view())?;
+        appendText(out, ".ptr, .len = ")?;
+        appendBytes(out, operand.view())?;
+        return appendText(out, ".len })");
+    }
+    if ((c.types.is(from, TypeKind.RawPointer) && c.types.is(t, TypeKind.Integer)) ||
+        c.types.is(from, TypeKind.FunctionPointer)) {
+        appendText(out, "((uint64_t)(uintptr_t)")?;
+        appendBytes(out, operand.view())?;
+        return out.push(')');
+    }
+    if (c.types.is(t, TypeKind.Float) && c.types.info(t).bits == 32 && c.types.is(from, TypeKind.Float) &&
+        c.types.info(from).bits == 64) {
+        // round<f32>(d): without C's undefined behaviour for finite values beyond f32's range (§35.6).
+        appendText(out, "nv_f64_to_f32(")?;
+        appendBytes(out, operand.view())?;
+        return out.push(')');
+    }
+    if ((c.types.isDynReference(t) || c.types.isDynBox(t)) && !c.types.isDyn(c.types.info(from).pointee)) {
+        // A coercion to a dyn type (§37.2, §37.4): the address and the table of the pair (T, dyn I).
+        appendText(out, "((")?;
+        appendCTypeName(c, out, t)?;
+        appendText(out, "){ .data = (void *)(uintptr_t)")?;
+        appendBytes(out, operand.view())?;
+        appendText(out, ", .vt = &")?;
+        appendDynTableName(c, out, c.types.info(from).pointee, c.types.info(t).pointee)?;
+        return appendText(out, " })");
+    }
+    let to = cTypeName(c, t)?;
+    let fromName = cTypeName(c, from)?;
+    if (sameBytes(to.view(), fromName.view())) {
+        return appendBytes(out, operand.view()); // `+ Send` forgotten (§38.4)
+    }
+    out.push('(')?;
+    appendBytes(out, to.view())?;
+    out.push(')')?;
+    return appendBytes(out, operand.view());
+}
+
+fn argumentType(n: borrow NirProgram, arguments: Range, k: u32) -> u32 => n.operandTypes[n.at(arguments, k) as usize];
+
+fn appendBuiltinRvalue(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    out: borrow mut Vector<u8>,
+    r: u32,
+    b: u32,
+    arguments: Range,
+    t: u32,
+) -> Result<void, AllocError> {
+    if (b == bfFloatBits()) {
+        appendText(out, "nv_f")?;
+        appendDecimal(out, c.types.info(argumentType(n, arguments, 0)).bits as u64)?;
+        return appendBuiltinCall(e, c, n, sources, f, out, "_bits".bytes(), arguments);
+    }
+    if (b == bfFloatFromBits()) {
+        appendText(out, "nv_f")?;
+        appendDecimal(out, c.types.info(t).bits as u64)?;
+        return appendBuiltinCall(e, c, n, sources, f, out, "_from_bits".bytes(), arguments);
+    }
+    if (b == bfFloatSqrt() || b == bfFloatAbs() || b == bfFloatFloor() || b == bfFloatCeil() || b == bfFloatMin() ||
+        b == bfFloatMax()) {
+        // rt.h's helpers (§35.8): exact portable C, and the hardware square root; never a libm call.
+        appendText(
+            out,
+            if (b ==
+                bfFloatSqrt()) "nv_sqrt_f" else if (b ==
+                bfFloatAbs()) "nv_abs_f" else if (b ==
+                bfFloatFloor()) "nv_floor_f" else if (b ==
+                bfFloatCeil()) "nv_ceil_f" else if (b == bfFloatMin()) "nv_min_f" else "nv_max_f",
+        )?;
+        appendDecimal(out, c.types.info(t).bits as u64)?;
+        return appendBuiltinCall(e, c, n, sources, f, out, "".bytes(), arguments);
+    }
+    if (b == bfThreadSpawn()) {
+        return appendHelperCall(e, c, n, sources, f, out, "nvTS_", argumentType(n, arguments, 0), arguments);
+    }
+    if (b == bfThreadJoin()) {
+        return appendHelperCall(e, c, n, sources, f, out, "nvTJ_", t, arguments);
+    }
+    if (b == bfThreadBoth()) {
+        var name = copyBytes("nvBOTH_".bytes())?;
+        appendMangle(c, mut name, argumentType(n, arguments, 0))?;
+        name.push('_')?;
+        appendMangle(c, mut name, argumentType(n, arguments, 1))?;
+        return appendBuiltinCall(e, c, n, sources, f, out, name.view(), arguments);
+    }
+    if (b == bfThreadSpawnBoxed()) {
+        return appendHelperCall(e, c, n, sources, f, out, "nvTSB_", c.types.info(resultOkOf(c, t)).element, arguments);
+    }
+    if (b == bfArenaCreate()) {
+        appendText(out, "nova_arena_create(")?;
+        appendAllocatorId(c, out, argumentType(n, arguments, 0))?;
+        appendText(out, ", ")?;
+        let capacity = operandText(e, c, n, sources, f, n.at(arguments, 1))?;
+        appendBytes(out, capacity.view())?;
+        return out.push(')');
+    }
+    if (b == bfArenaAlloc() || b == bfArenaAllocArray()) {
+        appendArenaHelperName(c, out, t)?;
+        out.push('(')?;
+        let arena = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        appendBytes(out, arena.view())?;
+        appendText(out, ", ")?;
+        appendRegionId(c, out, argumentType(n, arguments, 0))?;
+        let last: u32 = if (b == bfArenaAlloc()) 2 else 3;
+        for (k in 1..last) {
+            appendText(out, ", ")?;
+            let value = operandText(e, c, n, sources, f, n.at(arguments, k))?;
+            appendBytes(out, value.view())?;
+        }
+        return out.push(')');
+    }
+    if (b == bfFixedBufferOver()) {
+        let buffer = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        appendText(out, "nova_fba_over(")?;
+        appendBytes(out, buffer.view())?;
+        appendText(out, ".ptr, ")?;
+        appendBytes(out, buffer.view())?;
+        return appendText(out, ".len)");
+    }
+    if (b == bfPoolCreate()) {
+        appendText(out, "nova_pool_create(")?;
+        appendAllocatorId(c, out, argumentType(n, arguments, 0))?;
+        appendText(out, ", (uint64_t)")?;
+        let count = operandText(e, c, n, sources, f, n.at(arguments, 1))?;
+        appendBytes(out, count.view())?;
+        return out.push(')');
+    }
+    if (b == bfPoolTake()) {
+        return appendHelperCall(e, c, n, sources, f, out, "nvPT_", argumentType(n, arguments, 1), arguments);
+    }
+    if (b == bfScratchNest()) {
+        return appendBuiltinCall(e, c, n, sources, f, out, "nova_scratch_enter_child".bytes(), arguments);
+    }
+    if (b == bfFileOpen() || b == bfFileCreate()) {
+        var call = Vector<u8>.create();
+        appendBuiltinCall(e, c, n, sources, f, mut call, "nova_file_open".bytes(), arguments)?;
+        call.pop();
+        appendText(mut call, if (b == bfFileOpen()) ", 0u)" else ", 1u)")?;
+        return appendIoCall(c, out, t, call.view());
+    }
+    if (b == bfFileRemove()) {
+        var call = Vector<u8>.create();
+        appendBuiltinCall(e, c, n, sources, f, mut call, "nova_file_remove".bytes(), arguments)?;
+        return appendIoCall(c, out, t, call.view());
+    }
+    if (b == bfResourceRead() || b == bfResourceWrite() || b == bfConsoleRead()) {
+        var call = Vector<u8>.create();
+        appendText(mut call, if (b == bfResourceWrite()) "nova_fd_write(" else "nova_fd_read(")?;
+        var buffer = Vector<u8>.create();
+        if (b == bfConsoleRead()) {
+            appendText(mut call, "0")?;
+            buffer = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        } else {
+            let resource = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+            call.push('*')?;
+            appendBytes(mut call, resource.view())?;
+            buffer = operandText(e, c, n, sources, f, n.at(arguments, 1))?;
+        }
+        appendText(mut call, ", ")?;
+        appendBytes(mut call, buffer.view())?;
+        appendText(mut call, ".ptr, ")?;
+        appendBytes(mut call, buffer.view())?;
+        appendText(mut call, ".len)")?;
+        return appendIoCall(c, out, t, call.view());
+    }
+    if (b == bfTcpListen() || b == bfTcpConnect()) {
+        var call = Vector<u8>.create();
+        appendBuiltinCall(
+            e, c, n, sources, f, mut call,
+            (if (b == bfTcpListen()) "nova_tcp_listen" else "nova_tcp_connect").bytes(), arguments,
+        )?;
+        return appendIoCall(c, out, t, call.view());
+    }
+    if (b == bfTcpPort() || b == bfTcpAccept() || b == bfTcpShutdownWrite()) {
+        let resource = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        var call = Vector<u8>.create();
+        appendText(
+            mut call,
+            if (b ==
+                bfTcpPort()) "nova_tcp_port(*" else if (b ==
+                bfTcpAccept()) "nova_tcp_accept(*" else "nova_tcp_shutdown_write(*",
+        )?;
+        appendBytes(mut call, resource.view())?;
+        call.push(')')?;
+        return appendIoCall(c, out, t, call.view());
+    }
+    if (b == bfIoErrorMessage()) {
+        let error = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        appendText(out, "nova_io_message((uint32_t)")?;
+        appendBytes(out, error.view())?;
+        return appendText(out, ".tag)");
+    }
+    if (b == bfArgumentCount()) {
+        return appendText(out, "nova_arg_count()");
+    }
+    if (b == bfPtrAdd() || b == bfPtrSub() || b == bfPtrOffset()) {
+        return appendPointerStep(e, c, n, sources, f, out, r);
+    }
+    if (b == bfPtrIsNull()) {
+        let pointer = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        out.push('(')?;
+        appendBytes(out, pointer.view())?;
+        return appendText(out, " == NULL)");
+    }
+    if (b == bfBoxIntoRaw() || b == bfBoxFromRaw()) {
+        // A box is a pointer to its contents in C (c-backend.md §2), so these are casts (§34.2).
+        let value = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        appendText(out, "((")?;
+        appendCTypeName(c, out, t)?;
+        out.push(')')?;
+        appendBytes(out, value.view())?;
+        return out.push(')');
+    }
+    if (b == bfPtrReadVolatile()) {
+        let pointer = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        appendText(out, "(*(volatile ")?;
+        appendCTypeName(c, out, t)?;
+        appendText(out, " *)")?;
+        appendBytes(out, pointer.view())?;
+        return out.push(')');
+    }
+    if (b == bfPtrWriteVolatile()) {
+        let pointer = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        let value = operandText(e, c, n, sources, f, n.at(arguments, 1))?;
+        appendText(out, "(*(volatile ")?;
+        appendCTypeName(c, out, c.types.info(argumentType(n, arguments, 0)).pointee)?;
+        appendText(out, " *)")?;
+        appendBytes(out, pointer.view())?;
+        appendText(out, " = ")?;
+        appendBytes(out, value.view())?;
+        return out.push(')');
+    }
+    if (b == bfSpinHint()) {
+        return appendText(out, "nv_spin_hint()");
+    }
+    if (b == bfCallerAddress()) {
+        return appendText(out, "nv_caller");
+    }
+    if (b == bfOffsetOf()) {
+        let index = match (n.operands[n.at(arguments, 1) as usize]) {
+            NirOperand.Const(v) => truncate<u32>(v.magnitude),
+            _ => 0,
+        };
+        return appendMeasuredOffset(c, out, c.types.info(argumentType(n, arguments, 0)).pointee, index);
+    }
+    if (b == bfLayoutOf()) {
+        appendText(out, "((")?;
+        appendCTypeName(c, out, t)?;
+        out.push(')')?;
+        appendMeasuredLayout(c, out, c.types.info(argumentType(n, arguments, 0)).pointee)?;
+        return out.push(')');
+    }
+    if (b == bfPtrPlace()) {
+        var name = Vector<u8>.create();
+        appendPlacedName(c, mut name, c.types.info(argumentType(n, arguments, 0)).pointee)?;
+        return appendBuiltinCall(e, c, n, sources, f, out, name.view(), arguments);
+    }
+    if (b == bfWrappingAdd() || b == bfWrappingSub() || b == bfWrappingMul() || b == bfSaturatingAdd() ||
+        b == bfSaturatingSub() || b == bfSaturatingMul()) {
+        return appendArithmeticCall(e, c, n, sources, f, out, r, "");
+    }
+    if (b == bfCallPointer()) {
+        // A call through a C function pointer converts like an extern wrapper (c-backend §2.3).
+        var call = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        call.push('(')?;
+        for (k in 1..arguments.count) {
+            if (k > 1) {
+                appendText(mut call, ", ")?;
+            }
+            let value = operandText(e, c, n, sources, f, n.at(arguments, k))?;
+            appendToBoundary(c, mut call, argumentType(n, arguments, k), value.view())?;
+        }
+        call.push(')')?;
+        return appendFromBoundary(c, out, t, call.view());
+    }
+    if (b == bfCallFunction()) {
+        let callee = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        appendBytes(out, callee.view())?;
+        out.push('(')?;
+        appendOperandList(e, c, n, sources, f, out, arguments, 1)?;
+        return out.push(')');
+    }
+    if (b == bfCallClosure()) {
+        // A closure call passes the closure itself as the environment (§36.2).
+        let closure = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        appendText(out, "(*")?;
+        appendBytes(out, closure.view())?;
+        appendText(out, ")(")?;
+        appendOperandList(e, c, n, sources, f, out, arguments, 0)?;
+        return out.push(')');
+    }
+    if (b == bfTargetIsX8664()) {
+        return appendText(out, "nv_target_is_x86_64()");
+    }
+    if (b == bfTargetIsAArch64()) {
+        return appendText(out, "nv_target_is_aarch64()");
+    }
+    if (b == bfSlicePtr()) {
+        let slice = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        appendText(out, "((")?;
+        appendCTypeName(c, out, t)?;
+        appendText(out, ")(uintptr_t)")?;
+        appendBytes(out, slice.view())?;
+        return appendText(out, ".ptr)");
+    }
+    if (b == bfStringViewFromUtf8()) {
+        // The operand is a place or constant, so reading it twice is safe (§22.2).
+        let bytes = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        var view = Vector<u8>.create();
+        appendText(mut view, "((nv_str){ .ptr = ")?;
+        appendBytes(mut view, bytes.view())?;
+        appendText(mut view, ".ptr, .len = ")?;
+        appendBytes(mut view, bytes.view())?;
+        appendText(mut view, ".len })")?;
+        appendText(out, "(nova_utf8_valid(")?;
+        appendBytes(out, bytes.view())?;
+        appendText(out, ".ptr, ")?;
+        appendBytes(out, bytes.view())?;
+        appendText(out, ".len) ? ")?;
+        appendVariantOf(e, c, out, t, "v_Some", 1, view.view())?;
+        appendText(out, " : ((")?;
+        appendCTypeName(c, out, t)?;
+        return appendText(out, "){ .tag = 0 }))");
+    }
+    if (b == bfSliceFromRaw()) {
+        appendText(out, "((")?;
+        appendCTypeName(c, out, t)?;
+        appendText(out, "){ .ptr = ")?;
+        let pointer = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        appendBytes(out, pointer.view())?;
+        appendText(out, ", .len = ")?;
+        let length = operandText(e, c, n, sources, f, n.at(arguments, 1))?;
+        appendBytes(out, length.view())?;
+        return appendText(out, " })");
+    }
+    if (b == bfProcessRun()) {
+        let program = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        let list = operandText(e, c, n, sources, f, n.at(arguments, 1))?;
+        var call = copyBytes("nova_process_run(".bytes())?;
+        appendBytes(mut call, program.view())?;
+        appendText(mut call, ", ")?;
+        appendBytes(mut call, list.view())?;
+        appendText(mut call, "->ptr, ")?;
+        appendBytes(mut call, list.view())?;
+        appendText(mut call, "->len)")?;
+        return appendIoCall(c, out, t, call.view());
+    }
+    if (b == bfArgument()) {
+        return appendBuiltinCall(e, c, n, sources, f, out, "nvARG".bytes(), arguments);
+    }
+    if (b == bfVectorCreate()) {
+        appendText(out, "((")?;
+        appendCTypeName(c, out, t)?;
+        if (c.types.is(t, TypeKind.StableVector)) {
+            return appendText(out, "){ .len = 0u })");
+        }
+        appendText(out, "){ .ptr = (")?;
+        if (c.types.is(t, TypeKind.SlotMap)) {
+            appendSlotName(c, out, t)?;
+            return appendText(
+                out,
+                " *)(void *)&nova_vec_empty, .len = 0u, .cap = 0u, .count = 0u, .free = UINT32_MAX })",
+            );
+        }
+        appendCTypeName(c, out, c.types.info(c.types.info(t).pointee).element)?;
+        return appendText(out, " *)(void *)&nova_vec_empty, .len = 0u, .cap = 0u })");
+    }
+    let receiver = if (arguments.count > 0) c.types.info(argumentType(n, arguments, 0)).pointee else none();
+    if (b == bfStableVectorPush()) {
+        return appendHelperCall(e, c, n, sources, f, out, "nvSVP_", receiver, arguments);
+    }
+    if (b == bfSlotMapInsert()) {
+        return appendHelperCall(e, c, n, sources, f, out, "nvKI_", receiver, arguments);
+    }
+    if (b == bfSlotMapGet()) {
+        let mutable = c.types.info(argumentType(n, arguments, 0)).mutableReference;
+        return appendHelperCall(e, c, n, sources, f, out, if (mutable) "nvKM_" else "nvKG_", receiver, arguments);
+    }
+    if (b == bfSlotMapRemove()) {
+        return appendHelperCall(e, c, n, sources, f, out, "nvKR_", receiver, arguments);
+    }
+    if (b == bfSlotMapContains()) {
+        return appendHelperCall(e, c, n, sources, f, out, "nvKV_", receiver, arguments);
+    }
+    if (b == bfSlotMapLength() || b == bfVectorCapacity()) {
+        let container = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        appendBytes(out, container.view())?;
+        return appendText(out, if (b == bfSlotMapLength()) "->count" else "->cap");
+    }
+    if (b == bfVectorWithCapacity()) {
+        return appendHelperCall(e, c, n, sources, f, out, "nvVW_", resultOkOf(c, t), arguments);
+    }
+    if (b == bfVectorPush()) {
+        return appendHelperCall(e, c, n, sources, f, out, "nvVP_", receiver, arguments);
+    }
+    if (b == bfStringAppend()) {
+        return appendHelperCall(e, c, n, sources, f, out, "nvVA_", receiver, arguments);
+    }
+    if (b == bfStringAppendNumber()) {
+        // The digits go into a compound literal, which lives to the end of the block, past the call (rt.h).
+        let s = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
+        let number = operandText(e, c, n, sources, f, n.at(arguments, 1))?;
+        let numberType = argumentType(n, arguments, 1);
+        appendText(out, "nvVA_")?;
+        appendMangle(c, out, receiver)?;
+        out.push('(')?;
+        appendBytes(out, s.view())?;
+        appendText(out, ", ")?;
+        if (c.types.is(numberType, TypeKind.Float)) {
+            appendText(out, "nova_format_f")?;
+            appendDecimal(out, c.types.info(numberType).bits as u64)?;
+            out.push('(')?;
+            appendBytes(out, number.view())?;
+            return appendText(out, ", (uint8_t[NV_FLOAT_CHARS]){ 0 }))");
+        }
+        if (c.types.info(numberType).signed) {
+            appendText(out, "nv_format_i64((int64_t)")?;
+        } else {
+            appendText(out, "nv_format_u64((uint64_t)")?;
+        }
+        appendBytes(out, number.view())?;
+        return appendText(out, ", (uint8_t[NV_DIGITS]){ 0 }))");
+    }
+    if (b == bfVectorPop()) {
+        return appendHelperCall(e, c, n, sources, f, out, "nvVO_", receiver, arguments);
+    }
+    if (b == bfVectorClear()) {
+        return appendHelperCall(e, c, n, sources, f, out, "nvVC_", receiver, arguments);
+    }
+    if (b == bfBoxCreate()) {
+        appendBoxCreateName(c, out, t)?;
+        out.push('(')?;
+        let value = operandText(e, c, n, sources, f, n.at(arguments, arguments.count - 1))?;
+        appendBytes(out, value.view())?;
+        return out.push(')');
+    }
+    return appendText(out, "?"); // the reference throws: cannot emit
+}
+
+/// An ordering comparison decided by one operand at its type's limit (AgainstLimit): 1 true, 0 false, or none.
+fn againstLimit(c: borrow Checker, n: borrow NirProgram, op: BinaryOp, left: u32, right: u32) -> u32 {
+    let lc = match (n.operands[left as usize]) {
+        NirOperand.Const(v) => Some(v),
+        _ => null,
+    };
+    let rc = match (n.operands[right as usize]) {
+        NirOperand.Const(v) => Some(v),
+        _ => null,
+    };
+    if (lc != null && rc != null) {
+        return if (compareInts(op, lc!, rc!)) 1 else 0; // two constants
+    }
+    // Write it as `x op c`: a constant on the left mirrors the operator.
+    var index = binaryIndex(op);
+    var value = left;
+    var constant = IntValue { negative: false, magnitude: 0 };
+    if (rc != null) {
+        constant = rc!;
+    } else if (lc != null) {
+        index = match (index) {
+            4 => 6,
+            6 => 4,
+            5 => 7,
+            _ => 5,
+        };
+        value = right;
+        constant = lc!;
+    } else {
+        return none();
+    }
+    let t = n.operandTypes[value as usize];
+    if (!c.types.is(t, TypeKind.Integer)) {
+        return none();
+    }
+    let info = c.types.info(t);
+    let isMin =
+        if (info.signed) constant.negative &&
+            constant.magnitude == (1u64 << ((info.bits - 1) as u64)) else constant.magnitude == 0;
+    let isMax = !(constant.negative && constant.magnitude != 0) && constant.magnitude == integerMax(c, t);
+    if (index == 4 && isMin) {
+        return 0;
+    }
+    if (index == 7 && isMin) {
+        return 1;
+    }
+    if (index == 6 && isMax) {
+        return 0;
+    }
+    if (index == 5 && isMax) {
+        return 1;
+    }
+    return none();
+}
+
+fn appendBinary(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    out: borrow mut Vector<u8>,
+    op: BinaryOp,
+    left: u32,
+    right: u32,
+    start: u32,
+    t: u32,
+) -> Result<void, AllocError> {
+    let l = operandText(e, c, n, sources, f, left)?;
+    let r = operandText(e, c, n, sources, f, right)?;
+    let operandType = n.operandTypes[left as usize];
+    let index = binaryIndex(op);
+    if (c.types.is(operandType, TypeKind.Handle) || c.types.isStringView(operandType)) {
+        if (index == 3) {
+            out.push('!')?;
+        }
+        appendText(out, if (c.types.is(operandType, TypeKind.Handle)) "nova_handle_eq(" else "nova_str_eq(")?;
+        appendBytes(out, l.view())?;
+        appendText(out, ", ")?;
+        appendBytes(out, r.view())?;
+        return out.push(')');
+    }
+    let symbol = match (op) {
+        BinaryOp.Add => "+",
+        BinaryOp.Subtract => "-",
+        BinaryOp.Multiply => "*",
+        BinaryOp.Divide => "/",
+        BinaryOp.Equal => "==",
+        BinaryOp.NotEqual => "!=",
+        BinaryOp.Less => "<",
+        BinaryOp.LessEqual => "<=",
+        BinaryOp.Greater => ">",
+        BinaryOp.GreaterEqual => ">=",
+        BinaryOp.BitAnd => "&",
+        BinaryOp.BitOr => "|",
+        BinaryOp.BitXor => "^",
+        _ => "?",
+    };
+    if (c.types.is(operandType, TypeKind.Float)) {
+        // IEEE arithmetic and comparisons need no check (§35.3). `x == x` is not folded: it is false for NaN.
+        out.push('(')?;
+        appendBytes(out, l.view())?;
+        out.push(' ')?;
+        appendText(out, symbol)?;
+        out.push(' ')?;
+        appendBytes(out, r.view())?;
+        return out.push(')');
+    }
+    let helper = match (op) {
+        BinaryOp.Add => "nv_add_",
+        BinaryOp.Subtract => "nv_sub_",
+        BinaryOp.Multiply => "nv_mul_",
+        BinaryOp.Divide => "nv_div_",
+        BinaryOp.Remainder => "nv_rem_",
+        _ => "",
+    };
+    if (helper.length > 0) {
+        let site = siteText(e, c, n, sources, f, start)?;
+        appendText(out, helper)?;
+        appendSuffix(c, out, operandType)?;
+        out.push('(')?;
+        appendBytes(out, l.view())?;
+        appendText(out, ", ")?;
+        appendBytes(out, r.view())?;
+        appendText(out, ", ")?;
+        appendBytes(out, site.view())?;
+        return out.push(')');
+    }
+    if (index >= 8 && index <= 10) {
+        out.push('(')?;
+        appendCTypeName(c, out, operandType)?;
+        appendText(out, ")(")?;
+        appendBytes(out, l.view())?;
+        out.push(' ')?;
+        appendText(out, symbol)?;
+        out.push(' ')?;
+        appendBytes(out, r.view())?;
+        return out.push(')');
+    }
+    if (index == 11 || index == 12) {
+        let site = siteText(e, c, n, sources, f, start)?;
+        let amountType = n.operandTypes[right as usize];
+        let bits = c.types.info(operandType).bits;
+        appendText(out, if (index == 11) "nv_shl_" else "nv_shr_")?;
+        appendSuffix(c, out, operandType)?;
+        out.push('(')?;
+        appendBytes(out, l.view())?;
+        appendText(
+            out,
+            if (c.types.info(amountType).signed) ", nv_shift_amount_s((int64_t)" else ", nv_shift_amount_u((uint64_t)",
+        )?;
+        appendBytes(out, r.view())?;
+        appendText(out, ", ")?;
+        appendDecimal(out, bits as u64)?;
+        appendText(out, "u, ")?;
+        appendBytes(out, site.view())?;
+        return appendText(out, "))");
+    }
+    // Comparing with the type's own limit: GCC warns (-Wtype-limits); a constant (§5).
+    if (index >= 4 && index <= 7) {
+        let limit = againstLimit(c, n, op, left, right);
+        if (limit != none()) {
+            return appendText(out, if (limit == 1) "true" else "false");
+        }
+    }
+    // Comparing a place with itself: C warns (-Wtautological-compare); the result is a constant (§5).
+    if (sameBytes(l.view(), r.view())) {
+        if (index == 2 || index == 5 || index == 7) {
+            return appendText(out, "true");
+        }
+        if (index == 3 || index == 4 || index == 6) {
+            return appendText(out, "false");
+        }
+    }
+    out.push('(')?;
+    appendBytes(out, l.view())?;
+    out.push(' ')?;
+    appendText(out, symbol)?;
+    out.push(' ')?;
+    appendBytes(out, r.view())?;
+    return out.push(')');
+}
+
+fn appendOperand(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    out: borrow mut Vector<u8>,
+    o: u32,
+) -> Result<void, AllocError> {
+    match (n.operands[o as usize]) {
+        NirOperand.Place(place, _) => {
+            if (isBoundaryField(c, n, f, place)) {
+                let text = appendPlaceIn(e, c, n, sources, f, place)?;
+                return appendFromBoundary(c, out, placeTypeIn(c, n, f, place), text.view());
+            }
+            return appendPlace(e, c, n, sources, f, out, place);
+        }
+        NirOperand.Const(v) => { return appendConstant(c, out, v, n.operandTypes[o as usize]); }
+        NirOperand.String(text) => {
+            // String literals are static data, so a view of one never dangles (§22.2).
+            let bytes = n.textOf(text);
+            appendText(out, "((nv_str){ .ptr = (const uint8_t *)")?;
+            appendCStringLiteral(out, bytes)?;
+            appendText(out, ", .len = ")?;
+            appendDecimal(out, bytes.length as u64)?;
+            return appendText(out, "u })");
+        }
+        NirOperand.Zero => { return appendText(out, "?"); } // the reference throws
+    }
+}
+
+/// A field of an imported C type whose C type differs from Nova's C for it (IsBoundaryField, §31.3).
+fn isBoundaryField(c: borrow Checker, n: borrow NirProgram, f: u32, place: u32) -> bool {
+    let p = n.places[place as usize];
+    if (p.projections.count == 0) {
+        return false;
+    }
+    let last = n.projections[(p.projections.start + p.projections.count - 1) as usize];
+    match (last.kind) {
+        ProjectionKind.Field => {}
+        _ => { return false; }
+    }
+    var owner = nirLocalType(n, f, p.local);
+    for (k in 0..(p.projections.count - 1)) {
+        owner = applyNirProjection(c, owner, n.projections[(p.projections.start + k) as usize]);
+    }
+    let t = c.types.fields[last.field as usize].typ;
+    return isImportedStruct(c, owner) && (c.types.is(t, TypeKind.RawPointer) || isUsize(c, t) || isIsize(c, t));
+}
+
+/// A place as a C lvalue (Place): a slice's deref stays the slice, its elements `s.ptr[i]`, an array's `a.e[i]`.
+fn appendPlace(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    out: borrow mut Vector<u8>,
+    place: u32,
+) -> Result<void, AllocError> {
+    let p = n.places[place as usize];
+    return appendPlaceParts(e, c, n, sources, f, out, p.local, p.projections, p.projections.count);
+}
+
+/// The first `count` projections of a place.
+fn appendPlaceParts(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    out: borrow mut Vector<u8>,
+    local: u32,
+    projections: Range,
+    count: u32,
+) -> Result<void, AllocError> {
+    var text = Vector<u8>.create();
+    appendLocalNameIn(c, n, mut text, f, local)?;
+    var t = nirLocalType(n, f, local);
+    var stable = none(); // the stable vector whose elements `t` is (§24.2)
+    for (k in 0..count) {
+        let projection = n.projections[(projections.start + k) as usize];
+        var next = Vector<u8>.create();
+        match (projection.kind) {
+            ProjectionKind.Deref => {
+                if (c.types.is(t, TypeKind.StableVector) || c.types.isSlice(t) || c.types.is(t, TypeKind.Vector)) {
+                    next = text; // the elements' (ptr, len) are the value's
+                } else if (c.types.isPoolBox(t)) {
+                    appendText(mut next, "(*")?;
+                    appendBytes(mut next, text.view())?;
+                    appendText(mut next, ".ptr)")?;
+                } else {
+                    appendText(mut next, "(*")?;
+                    appendBytes(mut next, text.view())?;
+                    next.push(')')?;
+                }
+            }
+            ProjectionKind.Field => {
+                let field = projection.field;
+                if (c.types.fields[field as usize].isRegionPart) {
+                    next = text; // the frame itself (§19.5)
+                } else if (isCArrayMember(c, t, field)) {
+                    // A C array member seen as Nova's array struct (§31.3), through uintptr_t.
+                    appendText(mut next, "(*(")?;
+                    appendCTypeName(c, mut next, c.types.fields[field as usize].typ)?;
+                    appendText(mut next, " *)(uintptr_t)&")?;
+                    appendBytes(mut next, text.view())?;
+                    next.push('.')?;
+                    appendFieldName(c, mut next, field)?;
+                    next.push(')')?;
+                } else {
+                    appendBytes(mut next, text.view())?;
+                    next.push('.')?;
+                    appendFieldName(c, mut next, field)?;
+                }
+            }
+            ProjectionKind.Downcast => { appendPayloadPlace(c, mut next, t, text.view(), projection.variant)?; }
+            ProjectionKind.Index => {
+                let index = operandText(e, c, n, sources, f, projection.index)?;
+                let constant = match (n.operands[projection.index as usize]) {
+                    NirOperand.Const(v) => Some(v),
+                    _ => null,
+                };
+                if (stable != none()) {
+                    appendText(mut next, "(*nvSVE_")?;
+                    appendMangle(c, mut next, stable)?;
+                    appendText(mut next, "(&")?;
+                    appendBytes(mut next, text.view())?;
+                    appendText(mut next, ", ")?;
+                    appendBytes(mut next, index.view())?;
+                    appendText(mut next, "))")?;
+                } else if (c.types.isUnsized(t)) {
+                    // A constant index too large for any object (its check panics first) would trip -Warray-bounds.
+                    let size = cLayout(c, c.types.info(t).element).size;
+                    let huge = constant != null && !constant!.negative && size > 0 &&
+                        constant!.magnitude > 0x7FFFFFFFFFFFFFFF / truncate<u64>(size);
+                    appendBytes(mut next, text.view())?;
+                    appendText(mut next, if (huge) ".ptr[nv_opaque_index(" else ".ptr[")?;
+                    appendBytes(mut next, index.view())?;
+                    appendText(mut next, if (huge) ")]" else "]")?;
+                } else {
+                    // A constant index past the end always panics first; hiding it keeps -Warray-bounds quiet (§5).
+                    let past = constant != null && !constant!.negative &&
+                        constant!.magnitude >= truncate<u64>(c.types.info(t).arrayLength);
+                    appendBytes(mut next, text.view())?;
+                    appendText(mut next, if (past) ".e[nv_opaque_index(" else ".e[")?;
+                    appendBytes(mut next, index.view())?;
+                    appendText(mut next, if (past) ")]" else "]")?;
+                }
+            }
+        }
+        stable = if (isNirDeref(projection) && c.types.is(t, TypeKind.StableVector)) t else none();
+        t = applyNirProjection(c, t, projection);
+        text = next;
+    }
+    return appendBytes(out, text.view());
+}
+
+fn appendEnumAggregate(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    out: borrow mut Vector<u8>,
+    t: u32,
+    variant: u32,
+    payload: Range,
+) -> Result<void, AllocError> {
+    let name = cTypeName(c, t)?;
+    if (c.types.isNicheOptional(t)) {
+        if (payload.count == 0) {
+            return appendOptionValue(e, c, out, t, false, "".bytes());
+        }
+        let value = operandText(e, c, n, sources, f, n.at(payload, 0))?;
+        return appendOptionValue(e, c, out, t, true, value.view());
+    }
+    let index = c.types.variants[variant as usize].index;
+    if (payload.count == 0) {
+        appendText(out, "((")?;
+        appendBytes(out, name.view())?;
+        appendText(out, "){ .tag = ")?;
+        appendDecimal(out, index as u64)?;
+        return appendText(out, " })");
+    }
+    var variantName = Vector<u8>.create();
+    appendCVariantName(c, mut variantName, variant)?;
+    if (usesConstructor(c, variant)) {
+        appendEnumConstructor(out, name.view(), variantName.view())?;
+        out.push('(')?;
+        appendOperandList(e, c, n, sources, f, out, payload, 0)?;
+        return out.push(')');
+    }
+    let fields = borrow c.types.variants[variant as usize].payload;
+    appendText(out, "((")?;
+    appendBytes(out, name.view())?;
+    appendText(out, "){ .tag = ")?;
+    appendDecimal(out, index as u64)?;
+    appendText(out, ", .u.")?;
+    appendBytes(out, variantName.view())?;
+    appendText(out, " = { ")?;
+    for (k in 0..payload.count) {
+        if (k > 0) {
+            appendText(out, ", ")?;
+        }
+        out.push('.')?;
+        appendFieldName(c, out, fields[k as usize])?;
+        appendText(out, " = ")?;
+        let value = operandText(e, c, n, sources, f, n.at(payload, k))?;
+        appendBytes(out, value.view())?;
+    }
+    return appendText(out, " } })");
+}
+
+fn appendAggregate(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    out: borrow mut Vector<u8>,
+    t: u32,
+    values: Range,
+) -> Result<void, AllocError> {
+    let fields = borrow c.types.structs[c.types.info(t).structDef as usize].fields;
+    appendText(out, "((")?;
+    appendCTypeName(c, out, t)?;
+    if (fields.length == 0) {
+        return appendText(out, "){ .nv_empty = 0 })");
+    }
+    appendText(out, "){ ")?;
+    // Fields of C state are left to C's zero-filling (§33.2); C array members are assigned after (ADR 0029).
+    var any = false;
+    for (k in 0..fields.length) {
+        let o = n.at(values, truncate<u32>(k));
+        if (isZeroOperand(n, o) || isCArrayMember(c, t, fields[k])) {
+            continue;
+        }
+        if (any) {
+            appendText(out, ", ")?;
+        }
+        any = true;
+        out.push('.')?;
+        appendFieldName(c, out, fields[k])?;
+        appendText(out, " = ")?;
+        let value = operandText(e, c, n, sources, f, o)?;
+        appendBytes(out, value.view())?;
+    }
+    if (!any) {
+        out.push('.')?;
+        appendFieldName(c, out, fields[0])?;
+        appendText(out, " = { 0 }")?;
+    }
+    return appendText(out, " })");
+}

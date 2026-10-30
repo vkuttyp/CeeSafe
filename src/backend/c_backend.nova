@@ -1,0 +1,107 @@
+// The C backend's entry (the reference's CBackend.Generate): N0300 for a missing `main`, the emitter run twice, the
+// exports header, and the runtime files the program needs.
+
+fn missingMain() -> u32 => 300;
+
+fn containsBytes(haystack: Slice<u8>, needle: StringView) -> bool {
+    let n = needle.bytes();
+    if (n.length > haystack.length) {
+        return false;
+    }
+    for (i in 0..(haystack.length - n.length + 1)) {
+        var same = true;
+        for (k in 0..n.length) {
+            if (same && haystack[i + k] != n[k]) {
+                same = false;
+            }
+        }
+        if (same) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn runtimeFile(k: usize, prefix: StringView) -> Result<CFile, AllocError> {
+    var text = Vector<u8>.create();
+    appendText(mut text, prefix)?;
+    appendRuntimeText(mut text, k)?;
+    return Ok(CFile { name: copyBytes(runtimeFileName(k).bytes())?, text: text });
+}
+
+/// Lowers a checked program to C files (Generate): false, with N0300 reported, if an executable needs a `main` the
+/// program lacks.
+fn generateC(
+    c: borrow mut Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    requireMain: bool,
+    freestanding: bool,
+    exportsHeaderName: Slice<u8>,
+    out: borrow mut Vector<CFile>,
+) -> Result<bool, AllocError> {
+    var hasMain = false;
+    for (f in c.hir.functions.view()) {
+        if (f.registered && f.owner == none() && sameText(c.name(f.name), "main")) {
+            hasMain = true;
+        }
+    }
+    if (requireMain && !hasMain) {
+        var file: u32 = 0;
+        while ((file as usize) < c.fileIsLibrary.length && c.fileIsLibrary[file as usize]) {
+            file += 1;
+        }
+        var message = Vector<u8>.create();
+        appendText(mut message, "an executable needs a 'main' function: fn main() -> i32 { ... }")?;
+        c.front.diagnostics.error(missingMain(), file, 0, 0, message)?;
+        return Ok(false);
+    }
+    computeLayouts(c);
+    // Twice: the location constants come before the code that uses them, and only emitting the code finds them.
+    var trial = CEmitter.create(true);
+    trial.exportsHeader = copyBytes(exportsHeaderName)?;
+    setUpEmitter(mut trial, c, n)?;
+    emitProgram(mut trial, c, n, sources)?;
+    var emitter = CEmitter.create(false);
+    emitter.exportsHeader = copyBytes(exportsHeaderName)?;
+    emitter.sites = trial.sites;
+    emitter.siteList = trial.siteList;
+    emitter.inPlaceResults = trial.inPlaceResults;
+    emitter.usedLibrary = trial.usedLibrary;
+    emitter.usedTypes = trial.usedTypes;
+    setUpEmitter(mut emitter, c, n)?;
+    emitProgram(mut emitter, c, n, sources)?;
+    var mainText = Vector<u8>.create();
+    for (file in emitter.files.view()) {
+        appendBytes(mut mainText, file.text.view())?; // what the runtime selection below looks for
+    }
+    var header = Vector<u8>.create();
+    let hasHeader = exportsHeader(c, n, exportsHeaderName, mut header)?;
+    for (file in emitter.files.view()) {
+        out.push(CFile { name: copyBytes(file.name.view())?, text: copyBytes(file.text.view())? })?;
+    }
+    out.push(runtimeFile(0, "")?)?;
+    if (freestanding) {
+        out.push(
+            runtimeFile(
+                1,
+                "/* The core runtime for the freestanding profile (cosmoos/profiles.md §4.2). */\n#define NV_FREESTANDING 1\n",
+            )?,
+        )?;
+    } else {
+        out.push(runtimeFile(1, "")?)?;
+        out.push(runtimeFile(2, "")?)?;
+        out.push(runtimeFile(3, "")?)?;
+        // The formatter's only callers are the generated calls of nova_format_f32/f64 (printing is hosted-only).
+        if (containsBytes(mainText.view(), "nova_format_f")) {
+            out.push(runtimeFile(4, "")?)?;
+        }
+        if (containsBytes(mainText.view(), "nova_thread_") || containsBytes(mainText.view(), "nova_mutex_")) {
+            out.push(runtimeFile(5, "")?)?;
+        }
+    }
+    if (hasHeader) {
+        out.push(CFile { name: copyBytes(exportsHeaderName)?, text: header })?;
+    }
+    return Ok(true);
+}

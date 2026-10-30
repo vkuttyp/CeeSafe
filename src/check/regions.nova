@@ -329,7 +329,7 @@ fn checkPoolTake(
     let valueSyntax = c.front.ast.at(arguments, 0);
     let value = checkExpr(c, valueSyntax, element)?;
     let poolBox = c.types.poolBoxOf(element)?;
-    let allocError = c.allocErrorType;
+    let allocError = usedAllocError(c);
     let result = resultOf(c, poolBox, allocError)?;
     let values = [reference, value];
     let list = c.hir.list(values[..])?;
@@ -649,7 +649,7 @@ fn checkArenaMethod(
     if (!checkRegionContent(c, valueType, isArray, valueSpan)?) {
         return c.errorResult(span.start, span.end);
     }
-    let allocError = c.allocErrorType;
+    let allocError = usedAllocError(c);
     var values = Vector<u32>.create();
     values.push(arena)?;
     if (isArray) {

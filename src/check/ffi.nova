@@ -32,10 +32,13 @@ fn checkLayoutUses(c: borrow mut Checker) -> Result<void, AllocError> {
     let saved = c.file;
     for (k in 0..c.layoutUses.length) {
         let use = c.layoutUses[k];
-        c.file = use.file;
+        {
+            let fileToSet = use.file;
+            c.setFile(fileToSet);
+        }
         checkLayoutUse(c, use.typ, Span { start: use.start, end: use.end })?;
     }
-    c.file = saved;
+    c.setFile(saved);
     return Ok();
 }
 
@@ -604,7 +607,10 @@ fn checkForeignInterfaces(c: borrow mut Checker) -> Result<void, AllocError> {
         if (!c.types.structs[definition as usize].isReprC) {
             continue;
         }
-        c.file = entry.file;
+        {
+            let fileToSet = entry.file;
+            c.setFile(fileToSet);
+        }
         let item = c.front.ast.items[entry.item as usize];
         var name = Vector<u8>.create();
         appendBytes(mut name, c.name(c.front.ast.idents[item.name as usize].symbol))?;
@@ -660,7 +666,10 @@ fn checkForeignInterfaces(c: borrow mut Checker) -> Result<void, AllocError> {
         if (c.types.enums[definition as usize].repr == none()) {
             continue;
         }
-        c.file = entry.file;
+        {
+            let fileToSet = entry.file;
+            c.setFile(fileToSet);
+        }
         let nameIdent = c.front.ast.items[entry.item as usize].name;
         var name = Vector<u8>.create();
         appendBytes(mut name, c.name(c.front.ast.idents[nameIdent as usize].symbol))?;
@@ -673,7 +682,10 @@ fn checkForeignInterfaces(c: borrow mut Checker) -> Result<void, AllocError> {
         if (!c.types.structs[definition as usize].isImported) {
             continue;
         }
-        c.file = entry.file;
+        {
+            let fileToSet = entry.file;
+            c.setFile(fileToSet);
+        }
         let item = c.front.ast.items[entry.item as usize];
         var name = Vector<u8>.create();
         appendBytes(mut name, c.name(c.front.ast.idents[item.name as usize].symbol))?;
@@ -775,7 +787,10 @@ fn checkForeignInterfaces(c: borrow mut Checker) -> Result<void, AllocError> {
             continue;
         }
         let function = truncate<u32>(k);
-        c.file = c.hir.functions[k].file;
+        {
+            let fileToSet = c.hir.functions[k].file;
+            c.setFile(fileToSet);
+        }
         var what = Vector<u8>.create();
         appendText(mut what, "callback '")?;
         appendBytes(mut what, c.name(c.hir.functions[k].name))?;
@@ -810,7 +825,10 @@ fn checkForeignInterfaces(c: borrow mut Checker) -> Result<void, AllocError> {
             continue;
         }
         let function = truncate<u32>(k);
-        c.file = c.hir.functions[k].file;
+        {
+            let fileToSet = c.hir.functions[k].file;
+            c.setFile(fileToSet);
+        }
         var name = Vector<u8>.create();
         if (exported) {
             appendBytes(mut name, c.hir.textOf(c.hir.functions[k].exportName))?;
@@ -839,7 +857,10 @@ fn checkForeignInterfaces(c: borrow mut Checker) -> Result<void, AllocError> {
         if (!hir.exported) {
             continue;
         }
-        c.file = entry.file;
+        {
+            let fileToSet = entry.file;
+            c.setFile(fileToSet);
+        }
         let item = c.front.ast.items[entry.item as usize];
         let span = attributeSpanNamed(c, item.attributes, "export");
         var name = Vector<u8>.create();
@@ -866,6 +887,6 @@ fn checkForeignInterfaces(c: borrow mut Checker) -> Result<void, AllocError> {
             c.error(notFfiSafe(), typeSpan.start, typeSpan.end, message)?;
         }
     }
-    c.file = saved;
+    c.setFile(saved);
     return Ok();
 }

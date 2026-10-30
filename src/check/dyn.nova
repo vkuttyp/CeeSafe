@@ -135,10 +135,13 @@ fn dynMethod(c: borrow mut Checker, dynType: u32, name: u32) -> Result<u32, Allo
     zipEnvironment(c, interfaceParameters, arguments.view(), mut pairs)?;
     let environment = storeEnvironment(c, pairs.view())?;
     let savedFile = c.file;
-    c.file = entry.file;
+    {
+        let fileToSet = entry.file;
+        c.setFile(fileToSet);
+    }
     let signature = c.front.ast.at(methods, slot);
     let function = declareSignature(c, signature, dynType, environment)?;
-    c.file = savedFile;
+    c.setFile(savedFile);
     c.hir.functions[function as usize].isDynMethod = true;
     c.hir.functions[function as usize].dynSlot = slot;
     let attributes = effectAttributesOf(c, signature);

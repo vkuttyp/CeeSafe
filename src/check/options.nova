@@ -297,7 +297,7 @@ fn checkResultOperand(c: borrow mut Checker, operand: u32, text: StringView, exp
     var hint = none();
     if (expected != none() && c.types.isDynBox(expected) &&
         c.types.info(c.types.info(expected).pointee).dynInterface == none()) {
-        let allocError = c.allocErrorType;
+        let allocError = usedAllocError(c);
         hint = resultOf(c, expected, allocError)?;
     } else if (expected != none() && c.types.is(expected, TypeKind.Thread)) {
         hint = expected; // Thread.spawn reads the result type from it (§38.2)

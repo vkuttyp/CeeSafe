@@ -1,0 +1,1103 @@
+// The program's skeleton (EmitProgram) and its types (EmitStructs, EmitComposite, EmitEnum, the statics).
+
+/// Whether a type's layout can be computed (the reference's LayoutOf would not throw), recursively.
+fn layoutComputable(c: borrow Checker, t: u32, depth: u32) -> bool {
+    if (depth > 64 || c.types.isGeneric(t)) {
+        return false;
+    }
+    let info = c.types.info(t);
+    match (info.kind) {
+        TypeKind.Void => { return false; }
+        TypeKind.Never => { return false; }
+        TypeKind.Error => { return false; }
+        TypeKind.Dyn => { return false; }
+        TypeKind.TypeParameter => { return false; }
+        TypeKind.Array => { return layoutComputable(c, info.element, depth + 1); }
+        TypeKind.Struct => {
+            let s = borrow c.types.structs[info.structDef as usize];
+            if (s.isRecursive || s.isImported) {
+                return false;
+            }
+            for (f in s.fields.view()) {
+                if (!layoutComputable(c, c.types.fields[f as usize].typ, depth + 1)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        TypeKind.Enum => {
+            for (v in c.types.enums[info.enumDef as usize].variants.view()) {
+                for (f in c.types.variants[v as usize].payload.view()) {
+                    if (!layoutComputable(c, c.types.fields[f as usize].typ, depth + 1)) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+        _ => { return true; }
+    }
+}
+
+/// Computes every layout the emitter may read, so that it reads them without changing the table.
+fn computeLayouts(c: borrow mut Checker) {
+    for (k in 0..c.types.types.length) {
+        let t = truncate<u32>(k);
+        if (layoutComputable(c, t, 0)) {
+            c.types.layoutOf(t);
+        }
+    }
+}
+
+/// A computed layout (TypeTable.LayoutOf, after computeLayouts).
+fn cLayout(c: borrow Checker, t: u32) -> SizeAlign {
+    let info = c.types.info(t);
+    match (info.kind) {
+        TypeKind.Integer => { return sizeAlign(info.bits / 8, info.bits / 8); }
+        TypeKind.Float => { return sizeAlign(info.bits / 8, info.bits / 8); }
+        TypeKind.Bool => { return sizeAlign(1, 1); }
+        TypeKind.Reference => {
+            return if (c.types.isSlice(t) || c.types.isDynReference(t)) sizeAlign(16, 8) else sizeAlign(8, 8);
+        }
+        TypeKind.Box => {
+            return if (c.types.isPoolBox(t) || c.types.isDynBox(t)) sizeAlign(16, 8) else sizeAlign(8, 8);
+        }
+        TypeKind.Vector => { return sizeAlign(24, 8); }
+        TypeKind.StableVector => { return sizeAlign(264, 8); }
+        TypeKind.SlotMap => { return sizeAlign(40, 8); }
+        TypeKind.Handle => { return sizeAlign(8, 4); }
+        TypeKind.Resource => { return sizeAlign(4, 4); }
+        TypeKind.CChar => { return sizeAlign(1, 1); }
+        TypeKind.Region => {
+            return match (info.region) {
+                RegionKind.Arena => sizeAlign(40, 8),
+                RegionKind.FixedBuffer => sizeAlign(24, 8),
+                RegionKind.Pool => sizeAlign(48, 8),
+                _ => sizeAlign(32, 8),
+            };
+        }
+        TypeKind.Array => {
+            let e = cLayout(c, info.element);
+            return SizeAlign { size: e.size * info.arrayLength, align: e.align };
+        }
+        TypeKind.Enum => {
+            let d = borrow c.types.enums[info.enumDef as usize];
+            return sizeAlign(d.size, d.align);
+        }
+        TypeKind.Struct => {
+            let s = borrow c.types.structs[info.structDef as usize];
+            return sizeAlign(s.size, s.align);
+        }
+        _ => { return sizeAlign(8, 8); } // pointers of every kind
+    }
+}
+
+/// A type whose C definition must come before a struct that holds it by value (IsAggregate).
+fn isCAggregate(c: borrow Checker, t: u32) -> bool {
+    let kind = c.types.kindOf(t);
+    return isKind(kind, TypeKind.Struct) || isKind(kind, TypeKind.Enum) || isKind(kind, TypeKind.Array) ||
+        isKind(kind, TypeKind.Vector) || isKind(kind, TypeKind.StableVector) || isKind(kind, TypeKind.SlotMap) ||
+        (c.types.isSlice(t) && !c.types.isStringView(t)) || c.types.isPoolBox(t);
+}
+
+/// The C tag of a struct type (StructTag): its Nova name for `@repr(C)` (§28.5), else its C type name.
+fn appendStructTag(c: borrow Checker, out: borrow mut Vector<u8>, t: u32) -> Result<void, AllocError> =>
+    if (isReprCStruct(c, t)) appendBytes(out, c.types.name(t)) else appendCTypeName(c, out, t);
+
+/// `_Alignas(n) ` on the first member of an `@align(n)` struct (AlignPrefix, §29.4).
+fn appendAlignPrefix(c: borrow Checker, out: borrow mut Vector<u8>, t: u32, index: u32) -> Result<void, AllocError> {
+    let align = c.types.structs[c.types.info(t).structDef as usize].explicitAlign;
+    if (index == 0 && align > 1) {
+        appendText(out, "_Alignas(")?;
+        appendDecimal(out, align as u64)?;
+        appendText(out, ") ")?;
+    }
+    return Ok();
+}
+
+/// An array field of an imported struct (ADR 0014) or of a `@repr(C)` struct (ADR 0029): a C array member
+/// (IsCArrayMember).
+fn isCArrayMember(c: borrow Checker, owner: u32, field: u32) -> bool {
+    let s = c.types.info(owner).structDef;
+    return s != none() && (c.types.structs[s as usize].isImported || c.types.structs[s as usize].isReprC) &&
+        c.types.is(c.types.fields[field as usize].typ, TypeKind.Array);
+}
+
+/// `novac layout: <what>` as a `_Static_assert` message.
+fn appendLayoutMessage(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    prefix: StringView,
+    t: u32,
+    suffix: StringView,
+) -> Result<void, AllocError> {
+    var text = Vector<u8>.create();
+    appendText(mut text, "novac layout: ")?;
+    appendText(mut text, prefix)?;
+    appendBytes(mut text, c.types.name(t))?;
+    appendText(mut text, suffix)?;
+    return appendCMessageLiteral(out, text.view());
+}
+
+/// `_Static_assert(sizeof(X) == n, …); _Static_assert(_Alignof(X) == a, …);`
+fn emitSizeAsserts(e: borrow mut CEmitter, c: borrow Checker, t: u32, name: Slice<u8>) -> Result<void, AllocError> {
+    let layout = cLayout(c, t);
+    e.t("_Static_assert(sizeof(")?;
+    e.b(name)?;
+    e.t(") == ")?;
+    e.d(truncate<u64>(layout.size))?;
+    e.t(", ")?;
+    appendLayoutMessage(c, mut e.buf, "sizeof(", t, ")")?;
+    e.t(");")?;
+    e.emit()?;
+    e.t("_Static_assert(_Alignof(")?;
+    e.b(name)?;
+    e.t(") == ")?;
+    e.d(layout.align as u64)?;
+    e.t(", ")?;
+    appendLayoutMessage(c, mut e.buf, "alignof(", t, ")")?;
+    e.t(");")?;
+    return e.emit();
+}
+
+/// The program (EmitProgram), unsplit; split mode is the build's (S2).
+fn emitProgram(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+) -> Result<void, AllocError> {
+    e.t("/* Generated by ")?;
+    e.t(compilerBanner())?;
+    e.t(". Do not edit. */")?;
+    e.emit()?;
+    if (usesFloats(e, c, n)) {
+        e.line("#define NV_FLOATS 1 /* rt.h's IEEE checks and float helpers (type-system.md §35.6) */")?;
+    }
+    e.line("#include \"nova/rt.h\"")?;
+    for (header in c.headers.view()) {
+        e.t("#include \"")?;
+        e.b(header.view())?;
+        e.t("\"")?;
+        e.emit()?; // imported C types (type-system.md §31.3)
+    }
+    if (e.headerStructs.length > 0) {
+        // The @repr(C) structs are defined once, in the exports header, which a @header may include too (ADR 0030).
+        e.t("#include \"")?;
+        let header = copyBytes(e.exportsHeader.view())?;
+        e.b(header.view())?;
+        e.t("\"")?;
+        e.emit()?;
+    }
+    e.line("")?;
+    e.t("_Static_assert(sizeof(void *) * 8 == ")?;
+    e.d(64 as u64)?;
+    e.t(", \"novac: generated for a ")?;
+    e.d(64 as u64)?;
+    e.t("-bit target\");")?;
+    e.emit()?;
+    e.line("")?;
+    for (id in 0..e.fileOrder.length) {
+        let file = e.fileOrder[id];
+        e.t("static NV_UNUSED const char nv_file_")?;
+        e.d(id as u64)?;
+        e.t("[] = ")?;
+        appendCStringLiteral(mut e.buf, c.filePaths[file as usize].view())?;
+        e.t(";")?;
+        e.emit()?;
+    }
+    e.line("")?;
+    if (!e.trial && e.siteList.length > 0) {
+        for (id in 0..e.siteList.length) {
+            let site = e.siteList[id];
+            e.t("static NV_UNUSED const nv_loc nvL_")?;
+            e.d(id as u64)?;
+            e.t(" = { nv_file_")?;
+            e.d(site.file as u64)?;
+            e.t(", ")?;
+            e.d(site.line as u64)?;
+            e.t("u, ")?;
+            e.d(site.column as u64)?;
+            e.t("u };")?;
+            e.emit()?;
+        }
+        e.line("")?;
+    }
+
+    emitStructs(e, c, n)?;
+    emitDynTableTypes(e, c)?;
+    emitThreadRecords(e, c)?;
+    emitImportedFieldChecks(e, c)?;
+    emitExterns(e, c, n, sources)?;
+    emitExportPrototypes(e, c, n)?;
+    emitExportedConstants(e, c)?;
+    emitStatics(e, c, true)?;
+
+    for (k in 0..e.compiled.length) {
+        let function = e.compiled[k];
+        e.t("static NV_UNUSED ")?;
+        appendSignature(e, c, n, function, false)?;
+        e.t(";")?;
+        e.emit()?;
+    }
+    emitDropGluePrototypes(e, c)?;
+    var placed = Vector<u32>.create();
+    placedTypes(e, c, n, mut placed)?;
+    for (t in placed.view()) {
+        e.t("static NV_UNUSED void ")?;
+        appendPlacedName(c, mut e.buf, t)?;
+        e.t("(")?;
+        appendCTypeName(c, mut e.buf, t)?;
+        e.t(" *p);")?;
+        e.emit()?; // a raw write calls them (ADR 0027)
+    }
+    emitBoxCreatePrototypes(e, c)?;
+    emitArenaHelperPrototypes(e, c)?;
+    emitVectorHelperPrototypes(e, c)?;
+    emitContainerHelperPrototypes(e, c)?;
+    emitIoHelperPrototypes(e, c)?;
+    for (k in 0..e.composites.length) {
+        let result = e.composites[k];
+        if (isPoolTakeResult(c, result)) {
+            e.t("static NV_UNUSED ")?;
+            appendPoolTakeSignature(c, mut e.buf, result)?;
+            e.t(";")?;
+            e.emit()?;
+        }
+    }
+    e.line("")?;
+    for (thread in c.types.threadList.view()) {
+        if (!c.types.isGeneric(thread)) {
+            e.t("static NV_UNUSED void ")?;
+            appendDropGlueName(c, mut e.buf, thread)?;
+            e.t("(")?;
+            appendCTypeName(c, mut e.buf, thread)?;
+            e.t(" *);")?;
+            e.emit()?;
+        }
+    }
+    emitDynTables(e, c)?;
+    emitThreadHelpers(e, c, n)?;
+    emitForkHelpers(e, c, n)?;
+
+    for (k in 0..e.compiled.length) {
+        let function = e.compiled[k];
+        emitFunction(e, c, n, sources, function)?;
+        e.line("")?;
+    }
+    emitHelpers(e, c, n)?;
+    emitExports(e, c, n, sources)?;
+    emitCallbacks(e, c, n)?;
+    return emitMainWrapper(e, c, n);
+}
+
+/// The per-type helpers' definitions, after the functions (EmitHelpers).
+fn emitHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirProgram) -> Result<void, AllocError> {
+    emitDropGlue(e, c)?;
+    emitPlacedHelpers(e, c, n)?;
+    emitBoxCreate(e, c)?;
+    emitBoxFree(e, c)?;
+    emitArenaHelpers(e, c)?;
+    emitVectorHelpers(e, c)?;
+    emitContainerHelpers(e, c)?;
+    emitIoHelpers(e, c)?;
+    return emitPoolTake(e, c);
+}
+
+/// Does the program compute with floats (UsesFloats, §35.6)?
+fn usesFloats(e: borrow CEmitter, c: borrow Checker, n: borrow NirProgram) -> bool {
+    for (t in 0..e.usedTypes.length) {
+        if (e.usedTypes[t] && c.types.is(truncate<u32>(t), TypeKind.Float)) {
+            return true;
+        }
+    }
+    for (k in e.compiled.view()) {
+        for (block in n.functions[k as usize].blocks.view()) {
+            for (s in block.statements.view()) {
+                let rvalue = match (n.statements[s as usize]) {
+                    NirStatement.Assign(_, r) => r,
+                    NirStatement.Eval(r) => r,
+                    _ => none(),
+                };
+                if (rvalue != none()) {
+                    var operands = Vector<u32>.create();
+                    rvalueOperands(n, rvalue, mut operands)!;
+                    for (o in operands.view()) {
+                        if (isFloatConstant(c, n, o)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            match (n.terminators[block.terminator as usize]) {
+                NirTerminator.Return(o) => {
+                    if (o != none() && isFloatConstant(c, n, o)) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    return false;
+}
+
+fn isFloatConstant(c: borrow Checker, n: borrow NirProgram, operand: u32) -> bool =>
+    match (n.operands[operand as usize]) {
+        NirOperand.Const(_) => c.types.is(n.operandTypes[operand as usize], TypeKind.Float),
+        _ => false,
+    };
+
+// ---- Statics (type-system.md §39.5) ----
+
+/// A static item's C object (StaticName): `nvS_` and its name, other characters as `_`.
+fn appendStaticName(c: borrow Checker, out: borrow mut Vector<u8>, item: u32) -> Result<void, AllocError> {
+    appendText(out, "nvS_")?;
+    for (b in c.name(c.hir.statics[item as usize].name)) {
+        out.push(if ((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')) b else '_')?;
+    }
+    return Ok();
+}
+
+/// The statics' definitions with their initialisers (EmitStatics); split mode's declarations are S2's.
+fn emitStatics(e: borrow mut CEmitter, c: borrow Checker, definitions: bool) -> Result<void, AllocError> {
+    if (definitions) {
+        // Each C string a static points to is a char array of its own, an address constant.
+        for (item in c.hir.statics.view()) {
+            collectStaticStrings(e, c, item.value)?;
+        }
+        for (id in 0..e.staticStrings.length) {
+            e.t("static NV_UNUSED char nvSC_")?;
+            e.d(id as u64)?;
+            e.t("[] = ")?;
+            let text = copyBytes(e.staticStrings[id].view())?;
+            appendCStringLiteral(mut e.buf, text.view())?;
+            e.t(";")?;
+            e.emit()?;
+        }
+    }
+    for (k in 0..c.hir.statics.length) {
+        let item = c.hir.statics[k];
+        var name = Vector<u8>.create();
+        appendStaticName(c, mut name, truncate<u32>(k))?;
+        e.t("static NV_UNUSED ")?;
+        appendCTypeName(c, mut e.buf, item.typ)?;
+        e.t(" ")?;
+        e.b(name.view())?;
+        e.t(" = ")?;
+        var initializer = Vector<u8>.create();
+        appendStaticInitializer(e, c, mut initializer, item.value, item.typ, name.view(), false)?;
+        e.b(initializer.view())?;
+        e.t(";")?;
+        e.emit()?;
+    }
+    if (c.hir.statics.length > 0) {
+        e.line("")?;
+    }
+    return Ok();
+}
+
+fn staticStringId(e: borrow CEmitter, text: Slice<u8>) -> u32 {
+    for (k in 0..e.staticStrings.length) {
+        if (sameBytes(e.staticStrings[k].view(), text)) {
+            return truncate<u32>(k);
+        }
+    }
+    return none();
+}
+
+/// The C strings statics point to, each once, in first-use order (CollectStaticStrings).
+fn collectStaticStrings(e: borrow mut CEmitter, c: borrow Checker, value: u32) -> Result<void, AllocError> {
+    match (c.hir.exprs[value as usize]) {
+        HirExpr.StaticCString(text) => {
+            let bytes = c.hir.textOf(text);
+            if (staticStringId(e, bytes) == none()) {
+                e.staticStrings.push(copyBytes(bytes)?)?;
+            }
+        }
+        HirExpr.StructLiteral(fields) => {
+            for (k in 0..fields.count) {
+                collectStaticStrings(e, c, c.hir.fieldValues[(fields.start + k) as usize].value)?;
+            }
+        }
+        HirExpr.ArrayLiteral(elements) => {
+            for (k in 0..elements.count) {
+                collectStaticStrings(e, c, c.hir.at(elements, k))?;
+            }
+        }
+        HirExpr.ArrayRepeat(repeated) => { collectStaticStrings(e, c, repeated)?; }
+        HirExpr.Call(_, arguments) => {
+            for (k in 0..arguments.count) {
+                collectStaticStrings(e, c, c.hir.at(arguments, k))?;
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+/// A static's evaluated initialiser as a C constant initialiser (StaticInitializer); `place` is the C place it
+/// initialises, which `here` takes the address of (ADR 0027).
+fn appendStaticInitializer(
+    e: borrow CEmitter,
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    value: u32,
+    t: u32,
+    place: Slice<u8>,
+    cArray: bool,
+) -> Result<void, AllocError> {
+    match (c.hir.exprs[value as usize]) {
+        HirExpr.IntConst(v) => { appendConstant(c, out, v, t)?; }
+        HirExpr.BoolConst(v) => { appendText(out, if (v) "true" else "false")?; }
+        HirExpr.FloatConst(f) => {
+            let bits = if (c.types.info(t).bits == 32) (round<f32>(f)).bits() as u64 else f.bits();
+            appendConstant(c, out, IntValue { negative: false, magnitude: bits }, t)?;
+        }
+        HirExpr.StringConst(text) => {
+            let bytes = c.hir.textOf(text);
+            appendText(out, "{ .ptr = (const uint8_t *)")?;
+            appendCStringLiteral(out, bytes)?;
+            appendText(out, ", .len = ")?;
+            appendDecimal(out, bytes.length as u64)?;
+            appendText(out, "u }")?;
+        }
+        HirExpr.StaticCString(text) => {
+            let id = staticStringId(e, c.hir.textOf(text));
+            let pointee = c.types.info(t).pointee;
+            if (pointee != none() && c.types.is(pointee, TypeKind.CChar)) {
+                appendText(out, "nvSC_")?;
+                appendDecimal(out, id as u64)?;
+            } else {
+                appendText(out, "(")?;
+                appendCTypeName(c, out, t)?;
+                appendText(out, ")(void *)nvSC_")?;
+                appendDecimal(out, id as u64)?;
+            }
+        }
+        HirExpr.StructLiteral(fields) => {
+            if (fields.count == 0) {
+                appendText(out, "{ 0 }")?;
+            } else {
+                appendText(out, "{ ")?;
+                for (k in 0..fields.count) {
+                    if (k > 0) {
+                        appendText(out, ", ")?;
+                    }
+                    let fieldValue = c.hir.fieldValues[(fields.start + k) as usize];
+                    var member = Vector<u8>.create();
+                    appendFieldName(c, mut member, fieldValue.field)?;
+                    out.push('.')?;
+                    appendBytes(out, member.view())?;
+                    appendText(out, " = ")?;
+                    var inner = copyBytes(place)?;
+                    inner.push('.')?;
+                    appendBytes(mut inner, member.view())?;
+                    let fieldType = c.types.fields[fieldValue.field as usize].typ;
+                    appendStaticInitializer(
+                        e, c, out, fieldValue.value, fieldType, inner.view(),
+                        isCArrayMember(c, t, fieldValue.field),
+                    )?;
+                }
+                appendText(out, " }")?;
+            }
+        }
+        HirExpr.ArrayLiteral(elements) => {
+            appendText(out, if (cArray) "{ " else "{ .e = { ")?;
+            for (k in 0..elements.count) {
+                if (k > 0) {
+                    appendText(out, ", ")?;
+                }
+                var inner = elementPlace(place, k, cArray)?;
+                appendStaticInitializer(
+                    e,
+                    c,
+                    out,
+                    c.hir.at(elements, k),
+                    c.types.info(t).element,
+                    inner.view(),
+                    cArray,
+                )?;
+            }
+            appendText(out, if (cArray) " }" else " } }")?;
+        }
+        HirExpr.ArrayRepeat(repeated) => {
+            appendText(out, if (cArray) "{ " else "{ .e = { ")?;
+            let length = truncate<u32>(c.types.info(t).arrayLength);
+            for (k in 0..length) {
+                if (k > 0) {
+                    appendText(out, ", ")?;
+                }
+                var inner = elementPlace(place, k, cArray)?;
+                appendStaticInitializer(e, c, out, repeated, c.types.info(t).element, inner.view(), cArray)?;
+            }
+            appendText(out, if (cArray) " }" else " } }")?;
+        }
+        HirExpr.BuiltinCall(function, arguments) => {
+            let of = c.types.info(c.hir.typeOf(c.hir.at(arguments, 0))).pointee;
+            if (function == bfLayoutOf()) {
+                appendMeasuredLayout(c, out, of)?;
+            } else {
+                let index = match (c.hir.exprs[c.hir.at(arguments, 1) as usize]) {
+                    HirExpr.IntConst(v) => truncate<u32>(v.magnitude),
+                    _ => 0,
+                };
+                appendMeasuredOffset(c, out, of, index)?;
+            }
+        }
+        HirExpr.Here => {
+            appendText(out, "(&")?;
+            appendBytes(out, place)?;
+            appendText(out, ")")?;
+        }
+        HirExpr.Call(callee, arguments) => {
+            appendBytes(out, c.name(c.hir.functions[callee as usize].name))?;
+            appendText(out, "(")?;
+            let parameters = borrow c.hir.functions[callee as usize].parameters;
+            for (k in 0..arguments.count) {
+                if (k > 0) {
+                    appendText(out, ", ")?;
+                }
+                let parameterType = c.hir.locals[parameters[k as usize] as usize].typ;
+                appendStaticInitializer(e, c, out, c.hir.at(arguments, k), parameterType, place, false)?;
+            }
+            appendText(out, ")")?;
+        }
+        _ => { appendText(out, "?")?; } // not evaluated: the reference throws
+    }
+    return Ok();
+}
+
+fn elementPlace(place: Slice<u8>, index: u32, cArray: bool) -> Result<Vector<u8>, AllocError> {
+    var out = copyBytes(place)?;
+    appendText(mut out, if (cArray) "[" else ".e[")?;
+    appendDecimal(mut out, index as u64)?;
+    out.push(']')?;
+    return Ok(out);
+}
+
+/// `offsetOf<T>(field)` of a C-laid-out or imported type: C's own `offsetof` (MeasuredOffset, ADR 0030).
+fn appendMeasuredOffset(c: borrow Checker, out: borrow mut Vector<u8>, t: u32, field: u32) -> Result<void, AllocError> {
+    appendText(out, "((uint64_t)offsetof(")?;
+    appendCTypeName(c, out, t)?;
+    appendText(out, ", ")?;
+    appendFieldName(c, out, c.types.structs[c.types.info(t).structDef as usize].fields[field as usize])?;
+    return appendText(out, "))");
+}
+
+/// `layoutOf<T>()` of a C-laid-out type: the C compiler's own size and alignment (MeasuredLayout, ADR 0027).
+fn appendMeasuredLayout(c: borrow Checker, out: borrow mut Vector<u8>, t: u32) -> Result<void, AllocError> {
+    appendText(out, "{ .f_size = sizeof(")?;
+    appendCTypeName(c, out, t)?;
+    appendText(out, "), .f_align = _Alignof(")?;
+    appendCTypeName(c, out, t)?;
+    return appendText(out, ") }");
+}
+
+// ---- Structs, composites and enums ----
+
+/// Struct definitions, each after the structs it contains by value, with static assertions that the C compiler's
+/// layout matches Nova's (EmitStructs, type-system.md §12).
+fn emitStructs(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirProgram) -> Result<void, AllocError> {
+    emitDynTypedefs(e, c)?;
+    // A box is a pointer, not a C struct; a pool box is a struct of two pointers.
+    var aggregates = Vector<u32>.create();
+    for (t in e.aggregates.view()) {
+        if (!c.types.is(t, TypeKind.Box) || c.types.isPoolBox(t)) {
+            aggregates.push(t)?;
+        }
+    }
+    if (aggregates.length == 0) {
+        return emitFunctionPointerTypedefs(e, c);
+    }
+    for (t in aggregates.view()) {
+        e.t("typedef struct ")?;
+        appendStructTag(c, mut e.buf, t)?;
+        e.t(" ")?;
+        appendCTypeName(c, mut e.buf, t)?;
+        e.t(";")?;
+        e.emit()?;
+    }
+    emitFunctionPointerTypedefs(e, c)?; // after the struct names, before the structs that may hold them
+    e.line("")?;
+    var emitted = Vector<bool>.create();
+    for (t in aggregates.view()) {
+        emitStructType(e, c, t, mut emitted)?;
+    }
+    return Ok();
+}
+
+fn emitStructType(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    t: u32,
+    emitted: borrow mut Vector<bool>,
+) -> Result<void, AllocError> {
+    if (!markType(emitted, t)? || isImportedStruct(c, t)) {
+        return Ok(); // an imported type is the header's (§31.3)
+    }
+    if (c.types.info(t).enumDef != none()) {
+        return emitEnum(e, c, t, emitted);
+    }
+    if (c.types.is(t, TypeKind.Array) || c.types.is(t, TypeKind.Reference) || c.types.is(t, TypeKind.Vector) ||
+        c.types.is(t, TypeKind.StableVector) || c.types.is(t, TypeKind.SlotMap) || c.types.isPoolBox(t)) {
+        return emitComposite(e, c, t, emitted);
+    }
+    let fields = borrow c.types.structs[c.types.info(t).structDef as usize].fields;
+    for (f in fields.view()) {
+        let fieldType = c.types.fields[f as usize].typ;
+        if (isCAggregate(c, fieldType)) {
+            emitStructType(e, c, fieldType, emitted)?;
+        }
+    }
+    let name = cTypeName(c, t)?;
+    var tag = Vector<u8>.create();
+    appendStructTag(c, mut tag, t)?;
+    if (!containsU32(e.headerStructs, t)) {
+        // Unless the exports header defines it, and main.c includes that (ADR 0030).
+        e.t("struct ")?;
+        e.b(tag.view())?;
+        e.t(" {")?;
+        e.emit()?;
+        if (fields.length == 0) {
+            e.t("    ")?;
+            appendAlignPrefix(c, mut e.buf, t, 0)?;
+            e.t("uint8_t nv_empty; /* C has no empty structs */")?;
+            e.emit()?;
+        }
+        for (f in fields.view()) {
+            let field = c.types.fields[f as usize];
+            e.t("    ")?;
+            appendAlignPrefix(c, mut e.buf, t, field.index)?;
+            appendCTypeName(c, mut e.buf, field.typ)?;
+            e.t(" ")?;
+            appendFieldName(c, mut e.buf, f)?;
+            e.t(";")?;
+            e.emit()?;
+        }
+        e.line("};")?;
+    }
+    if (isReprCStruct(c, t)) {
+        for (f in fields.view()) {
+            let fieldType = c.types.fields[f as usize].typ;
+            if (!c.types.is(fieldType, TypeKind.Array)) {
+                continue;
+            }
+            // The C array member is used as Nova's array struct, so the two must have one layout (ADR 0029).
+            e.t("_Static_assert(sizeof(((struct ")?;
+            e.b(tag.view())?;
+            e.t(" *)0)->")?;
+            appendFieldName(c, mut e.buf, f)?;
+            e.t(") == sizeof(")?;
+            appendCTypeName(c, mut e.buf, fieldType)?;
+            e.t(") && _Alignof(")?;
+            appendCTypeName(c, mut e.buf, fieldType)?;
+            e.t(") == _Alignof(")?;
+            appendCTypeName(c, mut e.buf, arrayBase(c, fieldType))?;
+            e.t("), ")?;
+            var message = Vector<u8>.create();
+            appendText(mut message, "novac layout: ")?;
+            appendBytes(mut message, c.types.name(t))?;
+            message.push('.')?;
+            appendBytes(mut message, c.name(c.types.fields[f as usize].name))?;
+            appendText(mut message, " as a C array")?;
+            appendCMessageLiteral(mut e.buf, message.view())?;
+            e.t(");")?;
+            e.emit()?;
+        }
+    }
+    if (c.types.isCLaidOut(t, 0)) {
+        return e.line(""); // it holds C state: the C compiler lays it out (§33.1)
+    }
+    emitSizeAsserts(e, c, t, name.view())?;
+    for (f in fields.view()) {
+        let field = c.types.fields[f as usize];
+        e.t("_Static_assert(offsetof(")?;
+        e.b(name.view())?;
+        e.t(", ")?;
+        appendFieldName(c, mut e.buf, f)?;
+        e.t(") == ")?;
+        e.d(field.offset as u64)?;
+        e.t(", ")?;
+        var message = Vector<u8>.create();
+        appendText(mut message, "novac layout: ")?;
+        appendBytes(mut message, c.types.name(t))?;
+        message.push('.')?;
+        appendBytes(mut message, c.name(field.name))?;
+        appendCMessageLiteral(mut e.buf, message.view())?;
+        e.t(");")?;
+        e.emit()?;
+    }
+    return e.line("");
+}
+
+/// `[T; N]` is `struct { T e[N]; }`; a slice is `struct { T *ptr; uint64_t len; }` (EmitComposite, §16.1).
+fn emitComposite(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    t: u32,
+    emitted: borrow mut Vector<bool>,
+) -> Result<void, AllocError> {
+    let name = cTypeName(c, t)?;
+    let info = c.types.info(t);
+    if (c.types.is(t, TypeKind.Array)) {
+        if (isCAggregate(c, info.element)) {
+            emitStructType(e, c, info.element, emitted)?;
+        }
+        e.t("struct ")?;
+        e.b(name.view())?;
+        e.t(" { ")?;
+        appendCTypeName(c, mut e.buf, info.element)?;
+        e.t(" e[")?;
+        e.d(truncate<u64>(info.arrayLength))?;
+        e.t("]; };")?;
+        e.emit()?;
+    } else if (c.types.isPoolBox(t)) {
+        e.t("struct ")?;
+        e.b(name.view())?;
+        e.t(" { ")?;
+        appendCTypeName(c, mut e.buf, info.pointee)?;
+        e.t(" *ptr; nv_pool *pool; };")?;
+        e.emit()?;
+    } else if (c.types.is(t, TypeKind.Vector)) {
+        e.t("struct ")?;
+        e.b(name.view())?;
+        e.t(" { ")?;
+        appendCTypeName(c, mut e.buf, c.types.info(info.pointee).element)?;
+        e.t(" *ptr; uint64_t len; uint64_t cap; };")?;
+        e.emit()?;
+    } else if (c.types.is(t, TypeKind.StableVector)) {
+        e.t("struct ")?;
+        e.b(name.view())?;
+        e.t(" { void *chunks[NV_SVEC_CHUNKS]; uint64_t len; };")?;
+        e.emit()?;
+    } else if (c.types.is(t, TypeKind.SlotMap)) {
+        // Slots hold values by value: the element type is complete first.
+        if (isCAggregate(c, info.element)) {
+            emitStructType(e, c, info.element, emitted)?;
+        }
+        var slot = Vector<u8>.create();
+        appendSlotName(c, mut slot, t)?;
+        e.t("typedef struct ")?;
+        e.b(slot.view())?;
+        e.t(" { uint32_t gen; uint32_t next; ")?;
+        appendCTypeName(c, mut e.buf, info.element)?;
+        e.t(" value; } ")?;
+        e.b(slot.view())?;
+        e.t(";")?;
+        e.emit()?;
+        e.t("struct ")?;
+        e.b(name.view())?;
+        e.t(" { ")?;
+        e.b(slot.view())?;
+        e.t(" *ptr; uint64_t len; uint64_t cap; uint64_t count; uint32_t free; };")?;
+        e.emit()?;
+    } else {
+        let element = cTypeName(c, c.types.info(info.pointee).element)?;
+        e.t("struct ")?;
+        e.b(name.view())?;
+        e.t(" { ")?;
+        // A shared slice's elements are const; for an element that is itself a pointer the const goes after it.
+        if (info.mutableReference) {
+            e.b(element.view())?;
+        } else if (element.length > 0 && element[element.length - 1] == '*') {
+            e.b(element.view())?;
+            e.t("const")?;
+        } else {
+            e.t("const ")?;
+            e.b(element.view())?;
+        }
+        e.t(" *ptr; uint64_t len; };")?;
+        e.emit()?;
+    }
+    if (!c.types.isCLaidOut(t, 0)) {
+        emitSizeAsserts(e, c, t, name.view())?;
+    }
+    return e.line("");
+}
+
+/// An enum: `struct { uintN_t tag; union { struct { … } v_V; … } u; }` (EmitEnum, §15.1).
+fn emitEnum(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    t: u32,
+    emitted: borrow mut Vector<bool>,
+) -> Result<void, AllocError> {
+    let definition = borrow c.types.enums[c.types.info(t).enumDef as usize];
+    for (v in definition.variants.view()) {
+        for (f in c.types.variants[v as usize].payload.view()) {
+            let fieldType = c.types.fields[f as usize].typ;
+            if (isCAggregate(c, fieldType)) {
+                emitStructType(e, c, fieldType, emitted)?;
+            }
+        }
+    }
+    let name = cTypeName(c, t)?;
+    if (c.types.isNicheOptional(t)) {
+        // The pointer alone, null for `null` (type-system.md §22.1).
+        let some = definition.variants[1];
+        e.t("struct ")?;
+        e.b(name.view())?;
+        e.t(" { ")?;
+        appendCTypeName(c, mut e.buf, definition.optionType)?;
+        e.t(" ")?;
+        appendFieldName(c, mut e.buf, c.types.variants[some as usize].payload[0])?;
+        e.t("; };")?;
+        e.emit()?;
+        emitSizeAsserts(e, c, t, name.view())?;
+        return e.line("");
+    }
+    e.t("struct ")?;
+    e.b(name.view())?;
+    e.t(" {")?;
+    e.emit()?;
+    e.t("    uint")?;
+    e.d((definition.tagSize * 8) as u64)?;
+    e.t("_t tag;")?;
+    e.emit()?;
+    var withPayload = false;
+    for (v in definition.variants.view()) {
+        if (c.types.variants[v as usize].payload.length > 0) {
+            withPayload = true;
+        }
+    }
+    if (withPayload) {
+        e.line("    union {")?;
+        for (v in definition.variants.view()) {
+            let payload = borrow c.types.variants[v as usize].payload;
+            if (payload.length == 0) {
+                continue;
+            }
+            e.t("        struct { ")?;
+            for (f in payload.view()) {
+                appendCTypeName(c, mut e.buf, c.types.fields[f as usize].typ)?;
+                e.t(" ")?;
+                appendFieldName(c, mut e.buf, f)?;
+                e.t("; ")?;
+            }
+            e.t("} ")?;
+            appendCVariantName(c, mut e.buf, v)?;
+            e.t(";")?;
+            e.emit()?;
+        }
+        e.line("    } u;")?;
+    }
+    e.line("};")?;
+    emitSizeAsserts(e, c, t, name.view())?;
+    if (definition.unionOffset >= 0) {
+        e.t("_Static_assert(offsetof(")?;
+        e.b(name.view())?;
+        e.t(", u) == ")?;
+        e.d(truncate<u64>(definition.unionOffset))?;
+        e.t(", ")?;
+        appendLayoutMessage(c, mut e.buf, "", t, " payload offset")?;
+        e.t(");")?;
+        e.emit()?;
+    }
+    for (v in definition.variants.view()) {
+        let payload = borrow c.types.variants[v as usize].payload;
+        if (payload.length == 0 || !usesConstructor(c, v)) {
+            continue;
+        }
+        var variantName = Vector<u8>.create();
+        appendCVariantName(c, mut variantName, v)?;
+        e.t("static inline NV_UNUSED ")?;
+        e.b(name.view())?;
+        e.t(" ")?;
+        appendEnumConstructor(mut e.buf, name.view(), variantName.view())?;
+        e.t("(")?;
+        for (k in 0..payload.length) {
+            if (k > 0) {
+                e.t(", ")?;
+            }
+            appendCTypeName(c, mut e.buf, c.types.fields[payload[k] as usize].typ)?;
+            e.t(" a")?;
+            e.d(k as u64)?;
+        }
+        e.t(") {")?;
+        e.emit()?;
+        e.t("    ")?;
+        e.b(name.view())?;
+        e.t(" r = { 0 };")?;
+        e.emit()?;
+        e.t("    r.tag = (uint")?;
+        e.d((definition.tagSize * 8) as u64)?;
+        e.t("_t)")?;
+        e.d(c.types.variants[v as usize].index as u64)?;
+        e.t(";")?;
+        e.emit()?;
+        for (k in 0..payload.length) {
+            e.t("    r.u.")?;
+            e.b(variantName.view())?;
+            e.t(".")?;
+            appendFieldName(c, mut e.buf, payload[k])?;
+            e.t(" = a")?;
+            e.d(k as u64)?;
+            e.t(";")?;
+            e.emit()?;
+        }
+        e.line("    return r;")?;
+        e.line("}")?;
+    }
+    return e.line("");
+}
+
+/// Whether a variant's values are built by its constructor, of member stores (UsesConstructor): when its payload may
+/// hold a pointer.
+fn usesConstructor(c: borrow Checker, variant: u32) -> bool {
+    for (f in c.types.variants[variant as usize].payload.view()) {
+        if (!isPlainPayload(c, c.types.fields[f as usize].typ)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn isPlainPayload(c: borrow Checker, t: u32) -> bool {
+    if (c.types.is(t, TypeKind.Integer) || c.types.is(t, TypeKind.Float) || c.types.is(t, TypeKind.Bool)) {
+        return true;
+    }
+    let e = c.types.info(t).enumDef;
+    if (!c.types.is(t, TypeKind.Enum) || e == none()) {
+        return false;
+    }
+    for (v in c.types.enums[e as usize].variants.view()) {
+        if (c.types.variants[v as usize].payload.length > 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The constructor of one variant of an enum with a payload (EnumConstructor): `nvMk_<enum>_<variant>`.
+fn appendEnumConstructor(
+    out: borrow mut Vector<u8>,
+    enumName: Slice<u8>,
+    variantName: Slice<u8>,
+) -> Result<void, AllocError> {
+    appendText(out, "nvMk_")?;
+    appendBytes(out, enumName)?;
+    out.push('_')?;
+    return appendBytes(out, variantName);
+}
+
+/// Every declared field of an imported C type has exactly its declared type and size in the header
+/// (EmitImportedFieldChecks, §31.3).
+fn emitImportedFieldChecks(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    var any = false;
+    for (t in c.programStructs.view()) {
+        let s = c.types.info(t).structDef;
+        if (s == none() || !c.types.structs[s as usize].isImported || c.types.structs[s as usize].fields.length == 0) {
+            continue;
+        }
+        any = true;
+        let spelling = c.types.rangeText(c.types.structs[s as usize].cSpelling);
+        let file = c.types.structs[s as usize].file;
+        for (f in c.types.structs[s as usize].fields.view()) {
+            let field = c.types.fields[f as usize];
+            var member = Vector<u8>.create();
+            appendText(mut member, "(((")?;
+            appendBytes(mut member, spelling)?;
+            appendText(mut member, " *)0)->")?;
+            appendFieldName(c, mut member, f)?;
+            appendText(mut member, ")")?;
+            var location = copyBytes(c.filePaths[file as usize].view())?;
+            location.push(':')?;
+            appendDecimal(mut location, lineOfOffset(c.fileTexts[file as usize], field.start))?;
+            var name = copyBytes(spelling)?;
+            name.push('.')?;
+            appendFieldName(c, mut name, f)?;
+            if (c.types.is(field.typ, TypeKind.Array)) {
+                // `&member` keeps the array type that `member` itself would decay from (§31.3).
+                let elementType = c.types.info(field.typ).element;
+                var element = Vector<u8>.create();
+                appendBoundaryType(c, mut element, elementType, false)?;
+                let length = truncate<u64>(c.types.info(field.typ).arrayLength);
+                e.t("_Static_assert(_Generic(&")?;
+                e.b(member.view())?;
+                e.t(", ")?;
+                e.b(element.view())?;
+                e.t(" (*)[")?;
+                e.d(length)?;
+                e.t("]: 1, default: 0), ")?;
+                var message = Vector<u8>.create();
+                appendText(mut message, "novac import: ")?;
+                appendBytes(mut message, name.view())?;
+                appendText(mut message, " is not ")?;
+                appendBytes(mut message, element.view())?;
+                message.push('[')?;
+                appendDecimal(mut message, length)?;
+                appendText(mut message, "] (")?;
+                appendBytes(mut message, location.view())?;
+                message.push(')')?;
+                appendCMessageLiteral(mut e.buf, message.view())?;
+                e.t(");")?;
+                e.emit()?;
+                let arrayName = cTypeName(c, field.typ)?;
+                e.t("_Static_assert(sizeof ")?;
+                e.b(member.view())?;
+                e.t(" == sizeof(")?;
+                e.b(arrayName.view())?;
+                e.t(") && _Alignof(")?;
+                e.b(arrayName.view())?;
+                e.t(") == _Alignof(")?;
+                e.b(element.view())?;
+                e.t("), ")?;
+                var layoutMessage = Vector<u8>.create();
+                appendText(mut layoutMessage, "novac import: ")?;
+                appendBytes(mut layoutMessage, name.view())?;
+                appendText(mut layoutMessage, " does not have the layout of ")?;
+                appendBytes(mut layoutMessage, arrayName.view())?;
+                appendText(mut layoutMessage, " (")?;
+                appendBytes(mut layoutMessage, location.view())?;
+                layoutMessage.push(')')?;
+                appendCMessageLiteral(mut e.buf, layoutMessage.view())?;
+                e.t(");")?;
+                e.emit()?;
+                continue;
+            }
+            var cType = Vector<u8>.create();
+            appendBoundaryType(c, mut cType, field.typ, false)?;
+            e.t("_Static_assert(_Generic(")?;
+            e.b(member.view())?;
+            e.t(", ")?;
+            e.b(cType.view())?;
+            e.t(": 1, default: 0), ")?;
+            var message = Vector<u8>.create();
+            appendText(mut message, "novac import: ")?;
+            appendBytes(mut message, name.view())?;
+            appendText(mut message, " is not ")?;
+            appendBytes(mut message, cType.view())?;
+            appendText(mut message, " (")?;
+            appendBytes(mut message, location.view())?;
+            message.push(')')?;
+            appendCMessageLiteral(mut e.buf, message.view())?;
+            e.t(");")?;
+            e.emit()?;
+            if (!c.types.isCLaidOut(field.typ, 0)) {
+                // An embedded member has only C's size (§31.1).
+                let size = cLayout(c, field.typ).size;
+                e.t("_Static_assert(sizeof ")?;
+                e.b(member.view())?;
+                e.t(" == ")?;
+                e.d(truncate<u64>(size))?;
+                e.t(", ")?;
+                var sizeMessage = Vector<u8>.create();
+                appendText(mut sizeMessage, "novac import: ")?;
+                appendBytes(mut sizeMessage, name.view())?;
+                appendText(mut sizeMessage, " is not ")?;
+                appendDecimal(mut sizeMessage, truncate<u64>(size))?;
+                appendText(mut sizeMessage, " bytes (")?;
+                appendBytes(mut sizeMessage, location.view())?;
+                sizeMessage.push(')')?;
+                appendCMessageLiteral(mut e.buf, sizeMessage.view())?;
+                e.t(");")?;
+                e.emit()?;
+            }
+        }
+    }
+    if (any) {
+        e.line("")?;
+    }
+    return Ok();
+}

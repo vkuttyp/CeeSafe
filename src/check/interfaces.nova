@@ -237,13 +237,19 @@ fn processImpls(c: borrow mut Checker) -> Result<void, AllocError> {
     let saved = c.file;
     for (k in 0..c.impls.length) {
         let pending = c.impls[k];
-        c.file = pending.file;
+        {
+            let fileToSet = pending.file;
+            c.setFile(fileToSet);
+        }
         processImpl(c, pending.item)?;
     }
     c.implsReady = true;
     for (k in 0..c.pendingBounds.length) {
         let p = c.pendingBounds[k];
-        c.file = p.file;
+        {
+            let fileToSet = p.file;
+            c.setFile(fileToSet);
+        }
         var parameters = Vector<u32>.create();
         listTypes(c, p.parameters, mut parameters)?;
         var arguments = Vector<u32>.create();
@@ -252,11 +258,14 @@ fn processImpls(c: borrow mut Checker) -> Result<void, AllocError> {
     }
     for (k in 0..c.pendingAllocators.length) {
         let p = c.pendingAllocators[k];
-        c.file = p.file;
+        {
+            let fileToSet = p.file;
+            c.setFile(fileToSet);
+        }
         verifyUserAllocator(c, p.typ, Span { start: p.start, end: p.end })?;
     }
     c.pendingBounds.truncate(0);
-    c.file = saved;
+    c.setFile(saved);
     return Ok();
 }
 
@@ -549,9 +558,12 @@ fn findMethod(c: borrow mut Checker, typ: u32, name: u32, span: Span) -> Result<
     zipEnvironment(c, interfaceParameters, arguments.view(), mut pairs)?;
     let environment = storeEnvironment(c, pairs.view())?;
     let savedFile = c.file;
-    c.file = entry.file;
+    {
+        let fileToSet = entry.file;
+        c.setFile(fileToSet);
+    }
     let function = declareSignature(c, signatures[0], typ, environment)?;
-    c.file = savedFile;
+    c.setFile(savedFile);
     c.boundMethods.push(BoundMethod { typ: typ, bound: bound, name: name, function: function })?;
     return Ok(function);
 }

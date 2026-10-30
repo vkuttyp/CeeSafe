@@ -105,7 +105,7 @@ fn synthStructLiteral(
         return c.errorResult(span.start, span.end);
     }
     let declared = c.types.info(c.structs[index as usize].typ).structDef;
-    let declaredType = c.structs[index as usize].typ;
+    let declaredType = useStructEntry(c, index);
     if (!c.types.structs[declared as usize].isImported && c.freestanding && isAllocatorType(c, declaredType)) {
         var what = Vector<u8>.create();
         appendQuotedName(mut what, c, nameIdent.symbol)?;
@@ -278,7 +278,7 @@ fn checkStaticCall(
     calleeSpan: Span,
     span: Span,
 ) -> Result<u32, AllocError> {
-    let typ = c.structs[index as usize].typ;
+    let typ = useStructEntry(c, index);
     let memberIdent = c.front.ast.idents[member as usize];
     if (index == 1 && (sameText(
         c.name(memberIdent.symbol),

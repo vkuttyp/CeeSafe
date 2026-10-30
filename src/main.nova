@@ -43,12 +43,15 @@ struct Options {
     dumpAst: bool;
     dumpHir: bool;
     noFloat: bool;
-    libraryDiagnostics: bool; // report diagnostics in the libraries' files too (porting gaps there; novac has none)
-    freestanding: bool;       // --profile freestanding (cosmoos/profiles.md §4)
-    kernel: bool;             // --kernel cosmoos: lib/kernel, in the freestanding profile (ADR 0025)
-    profileGiven: bool;       // --profile was given: package mode keeps it over the manifest's
-    building: bool;           // `build`: until P5, only `--dump-nir`, which prints the NIR and stops
-    dumpNir: bool;            // --dump-nir (build)
+    libraryDiagnostics: bool;  // report diagnostics in the libraries' files too (porting gaps there; novac has none)
+    freestanding: bool;        // --profile freestanding (cosmoos/profiles.md §4)
+    kernel: bool;              // --kernel cosmoos: lib/kernel, in the freestanding profile (ADR 0025)
+    profileGiven: bool;        // --profile was given: package mode keeps it over the manifest's
+    building: bool;            // `build`: until P5, only `--dump-nir`, which prints the NIR and stops
+    dumpNir: bool;             // --dump-nir (build)
+    emit: Vector<u8>;          // --emit c|exe|obj (build)
+    output: Vector<u8>;        // -o (build), or empty
+    exportsHeader: Vector<u8>; // --exports-header (build)
     files: Vector<String>;
 }
 
@@ -93,11 +96,35 @@ fn readOptions(options: borrow mut Options) -> i32 {
             options.dumpHir = true;
         } else if (options.building && arg == "--dump-nir") {
             options.dumpNir = true;
-        } else if (options.building && (arg == "--emit" || arg == "-o")) {
-            a += 1; // the C backend's options (P5): `--dump-nir` stops before them
+        } else if (options.building && (arg == "--emit" || arg == "-o" || arg == "--exports-header")) {
+            let value = match (Process.argument(a)) {
+                Some(v) => v,
+                null => {
+                    var message = String.create();
+                    message.append("option '")!;
+                    message.append(arg)!;
+                    message.append("' needs a value")!;
+                    return fail(message.view());
+                }
+            };
+            a += 1;
+            if (arg == "--emit") {
+                if (value != "c" && value != "exe" && value != "obj") {
+                    var message = String.create();
+                    message.append("--emit must be 'c', 'exe' or 'obj', not '")!;
+                    message.append(value)!;
+                    message.append("'")!;
+                    return fail(message.view());
+                }
+                options.emit = copyBytes(value.bytes())!;
+            } else if (arg == "-o") {
+                options.output = copyBytes(value.bytes())!;
+            } else {
+                options.exportsHeader = copyBytes(value.bytes())!;
+            }
         } else if (options.building && (arg == "--no-closure-specialisation" || arg == "--no-placement" ||
-            arg == "--no-bce" || arg == "--no-oce")) {
-            // The NIR printed is before these optimisations (P7), as novac's is with them turned off.
+            arg == "--no-bce" || arg == "--no-oce" || arg == "--flat-c")) {
+            // The optimisations and the structured form are P7's: ceesafec always emits as novac does with these.
         } else if (arg == "--no-float") {
             options.noFloat = true;
         } else if (arg == "--library-diagnostics") {
@@ -287,6 +314,9 @@ fn parseCommand() -> i32 {
         profileGiven: false,
         building: false,
         dumpNir: false,
+        emit: copyBytes("exe".bytes())!,
+        output: Vector<u8>.create(),
+        exportsHeader: copyBytes("nova_exports.h".bytes())!,
         files: Vector<String>.create(),
     };
     let status = readOptions(mut options);
@@ -458,6 +488,9 @@ fn fileCommand(building: bool) -> i32 {
         profileGiven: false,
         building: building,
         dumpNir: false,
+        emit: copyBytes("exe".bytes())!,
+        output: Vector<u8>.create(),
+        exportsHeader: copyBytes("nova_exports.h".bytes())!,
         files: Vector<String>.create(),
     };
     let status = readOptions(mut options);
@@ -575,12 +608,57 @@ fn fileCommand(building: bool) -> i32 {
         if (checker.front.diagnostics.hasErrors()) {
             return report(options.json, checker.front.diagnostics, sources);
         }
-        if (!options.dumpNir) {
-            return fail("'build' is not implemented yet (ROADMAP P5); only 'build --dump-nir' is");
+        if (options.dumpNir) {
+            var out = Vector<u8>.create();
+            printNir(checker, nir, mut out)!;
+            Console.writeBytes(out.view());
+            if (!sameText(options.emit.view(), "c")) {
+                return report(options.json, checker.front.diagnostics, sources);
+            }
         }
-        var out = Vector<u8>.create();
-        printNir(checker, nir, mut out)!;
-        Console.writeBytes(out.view());
+        if (!sameText(options.emit.view(), "c")) {
+            return fail("'build --emit exe' and '--emit obj' are not implemented yet (ROADMAP P5 S2); use '--emit c'");
+        }
+        var files = Vector<CFile>.create();
+        if (!generateC(
+            mut checker,
+            nir,
+            sources,
+            false,
+            options.freestanding,
+            options.exportsHeader.view(),
+            mut files,
+        )!) {
+            return report(options.json, checker.front.diagnostics, sources);
+        }
+        var directory = copyBytes(options.output.view())!;
+        if (directory.length == 0) {
+            // The first input's name with `-c` (novac's default for --emit c).
+            var user: usize = 0;
+            while (user + 1 < sources.length && checker.fileIsLibrary[user]) {
+                user += 1;
+            }
+            let first = sources[user].path.view();
+            var start = first.length;
+            while (start > 0 && first[start - 1] != '/') {
+                start -= 1;
+            }
+            var end = first.length;
+            while (end > start && first[end - 1] != '.') {
+                end -= 1;
+            }
+            appendBytes(mut directory, first[start..(if (end > start) end - 1 else first.length)])!;
+            appendText(mut directory, "-c")!;
+        }
+        match (writeFilesUnder(directory.view(), files)) {
+            Ok() => {}
+            Err(e) => {
+                var message = String.create();
+                message.append("cannot write the C: ")!;
+                message.append(e.message())!;
+                return fail(message.view());
+            }
+        }
     }
     return report(options.json, checker.front.diagnostics, sources);
 }

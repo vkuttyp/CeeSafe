@@ -1,0 +1,462 @@
+// The C program's skeleton (the reference's CEmitter: the constructor's analyses, EmitProgram, the statics, the
+// structs and enums, C interoperability, the exports header and the main wrapper).
+
+/// The compiler named in the generated C's banners.
+fn compilerBanner() -> StringView => "ceesafec 0.0.0-dev";
+
+fn isLibraryFunction(c: borrow Checker, function: u32) -> bool => c.hir.functions[function as usize].library;
+
+/// The NIR function of a HIR function, or none (a generic version, an extern, a compile-time-only function).
+fn nirFunctionOf(n: borrow NirProgram, bodies: borrow Vector<u32>, function: u32) -> u32 =>
+    if ((function as usize) < bodies.length) bodies[function as usize] else none();
+
+/// The NIR function of each HIR function, by HIR index.
+fn nirBodies(c: borrow Checker, n: borrow NirProgram) -> Result<Vector<u32>, AllocError> {
+    var bodies = Vector<u32>.create();
+    for (k in 0..c.hir.functions.length) {
+        bodies.push(none())?;
+    }
+    for (k in 0..n.functions.length) {
+        bodies[n.functions[k].source as usize] = truncate<u32>(k);
+    }
+    return Ok(bodies);
+}
+
+fn markType(set: borrow mut Vector<bool>, t: u32) -> Result<bool, AllocError> {
+    while (set.length <= t as usize) {
+        set.push(false)?;
+    }
+    if (set[t as usize]) {
+        return Ok(false);
+    }
+    set[t as usize] = true;
+    return Ok(true);
+}
+
+fn inSet(set: borrow Vector<bool>, t: u32) -> bool => (t as usize) < set.length && set[t as usize];
+
+/// The `drop` functions destroying a value may run, through its fields and contents (DropFunctions).
+fn dropFunctions(
+    c: borrow Checker,
+    t: u32,
+    seen: borrow mut Vector<bool>,
+    out: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    if (!markType(seen, t)? || !c.types.needsDrop(t)) {
+        return Ok();
+    }
+    let info = c.types.info(t);
+    var parts = Vector<u32>.create();
+    if (info.structDef != none()) {
+        for (f in c.types.structs[info.structDef as usize].fields.view()) {
+            parts.push(c.types.fields[f as usize].typ)?;
+        }
+    } else if (info.enumDef != none()) {
+        let e = borrow c.types.enums[info.enumDef as usize];
+        for (v in e.variants.view()) {
+            for (f in c.types.variants[v as usize].payload.view()) {
+                parts.push(c.types.fields[f as usize].typ)?;
+            }
+        }
+        if (e.resultOk != none()) {
+            parts.push(e.resultOk)?;
+            parts.push(e.resultErr)?;
+        } else if (e.optionType != none()) {
+            parts.push(e.optionType)?;
+        }
+    } else if (c.types.is(t, TypeKind.Box) || c.types.is(t, TypeKind.Vector) || c.types.is(t, TypeKind.StableVector)) {
+        let element = c.types.info(info.pointee).element;
+        parts.push(if (element != none()) element else info.pointee)?;
+    } else if (c.types.is(t, TypeKind.SlotMap)) {
+        parts.push(info.element)?;
+    }
+    if (info.structDef != none()) {
+        let ownFunction = c.types.structs[info.structDef as usize].dropFunction;
+        if (ownFunction != none()) {
+            out.push(ownFunction)?;
+        }
+    }
+    for (part in parts.view()) {
+        dropFunctions(c, part, seen, out)?;
+    }
+    return Ok();
+}
+
+/// The `@placed` methods placing a value runs (PlacedFunctions).
+fn placedFunctions(
+    c: borrow Checker,
+    t: u32,
+    seen: borrow mut Vector<bool>,
+    out: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    let s = c.types.info(t).structDef;
+    if (s == none() || !markType(seen, t)?) {
+        return Ok();
+    }
+    let ownFunction = c.types.structs[s as usize].placedMethod;
+    if (ownFunction != none()) {
+        out.push(ownFunction)?;
+    }
+    for (f in c.types.structs[s as usize].fields.view()) {
+        placedFunctions(c, c.types.fields[f as usize].typ, seen, out)?;
+    }
+    return Ok();
+}
+
+/// The allocator methods a box's construction and freeing call, and its contents' `@placed` methods (BoxFunctions).
+fn boxFunctions(c: borrow Checker, box: u32, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    let allocator = c.types.info(box).allocator;
+    if (allocator != none()) {
+        let s = c.types.info(allocator).structDef;
+        if (s != none()) {
+            let definition = borrow c.types.structs[s as usize];
+            if (definition.allocateMethod != none()) {
+                out.push(definition.allocateMethod)?;
+            }
+            if (definition.deallocateMethod != none()) {
+                out.push(definition.deallocateMethod)?;
+            }
+        }
+    }
+    var seen = Vector<bool>.create();
+    return placedFunctions(c, c.types.info(box).pointee, mut seen, out);
+}
+
+fn builtinOf(n: borrow NirProgram, rvalue: u32) -> u32 => match (n.rvalues[rvalue as usize]) {
+    NirRvalue.Builtin(b, _) => b,
+    _ => none(),
+};
+
+fn builtinArgument(n: borrow NirProgram, rvalue: u32, k: u32) -> u32 => match (n.rvalues[rvalue as usize]) {
+    NirRvalue.Builtin(_, arguments) => n.at(arguments, k),
+    NirRvalue.Call(_, arguments) => n.at(arguments, k),
+    _ => none(),
+};
+
+/// The functions a function calls, directly or through drops, boxes and addresses (Callees).
+fn callees(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    function: u32,
+    out: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    let f = borrow n.functions[function as usize];
+    for (block in f.blocks.view()) {
+        for (s in block.statements.view()) {
+            match (n.statements[s as usize]) {
+                NirStatement.Assign(_, r) => {
+                    match (n.rvalues[r as usize]) {
+                        NirRvalue.Call(callee, _) => { out.push(callee)?; }
+                        NirRvalue.FunctionAddress(target) => { out.push(target)?; }
+                        NirRvalue.Builtin(b, _) => {
+                            if (b == bfBoxCreate()) {
+                                // A box's construction runs its allocator and its contents' @placed methods.
+                                boxFunctions(c, resultOkOf(c, n.rvalueTypes[r as usize]), out)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                NirStatement.Eval(r) => {
+                    match (n.rvalues[r as usize]) {
+                        NirRvalue.Call(callee, _) => { out.push(callee)?; }
+                        NirRvalue.FunctionAddress(target) => { out.push(target)?; }
+                        NirRvalue.Builtin(b, arguments) => {
+                            if (b == bfPtrPlace()) {
+                                // A raw write's placement runs the contents' @placed methods (ADR 0027).
+                                let pointer = n.operandTypes[n.at(arguments, 0) as usize];
+                                var seen = Vector<bool>.create();
+                                placedFunctions(c, c.types.info(pointer).pointee, mut seen, out)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                NirStatement.Drop(place, _) => {
+                    // A drop runs the `drop` blocks of the value and of everything it owns (§38.3).
+                    var seen = Vector<bool>.create();
+                    dropFunctions(c, nirPlaceType(c, n, f.locals, place), mut seen, out)?;
+                }
+                NirStatement.BoxFree(place, _) => {
+                    boxFunctions(c, nirPlaceType(c, n, f.locals, place), out)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    return Ok();
+}
+
+/// The library functions the program reaches (UsedLibraryFunctions); the reference's closure variants are P7's.
+fn usedLibraryFunctions(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    used: borrow mut Vector<bool>,
+) -> Result<void, AllocError> {
+    let bodies = nirBodies(c, n)?;
+    for (k in 0..c.hir.functions.length) {
+        used.push(false)?;
+    }
+    var work = Vector<u32>.create();
+    for (k in 0..n.functions.length) {
+        let source = n.functions[k].source;
+        if (!functionIsGeneric(c, source) && !isLibraryFunction(c, source)) {
+            work.push(truncate<u32>(k))?;
+        }
+    }
+    // A dyn table's entries and its type's drop are reached through the table (§37.4).
+    var reached = Vector<u32>.create();
+    for (table in c.dynTables.view()) {
+        for (k in 0..table.methods.count) {
+            reached.push(c.hir.at(table.methods, k))?;
+        }
+        var seen = Vector<bool>.create();
+        dropFunctions(c, table.implementation, mut seen, mut reached)?;
+    }
+    while (true) {
+        for (callee in reached.view()) {
+            if (isLibraryFunction(c, callee) && !used[callee as usize]) {
+                used[callee as usize] = true;
+                let body = nirFunctionOf(n, bodies, callee);
+                if (body != none()) {
+                    work.push(body)?;
+                }
+            }
+        }
+        reached.clear();
+        match (work.pop()) {
+            Some(function) => { callees(c, n, function, mut reached)?; }
+            null => { break; }
+        }
+    }
+    return Ok();
+}
+
+/// Adds a type and everything it mentions (UsedTypes' Add).
+fn addUsedType(c: borrow Checker, used: borrow mut Vector<bool>, t: u32) -> Result<void, AllocError> {
+    if (t == none() || !markType(used, t)?) {
+        return Ok();
+    }
+    let info = c.types.info(t);
+    addUsedType(c, used, info.pointee)?;
+    addUsedType(c, used, info.element)?;
+    addUsedType(c, used, info.allocator)?;
+    if (info.structDef != none()) {
+        for (f in c.types.structs[info.structDef as usize].fields.view()) {
+            addUsedType(c, used, c.types.fields[f as usize].typ)?;
+        }
+    }
+    if (info.enumDef != none()) {
+        for (v in c.types.enums[info.enumDef as usize].variants.view()) {
+            for (f in c.types.variants[v as usize].payload.view()) {
+                addUsedType(c, used, c.types.fields[f as usize].typ)?;
+            }
+        }
+    }
+    return Ok();
+}
+
+fn addFunctionSignature(c: borrow Checker, used: borrow mut Vector<bool>, function: u32) -> Result<void, AllocError> {
+    let f = borrow c.hir.functions[function as usize];
+    addUsedType(c, used, f.returnType)?;
+    for (p in f.parameters.view()) {
+        addUsedType(c, used, c.hir.locals[p as usize].typ)?;
+    }
+    return Ok();
+}
+
+/// The extern functions to declare (Externs): the package's, and the library's that emitted library code calls; a C
+/// constant macro (§39.4) has no prototype.
+fn emittedExterns(c: borrow Checker, e: borrow CEmitter, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    for (k in 0..c.hir.functions.length) {
+        let f = truncate<u32>(k);
+        if (c.hir.functions[k].registered && isExternFunction(c, f) && !c.hir.functions[k].isConstant &&
+            (!isLibraryFunction(c, f) || inSet(e.usedLibrary, f))) {
+            out.push(f)?;
+        }
+    }
+    return Ok();
+}
+
+/// Every type the emitted code mentions (UsedTypes).
+fn usedTypesOf(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    e: borrow CEmitter,
+    used: borrow mut Vector<bool>,
+) -> Result<void, AllocError> {
+    for (k in e.compiled.view()) {
+        let function = borrow n.functions[k as usize];
+        addUsedType(c, used, c.hir.functions[function.source as usize].returnType)?;
+        for (local in function.locals.view()) {
+            addUsedType(c, used, local.typ)?;
+        }
+    }
+    var externs = Vector<u32>.create();
+    emittedExterns(c, e, mut externs)?;
+    for (f in externs.view()) {
+        addFunctionSignature(c, used, f)?;
+    }
+    for (signature in c.dynSignatures.view()) {
+        for (k in 0..signature.methods.count) {
+            addFunctionSignature(c, used, c.hir.at(signature.methods, k))?;
+        }
+    }
+    for (table in c.dynTables.view()) {
+        addUsedType(c, used, table.implementation)?;
+    }
+    // Every static is emitted, used or not (§39), so its type is too.
+    for (item in c.hir.statics.view()) {
+        addUsedType(c, used, item.typ)?;
+    }
+    // A composite the program asked for is emitted even where its use was unreachable code.
+    for (t in c.types.composites.view()) {
+        if (!c.types.isGeneric(t) && c.types.info(t).usedOutsideHostedLibrary) {
+            addUsedType(c, used, t)?;
+        }
+    }
+    for (t in c.types.threadList.view()) {
+        if (!c.types.isGeneric(t)) {
+            addUsedType(c, used, c.types.info(t).element)?;
+        }
+    }
+    // A container's helpers return optionals of its element or of references to it (pop, get, remove; §23–§24).
+    var containers = Vector<u32>.create();
+    for (t in 0..used.length) {
+        let id = truncate<u32>(t);
+        if (used[t] && (c.types.is(id, TypeKind.Vector) || c.types.is(id, TypeKind.StableVector) ||
+            c.types.is(id, TypeKind.SlotMap)) && !c.types.isString(id)) {
+            containers.push(id)?;
+        }
+    }
+    for (container in containers.view()) {
+        let info = c.types.info(container);
+        let element = if (info.element != none()) info.element else c.types.info(info.pointee).element;
+        for (option in c.types.composites.view()) {
+            let value = c.types.optionType(option);
+            if (value != none() && (value == element ||
+                (c.types.is(value, TypeKind.Reference) && c.types.info(value).pointee == element))) {
+                addUsedType(c, used, option)?;
+            }
+        }
+    }
+    return Ok();
+}
+
+fn isLibraryType(c: borrow Checker, t: u32) -> bool {
+    let info = c.types.info(t);
+    if (info.structDef != none()) {
+        let file = c.types.structs[info.structDef as usize].file;
+        return file != none() && c.fileIsLibrary[file as usize];
+    }
+    if (info.enumDef != none()) {
+        let file = c.types.enums[info.enumDef as usize].file;
+        return file != none() && c.fileIsLibrary[file as usize];
+    }
+    return false;
+}
+
+fn arrayBase(c: borrow Checker, t: u32) -> u32 =>
+    if (c.types.is(t, TypeKind.Array)) arrayBase(c, c.types.info(t).element) else t;
+
+/// The structs the exports header defines, each after those it contains (HeaderStructs).
+fn headerStructsOf(c: borrow Checker, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    var seen = Vector<bool>.create();
+    for (t in c.programStructs.view()) {
+        if (isReprCStruct(c, t)) {
+            visitHeaderStruct(c, t, mut seen, out)?;
+        }
+    }
+    return Ok();
+}
+
+fn visitHeaderStruct(
+    c: borrow Checker,
+    t: u32,
+    seen: borrow mut Vector<bool>,
+    out: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    if (!markType(seen, t)?) {
+        return Ok();
+    }
+    for (f in c.types.structs[c.types.info(t).structDef as usize].fields.view()) {
+        let base = arrayBase(c, c.types.fields[f as usize].typ);
+        let s = c.types.info(base).structDef;
+        if (s != none() && !c.types.structs[s as usize].isImported) {
+            visitHeaderStruct(c, base, seen, out)?;
+        }
+    }
+    return out.push(t);
+}
+
+/// The trial emission's analyses (the CEmitter constructor); `trial` is none for the trial itself.
+fn setUpEmitter(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+) -> Result<void, AllocError> {
+    headerStructsOf(c, mut e.headerStructs)?;
+    if (e.trial) {
+        usedLibraryFunctions(c, n, mut e.usedLibrary)?;
+    }
+    for (k in 0..n.functions.length) {
+        let source = n.functions[k].source;
+        if (!functionIsGeneric(c, source) && (!isLibraryFunction(c, source) || inSet(e.usedLibrary, source))) {
+            e.compiled.push(truncate<u32>(k))?;
+        }
+    }
+    if (e.trial) {
+        var used = Vector<bool>.create();
+        usedTypesOf(c, n, e, mut used)?;
+        e.usedTypes = used;
+    }
+    // A library file is named only if code from it is emitted (type-system.md §29.2).
+    for (file in 0..c.filePaths.length) {
+        e.paths.push(copyBytes(c.filePaths[file].view())?)?;
+        var named = !c.fileIsLibrary[file];
+        if (!named) {
+            for (f in 0..c.hir.functions.length) {
+                if (!named && e.usedLibrary.length > f && e.usedLibrary[f] &&
+                    c.hir.functions[f].file as usize == file) {
+                    named = true;
+                }
+            }
+        }
+        if (named) {
+            e.fileIds.push(truncate<u32>(e.fileOrder.length))?;
+            e.fileOrder.push(truncate<u32>(file))?;
+        } else {
+            e.fileIds.push(none())?;
+        }
+    }
+    // Composites: `nv_str` is the runtime's; `dyn I` and `dyn I + Send` share a C type, so each is emitted once.
+    var names = Vector<Vector<u8>>.create();
+    for (t in c.types.composites.view()) {
+        if (c.types.isGeneric(t) || c.types.isStringView(t) ||
+            !(c.types.info(t).usedOutsideHostedLibrary || inSet(e.usedTypes, t))) {
+            continue;
+        }
+        let m = mangled(c, t)?;
+        var seen = false;
+        for (other in names.view()) {
+            if (!seen && sameBytes(other.view(), m.view())) {
+                seen = true;
+            }
+        }
+        if (!seen) {
+            names.push(m)?;
+            e.composites.push(t)?;
+        }
+    }
+    for (t in c.programStructs.view()) {
+        let info = c.types.info(t);
+        let libraryUse = info.libraryUse;
+        if (((!isLibraryType(c, t) && !libraryUse) || inSet(e.usedTypes, t)) && !isImportedStruct(c, t)) {
+            e.aggregates.push(t)?;
+        }
+    }
+    for (t in e.composites.view()) {
+        e.aggregates.push(t)?;
+    }
+    return Ok();
+}

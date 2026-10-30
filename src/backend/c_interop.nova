@@ -1,0 +1,848 @@
+// C interoperability (the reference's CEmitter, type-system.md §28, c-backend.md §2.3): the C types at the boundary,
+// extern wrappers, exports, callbacks, exported constants, function-pointer typedefs and the main wrapper.
+
+fn isUsize(c: borrow Checker, t: u32) -> bool => t == c.types.usize;
+
+fn isIsize(c: borrow Checker, t: u32) -> bool => t == c.types.isize;
+
+fn reprOf(c: borrow Checker, t: u32) -> u32 => c.types.enums[c.types.info(t).enumDef as usize].repr;
+
+/// The C type of a value crossing to or from C (BoundaryType, §28.3); in the header, `@repr(C)` structs are
+/// `struct S`.
+fn appendBoundaryType(c: borrow Checker, out: borrow mut Vector<u8>, t: u32, header: bool) -> Result<void, AllocError> {
+    let info = c.types.info(t);
+    match (info.kind) {
+        TypeKind.Integer => {
+            if (isUsize(c, t)) {
+                return appendText(out, "size_t");
+            }
+            if (isIsize(c, t)) {
+                return appendText(out, "ptrdiff_t");
+            }
+            return appendCTypeName(c, out, t);
+        }
+        TypeKind.Enum => {
+            // The header's typedef names the same integer type.
+            return if (header) appendBytes(out, c.types.name(t)) else appendCTypeName(c, out, reprOf(c, t));
+        }
+        TypeKind.Struct => {
+            if (isImportedStruct(c, t)) {
+                return appendBytes(out, c.types.rangeText(c.types.structs[info.structDef as usize].cSpelling));
+            }
+            if (header) {
+                appendText(out, "struct ")?;
+                return appendBytes(out, c.types.name(t));
+            }
+            return appendCTypeName(c, out, t);
+        }
+        TypeKind.RawPointer => {
+            if (c.types.is(info.pointee, TypeKind.CChar)) {
+                appendText(out, "char")?;
+            } else if (c.types.is(info.pointee, TypeKind.Void)) {
+                appendText(out, "void")?;
+            } else {
+                appendBoundaryType(c, out, info.pointee, header)?;
+            }
+            return appendText(out, if (info.mutablePointer) " *" else " const *");
+        }
+        _ => { return appendCTypeName(c, out, t); }
+    }
+}
+
+/// A member of a `@repr(C)` struct in the exports header (HeaderMemberType, §28.5).
+fn appendHeaderMemberType(c: borrow Checker, out: borrow mut Vector<u8>, t: u32) -> Result<void, AllocError> {
+    let info = c.types.info(t);
+    match (info.kind) {
+        TypeKind.Struct => {
+            if (isImportedStruct(c, t)) {
+                return appendBytes(out, c.types.rangeText(c.types.structs[info.structDef as usize].cSpelling));
+            }
+            appendText(out, "struct ")?;
+            return appendStructTag(c, out, t);
+        }
+        TypeKind.RawPointer => {
+            if (c.types.is(info.pointee, TypeKind.CChar)) {
+                appendText(out, "char")?;
+            } else if (c.types.is(info.pointee, TypeKind.Void)) {
+                appendText(out, "void")?;
+            } else {
+                appendHeaderMemberType(c, out, info.pointee)?;
+            }
+            return appendText(out, " *");
+        }
+        _ => { return appendCTypeName(c, out, t); }
+    }
+}
+
+/// A Nova value as the C type of §28.3 (ToBoundary).
+fn appendToBoundary(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    t: u32,
+    value: Slice<u8>,
+) -> Result<void, AllocError> {
+    let info = c.types.info(t);
+    if (c.types.is(t, TypeKind.RawPointer)) {
+        appendText(out, "(")?;
+        appendBoundaryType(c, out, t, false)?;
+        appendText(out, ")(uintptr_t)")?;
+        return appendBytes(out, value);
+    }
+    if (c.types.is(t, TypeKind.Integer) && info.bits == 64 && (isUsize(c, t) || isIsize(c, t))) {
+        appendText(out, "(")?;
+        appendBoundaryType(c, out, t, false)?;
+        appendText(out, ")")?;
+        return appendBytes(out, value);
+    }
+    if (c.types.is(t, TypeKind.Enum)) {
+        appendText(out, "(")?;
+        appendBoundaryType(c, out, t, false)?;
+        appendText(out, ")")?;
+        appendBytes(out, value)?;
+        return appendText(out, ".tag");
+    }
+    return appendBytes(out, value);
+}
+
+/// A C value of the type of §28.3 as Nova's (FromBoundary); an enum must have been checked.
+fn appendFromBoundary(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    t: u32,
+    value: Slice<u8>,
+) -> Result<void, AllocError> {
+    if (c.types.is(t, TypeKind.RawPointer) || isUsize(c, t) || isIsize(c, t)) {
+        appendText(out, "(")?;
+        appendCTypeName(c, out, t)?;
+        appendText(out, if (c.types.is(t, TypeKind.RawPointer)) ")(uintptr_t)" else ")")?;
+        return appendBytes(out, value);
+    }
+    if (c.types.is(t, TypeKind.Enum)) {
+        appendText(out, "((")?;
+        appendCTypeName(c, out, t)?;
+        appendText(out, "){ .tag = (uint")?;
+        appendDecimal(out, (c.types.enums[c.types.info(t).enumDef as usize].tagSize * 8) as u64)?;
+        appendText(out, "_t)")?;
+        appendBytes(out, value)?;
+        return appendText(out, " })");
+    }
+    return appendBytes(out, value);
+}
+
+/// `NV_LOC(nv_file_<id>, line, column)` (Location).
+fn appendLocation(
+    e: borrow CEmitter,
+    out: borrow mut Vector<u8>,
+    sources: borrow Vector<SourceText>,
+    file: u32,
+    offset: u32,
+) -> Result<void, AllocError> {
+    let position = sources[file as usize].position(offset as usize);
+    appendText(out, "NV_LOC(nv_file_")?;
+    appendDecimal(out, e.fileIds[file as usize] as u64)?;
+    appendText(out, ", ")?;
+    appendDecimal(out, position.line as u64)?;
+    appendText(out, "u, ")?;
+    appendDecimal(out, position.column as u64)?;
+    return appendText(out, "u)");
+}
+
+/// The start of a function's name in its declaration (`function.Syntax.Name.Span`).
+fn functionNameStart(c: borrow Checker, function: u32) -> u32 {
+    let syntax = c.front.ast.functions[c.hir.functions[function as usize].syntax as usize];
+    return c.front.ast.idents[syntax.name as usize].start;
+}
+
+fn integerMax(c: borrow Checker, t: u32) -> u64 {
+    let info = c.types.info(t);
+    let bits = if (info.signed) info.bits - 1 else info.bits;
+    return if (bits >= 64) 0xFFFFFFFFFFFFFFFF else (1u64 << (bits as u64)) - 1;
+}
+
+/// A `@repr` enum value from C must be a variant's index (CheckEnumFromC, §28.5): panics otherwise.
+fn emitCheckEnumFromC(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    sources: borrow Vector<SourceText>,
+    t: u32,
+    value: Slice<u8>,
+    function: u32,
+) -> Result<void, AllocError> {
+    if (!c.types.is(t, TypeKind.Enum)) {
+        return Ok();
+    }
+    let count = c.types.enums[c.types.info(t).enumDef as usize].variants.length as u64;
+    let repr = reprOf(c, t);
+    var tests = Vector<u8>.create();
+    if (c.types.info(repr).signed) {
+        appendBytes(mut tests, value)?;
+        appendText(mut tests, " < 0")?;
+    }
+    if (count - 1 < integerMax(c, repr)) {
+        if (tests.length > 0) {
+            appendText(mut tests, " || ")?;
+        }
+        appendBytes(mut tests, value)?;
+        appendText(mut tests, " >= ")?;
+        appendDecimal(mut tests, count)?;
+    }
+    if (tests.length > 0) {
+        e.t("    if (")?;
+        e.b(tests.view())?;
+        e.t(") nova_panic(NV_PANIC_FFI_ENUM, ")?;
+        var location = Vector<u8>.create();
+        appendLocation(
+            e,
+            mut location,
+            sources,
+            c.hir.functions[function as usize].file,
+            functionNameStart(c, function),
+        )?;
+        e.b(location.view())?;
+        e.t(");")?;
+        e.emit()?;
+    }
+    return Ok();
+}
+
+fn parameterType(c: borrow Checker, function: u32, k: usize) -> u32 =>
+    c.hir.locals[c.hir.functions[function as usize].parameters[k] as usize].typ;
+
+/// A function's C parameters with the boundary types (CParameters).
+fn appendBoundaryParameters(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    function: u32,
+    withNames: bool,
+    header: bool,
+) -> Result<void, AllocError> {
+    let count = c.hir.functions[function as usize].parameters.length;
+    if (count == 0) {
+        return appendText(out, "void");
+    }
+    for (k in 0..count) {
+        if (k > 0) {
+            appendText(out, ", ")?;
+        }
+        appendBoundaryType(c, out, parameterType(c, function, k), header)?;
+        if (withNames) {
+            appendText(out, " a")?;
+            appendDecimal(out, k as u64)?;
+        }
+    }
+    return Ok();
+}
+
+/// Each extern function's C prototype, and a static wrapper with Nova's types that converts (EmitExterns).
+fn emitExterns(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+) -> Result<void, AllocError> {
+    var externs = Vector<u32>.create();
+    emittedExterns(c, e, mut externs)?;
+    for (function in externs.view()) {
+        let name = c.name(c.hir.functions[function as usize].name);
+        let returnType = c.hir.functions[function as usize].returnType;
+        let count = c.hir.functions[function as usize].parameters.length;
+        appendBoundaryType(c, mut e.buf, returnType, false)?;
+        e.t(" ")?;
+        e.b(name)?;
+        e.t("(")?;
+        appendBoundaryParameters(c, mut e.buf, function, false, false)?;
+        e.t(");")?;
+        e.emit()?;
+        e.t("static NV_UNUSED ")?;
+        appendCTypeName(c, mut e.buf, returnType)?;
+        e.t(" nvC_")?;
+        e.b(name)?;
+        e.t("(")?;
+        if (count == 0) {
+            e.t("void")?;
+        }
+        for (k in 0..count) {
+            if (k > 0) {
+                e.t(", ")?;
+            }
+            appendCTypeName(c, mut e.buf, parameterType(c, function, k))?;
+            e.t(" a")?;
+            e.d(k as u64)?;
+        }
+        e.t(") {")?;
+        e.emit()?;
+        var call = copyBytes(name)?;
+        call.push('(')?;
+        for (k in 0..count) {
+            if (k > 0) {
+                appendText(mut call, ", ")?;
+            }
+            var argument = Vector<u8>.create();
+            argument.push('a')?;
+            appendDecimal(mut argument, k as u64)?;
+            appendToBoundary(c, mut call, parameterType(c, function, k), argument.view())?;
+        }
+        call.push(')')?;
+        if (c.types.is(returnType, TypeKind.Void)) {
+            e.t("    ")?;
+            e.b(call.view())?;
+            e.t(";")?;
+            e.emit()?;
+        } else {
+            e.t("    ")?;
+            appendBoundaryType(c, mut e.buf, returnType, false)?;
+            e.t(" r = ")?;
+            e.b(call.view())?;
+            e.t(";")?;
+            e.emit()?;
+            emitCheckEnumFromC(e, c, sources, returnType, "r".bytes(), function)?;
+            e.t("    return ")?;
+            appendFromBoundary(c, mut e.buf, returnType, "r".bytes())?;
+            e.t(";")?;
+            e.emit()?;
+        }
+        e.line("}")?;
+    }
+    if (externs.length > 0) {
+        e.line("")?;
+    }
+    return Ok();
+}
+
+/// The compiled `@export` functions (Exports).
+fn emittedExports(
+    e: borrow CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    out: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    for (k in e.compiled.view()) {
+        let source = n.functions[k as usize].source;
+        if (c.hir.functions[source as usize].exported) {
+            out.push(source)?;
+        }
+    }
+    return Ok();
+}
+
+/// The `@callback` functions whose address the program takes, in a stable order (Callbacks, §34.1).
+fn emittedCallbacks(
+    e: borrow CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    out: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    for (k in e.compiled.view()) {
+        for (block in n.functions[k as usize].blocks.view()) {
+            for (s in block.statements.view()) {
+                let r = match (n.statements[s as usize]) {
+                    NirStatement.Assign(_, r) => r,
+                    NirStatement.Eval(r) => r,
+                    _ => none(),
+                };
+                if (r == none()) {
+                    continue;
+                }
+                match (n.rvalues[r as usize]) {
+                    NirRvalue.FunctionAddress(f) => {
+                        if (c.hir.functions[f as usize].isCallback && !containsU32(out, f)) {
+                            out.push(f)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    return Ok();
+}
+
+/// A callback's C function (CallbackName): `nvW_` and the Nova function's own name.
+fn appendCallbackName(c: borrow Checker, out: borrow mut Vector<u8>, function: u32) -> Result<void, AllocError> {
+    var name = Vector<u8>.create();
+    appendCFunctionName(c, mut name, function)?;
+    appendText(out, "nvW_")?;
+    let text = name.view();
+    return appendBytes(out, text[4..]);
+}
+
+fn appendCallbackSignature(c: borrow Checker, out: borrow mut Vector<u8>, function: u32) -> Result<void, AllocError> {
+    appendText(out, "static ")?;
+    appendBoundaryType(c, out, c.hir.functions[function as usize].returnType, false)?;
+    out.push(' ')?;
+    appendCallbackName(c, out, function)?;
+    out.push('(')?;
+    appendBoundaryParameters(c, out, function, true, false)?;
+    return out.push(')');
+}
+
+fn appendExportSignature(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    function: u32,
+    header: bool,
+) -> Result<void, AllocError> {
+    appendBoundaryType(c, out, c.hir.functions[function as usize].returnType, header)?;
+    out.push(' ')?;
+    appendBytes(out, c.hir.textOf(c.hir.functions[function as usize].exportName))?;
+    out.push('(')?;
+    appendBoundaryParameters(c, out, function, !header, header)?;
+    return out.push(')');
+}
+
+/// A call of a Nova function from its C-typed wrapper: the arguments from the boundary, and the caller's address
+/// last for a function that uses `callerAddress()` (ADR 0030).
+fn appendWrapperCall(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    function: u32,
+    caller: StringView,
+) -> Result<void, AllocError> {
+    appendCFunctionName(c, out, function)?;
+    out.push('(')?;
+    let count = c.hir.functions[function as usize].parameters.length;
+    for (k in 0..count) {
+        if (k > 0) {
+            appendText(out, ", ")?;
+        }
+        var argument = Vector<u8>.create();
+        argument.push('a')?;
+        appendDecimal(mut argument, k as u64)?;
+        appendFromBoundary(c, out, parameterType(c, function, k), argument.view())?;
+    }
+    if (c.hir.functions[function as usize].usesCallerAddress) {
+        if (count > 0) {
+            appendText(out, ", ")?;
+        }
+        appendText(out, caller)?;
+    }
+    return out.push(')');
+}
+
+fn emitWrapperBody(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    function: u32,
+    call: Slice<u8>,
+) -> Result<void, AllocError> {
+    let returnType = c.hir.functions[function as usize].returnType;
+    if (c.types.is(returnType, TypeKind.Void)) {
+        e.t("    ")?;
+        e.b(call)?;
+        e.t(";")?;
+    } else {
+        e.t("    return ")?;
+        appendToBoundary(c, mut e.buf, returnType, call)?;
+        e.t(";")?;
+    }
+    return e.emit();
+}
+
+/// Each callback in use: a C function with the C types that converts and calls the Nova function (EmitCallbacks).
+fn emitCallbacks(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirProgram) -> Result<void, AllocError> {
+    var callbacks = Vector<u32>.create();
+    emittedCallbacks(e, c, n, mut callbacks)?;
+    for (function in callbacks.view()) {
+        appendCallbackSignature(c, mut e.buf, function)?;
+        e.t(" {")?;
+        e.emit()?;
+        var call = Vector<u8>.create();
+        appendWrapperCall(c, mut call, function, "0")?;
+        emitWrapperBody(e, c, function, call.view())?;
+        e.line("}")?;
+        e.line("")?;
+    }
+    return Ok();
+}
+
+/// `extern const uint8_t name[16]` or `extern const uint32_t name` (ExportedConstantDeclarator).
+fn appendExportedConstantDeclarator(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    constant: u32,
+) -> Result<void, AllocError> {
+    let k = c.hir.constants[constant as usize];
+    appendText(out, "extern const ")?;
+    if (c.types.is(k.typ, TypeKind.Array)) {
+        appendCTypeName(c, out, c.types.info(k.typ).element)?;
+        out.push(' ')?;
+        appendBytes(out, c.hir.textOf(k.exportName))?;
+        out.push('[')?;
+        appendDecimal(out, truncate<u64>(c.types.info(k.typ).arrayLength))?;
+        return out.push(']');
+    }
+    appendCTypeName(c, out, k.typ)?;
+    out.push(' ')?;
+    return appendBytes(out, c.hir.textOf(k.exportName));
+}
+
+fn appendExportedScalar(c: borrow Checker, out: borrow mut Vector<u8>, value: u32) -> Result<void, AllocError> {
+    match (c.hir.exprs[value as usize]) {
+        HirExpr.IntConst(v) => { return appendConstant(c, out, v, c.hir.typeOf(value)); }
+        HirExpr.BoolConst(b) => { return appendText(out, if (b) "true" else "false"); }
+        _ => { return appendText(out, "?"); }
+    }
+}
+
+fn appendExportedConstantInitialiser(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    constant: u32,
+) -> Result<void, AllocError> {
+    let k = c.hir.constants[constant as usize];
+    match (c.hir.exprs[k.value as usize]) {
+        HirExpr.ArrayLiteral(elements) => {
+            appendText(out, "{ ")?;
+            for (j in 0..elements.count) {
+                if (j > 0) {
+                    appendText(out, ", ")?;
+                }
+                appendExportedScalar(c, out, c.hir.at(elements, j))?;
+            }
+            return appendText(out, " }");
+        }
+        HirExpr.ArrayRepeat(repeated) => {
+            appendText(out, "{ ")?;
+            let length = truncate<u64>(c.types.info(k.typ).arrayLength);
+            for (j in 0..length) {
+                if (j > 0) {
+                    appendText(out, ", ")?;
+                }
+                appendExportedScalar(c, out, repeated)?;
+            }
+            return appendText(out, " }");
+        }
+        _ => { return appendExportedScalar(c, out, k.value); }
+    }
+}
+
+/// `@export` constants (EmitExportedConstants, §28.4): read-only C data, declared `extern` first.
+fn emitExportedConstants(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    var any = false;
+    for (k in 0..c.hir.constants.length) {
+        if (!c.hir.constants[k].exported) {
+            continue;
+        }
+        any = true;
+        var declarator = Vector<u8>.create();
+        appendExportedConstantDeclarator(c, mut declarator, truncate<u32>(k))?;
+        e.b(declarator.view())?;
+        e.t(";")?;
+        e.emit()?;
+        let text = declarator.view();
+        e.b(text["extern ".length..])?;
+        e.t(" = ")?;
+        appendExportedConstantInitialiser(c, mut e.buf, truncate<u32>(k))?;
+        e.t(";")?;
+        e.emit()?;
+    }
+    if (any) {
+        e.line("")?;
+    }
+    return Ok();
+}
+
+/// The exports' and callbacks' prototypes come before every function (EmitExportPrototypes, §29.5).
+fn emitExportPrototypes(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirProgram) -> Result<void, AllocError> {
+    var exports = Vector<u32>.create();
+    emittedExports(e, c, n, mut exports)?;
+    for (function in exports.view()) {
+        appendExportSignature(c, mut e.buf, function, false)?;
+        e.t(";")?;
+        e.emit()?;
+    }
+    var callbacks = Vector<u32>.create();
+    emittedCallbacks(e, c, n, mut callbacks)?;
+    for (function in callbacks.view()) {
+        appendCallbackSignature(c, mut e.buf, function)?;
+        e.t(";")?;
+        e.emit()?;
+    }
+    return Ok();
+}
+
+fn appendFunctionPointerParameters(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    t: u32,
+    header: bool,
+) -> Result<void, AllocError> {
+    let parameters = c.types.info(t).parameters;
+    if (parameters.count == 0) {
+        return appendText(out, "void");
+    }
+    for (k in 0..parameters.count) {
+        if (k > 0) {
+            appendText(out, ", ")?;
+        }
+        appendBoundaryType(c, out, c.types.listAt(parameters, k), header)?;
+    }
+    return Ok();
+}
+
+/// `typedef R (*nvP_…)(A, …);` for each C function pointer type, Nova function value type and closure code pointer
+/// (EmitFunctionPointerTypedefs).
+fn emitFunctionPointerTypedefs(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    for (t in c.types.functionPointerList.view()) {
+        if (c.types.isGeneric(t)) {
+            continue;
+        }
+        e.t("typedef ")?;
+        appendBoundaryType(c, mut e.buf, c.types.info(t).result, false)?;
+        e.t(" (*")?;
+        appendCTypeName(c, mut e.buf, t)?;
+        e.t(")(")?;
+        appendFunctionPointerParameters(c, mut e.buf, t, false)?;
+        e.t(");")?;
+        e.emit()?;
+    }
+    // Nova function values (§36.1): pointers to the functions' own C signatures, with Nova's C types.
+    for (t in c.types.functionList.view()) {
+        if (c.types.isGeneric(t)) {
+            continue;
+        }
+        let parameters = c.types.info(t).parameters;
+        e.t("typedef ")?;
+        appendCTypeName(c, mut e.buf, c.types.info(t).result)?;
+        e.t(" (*")?;
+        appendCTypeName(c, mut e.buf, t)?;
+        e.t(")(")?;
+        if (parameters.count == 0) {
+            e.t("void")?;
+        }
+        for (k in 0..parameters.count) {
+            if (k > 0) {
+                e.t(", ")?;
+            }
+            appendCTypeName(c, mut e.buf, c.types.listAt(parameters, k))?;
+        }
+        e.t(");")?;
+        e.emit()?;
+    }
+    // Closures' code pointers (§36.2): the environment first, as `const void *`, then the parameters.
+    for (t in c.types.closureList.view()) {
+        if (c.types.isGeneric(t)) {
+            continue;
+        }
+        let parameters = c.types.info(t).parameters;
+        e.t("typedef ")?;
+        appendCTypeName(c, mut e.buf, c.types.info(t).result)?;
+        e.t(" (*")?;
+        appendCTypeName(c, mut e.buf, t)?;
+        e.t(")(const void *")?;
+        for (k in 0..parameters.count) {
+            e.t(", ")?;
+            appendCTypeName(c, mut e.buf, c.types.listAt(parameters, k))?;
+        }
+        e.t(");")?;
+        e.emit()?;
+    }
+    return Ok();
+}
+
+/// A C-callable wrapper for each `@export` function (EmitExports, c-backend §2.3).
+fn emitExports(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+) -> Result<void, AllocError> {
+    var exports = Vector<u32>.create();
+    emittedExports(e, c, n, mut exports)?;
+    for (function in exports.view()) {
+        appendExportSignature(c, mut e.buf, function, false)?;
+        e.t(" {")?;
+        e.emit()?;
+        for (k in 0..c.hir.functions[function as usize].parameters.length) {
+            var argument = Vector<u8>.create();
+            argument.push('a')?;
+            appendDecimal(mut argument, k as u64)?;
+            emitCheckEnumFromC(e, c, sources, parameterType(c, function, k), argument.view(), function)?;
+        }
+        // The address this wrapper returns to is its C caller's (ADR 0030), taken here, where inlining cannot move it.
+        var call = Vector<u8>.create();
+        appendWrapperCall(c, mut call, function, "nv_return_address()")?;
+        emitWrapperBody(e, c, function, call.view())?;
+        e.line("}")?;
+        e.line("")?;
+    }
+    return Ok();
+}
+
+/// `int main` calling the Nova `main` (EmitMainWrapper): C's signature is the one place plain `char` appears.
+fn emitMainWrapper(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirProgram) -> Result<void, AllocError> {
+    var main = none();
+    for (function in n.functions.view()) {
+        let f = borrow c.hir.functions[function.source as usize];
+        if (main == none() && f.owner == none() && sameText(c.name(f.name), "main")) {
+            main = function.source;
+        }
+    }
+    if (main == none()) {
+        return Ok();
+    }
+    e.line("int main(int argc, char **argv) {")?;
+    e.line("    nova_rt_args((int32_t)argc, (const uint8_t *const *)(void *)argv);")?;
+    e.line("    nova_rt_start();")?;
+    if (c.types.is(c.hir.functions[main as usize].returnType, TypeKind.Void)) {
+        e.line("    nvF_main();\n    return (int)nova_rt_finish(0);")?;
+    } else {
+        e.line("    return (int)nova_rt_finish(nvF_main());")?;
+    }
+    return e.line("}");
+}
+
+/// `nova_exports.h` (ExportsHeader, c-backend §2.3): the `@repr(C)` structs and `@repr` enums, and the exports'
+/// prototypes; none when the program has none.
+fn exportsHeader(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    name: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    var structs = Vector<u32>.create();
+    var enums = Vector<u32>.create();
+    for (t in c.programStructs.view()) {
+        if (isReprCStruct(c, t)) {
+            structs.push(t)?;
+        }
+        let e = c.types.info(t).enumDef;
+        if (e != none() && c.types.enums[e as usize].repr != none()) {
+            enums.push(t)?;
+        }
+    }
+    var exports = Vector<u32>.create();
+    for (function in n.functions.view()) {
+        if (c.hir.functions[function.source as usize].exported && !functionIsGeneric(c, function.source)) {
+            exports.push(function.source)?;
+        }
+    }
+    var constants = Vector<u32>.create();
+    for (k in 0..c.hir.constants.length) {
+        if (c.hir.constants[k].exported) {
+            constants.push(truncate<u32>(k))?;
+        }
+    }
+    if (structs.length == 0 && enums.length == 0 && exports.length == 0 && constants.length == 0) {
+        return Ok(false);
+    }
+    var guard = Vector<u8>.create();
+    appendHeaderGuard(mut guard, name)?;
+    appendText(out, "/* Generated by ")?;
+    appendText(out, compilerBanner())?;
+    appendText(out, ". Do not edit. Nova's C interface (type-system.md §28). */\n#ifndef ")?;
+    appendBytes(out, guard.view())?;
+    appendText(out, "\n#define ")?;
+    appendBytes(out, guard.view())?;
+    appendText(out, "\n\n#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n")?;
+    for (header in c.headers.view()) {
+        appendText(out, "#include \"")?;
+        appendBytes(out, header.view())?;
+        appendText(out, "\"\n")?; // imported C types (type-system.md §31.3)
+    }
+    out.push('\n')?;
+    // Struct names first: function pointer types may name them, and structs may hold function pointers.
+    for (t in structs.view()) {
+        appendText(out, "struct ")?;
+        appendStructTag(c, out, t)?;
+        appendText(out, ";\n")?;
+    }
+    for (t in c.types.functionPointerList.view()) {
+        if (c.types.isGeneric(t)) {
+            continue;
+        }
+        appendText(out, "typedef ")?;
+        appendBoundaryType(c, out, c.types.info(t).result, true)?;
+        appendText(out, " (*")?;
+        appendCTypeName(c, out, t)?;
+        appendText(out, ")(")?;
+        appendFunctionPointerParameters(c, out, t, true)?;
+        appendText(out, ");\n")?;
+    }
+    out.push('\n')?;
+    var ordered = Vector<u32>.create();
+    headerStructsOf(c, mut ordered)?;
+    for (t in ordered.view()) {
+        appendText(out, "struct ")?;
+        appendStructTag(c, out, t)?;
+        appendText(out, " {\n")?;
+        for (f in c.types.structs[c.types.info(t).structDef as usize].fields.view()) {
+            let field = c.types.fields[f as usize];
+            appendText(out, "    ")?;
+            appendAlignPrefix(c, out, t, field.index)?;
+            var member = Vector<u8>.create();
+            if (!field.hasNovaCName) {
+                appendText(mut member, "f_")?;
+            }
+            appendBytes(mut member, c.name(field.name))?;
+            appendCArrayDeclarator(c, out, field.typ, member.view())?;
+            appendText(out, ";\n")?;
+        }
+        appendText(out, "};\n\n")?;
+    }
+    for (t in enums.view()) {
+        let repr = reprOf(c, t);
+        appendText(out, "typedef ")?;
+        appendCTypeName(c, out, repr)?;
+        out.push(' ')?;
+        appendId(out, c.types.name(t))?;
+        appendText(out, ";\nenum { ")?;
+        let variants = borrow c.types.enums[c.types.info(t).enumDef as usize].variants;
+        for (k in 0..variants.length) {
+            if (k > 0) {
+                appendText(out, ", ")?;
+            }
+            appendId(out, c.types.name(t))?;
+            out.push('_')?;
+            appendBytes(out, c.name(c.types.variants[variants[k] as usize].name))?;
+            appendText(out, " = ")?;
+            appendDecimal(out, c.types.variants[variants[k] as usize].index as u64)?;
+        }
+        appendText(out, " };\n\n")?;
+    }
+    for (function in exports.view()) {
+        appendExportSignature(c, out, function, true)?;
+        appendText(out, ";\n")?;
+    }
+    for (k in constants.view()) {
+        appendExportedConstantDeclarator(c, out, k)?;
+        appendText(out, ";\n")?;
+    }
+    appendText(out, "\n#endif\n")?;
+    return Ok(true);
+}
+
+/// An include guard from a header's name (HeaderGuard): `kernel/wait_types.h` → `KERNEL_WAIT_TYPES_H`.
+fn appendHeaderGuard(out: borrow mut Vector<u8>, name: Slice<u8>) -> Result<void, AllocError> {
+    for (b in name) {
+        if (b >= 'a' && b <= 'z') {
+            out.push(b - 32)?;
+        } else if ((b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')) {
+            out.push(b)?;
+        } else {
+            out.push('_')?;
+        }
+    }
+    return Ok();
+}
+
+/// A C array declarator, `E name[N][M]`, for a (nested) array type (CArrayDeclarator), with the header's member types.
+fn appendCArrayDeclarator(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    t: u32,
+    name: Slice<u8>,
+) -> Result<void, AllocError> {
+    var dimensions = Vector<u8>.create();
+    var element = t;
+    while (c.types.is(element, TypeKind.Array)) {
+        dimensions.push('[')?;
+        appendDecimal(mut dimensions, truncate<u64>(c.types.info(element).arrayLength))?;
+        dimensions.push(']')?;
+        element = c.types.info(element).element;
+    }
+    appendHeaderMemberType(c, out, element)?;
+    out.push(' ')?;
+    appendBytes(out, name)?;
+    return appendBytes(out, dimensions.view());
+}

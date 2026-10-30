@@ -25,7 +25,7 @@ fn checkQualifiedNames(c: borrow mut Checker) -> Result<void, AllocError> {
         if (c.fileIsLibrary[file as usize]) {
             continue;
         }
-        c.file = file;
+        c.setFile(file);
         let importCount = c.front.ast.units[u].imports.length;
         for (k in 0..importCount) {
             let imported = c.front.ast.units[u].imports[k];
@@ -72,7 +72,7 @@ fn checkQualifiedNames(c: borrow mut Checker) -> Result<void, AllocError> {
         }
         checkAmbiguousImports(c, truncate<u32>(u), identifiers.view())?;
     }
-    c.file = saved;
+    c.setFile(saved);
     return Ok();
 }
 
@@ -340,7 +340,7 @@ fn checkPublicSignatures(c: borrow mut Checker) -> Result<void, AllocError> {
         if (c.fileIsLibrary[file as usize]) {
             continue;
         }
-        c.file = file;
+        c.setFile(file);
         let items = c.front.ast.units[u].items;
         for (k in 0..items.count) {
             let item = c.front.ast.at(items, k);
@@ -408,7 +408,7 @@ fn checkPublicSignatures(c: borrow mut Checker) -> Result<void, AllocError> {
             }
         }
     }
-    c.file = saved;
+    c.setFile(saved);
     return Ok();
 }
 

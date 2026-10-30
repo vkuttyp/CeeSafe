@@ -29,13 +29,16 @@ fn evaluateConstant(c: borrow mut Checker, k: u32) -> Result<u32, AllocError> {
     }
     if (entry.state == 1) {
         let saved = c.file;
-        c.file = entry.file;
+        {
+            let fileToSet = entry.file;
+            c.setFile(fileToSet);
+        }
         var message = Vector<u8>.create();
         appendText(mut message, "constant '")?;
         appendBytes(mut message, c.name(hirConstant.name))?;
         appendText(mut message, "' depends on itself")?;
         c.error(cyclicConstant(), id.start, id.end, message)?;
-        c.file = saved;
+        c.setFile(saved);
         return c.errorResult(id.start, id.end);
     }
     c.constants[k as usize].state = 1;
@@ -44,7 +47,10 @@ fn evaluateConstant(c: borrow mut Checker, k: u32) -> Result<u32, AllocError> {
     let savedLoop = c.loopDepth;
     let savedScopeCount = c.scopes.length;
     let savedStarts = c.scopeStarts.length;
-    c.file = entry.file;
+    {
+        let fileToSet = entry.file;
+        c.setFile(fileToSet);
+    }
     c.function = none();
     c.loopDepth = 0;
     let valueSyntax = match (item.kind) {
@@ -57,7 +63,7 @@ fn evaluateConstant(c: borrow mut Checker, k: u32) -> Result<u32, AllocError> {
         valueSpan.start,
         valueSpan.end,
     )? else fold(c, checked)?;
-    c.file = savedFile;
+    c.setFile(savedFile);
     c.function = savedFunction;
     c.loopDepth = savedLoop;
     c.scopes.truncate(savedScopeCount);
