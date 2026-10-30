@@ -1,0 +1,568 @@
+// The in-place checker and the move checker (the reference's Analysis/InPlaceChecker.cs and MoveChecker.cs), run on
+// every NIR function that is not an instantiation.
+
+fn possiblyUnassigned() -> u32 => 212;
+fn useOfMoved() -> u32 => 250;
+fn moveOutOfReference() -> u32 => 251;
+fn moveOutOfDropType() -> u32 => 252;
+fn moveOutOfUsing() -> u32 => 253;
+
+fn functionFile(c: borrow Checker, n: borrow NirProgram, function: u32) -> u32 =>
+    c.hir.functions[n.functions[function as usize].source as usize].file;
+
+// ---- InPlaceChecker ----
+
+/// C state is made in place and never moved (type-system.md §33.2). A value of a C-laid-out type may be used as a
+/// value only where its struct literal flows into its box: from the literal's temporary into `Box.create`/`createIn`,
+/// or into raw memory by `p.write` (§27.3, ADR 0027), or into a field of an enclosing such literal. Every other use of
+/// one as a value is N0294, and so is a literal that does not reach a box.
+struct InPlace {
+    function: u32;
+    file: u32;
+    reported: Vector<u32>;          // span starts, one error per statement
+    literalLocals: Vector<u32>;     // temporaries that hold a C-laid-out literal, in the order they were first seen
+    literalStatements: Vector<u32>; // where each is made (the last such statement)
+    used: Vector<u32>;
+}
+
+fn inPlaceReport(
+    c: borrow mut Checker,
+    p: borrow mut InPlace,
+    span: Span,
+    message: Vector<u8>,
+) -> Result<void, AllocError> {
+    if (containsU32(p.reported, span.start)) {
+        return Ok();
+    }
+    p.reported.push(span.start)?;
+    return c.front.diagnostics.error(importedTypeByValue(), p.file, span.start, span.end, message);
+}
+
+fn notPlaced(c: borrow Checker, typ: u32) -> Result<Vector<u8>, AllocError> {
+    var message = Vector<u8>.create();
+    appendText(mut message, "a ")?;
+    appendQuotedType(mut message, c, typ)?;
+    appendText(
+        mut message,
+        " holds C state, so it is made only in place, as the value of 'Box.create' or 'Box.createIn' (type-system.md §33.2)",
+    )?;
+    return Ok(message);
+}
+
+fn inPlaceUse(
+    c: borrow mut Checker,
+    n: borrow NirProgram,
+    p: borrow mut InPlace,
+    operand: u32,
+    intoBox: bool,
+    span: Span,
+) -> Result<void, AllocError> {
+    let place = operandPlace(n, operand);
+    if (place == none()) {
+        return Ok();
+    }
+    let typ = nirPlaceType(c, n, n.functions[p.function as usize].locals, place);
+    if (!c.types.isCLaidOut(typ, 0)) {
+        return Ok();
+    }
+    let local = n.places[place as usize].local;
+    if (n.places[place as usize].projections.count == 0 && containsU32(p.literalLocals, local)) {
+        if (!containsU32(p.used, local)) {
+            p.used.push(local)?;
+        }
+        if (intoBox) {
+            return Ok();
+        }
+    }
+    var message = Vector<u8>.create();
+    appendText(mut message, "a ")?;
+    appendQuotedType(mut message, c, typ)?;
+    appendText(
+        mut message,
+        " holds C state, which never moves once made: borrow it, or make it in place as the value of 'Box.createIn' (type-system.md §33.2)",
+    )?;
+    return inPlaceReport(c, p, span, message);
+}
+
+fn inPlaceUseAll(
+    c: borrow mut Checker,
+    n: borrow NirProgram,
+    p: borrow mut InPlace,
+    operands: Range,
+    intoBox: bool,
+    span: Span,
+) -> Result<void, AllocError> {
+    for (k in 0..operands.count) {
+        inPlaceUse(c, n, p, n.at(operands, k), intoBox, span)?;
+    }
+    return Ok();
+}
+
+fn inPlaceRvalue(
+    c: borrow mut Checker,
+    n: borrow NirProgram,
+    p: borrow mut InPlace,
+    rvalue: u32,
+    span: Span,
+) -> Result<void, AllocError> {
+    match (n.rvalues[rvalue as usize]) {
+        NirRvalue.Builtin(function, arguments) => {
+            for (k in 0..arguments.count) {
+                let intoBox = function == bfBoxCreate() && k == arguments.count - 1;
+                inPlaceUse(c, n, p, n.at(arguments, k), intoBox, span)?;
+            }
+        }
+        NirRvalue.Aggregate(fields) => {
+            // A field of a C-laid-out literal is placed with it.
+            let nested = c.types.isCLaidOut(n.rvalueTypes[rvalue as usize], 0);
+            inPlaceUseAll(c, n, p, fields, nested, span)?;
+        }
+        NirRvalue.Use(operand) => { inPlaceUse(c, n, p, operand, false, span)?; }
+        NirRvalue.Call(_, arguments) => { inPlaceUseAll(c, n, p, arguments, false, span)?; }
+        NirRvalue.EnumAggregate(_, payload) => { inPlaceUseAll(c, n, p, payload, false, span)?; }
+        NirRvalue.Array(elements) => { inPlaceUseAll(c, n, p, elements, false, span)?; }
+        NirRvalue.ArrayRepeat(operand) => { inPlaceUse(c, n, p, operand, false, span)?; }
+        NirRvalue.Cast(operand) => { inPlaceUse(c, n, p, operand, false, span)?; }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn checkInPlace(c: borrow mut Checker, n: borrow NirProgram, function: u32) -> Result<void, AllocError> {
+    var p = InPlace {
+        function: function,
+        file: functionFile(c, n, function),
+        reported: Vector<u32>.create(),
+        literalLocals: Vector<u32>.create(),
+        literalStatements: Vector<u32>.create(),
+        used: Vector<u32>.create(),
+    };
+    let blockCount = n.functions[function as usize].blocks.length;
+    // The temporaries that hold a C-laid-out literal, and where each is made. A literal made straight into a variable
+    // or a field is never in its box.
+    for (position in 0..blockCount) {
+        for (s in n.functions[function as usize].blocks[position].statements.view()) {
+            match (n.statements[s as usize]) {
+                NirStatement.Assign(target, value) => {
+                    let isAggregate = match (n.rvalues[value as usize]) {
+                        NirRvalue.Aggregate(_) => true,
+                        _ => false,
+                    };
+                    let typ = n.rvalueTypes[value as usize];
+                    if (isAggregate && c.types.isCLaidOut(typ, 0)) {
+                        let local = n.places[target as usize].local;
+                        if (n.places[target as usize].projections.count == 0 &&
+                            n.functions[function as usize].locals[local as usize].name == none()) {
+                            var found = false;
+                            for (k in 0..p.literalLocals.length) {
+                                if (p.literalLocals[k] == local) {
+                                    p.literalStatements[k] = s;
+                                    found = true;
+                                }
+                            }
+                            if (!found) {
+                                p.literalLocals.push(local)?;
+                                p.literalStatements.push(s)?;
+                            }
+                        } else {
+                            let message = notPlaced(c, typ)?;
+                            inPlaceReport(c, mut p, n.statementSpans[s as usize], message)?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for (position in 0..blockCount) {
+        for (s in n.functions[function as usize].blocks[position].statements.view()) {
+            let span = n.statementSpans[s as usize];
+            match (n.statements[s as usize]) {
+                NirStatement.Assign(target, value) => {
+                    let use = match (n.rvalues[value as usize]) {
+                        NirRvalue.Use(operand) => operand,
+                        _ => none(),
+                    };
+                    // `p.write(v)`: the literal is placed at `*p`, and its @placed methods run there (§27.3).
+                    if (use != none() && isRawDeref(c, n, n.functions[function as usize].locals, target)) {
+                        inPlaceUse(c, n, mut p, use, true, span)?;
+                    } else {
+                        inPlaceRvalue(c, n, mut p, value, span)?;
+                    }
+                }
+                NirStatement.Eval(value) => { inPlaceRvalue(c, n, mut p, value, span)?; }
+                _ => {}
+            }
+        }
+        let terminator = n.functions[function as usize].blocks[position].terminator;
+        match (n.terminators[terminator as usize]) {
+            NirTerminator.Return(result) => {
+                if (result != none()) {
+                    inPlaceUse(c, n, mut p, result, false, n.terminatorSpans[terminator as usize])?;
+                }
+            }
+            _ => {}
+        }
+    }
+    for (k in 0..p.literalLocals.length) {
+        let local = p.literalLocals[k];
+        if (!containsU32(p.used, local)) {
+            let made = p.literalStatements[k];
+            let typ = n.functions[function as usize].locals[local as usize].typ;
+            let message = notPlaced(c, typ)?;
+            inPlaceReport(c, mut p, n.statementSpans[made as usize], message)?;
+        }
+    }
+    return Ok();
+}
+
+// ---- MoveChecker ----
+
+/// Initialisation and move checking on NIR (type-system.md §14.3–14.4; ownership.md O2, O3): every read, borrow or
+/// move needs a definitely initialised place (N0212, N0250). Moves out of references (N0251), out of fields of types
+/// with a drop block (N0252) and out of `using` bindings (N0253) are rejected. Each variable is reported at most once.
+struct MoveCheck {
+    function: u32;
+    file: u32;
+    reported: Vector<u32>; // locals
+}
+
+fn nirLocalName(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    m: borrow MoveCheck,
+    local: u32,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    let name = n.functions[m.function as usize].locals[local as usize].name;
+    if (name == none()) {
+        return appendText(out, "a temporary");
+    }
+    return appendBytes(out, c.name(name));
+}
+
+/// A place as the user wrote it (Describe): the local's name, then its fields up to the first other projection.
+fn describeNirPlace(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    m: borrow MoveCheck,
+    place: u32,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    let p = n.places[place as usize];
+    nirLocalName(c, n, m, p.local, out)?;
+    for (k in 0..p.projections.count) {
+        let projection = n.projections[(p.projections.start + k) as usize];
+        if (isFieldProjectionN(projection)) {
+            appendText(out, ".")?;
+            appendBytes(out, c.name(c.types.fields[projection.field as usize].name))?;
+        } else if (!isDerefProjectionN(projection)) {
+            break;
+        }
+    }
+    return Ok();
+}
+
+/// Describe(node.Place()): a move path's fields; box contents add nothing, a box allocation is its box.
+fn describeNode(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    m: borrow MoveCheck,
+    d: borrow MoveData,
+    node: u32,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    var fields = Vector<u32>.create();
+    var current = if (d.nodes[node as usize].isBoxAllocation) d.nodes[node as usize].parent else node;
+    while (d.nodes[current as usize].parent != none()) {
+        if (!d.nodes[current as usize].isBoxContents) {
+            fields.push(d.nodes[current as usize].field)?;
+        }
+        current = d.nodes[current as usize].parent;
+    }
+    nirLocalName(c, n, m, d.nodes[node as usize].local, out)?;
+    var k = fields.length;
+    while (k > 0) {
+        k -= 1;
+        appendText(out, ".")?;
+        appendBytes(out, c.name(c.types.fields[fields[k] as usize].name))?;
+    }
+    return Ok();
+}
+
+fn moveError(
+    c: borrow mut Checker,
+    m: borrow mut MoveCheck,
+    local: u32,
+    code: u32,
+    span: Span,
+    message: Vector<u8>,
+) -> Result<void, AllocError> {
+    if (containsU32(m.reported, local)) {
+        return Ok();
+    }
+    m.reported.push(local)?;
+    return c.front.diagnostics.error(code, m.file, span.start, span.end, message);
+}
+
+/// A read, borrow or move of `place` (CheckUse).
+fn checkUse(
+    c: borrow mut Checker,
+    n: borrow NirProgram,
+    m: borrow mut MoveCheck,
+    d: borrow MoveData,
+    place: u32,
+    isMove: bool,
+    state: borrow InitState,
+    span: Span,
+) -> Result<void, AllocError> {
+    let locals = borrow n.functions[m.function as usize].locals;
+    let local = n.places[place as usize].local;
+    let hasDeref = !isMovePath(c, n, locals, place); // through a reference, into an element, or into an enum variant
+    // Reading through a reference needs the reference; reading a place needs the place.
+    let path = if (hasDeref) d.roots[local as usize] else pathFor(c, n, d, place);
+    if (!definitelyInit(d, state, path)?) {
+        var what = Vector<u8>.create();
+        if (hasDeref) {
+            nirLocalName(c, n, m, local, mut what)?;
+        } else {
+            describeNirPlace(c, n, m, place, mut what)?;
+        }
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, what.view())?;
+        if (anyMaybeMoved(d, state, path)?) {
+            appendText(mut message, "' is used here after it was moved (on at least one path)")?;
+            return moveError(c, m, local, useOfMoved(), span, message);
+        }
+        appendText(mut message, "' is read here but may not have been assigned a value")?;
+        return moveError(c, m, local, possiblyUnassigned(), span, message);
+    }
+    if (!isMove) {
+        return Ok();
+    }
+    if (hasDeref && isPayloadOfLocal(n, place)) {
+        return Ok(); // `?` / `!` consuming a result (type-system.md §17.4)
+    }
+    if (isRawDeref(c, n, locals, place)) {
+        return Ok(); // `p.read()` moves the value out of raw memory, in unsafe code (type-system.md §27.3, ADR 0027)
+    }
+    if (hasDeref) {
+        let p = n.places[place as usize];
+        let localType = locals[local as usize].typ;
+        let firstIsDeref = isDerefProjectionN(n.projections[p.projections.start as usize]);
+        var anyDeref = false;
+        for (k in 0..p.projections.count) {
+            if (isDerefProjectionN(n.projections[(p.projections.start + k) as usize])) {
+                anyDeref = true;
+            }
+        }
+        var message = Vector<u8>.create();
+        appendText(mut message, "cannot move a ")?;
+        appendQuotedType(mut message, c, nirPlaceType(c, n, locals, place))?;
+        var name = Vector<u8>.create();
+        nirLocalName(c, n, m, local, mut name)?;
+        if (c.types.is(localType, TypeKind.Box) && firstIsDeref) {
+            appendText(mut message, " out of the contents of the box '")?;
+            appendBytes(mut message, name.view())?;
+            appendText(mut message, "'; only Copy values can be read out of a box")?;
+        } else if (c.types.is(localType, TypeKind.Vector) && firstIsDeref) {
+            appendText(mut message, " out of an element of the vector '")?;
+            appendBytes(mut message, name.view())?;
+            appendText(mut message, "'; only Copy values can be read from there (use 'pop()')")?;
+        } else if (anyDeref) {
+            appendText(mut message, " out of the value '")?;
+            appendBytes(mut message, name.view())?;
+            appendText(mut message, "' refers to; only Copy values can be read through a reference")?;
+        } else {
+            appendText(mut message, " out of an element or enum payload of '")?;
+            appendBytes(mut message, name.view())?;
+            appendText(mut message, "'; only Copy values can be read from there")?;
+        }
+        return moveError(c, m, local, moveOutOfReference(), span, message);
+    }
+    if (locals[local as usize].isUsing) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "cannot move out of '")?;
+        describeNirPlace(c, n, m, place, mut message)?;
+        appendText(mut message, "': it is a 'using' binding, which lives until the end of its block")?;
+        return moveError(c, m, local, moveOutOfUsing(), span, message);
+    }
+    // Partial moves are not allowed out of a struct whose drop block needs the whole value.
+    var owner = d.nodes[pathFor(c, n, d, place) as usize].parent;
+    while (owner != none() && !hasDropFunction(c, d.nodes[owner as usize].typ)) {
+        owner = d.nodes[owner as usize].parent;
+    }
+    if (owner != none()) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "cannot move '")?;
+        describeNirPlace(c, n, m, place, mut message)?;
+        appendText(mut message, "' out of '")?;
+        describeNode(c, n, m, d, owner, mut message)?;
+        appendText(mut message, "': ")?;
+        appendQuotedType(mut message, c, d.nodes[owner as usize].typ)?;
+        appendText(mut message, " has a drop block, which needs the whole value")?;
+        return moveError(c, m, local, moveOutOfDropType(), span, message);
+    }
+    return Ok();
+}
+
+/// A write to `target` (CheckWrite).
+fn checkWrite(
+    c: borrow mut Checker,
+    n: borrow NirProgram,
+    m: borrow mut MoveCheck,
+    d: borrow MoveData,
+    target: u32,
+    state: borrow InitState,
+    span: Span,
+) -> Result<void, AllocError> {
+    let locals = borrow n.functions[m.function as usize].locals;
+    let local = n.places[target as usize].local;
+    if (!isMovePath(c, n, locals, target)) {
+        // As CheckUse of the bare local: it must be initialised.
+        let root = d.roots[local as usize];
+        if (!definitelyInit(d, state, root)?) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "'")?;
+            nirLocalName(c, n, m, local, mut message)?;
+            if (anyMaybeMoved(d, state, root)?) {
+                appendText(mut message, "' is used here after it was moved (on at least one path)")?;
+                return moveError(c, m, local, useOfMoved(), span, message);
+            }
+            appendText(mut message, "' is read here but may not have been assigned a value")?;
+            return moveError(c, m, local, possiblyUnassigned(), span, message);
+        }
+        return Ok();
+    }
+    if (n.places[target as usize].projections.count == 0) {
+        return Ok();
+    }
+    // p.f = v needs the rest of p initialised: no piecewise construction (type-system.md §14.4).
+    let written = pathFor(c, n, d, target);
+    // A struct with a drop block is never partially moved (N0252), so an uninitialised leaf means the whole value is
+    // gone: its fields cannot be written, even when the written field is the only one.
+    var owner: u32 = none();
+    var ancestor = d.nodes[written as usize].parent;
+    while (ancestor != none()) {
+        if (hasDropFunction(c, d.nodes[ancestor as usize].typ)) {
+            owner = ancestor;
+        }
+        ancestor = d.nodes[ancestor as usize].parent;
+    }
+    var rootLeaves = Vector<u32>.create();
+    moveLeaves(d, d.roots[local as usize], mut rootLeaves)?;
+    var writtenLeaves = Vector<u32>.create();
+    if (owner == none()) {
+        moveLeaves(d, written, mut writtenLeaves)?;
+    }
+    var anyUninit = false;
+    var moved = false;
+    for (leaf in rootLeaves.view()) {
+        if (containsU32(writtenLeaves, leaf)) {
+            continue;
+        }
+        let i = d.nodes[leaf as usize].leafIndex;
+        if (InitState.bit(state.maybeUninit, i)) {
+            anyUninit = true;
+            if (InitState.bit(state.maybeMoved, i)) {
+                moved = true;
+            }
+        }
+    }
+    if (!anyUninit) {
+        return Ok();
+    }
+    var message = Vector<u8>.create();
+    if (moved) {
+        appendText(mut message, "cannot assign to '")?;
+        describeNirPlace(c, n, m, target, mut message)?;
+        appendText(mut message, "': the rest of '")?;
+        nirLocalName(c, n, m, local, mut message)?;
+        appendText(mut message, "' was moved")?;
+        return moveError(c, m, local, useOfMoved(), span, message);
+    }
+    appendText(mut message, "'")?;
+    nirLocalName(c, n, m, local, mut message)?;
+    appendText(mut message, "' is read here but may not have been assigned a value")?;
+    return moveError(c, m, local, possiblyUnassigned(), span, message);
+}
+
+/// Operands are evaluated left to right; a place moved by an earlier operand is uninitialised for later ones.
+fn checkMoveRvalue(
+    c: borrow mut Checker,
+    n: borrow NirProgram,
+    m: borrow mut MoveCheck,
+    d: borrow MoveData,
+    rvalue: u32,
+    state: borrow InitState,
+    span: Span,
+) -> Result<void, AllocError> {
+    match (n.rvalues[rvalue as usize]) {
+        NirRvalue.Ref(_, place) => { return checkUse(c, n, m, d, place, false, state, span); }
+        NirRvalue.Discriminant(place) => { return checkUse(c, n, m, d, place, false, state, span); }
+        NirRvalue.Length(place) => { return checkUse(c, n, m, d, place, false, state, span); }
+        NirRvalue.Slice(_, base, _, _) => { checkUse(c, n, m, d, base, false, state, span)?; }
+        _ => {}
+    }
+    var running = state.clone()?;
+    var operands = Vector<u32>.create();
+    rvalueOperands(n, rvalue, mut operands)?;
+    for (o in operands.view()) {
+        match (n.operands[o as usize]) {
+            NirOperand.Place(place, isMove) => {
+                checkUse(c, n, m, d, place, isMove, running, span)?;
+                if (isMove) {
+                    let moved = movedPath(c, n, n.functions[m.function as usize].locals, d, place);
+                    if (moved != none()) {
+                        uninitialize(d, mut running, moved, true)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    return Ok();
+}
+
+fn checkMoves(c: borrow mut Checker, n: borrow NirProgram, function: u32) -> Result<void, AllocError> {
+    let d = analyzeMoves(c, n, n.functions[function as usize])?;
+    var m = MoveCheck { function: function, file: functionFile(c, n, function), reported: Vector<u32>.create() };
+    let blockCount = n.functions[function as usize].blocks.length;
+    for (position in 0..blockCount) {
+        let statementCount = n.functions[function as usize].blocks[position].statements.length;
+        for (i in 0..statementCount) {
+            let s = n.functions[function as usize].blocks[position].statements[i];
+            let span = n.statementSpans[s as usize];
+            var state = d.before[position][i].clone()?;
+            match (n.statements[s as usize]) {
+                NirStatement.Assign(target, value) => {
+                    checkMoveRvalue(c, n, mut m, d, value, state, span)?;
+                    applyMoves(c, n, n.functions[function as usize].locals, d, value, mut state)?;
+                    checkWrite(c, n, mut m, d, target, state, span)?;
+                }
+                NirStatement.Eval(value) => { checkMoveRvalue(c, n, mut m, d, value, state, span)?; }
+                NirStatement.Unpack(source, _, _) => { checkUse(c, n, mut m, d, source, true, state, span)?; }
+                _ => {}
+            }
+        }
+        let terminator = n.functions[function as usize].blocks[position].terminator;
+        let operand = match (n.terminators[terminator as usize]) {
+            NirTerminator.Branch(condition, _, _) => condition,
+            NirTerminator.Switch(value, _, _) => value,
+            NirTerminator.Return(value) => value,
+            NirTerminator.Exit(code) => code,
+            _ => none(),
+        };
+        if (operand != none()) {
+            match (n.operands[operand as usize]) {
+                NirOperand.Place(place, isMove) => {
+                    let span = n.terminatorSpans[terminator as usize];
+                    checkUse(c, n, mut m, d, place, isMove, d.before[position][statementCount], span)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    return Ok();
+}

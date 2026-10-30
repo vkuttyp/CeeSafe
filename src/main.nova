@@ -548,6 +548,11 @@ fn fileCommand(building: bool) -> i32 {
         // The reference's libraries check cleanly: what is reported in them here is a porting gap (docs/p3-plan.md S5).
         checker.front.diagnostics.removeFiles(checker.fileIsLibrary.view());
     }
+    // The ownership analyses run on NIR, after type checking succeeded (lifetimes.md).
+    var nir = NirProgram.create();
+    if (!checker.front.diagnostics.hasErrors()) {
+        nir = analyzeProgram(mut checker)!;
+    }
     if (options.dumpHir && !building) {
         var printer = HirPrinter.create();
         printer.printProgram(checker.hir, checker.types, checker.front.symbols)!;
@@ -560,17 +565,9 @@ fn fileCommand(building: bool) -> i32 {
         if (!options.dumpNir) {
             return fail("'build' is not implemented yet (ROADMAP P5); only 'build --dump-nir' is");
         }
-        var nir = buildNir(mut checker)!;
-        // Destruction goes only into code that is compiled, not into generic versions (type-system.md §14.5).
-        for (k in 0..nir.functions.length) {
-            if (!functionIsGeneric(checker, nir.functions[k].source)) {
-                elaborateDrops(checker, mut nir, truncate<u32>(k))!;
-            }
-        }
         var out = Vector<u8>.create();
         printNir(checker, nir, mut out)!;
         Console.writeBytes(out.view());
-        return report(options.json, checker.front.diagnostics, sources);
     }
     return report(options.json, checker.front.diagnostics, sources);
 }

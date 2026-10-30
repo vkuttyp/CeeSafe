@@ -1,0 +1,39 @@
+// What runs after the type checker succeeded (the reference's Compilation.CreateOnCompilerStack): the HIR lowered to
+// NIR, the ownership analyses on every function that is not an instantiation, N0222 for instances whose bodies did
+// not check, then drop elaboration.
+
+fn invalidInstantiation() -> u32 => 222;
+
+fn analyzeProgram(c: borrow mut Checker) -> Result<NirProgram, AllocError> {
+    var n = buildNir(c)?;
+    // Generic code is checked once, in its generic version; instantiations repeat it (type-system.md §20.3).
+    for (k in 0..n.functions.length) {
+        if (!functionIsInstantiation(c, n.functions[k].source)) {
+            checkInPlace(c, n, truncate<u32>(k))?;
+            checkMoves(c, n, truncate<u32>(k))?;
+        }
+    }
+    // An instance whose body does not check, with no other error to explain it, is N0222 at its use (§20.4).
+    if (!c.front.diagnostics.hasErrors()) {
+        for (function in n.functions.view()) {
+            let f = borrow c.hir.functions[function.source as usize];
+            if (f.hasInstanceError) {
+                let message = copyBytes(f.instanceError.view())?;
+                let file = f.siteFile;
+                let start = f.siteStart;
+                let end = f.siteEnd;
+                c.front.diagnostics.error(invalidInstantiation(), file, start, end, message)?;
+            }
+        }
+    }
+    if (!c.front.diagnostics.hasErrors()) {
+        // Destruction is inserted only into programs that passed every check (type-system.md §14.5), and only into
+        // code that is compiled: not into generic versions.
+        for (k in 0..n.functions.length) {
+            if (!functionIsGeneric(c, n.functions[k].source)) {
+                elaborateDrops(c, mut n, truncate<u32>(k))?;
+            }
+        }
+    }
+    return Ok(n);
+}
