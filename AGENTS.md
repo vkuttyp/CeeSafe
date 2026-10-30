@@ -66,7 +66,8 @@ the markers, and never edit between them.
 ## Governing documents (in order of authority)
 
 1. `ROADMAP.md`: scope, phases P0–P9, the N track (upstream Nova M15), gates and the execution record.
-2. `docs/decisions/*.md`: CeeSafe's accepted decisions (0001: identity and bootstrap; 0002: the rename cut-over).
+2. `docs/decisions/*.md`: CeeSafe's accepted decisions (0001: identity and bootstrap; 0002: the rename cut-over;
+   0003: Nova and CeeSafe in parallel).
 3. Nova's specifications in `~/Nova/docs/` (type system, ownership, C backend) and its ADRs: the port preserves their
    semantics. Nova's `AGENTS.md` rules (spec before code, safety first, determinism, target layout from `TargetInfo`
    only) apply here too.
@@ -83,8 +84,9 @@ the markers, and never edit between them.
   development wrapper around `~/Nova`'s working tree and is not reproducible.
 - Formatting is still novac's until ceesafec has `fmt` (P8): `~/.nova/0.6.0/bin/novac fmt $(git ls-files 'src/*.cee')`
   (`novac fmt` on a directory looks only for `.nova` files).
-- Legacy mode: ceesafec still reads `nova.toml` packages and `.nova` files (CosmoOS has not migrated), and Nova's
-  corpus and `tests/` stay `.nova`, compared with novac. Diagnostic codes keep the letter N.
+- Nova and CeeSafe exist in parallel (Decision 0003): ceesafec reads only `ceesafe.toml` packages, but files named on
+  the command line may have any extension, so Nova's corpus and `tests/` stay `.nova`, compared with novac. CeeSafe
+  tracks Nova (its specifications, releases and corpus) until P8. Diagnostic codes keep the letter N.
 - A missing language or library feature is an upstream Nova task (ROADMAP's N track: spec and ADR in `~/Nova`, then a
   novac release and a re-pin). Pure library code (tables, interner, bignum, JSON) is written here in Nova. Never
   work around a gap with `unsafe`, C, or a weaker check where a safe design exists.

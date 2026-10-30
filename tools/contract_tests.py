@@ -59,8 +59,6 @@ def main():
         ("c -g", py + [f"{HERE}/compare_c.py"] + common + ["--extra=-g"] + families),
         ("c -g split", py + [f"{HERE}/compare_c.py"] + common + ["--extra=-g", "--extra=--split"] + families),
         ("packages", py + [f"{HERE}/compare_packages.py", "--ceesafec", cee, "--novac", novac]),
-        ("pkg renamed", py + [f"{HERE}/compare_packages.py", "--ceesafec", cee, "--novac", novac, "--renamed", "all"]),
-        ("pkg mixed", py + [f"{HERE}/compare_packages.py", "--ceesafec", cee, "--novac", novac, "--renamed", "root"]),
         ("run -Werror", py + [f"{HERE}/run_corpus.py", "--compiler", cee, "--corpus", corpus] + run_families +
          ["--cflag=-Werror"]),
         ("run asan", py + [f"{HERE}/run_corpus.py", "--compiler", cee, "--corpus", corpus] + run_families +

@@ -3,6 +3,7 @@
 - Status: **Accepted** by the owner, 2026-10-30. The owner chose to keep the legacy mode and left the code letter to
   the agent ("keep 'N' or replace it with 'C'"); the agent chose N, for the reasons below.
 - Implements: ROADMAP P6R, Decision 0001 §2–§3.
+- §1 (the legacy mode) is **superseded** by Decision 0003 (2026-10-30): CeeSafe no longer reads Nova packages.
 
 ## Decisions
 

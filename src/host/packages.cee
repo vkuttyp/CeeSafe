@@ -32,7 +32,6 @@ struct PackageManifest {
     floatAllowed: bool;
     kernel: bool;
     trusted: bool;
-    legacy: bool;               // read from `nova.toml`: `*.nova` sources and `nova.lock` (Decision 0002)
     object: bool;               // kind = "object": `build` makes a relocatable object (cosmoos/profiles.md §4.3)
     cFiles: Vector<Vector<u8>>; // `c = [...]`, relative to the package (type-system.md §28.6)
 }
@@ -329,8 +328,8 @@ fn isDirectory(path: Slice<u8>) -> bool {
     };
 }
 
-/// Every source file under `directory` (`*.cee`, or `*.nova` for a legacy package), absolute, recursively.
-fn novaFilesUnder(directory: Slice<u8>, legacy: bool, out: borrow mut Vector<Vector<u8>>) -> Result<void, AllocError> {
+/// Every `*.cee` file under `directory`, absolute, recursively.
+fn sourceFilesUnder(directory: Slice<u8>, out: borrow mut Vector<Vector<u8>>) -> Result<void, AllocError> {
     let text = match (StringView.fromUtf8(directory)) {
         Some(t) => t,
         null => { return Ok(); }
@@ -346,8 +345,8 @@ fn novaFilesUnder(directory: Slice<u8>, legacy: bool, out: borrow mut Vector<Vec
         }
         let path = joinPath(directory, name)?;
         if (isDirectory(path.view())) {
-            novaFilesUnder(path.view(), legacy, out)?;
-        } else if (hasSourceExtension(name, legacy)) {
+            sourceFilesUnder(path.view(), out)?;
+        } else if (hasSourceExtension(name)) {
             out.push(path)?;
         }
     }
@@ -370,7 +369,7 @@ fn sourceFiles(manifest: borrow PackageManifest, out: borrow mut Vector<Vector<u
     for (source in manifest.sources.view()) {
         let directory = joinPath(manifest.directory.view(), source.view())?;
         if (isDirectory(directory.view())) {
-            novaFilesUnder(directory.view(), manifest.legacy, out)?;
+            sourceFilesUnder(directory.view(), out)?;
         }
     }
     // Paths below one directory sort as their relative paths do; insertion sort keeps it simple and deterministic.
@@ -397,37 +396,35 @@ fn sourceFiles(manifest: borrow PackageManifest, out: borrow mut Vector<Vector<u
 
 // ---- Manifests ----
 
-fn hasSourceExtension(name: Slice<u8>, legacy: bool) -> bool =>
-    if (legacy) name.length > 5 && sameText(
-        name[(name.length - 5)..],
-        ".nova",
-    ) else name.length > 4 && sameText(name[(name.length - 4)..], ".cee");
+fn hasSourceExtension(name: Slice<u8>) -> bool => name.length > 4 && sameText(name[(name.length - 4)..], ".cee");
 
-/// A directory's manifest (Decision 0002): 1 `ceesafe.toml`, 2 `nova.toml` (legacy), 3 both, 0 neither.
-fn manifestKindIn(directory: Slice<u8>) -> Result<u32, AllocError> {
-    let ceePath = joinPath(directory, "ceesafe.toml".bytes())?;
-    let novaPath = joinPath(directory, "nova.toml".bytes())?;
-    let cee = fileExists(ceePath.view());
-    let nova = fileExists(novaPath.view());
-    return Ok((if (cee) 1u32 else 0u32) | (if (nova) 2u32 else 0u32));
+/// The manifest's file name. Nova's `nova.toml` packages are not read (Decision 0003).
+fn manifestName() -> StringView => "ceesafe.toml";
+
+fn lockName() -> StringView => "ceesafe.lock";
+
+fn hasManifest(directory: Slice<u8>) -> Result<bool, AllocError> {
+    let path = joinPath(directory, manifestName().bytes())?;
+    return Ok(fileExists(path.view()));
 }
 
-/// The manifest's file name: `ceesafe.toml`, or `nova.toml` for a legacy package.
-fn manifestName(legacy: bool) -> StringView => if (legacy) "nova.toml" else "ceesafe.toml";
+/// Whether a directory holds a Nova package (`nova.toml`), which CeeSafe does not read: its messages say so.
+fn hasNovaManifest(directory: Slice<u8>) -> Result<bool, AllocError> {
+    let path = joinPath(directory, "nova.toml".bytes())?;
+    return Ok(fileExists(path.view()));
+}
 
-/// The lock's file name: `ceesafe.lock`, or `nova.lock` for a legacy package.
-fn lockName(legacy: bool) -> StringView => if (legacy) "nova.lock" else "ceesafe.lock";
-
-/// Reads `directory/ceesafe.toml`, or `directory/nova.toml` (legacy). On failure, `problem` says why.
+/// Reads `directory/ceesafe.toml`. On failure, `problem` says why.
 fn readManifest(directory: Slice<u8>, problem: borrow mut Vector<u8>) -> Result<PackageManifest?, AllocError> {
-    let kind = manifestKindIn(directory)?;
-    if (kind == 3) {
+    if (!hasManifest(directory)? && hasNovaManifest(directory)?) {
         appendBytes(problem, directory)?;
-        appendText(problem, ": has both ceesafe.toml and nova.toml; keep one (Decision 0002)")?;
+        appendText(
+            problem,
+            " is a Nova package (nova.toml): CeeSafe reads only ceesafe.toml packages (Decision 0003)",
+        )?;
         return Ok(null);
     }
-    let legacy = kind == 2;
-    let path = joinPath(directory, manifestName(legacy).bytes())?;
+    let path = joinPath(directory, manifestName().bytes())?;
     let pathText = match (StringView.fromUtf8(path.view())) {
         Some(t) => t,
         null => { return Ok(null); }
@@ -457,7 +454,6 @@ fn readManifest(directory: Slice<u8>, problem: borrow mut Vector<u8>) -> Result<
         floatAllowed: true,
         kernel: false,
         trusted: false,
-        legacy: legacy,
         object: false,
         cFiles: Vector<Vector<u8>>.create(),
     };
@@ -514,11 +510,11 @@ fn readManifest(directory: Slice<u8>, problem: borrow mut Vector<u8>) -> Result<
     return Ok(manifest);
 }
 
-/// The directory of the nearest `ceesafe.toml` or `nova.toml`, here or above (Manifest.FindDirectory), or none.
+/// The directory of the nearest `ceesafe.toml`, here or above (Manifest.FindDirectory), or none.
 fn findManifestDirectory(start: Slice<u8>) -> Result<Vector<u8>?, AllocError> {
     var directory = copyBytes(start)?;
     loop {
-        if (manifestKindIn(directory.view())? != 0) {
+        if (hasManifest(directory.view())?) {
             return Ok(directory);
         }
         if (directory.length <= 1) {

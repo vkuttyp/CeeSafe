@@ -203,7 +203,7 @@ Subdirectories under `src/` are only for organisation, since every `.nova` file 
 | MCP/LSP | server `novac`, tools `nova_*` | `ceesafec`, `ceesafe_*` | P8 |
 | Agent files | `<!--NOVA START/END-->`, `nova.mdc` | CeeSafe markers | P8 |
 | Editor | `nova-language`, language id `nova` | CeeSafe extension | P8 |
-| CosmoOS | `.nova`, pinned novac | `.cee`, pinned `ceesafec` | P9, reviewed PRs |
+| CosmoOS | `.nova`, pinned novac | stays on Nova (Decision 0003); a migration is the owner's option | — |
 
 Nova's generated-C ABI is kept through the first fixed point. Renaming never changes ownership, lifetime, drop or
 safety semantics, and it is never done by text substitution.
@@ -471,7 +471,8 @@ Dependencies: P6.
 
 - [x] `ceesafec` accepts `.cee`, `ceesafe.toml` (and `ceesafe.lock`). `$CEESAFE_HOME` is named (Decision 0002); nothing
   reads a home directory until P8's git and registry dependencies. `.nova` and `nova.toml` are kept as an explicit
-  legacy mode (Decision 0002, owner 2026-10-30: CosmoOS has yet to migrate).
+  legacy mode (Decision 0002), then dropped the same day by Decision 0003: Nova and CeeSafe exist in parallel, so
+  ceesafec reads only `ceesafe.toml` packages; files named on the command line may have any extension.
 - [x] The diagnostic code letter stays **N** (Decision 0002: `C` would collide with MSVC's codes), so no mapping and
   no corpus conversion is needed.
 - [x] One commit (`8941c10`) renames CeeSafe's own sources and manifest; `3d6ac40` is the bootstrap anchor that novac
@@ -509,7 +510,8 @@ Dependencies: P7. Parser-only tools may start after P2, and semantic tools after
   - manifest/TOML, path and git dependencies, the lock file and cache;
   - the registry index and version solving, `fetch`/`publish`/`index-check`;
   - `$CEESAFE_HOME`;
-  - conversion from `nova.toml` and `nova.lock`.
+  - a one-way conversion of a Nova package to a CeeSafe package (`nova.toml`, `nova.lock`, `.nova`), if wanted:
+    ceesafec does not read Nova packages (Decision 0003).
 
   Local fixture repositories, no network.
 - [ ] Interpreter: values, memory, numerics, builtins, deterministic threads (`Interpreter/Threads.cs`) and the sandbox.
@@ -521,6 +523,10 @@ Dependencies: P7. Parser-only tools may start after P2, and semantic tools after
 - [ ] MCP: lifecycle, tools (`ceesafe_*`), resources and prompts, the sandbox.
 - [ ] Host parity: Windows/MSVC, debugger scripts, the VS Code extension.
 - [ ] The normal self-build uses package mode, and P6 is rerun through it.
+
+- [ ] Decide whether the command line accepts only `.cee` files (Decision 0003 §2).
+- [ ] The fork point (Decision 0003 §3): the owner decides when CeeSafe stops tracking Nova; CeeSafe's own
+  specifications and corpus start there, and the novac comparisons become regression tests against its output.
 
 Gate: every command and flag in the P0 ledger is implemented, or has an accepted decision. The contract suites pass.
 No C# fallback.
@@ -538,7 +544,8 @@ Dependencies: P8.
 - [ ] Ship a source-release C seed (in the spirit of ADR 0023 option A), verified to build with a C toolchain alone.
 - [ ] Build and run `ceesafec` on CosmoOS userland, on both architectures, including self-compilation.
 - [ ] Have the safety passes and `unsafe` adapters reviewed independently when a reviewer is available.
-- [ ] Migrate CosmoOS (`.nova` to `.cee`, the pin to `ceesafec`) one component per reviewed, reversible PR.
+- [ ] Optional (Decision 0003: CosmoOS stays on Nova): migrate CosmoOS (`.nova` to `.cee`, the pin to `ceesafec`) one
+  component per reviewed, reversible PR, if the owner takes it up.
 - [ ] Document the point at which CeeSafe becomes the supported compiler, and the frozen C# reference.
 
 Gate: parity, fixed point, CLI parity and release evidence are complete. Hosted CosmoOS support, an outside audit and
