@@ -1,3 +1,4 @@
+// Filed as https://github.com/vkuttyp/Nova/issues/5 (2026-10-30).
 // Upstream imprecision (novac 0.3.1): a method declared `-> borrow(this) T?` whose other reference parameter has a
 // type-parameter type (`key: borrow K`) is treated as if its result also borrowed `key`, so a temporary argument
 // is rejected with N0243. With a concrete key type (`key: borrow Key`) the same program is accepted. Expected:

@@ -1,3 +1,4 @@
+// Filed as https://github.com/vkuttyp/Nova/issues/1 (2026-10-30).
 // Upstream bug (novac 0.3.1 and 07d561f, native and --interp alike): a temporary that needs drop, created in the
 // condition of an `if` or `while`, is not destroyed: "drop 1" is never printed, and the `while` condition makes
 // two `make(4)` temporaries but destroys one. `let` and `match` destroy theirs. lifetimes.md: a temporary lives until

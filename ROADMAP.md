@@ -258,16 +258,16 @@ Each item is a Nova change approved by the owner and made under Nova's rules: sp
 `roadmap.md` and `risks.md`. It ships in a novac release, and CeeSafe re-pins (`bootstrap/reference.md`). P1's probes
 (2026-10-30, `docs/p1-probes.md` §4) set this list and its order.
 
-- [ ] **N0. Fix the compiler crash** on a generic `Result` rebuild instantiated with `T = void`
+- [ ] **N0. Fix the compiler crash** ([Nova #2](https://github.com/vkuttyp/Nova/issues/2)) on a generic `Result` rebuild instantiated with `T = void`
   (`probes/upstream/void-result-rebuild-crash.nova`). This is a bug fix with a corpus regression, not a language
   change. Until it lands, `void` results use non-generic lifts.
-- [ ] **N0b. Fix the missing drop** of a temporary made in an `if` or `while` condition
+- [ ] **N0b. Fix the missing drop** ([Nova #1](https://github.com/vkuttyp/Nova/issues/1)) of a temporary made in an `if` or `while` condition
   (`probes/upstream/condition-temporary-not-dropped.nova`). Its regression test needs a leak check, which Nova's run
   corpus lacks. **Before P4**, since drops are part of parity.
-- [ ] N0c. Fix two false rejections, each with a workaround:
+- [ ] N0c. Fix two false rejections ([Nova #4](https://github.com/vkuttyp/Nova/issues/4), [#5](https://github.com/vkuttyp/Nova/issues/5)), each with a workaround:
   - `truncate` is not two-phase, against §23.1;
   - `borrow(this)` is ignored when the other parameter has a type-parameter type.
-- [ ] **N0d. Specify a nesting limit and its diagnostic.** novac crashes at 100,000 nested parentheses (SIGSEGV;
+- [ ] **N0d. Specify a nesting limit and its diagnostic** ([Nova #3](https://github.com/vkuttyp/Nova/issues/3)). novac crashes at 100,000 nested parentheses (SIGSEGV;
   `docs/limits.md`). **Before P2's robustness gate.**
 - [ ] **N1a. Bytes to text.** Add `StringView.fromUtf8(Slice<u8>) -> StringView?` (validating), and a way to append
   checked bytes to a `String`. Needed by P2 so that diagnostics can quote source names, and by P8 so that JSON, fixes
@@ -335,9 +335,7 @@ Dependencies: P0. Runs alongside the N track.
 
 Gate: probes and the support library pass under ASan and UBSan with the pinned novac. Every compiler bug found has a
 reduced reproducer filed upstream. Missing features block; they are never worked around by weakening checks.
-**Passed 2026-10-30 (§10).** The four reproducers in `probes/upstream/` and the nesting crash (`docs/limits.md`) are ready to file, but not yet
-filed: that is
-an action on Nova, and waits for the owner.
+**Passed 2026-10-30 (§10).** The four reproducers in `probes/upstream/` and the nesting crash are filed as Nova #1–#5 (2026-10-30).
 
 ### P2 — Source frontend
 
@@ -561,7 +559,7 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
 
 ## 9. Immediate work queue
 
-1. **Owner decision:** file the four upstream reproducers (`probes/upstream/`) and the nesting crash and start Nova M15 (N6). Its order:
+1. **Owner decision:** start Nova M15 (N6); the bugs are filed as Nova #1–#5. Its order:
    - N0 (the crash) and N0b (the missing drop) first, since they are bugs;
    - then N1a (bytes to text) and N0d (the nesting limit), which P2 needs;
    - N4 (host services) later, before P5.
@@ -585,6 +583,7 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 | 2026-10-30 | P0 gate on the Ryzen box | passed; P0 complete |
 | 2026-10-30 | P1 probes (`probes/`), the report (`docs/p1-probes.md`), and an upstream crash reproducer (`probes/upstream/`) | 12/12 pass; N list revised |
 | 2026-10-30 | P1 support library, oracles (`tools/oracles/`), fault sweep, limits, skeleton loading; `run_corpus.py --with` and `--check-leaks`; 4 more upstream reproducers | all pass; P1 gate passed |
+| 2026-10-30 | Filed Nova issues #1–#5 (the P1 upstream defects; each reproduced again on `origin/main` 07d561f first) | filed |
 
 **Tests run for the skeleton** (2026-10-30, novac 0.3.1, Apple clang 21.0.0):
 - `novac check` and `novac fmt --check`: clean.
