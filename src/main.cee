@@ -51,6 +51,8 @@ struct Options {
     dumpNir: bool;               // --dump-nir (build)
     closureSpecialisation: bool; // on unless --no-closure-specialisation (optimisations.md §5)
     explainClosureCalls: bool;   // --explain-closure-calls
+    placement: bool;             // on unless --no-placement (memory-model.md §5)
+    explainAllocations: bool;    // --explain-allocations
     emit: Vector<u8>;            // --emit c|exe|obj (build)
     output: Vector<u8>;          // -o (build), or empty
     exportsHeader: Vector<u8>;   // --exports-header (build)
@@ -156,8 +158,11 @@ fn readOptions(options: borrow mut Options) -> i32 {
             options.closureSpecialisation = false;
         } else if (options.building && arg == "--explain-closure-calls") {
             options.explainClosureCalls = true;
-        } else if (options.building && (arg == "--no-placement" || arg == "--no-bce" || arg == "--no-oce" ||
-            arg == "--flat-c")) {
+        } else if (options.building && arg == "--no-placement") {
+            options.placement = false;
+        } else if (options.building && arg == "--explain-allocations") {
+            options.explainAllocations = true;
+        } else if (options.building && (arg == "--no-bce" || arg == "--no-oce" || arg == "--flat-c")) {
             // Not ported yet (docs/p7-plan.md): ceesafec emits as novac does with these.
         } else if (arg == "--no-float") {
             options.noFloat = true;
@@ -350,6 +355,8 @@ fn parseCommand() -> i32 {
         dumpNir: false,
         closureSpecialisation: true,
         explainClosureCalls: false,
+        placement: true,
+        explainAllocations: false,
         emit: copyBytes("exe".bytes())!,
         output: Vector<u8>.create(),
         exportsHeader: copyBytes("nova_exports.h".bytes())!,
@@ -568,6 +575,8 @@ fn fileCommand(building: bool) -> i32 {
         dumpNir: false,
         closureSpecialisation: true,
         explainClosureCalls: false,
+        placement: true,
+        explainAllocations: false,
         emit: copyBytes("exe".bytes())!,
         output: Vector<u8>.create(),
         exportsHeader: copyBytes("nova_exports.h".bytes())!,
@@ -747,6 +756,7 @@ fn fileCommand(building: bool) -> i32 {
             programName: programName,
             exportsHeader: copyBytes(options.exportsHeader.view())!,
             closureSpecialisation: options.closureSpecialisation,
+            placement: options.placement,
         };
         if (!generateC(mut checker, mut nir, sources, build, mut files)!) {
             return report(options.json, checker.front.diagnostics, sources);
@@ -754,6 +764,11 @@ fn fileCommand(building: bool) -> i32 {
         var printed = Vector<u8>.create();
         if (options.dumpNir) {
             printNir(checker, nir, mut printed)!; // the NIR the C was made from (closure variants included)
+        }
+        if (options.explainAllocations) {
+            // The decisions placement acts on unless --no-placement is given (memory-model.md §5, rule 4).
+            let placement = analyzePlacement(checker, nir, sources)!;
+            explainAllocations(checker, sources, placement, mut printed)!;
         }
         if (options.explainClosureCalls) {
             explainClosureCalls(checker, nir, sources, closureReport, mut printed)!;

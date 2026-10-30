@@ -1,0 +1,242 @@
+// A function's control flow (the reference's ControlFlow in Backend.C/CStructurer.cs): reverse postorder, predecessors,
+// dominators (Cooper, Harvey and Kennedy), natural loops and reducibility. Placement (memory-model.md §5.1) and the
+// structured C (c-backend.md §3) read it. Blocks are named here by their index in `NirFunction.blocks`; a terminator
+// names its targets by block id, mapped through `indexOf`.
+
+struct ControlFlow {
+    indexOf: Vector<u32>;              // by block id: its index, or none
+    reversePostorder: Vector<u32>;     // block indices
+    order: Vector<u32>;                // by index: its position in reversePostorder
+    idom: Vector<u32>;                 // by index: its immediate dominator, or none until known
+    predecessors: Vector<Vector<u32>>; // by index, in the order the edges are met in reverse postorder
+    loopHeaders: Vector<u32>;          // in the order their loops were found
+    loopMembers: Vector<Vector<bool>>; // parallel to loopHeaders: membership by index
+    loopSizes: Vector<u32>;
+    forwardPredecessors: Vector<u32>; // by index
+    children: Vector<Vector<u32>>;    // by index: the blocks it immediately dominates, in reverse postorder
+    isReducible: bool;
+}
+
+fn blockIndexIn(flow: borrow ControlFlow, id: u32) -> u32 => flow.indexOf[id as usize];
+
+/// A block's successors, as indices, in its terminator's order.
+fn successorIndices(
+    flow: borrow ControlFlow,
+    function: borrow NirFunction,
+    block: u32,
+    out: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    for (id in function.blocks[block as usize].successors.view()) {
+        out.push(flow.indexOf[id as usize])?;
+    }
+    return Ok();
+}
+
+fn controlFlowOf(function: borrow NirFunction) -> Result<ControlFlow, AllocError> {
+    let count = function.blocks.length;
+    var flow = ControlFlow {
+        indexOf: Vector<u32>.create(),
+        reversePostorder: Vector<u32>.create(),
+        order: Vector<u32>.create(),
+        idom: Vector<u32>.create(),
+        predecessors: Vector<Vector<u32>>.create(),
+        loopHeaders: Vector<u32>.create(),
+        loopMembers: Vector<Vector<bool>>.create(),
+        loopSizes: Vector<u32>.create(),
+        forwardPredecessors: Vector<u32>.create(),
+        children: Vector<Vector<u32>>.create(),
+        isReducible: true,
+    };
+    for (k in 0..count) {
+        let id = function.blocks[k].id as usize;
+        while (flow.indexOf.length <= id) {
+            flow.indexOf.push(none())?;
+        }
+        flow.indexOf[id] = truncate<u32>(k);
+        flow.order.push(none())?;
+        flow.idom.push(none())?;
+        flow.predecessors.push(Vector<u32>.create())?;
+        flow.forwardPredecessors.push(0)?;
+        flow.children.push(Vector<u32>.create())?;
+    }
+    // Reverse postorder by an explicit stack of (block, next successor).
+    var postorder = Vector<u32>.create();
+    var visited = Vector<bool>.create();
+    for (k in 0..count) {
+        visited.push(false)?;
+    }
+    var stackBlocks = Vector<u32>.create();
+    var stackNext = Vector<usize>.create();
+    visited[0] = true;
+    stackBlocks.push(0)?;
+    stackNext.push(0)?;
+    while (stackBlocks.length > 0) {
+        let top = stackBlocks.length - 1;
+        let block = stackBlocks[top];
+        let next = stackNext[top];
+        let successors = borrow function.blocks[block as usize].successors;
+        if (next < successors.length) {
+            stackNext[top] = next + 1;
+            let successor = flow.indexOf[successors[next] as usize];
+            if (!visited[successor as usize]) {
+                visited[successor as usize] = true;
+                stackBlocks.push(successor)?;
+                stackNext.push(0)?;
+            }
+        } else {
+            stackBlocks.pop();
+            stackNext.pop();
+            postorder.push(block)?;
+        }
+    }
+    var k = postorder.length;
+    while (k > 0) {
+        k -= 1;
+        flow.reversePostorder.push(postorder[k])?;
+    }
+    for (i in 0..flow.reversePostorder.length) {
+        flow.order[flow.reversePostorder[i] as usize] = truncate<u32>(i);
+    }
+    for (i in 0..flow.reversePostorder.length) {
+        let block = flow.reversePostorder[i];
+        var successors = Vector<u32>.create();
+        successorIndices(flow, function, block, mut successors)?;
+        for (successor in successors.view()) {
+            flow.predecessors[successor as usize].push(block)?;
+        }
+    }
+    computeDominators(mut flow)?;
+    for (i in 0..flow.reversePostorder.length) {
+        let block = flow.reversePostorder[i];
+        if (block != 0) {
+            let parent = flow.idom[block as usize];
+            flow.children[parent as usize].push(block)?;
+        }
+        var successors = Vector<u32>.create();
+        successorIndices(flow, function, block, mut successors)?;
+        for (successor in successors.view()) {
+            if (dominates(flow, successor, block)) {
+                addToLoop(mut flow, successor, block)?;
+            } else if (flow.order[successor as usize] <= flow.order[block as usize]) {
+                flow.isReducible = false; // a retreating edge that is not a back edge
+            } else {
+                flow.forwardPredecessors[successor as usize] = flow.forwardPredecessors[successor as usize] + 1;
+            }
+        }
+    }
+    return Ok(flow);
+}
+
+/// Cooper, Harvey and Kennedy, "A Simple, Fast Dominance Algorithm" (ComputeDominators).
+fn computeDominators(flow: borrow mut ControlFlow) -> Result<void, AllocError> {
+    flow.idom[0] = 0;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (i in 1..flow.reversePostorder.length) {
+            let block = flow.reversePostorder[i];
+            var candidate = none();
+            for (p in 0..flow.predecessors[block as usize].length) {
+                let predecessor = flow.predecessors[block as usize][p];
+                if (flow.idom[predecessor as usize] == none()) {
+                    continue;
+                }
+                candidate = if (candidate == none()) predecessor else intersectDominators(flow, predecessor, candidate);
+            }
+            if (candidate != none() && flow.idom[block as usize] != candidate) {
+                flow.idom[block as usize] = candidate;
+                changed = true;
+            }
+        }
+    }
+    return Ok();
+}
+
+fn intersectDominators(flow: borrow ControlFlow, a0: u32, b0: u32) -> u32 {
+    var a = a0;
+    var b = b0;
+    while (a != b) {
+        while (flow.order[a as usize] > flow.order[b as usize]) {
+            a = flow.idom[a as usize];
+        }
+        while (flow.order[b as usize] > flow.order[a as usize]) {
+            b = flow.idom[b as usize];
+        }
+    }
+    return a;
+}
+
+/// Whether block `a` dominates block `b` (Dominates).
+fn dominates(flow: borrow ControlFlow, a: u32, b: u32) -> bool {
+    var x = b;
+    loop {
+        if (x == a) {
+            return true;
+        }
+        if (x == 0) {
+            return false;
+        }
+        x = flow.idom[x as usize];
+    }
+}
+
+fn addToLoop(flow: borrow mut ControlFlow, header: u32, source: u32) -> Result<void, AllocError> {
+    var found = none();
+    for (k in 0..flow.loopHeaders.length) {
+        if (flow.loopHeaders[k] == header) {
+            found = truncate<u32>(k);
+        }
+    }
+    if (found == none()) {
+        var members = Vector<bool>.create();
+        for (k in 0..flow.order.length) {
+            members.push(false)?;
+        }
+        members[header as usize] = true;
+        flow.loopHeaders.push(header)?;
+        flow.loopMembers.push(members)?;
+        flow.loopSizes.push(1)?;
+        found = truncate<u32>(flow.loopHeaders.length - 1);
+    }
+    let l = found as usize;
+    var stack = Vector<u32>.create();
+    if (!flow.loopMembers[l][source as usize]) {
+        flow.loopMembers[l][source as usize] = true;
+        flow.loopSizes[l] = flow.loopSizes[l] + 1;
+        stack.push(source)?;
+    }
+    while (stack.length > 0) {
+        let block = stack.pop()!;
+        for (p in 0..flow.predecessors[block as usize].length) {
+            let predecessor = flow.predecessors[block as usize][p];
+            if (!flow.loopMembers[l][predecessor as usize]) {
+                flow.loopMembers[l][predecessor as usize] = true;
+                flow.loopSizes[l] = flow.loopSizes[l] + 1;
+                stack.push(predecessor)?;
+            }
+        }
+    }
+    return Ok();
+}
+
+/// Whether the block belongs to a loop (InLoop): an irreducible graph counts every block as in one.
+fn inLoop(flow: borrow ControlFlow, block: u32) -> bool {
+    if (!flow.isReducible) {
+        return true;
+    }
+    for (members in flow.loopMembers.view()) {
+        if (members[block as usize]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn isLoopHeader(flow: borrow ControlFlow, block: u32) -> bool {
+    for (h in flow.loopHeaders.view()) {
+        if (h == block) {
+            return true;
+        }
+    }
+    return false;
+}

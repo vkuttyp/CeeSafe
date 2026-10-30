@@ -160,6 +160,17 @@ fn emitFunction(
         }
         declarations.push(text)?;
     }
+    if ((f as usize) < e.placements.length) {
+        // The storage of each stack-placed box (§2.2).
+        for (slot in 0..e.placements[f as usize].slots.length) {
+            var text = copyBytes("NV_UNUSED ".bytes())?;
+            appendCTypeName(c, mut text, e.placements[f as usize].slots[slot])?;
+            appendText(mut text, " nv_box_")?;
+            appendDecimal(mut text, slot as u64)?;
+            appendText(mut text, " = {0};")?;
+            declarations.push(text)?;
+        }
+    }
     if (e.lineDirectives) {
         // With directives, the declarations share one line, attributed to the function's name.
         if (declarations.length > 0) {
@@ -652,6 +663,38 @@ fn emitStatement(
                 _ => {}
             }
             let built = inPlaceConstructionOf(e, s);
+            let slot = placedSlot(e, f, s);
+            if (builtin == bfBoxCreate() && slot != none()) {
+                // A stack-placed box (§2.2): the value goes into the slot, and nothing is allocated.
+                var storage = copyBytes("nv_box_".bytes())?;
+                appendDecimal(mut storage, slot as u64)?;
+                if (built != none()) {
+                    emitConstruction(e, c, n, sources, f, statementRvalue(n, built), storage.view(), "    ")?;
+                } else {
+                    let arguments = match (n.rvalues[r as usize]) {
+                        NirRvalue.Builtin(_, a) => a,
+                        _ => emptyRange(),
+                    };
+                    let value = operandText(e, c, n, sources, f, n.at(arguments, arguments.count - 1))?;
+                    e.t("    ")?;
+                    e.b(storage.view())?;
+                    e.t(" = ")?;
+                    e.b(value.view())?;
+                    e.t(";")?;
+                    e.emit()?;
+                }
+                let place = appendPlaceIn(e, c, n, sources, f, target)?;
+                var address = copyBytes("&".bytes())?;
+                appendBytes(mut address, storage.view())?;
+                var ok = Vector<u8>.create();
+                appendOkValue(e, c, mut ok, n.rvalueTypes[r as usize], address.view())?;
+                e.t("    ")?;
+                e.b(place.view())?;
+                e.t(" = ")?;
+                e.b(ok.view())?;
+                e.t(";")?;
+                return e.emit();
+            }
             if (builtin == bfBoxCreate() && built != none()) {
                 // Built in place (§2): allocate first, then construct in the box's memory.
                 let resultType = n.rvalueTypes[r as usize];
@@ -807,6 +850,9 @@ fn emitStatement(
             return Ok();
         }
         NirStatement.BoxFree(box, flag) => {
+            if (isPlacedBox(e, n, f, box)) {
+                return Ok(); // a stack-placed box's memory is the frame's (§2.2)
+            }
             let boxType = placeTypeIn(c, n, f, box);
             let place = appendPlaceIn(e, c, n, sources, f, box)?;
             var release = Vector<u8>.create();
@@ -902,6 +948,24 @@ fn emitStatement(
         NirStatement.Drop(place, flag) => {
             let t = placeTypeIn(c, n, f, place);
             let text = appendPlaceIn(e, c, n, sources, f, place)?;
+            if (isPlacedBox(e, n, f, place)) {
+                // A stack-placed box: destroy the contents, free nothing (§2.2).
+                let contents = c.types.info(t).pointee;
+                if (!c.types.needsDrop(contents)) {
+                    return Ok();
+                }
+                e.t("    ")?;
+                if (flag != none()) {
+                    e.t("if (")?;
+                    appendLocalNameIn(c, n, mut e.buf, f, flag)?;
+                    e.t(") ")?;
+                }
+                appendDropGlueName(c, mut e.buf, contents)?;
+                e.t("(")?;
+                e.b(text.view())?;
+                e.t(");")?;
+                return e.emit();
+            }
             e.t("    ")?;
             if (flag != none()) {
                 e.t("if (")?;
@@ -2533,3 +2597,12 @@ fn appendAggregate(
     }
     return appendText(out, " })");
 }
+
+/// The slot of a stack-placed `Box.create` statement, or none (FunctionPlacement.IsSite).
+fn placedSlot(e: borrow CEmitter, f: u32, statement: u32) -> u32 =>
+    if ((f as usize) < e.placements.length) placementSlotOf(e.placements[f as usize], statement) else none();
+
+/// A local box of a stack-placed site (IsPlacedBox).
+fn isPlacedBox(e: borrow CEmitter, n: borrow NirProgram, f: u32, place: u32) -> bool =>
+    placeIsLocal(n, place) && (f as usize) < e.placements.length &&
+        isPlacedBoxLocal(e.placements[f as usize], placeLocal(n, place));

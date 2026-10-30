@@ -32,23 +32,24 @@ struct CEmitter {
     exportsHeader: Vector<u8>;
     trial: bool;
     files: Vector<CFile>;
-    current: usize;                    // the file being written
-    buf: Vector<u8>;                   // the line being built
-    fileIds: Vector<u32>;              // by source: its `nv_file_<id>`, or none
-    fileOrder: Vector<u32>;            // the sources named, in id order
-    sites: Map<PairKey, u32>;          // (file << 32 | line, column) → id
-    siteList: Vector<CSite>;           // by id
-    usedLibrary: Vector<bool>;         // by HIR function: library code that compiled code reaches (§29.2)
-    usedVariants: Vector<u64>;         // the library (function, variant) pairs reached (variantKey)
-    usedTypes: Vector<bool>;           // by type: mentioned by emitted code
-    inPlaceResults: Vector<bool>;      // by type: Box.create results some site builds in place (nvBA_)
-    headerStructs: Vector<u32>;        // defined by the exports header (ADR 0030)
-    compiled: Vector<u32>;             // the NIR functions compiled to C (CompiledFunctions)
-    composites: Vector<u32>;           // Composites
-    aggregates: Vector<u32>;           // Aggregates
-    staticStrings: Vector<Vector<u8>>; // the C strings statics point to, in first-use order
-    splitData: Vector<Vector<u8>>;     // C data split mode renames (sorted)
-    function: u32;                     // the NIR function being emitted, or none
+    current: usize;                        // the file being written
+    buf: Vector<u8>;                       // the line being built
+    fileIds: Vector<u32>;                  // by source: its `nv_file_<id>`, or none
+    fileOrder: Vector<u32>;                // the sources named, in id order
+    sites: Map<PairKey, u32>;              // (file << 32 | line, column) → id
+    siteList: Vector<CSite>;               // by id
+    usedLibrary: Vector<bool>;             // by HIR function: library code that compiled code reaches (§29.2)
+    usedVariants: Vector<u64>;             // the library (function, variant) pairs reached (variantKey)
+    placements: Vector<FunctionPlacement>; // by NIR function: its stack-placed boxes (empty with --no-placement)
+    usedTypes: Vector<bool>;               // by type: mentioned by emitted code
+    inPlaceResults: Vector<bool>;          // by type: Box.create results some site builds in place (nvBA_)
+    headerStructs: Vector<u32>;            // defined by the exports header (ADR 0030)
+    compiled: Vector<u32>;                 // the NIR functions compiled to C (CompiledFunctions)
+    composites: Vector<u32>;               // Composites
+    aggregates: Vector<u32>;               // Aggregates
+    staticStrings: Vector<Vector<u8>>;     // the C strings statics point to, in first-use order
+    splitData: Vector<Vector<u8>>;         // C data split mode renames (sorted)
+    function: u32;                         // the NIR function being emitted, or none
     inPlace: Vector<InPlacePair>;
     cLines: u64;
     mappedFile: u32; // the Nova line the next C line is attributed to by the last #line, or none
@@ -75,6 +76,7 @@ struct CEmitter {
         siteList: Vector<CSite>.create(),
         usedLibrary: Vector<bool>.create(),
         usedVariants: Vector<u64>.create(),
+        placements: Vector<FunctionPlacement>.create(),
         usedTypes: Vector<bool>.create(),
         inPlaceResults: Vector<bool>.create(),
         headerStructs: Vector<u32>.create(),

@@ -1,0 +1,732 @@
+// Escape and placement analysis (the reference's Analysis/PlacementAnalysis.cs; M5, memory-model.md §5): which
+// `Box.create` sites may use the function's stack. It runs on checked NIR after drop elaboration and never affects
+// whether a program is accepted.
+
+fn maxBoxSize() -> i64 => 1024;
+fn maxFunctionSlots() -> i64 => 4096;
+
+/// One line of `--explain-allocations` (PlacementDecision).
+struct PlacementDecision {
+    file: u32;
+    start: u32;
+    what: Vector<u8>;
+    onStack: bool;
+    reason: Vector<u8>;
+}
+
+/// The stack-placed boxes of one function (FunctionPlacement).
+struct FunctionPlacement {
+    sites: Vector<u64>;      // (statement << 32) | slot, for each stack-placed Box.create statement
+    slots: Vector<u32>;      // the slots' value types, by slot number
+    boxLocals: Vector<bool>; // by local: the box locals of placed sites (their drops destroy contents only)
+}
+
+struct PlacementAnalysis {
+    functions: Vector<FunctionPlacement>; // by NIR function
+    decisions: Vector<PlacementDecision>; // in source order
+}
+
+fn placementSlotOf(p: borrow FunctionPlacement, statement: u32) -> u32 {
+    for (site in p.sites.view()) {
+        if ((site >> 32) == statement as u64) {
+            return truncate<u32>(site & 0xFFFFFFFF);
+        }
+    }
+    return none();
+}
+
+fn isPlacedBoxLocal(p: borrow FunctionPlacement, local: u32) -> bool =>
+    (local as usize) < p.boxLocals.length && p.boxLocals[local as usize];
+
+/// Allocating built-ins that M5 does not place (Unanalysed): what, and why; none otherwise.
+fn unanalysedAllocation(b: u32) -> u32 =>
+    if (b == bfVectorPush() ||
+        b == bfStringAppend() ||
+        b == bfStringAppendNumber() ||
+        b ==
+            bfVectorWithCapacity()) 0 else if (b ==
+        bfStableVectorPush()) 1 else if (b == bfSlotMapInsert()) 2 else if (b == bfArenaAlloc() ||
+        b == bfArenaAllocArray()) 3 else if (b == bfPoolTake()) 4 else none();
+
+fn unanalysedWhat(k: u32) -> StringView => match (k) {
+    0 => "vector storage",
+    1 => "stable-vector chunk",
+    2 => "slot-map storage",
+    3 => "region allocation",
+    _ => "pool slot",
+};
+
+fn unanalysedReason(k: u32) -> StringView => match (k) {
+    3 => "a region's memory is the region's",
+    4 => "a pool's memory is the pool's",
+    _ => "growable storage is not analysed (M5)",
+};
+
+struct PlacementContext {
+    function: u32; // the NIR function
+    file: u32;
+    flow: ControlFlow;
+    exposesAddresses: bool;
+    slotBytes: i64;
+    definitions: Vector<u32>; // by local: its definitions
+}
+
+fn analyzePlacement(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+) -> Result<PlacementAnalysis, AllocError> {
+    var analysis = PlacementAnalysis {
+        functions: Vector<FunctionPlacement>.create(),
+        decisions: Vector<PlacementDecision>.create(),
+    };
+    for (k in 0..n.functions.length) {
+        var placement = FunctionPlacement {
+            sites: Vector<u64>.create(),
+            slots: Vector<u32>.create(),
+            boxLocals: Vector<bool>.create(),
+        };
+        if (!functionIsGeneric(c, n.functions[k].source)) {
+            analyzeFunctionPlacement(c, n, sources, truncate<u32>(k), mut placement, mut analysis.decisions)?;
+        }
+        analysis.functions.push(placement)?;
+    }
+    sortDecisions(c, mut analysis.decisions);
+    return Ok(analysis);
+}
+
+/// Path order (ordinal), then position, then what (ordinal), stably (the reference's OrderBy/ThenBy).
+fn sortDecisions(c: borrow Checker, decisions: borrow mut Vector<PlacementDecision>) {
+    for (i in 1..decisions.length) {
+        var j = i;
+        while (j > 0 && decisionBefore(c, decisions[j], decisions[j - 1])) {
+            decisions.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+}
+
+fn decisionBefore(c: borrow Checker, a: borrow PlacementDecision, b: borrow PlacementDecision) -> bool {
+    let byPath = compareBytes(c.filePaths[a.file as usize].view(), c.filePaths[b.file as usize].view());
+    if (byPath != 0) {
+        return byPath < 0;
+    }
+    if (a.start != b.start) {
+        return a.start < b.start;
+    }
+    return compareBytes(a.what.view(), b.what.view()) < 0;
+}
+
+fn addDecision(
+    decisions: borrow mut Vector<PlacementDecision>,
+    file: u32,
+    start: u32,
+    what: Slice<u8>,
+    onStack: bool,
+    reason: Slice<u8>,
+) -> Result<void, AllocError> =>
+    decisions.push(
+        PlacementDecision {
+            file: file,
+            start: start,
+            what: copyBytes(what)?,
+            onStack: onStack,
+            reason: copyBytes(reason)?,
+        },
+    );
+
+fn analyzeFunctionPlacement(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+    placement: borrow mut FunctionPlacement,
+    decisions: borrow mut Vector<PlacementDecision>,
+) -> Result<void, AllocError> {
+    let function = borrow n.functions[f as usize];
+    var context = PlacementContext {
+        function: f,
+        file: c.hir.functions[function.source as usize].file,
+        flow: controlFlowOf(function)?,
+        exposesAddresses: false,
+        slotBytes: 0,
+        definitions: Vector<u32>.create(),
+    };
+    for (k in 0..function.locals.length) {
+        context.definitions.push(0)?;
+        placement.boxLocals.push(false)?;
+    }
+    // Rule 1c (memory-model.md §5.1, §27.5): references or slices turned into raw pointers, or back, may expose any
+    // box's address.
+    for (block in function.blocks.view()) {
+        for (s in block.statements.view()) {
+            match (n.statements[s as usize]) {
+                NirStatement.Assign(target, r) => {
+                    let t = n.rvalueTypes[r as usize];
+                    match (n.rvalues[r as usize]) {
+                        NirRvalue.Cast(o) => {
+                            let from = n.operandTypes[o as usize];
+                            if ((c.types.is(t, TypeKind.RawPointer) && c.types.is(from, TypeKind.Reference)) ||
+                                (c.types.is(t, TypeKind.Reference) && c.types.is(from, TypeKind.RawPointer))) {
+                                context.exposesAddresses = true;
+                            }
+                        }
+                        NirRvalue.Builtin(b, _) => {
+                            if (b == bfSlicePtr() || b == bfSliceFromRaw()) {
+                                context.exposesAddresses = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if (placeIsLocal(n, target)) {
+                        let local = placeLocal(n, target) as usize;
+                        context.definitions[local] = context.definitions[local] + 1;
+                    }
+                }
+                NirStatement.Unpack(_, _, targets) => {
+                    for (k in 0..targets.count) {
+                        let target = n.at(targets, k);
+                        if (target != none()) {
+                            context.definitions[target as usize] = context.definitions[target as usize] + 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for (b in 0..function.blocks.length) {
+        for (s in function.blocks[b].statements.view()) {
+            let start = n.statementSpans[s as usize].start;
+            match (n.statements[s as usize]) {
+                NirStatement.Assign(target, r) => {
+                    let builtin = builtinOf(n, r);
+                    if (placeIsLocal(n, target) && builtin == bfBoxCreate()) {
+                        decidePlacement(c, n, sources, mut context, truncate<u32>(b), s, placement, decisions)?;
+                    } else if (builtin != none() && unanalysedAllocation(builtin) != none()) {
+                        let k = unanalysedAllocation(builtin);
+                        addDecision(
+                            decisions,
+                            context.file,
+                            start,
+                            unanalysedWhat(k).bytes(),
+                            false,
+                            unanalysedReason(k).bytes(),
+                        )?;
+                    }
+                }
+                NirStatement.Eval(r) => {
+                    let builtin = builtinOf(n, r);
+                    if (builtin != none() && unanalysedAllocation(builtin) != none()) {
+                        let k = unanalysedAllocation(builtin);
+                        addDecision(
+                            decisions,
+                            context.file,
+                            start,
+                            unanalysedWhat(k).bytes(),
+                            false,
+                            unanalysedReason(k).bytes(),
+                        )?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    return Ok();
+}
+
+/// `'name'`, or `temporary _<id>` (Name).
+fn appendPlacementLocal(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    function: borrow NirFunction,
+    local: u32,
+) -> Result<void, AllocError> {
+    let name = function.locals[local as usize].name;
+    if (name == none()) {
+        appendText(out, "temporary _")?;
+        return appendDecimal(out, local as u64);
+    }
+    out.push('\'')?;
+    appendBytes(out, c.name(name))?;
+    return out.push('\'');
+}
+
+/// `line:column` (Where).
+fn appendWhere(
+    out: borrow mut Vector<u8>,
+    sources: borrow Vector<SourceText>,
+    file: u32,
+    start: u32,
+) -> Result<void, AllocError> {
+    let position = sources[file as usize].position(start as usize);
+    appendDecimal(out, position.line as u64)?;
+    out.push(':')?;
+    return appendDecimal(out, position.column as u64);
+}
+
+fn decidePlacement(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    context: borrow mut PlacementContext,
+    block: u32,
+    site: u32,
+    placement: borrow mut FunctionPlacement,
+    decisions: borrow mut Vector<PlacementDecision>,
+) -> Result<void, AllocError> {
+    let function = borrow n.functions[context.function as usize];
+    let start = n.statementSpans[site as usize].start;
+    let target = match (n.statements[site as usize]) {
+        NirStatement.Assign(t, _) => t,
+        _ => none(),
+    };
+    let resultLocal = placeLocal(n, target);
+    let result = function.locals[resultLocal as usize].typ;
+    let box = resultOkOf(c, result);
+    let what = copyBytes(c.types.name(box))?;
+    let allocator = c.types.info(box).allocator;
+    let contents = c.types.info(box).pointee;
+    var reason = Vector<u8>.create();
+    if (!sameText(c.types.name(allocator), "SystemHeap")) {
+        appendBytes(mut reason, c.types.name(allocator))?;
+        appendText(mut reason, " is not placement-transparent")?;
+        return addDecision(decisions, context.file, start, what.view(), false, reason.view());
+    }
+    if (c.types.isCLaidOut(contents, 0)) {
+        return addDecision(
+            decisions, context.file, start, what.view(), false,
+            "it holds C state, which stays where it was placed (type-system.md §33.2)".bytes(),
+        );
+    }
+    let size = cLayout(c, contents).size;
+    if (size > maxBoxSize()) {
+        appendDecimal(mut reason, truncate<u64>(size))?;
+        appendText(mut reason, " bytes is over the 1024-byte stack limit")?;
+        return addDecision(decisions, context.file, start, what.view(), false, reason.view());
+    }
+    if (context.exposesAddresses) {
+        return addDecision(
+            decisions, context.file, start, what.view(), false,
+            "address exposed: the function converts between references and raw pointers".bytes(),
+        );
+    }
+    var flow = flowSet(c, n, function, resultLocal, box, result)?;
+    // In local order, for a deterministic first reason.
+    for (local in 0..flow.length) {
+        if (flow[local] && context.definitions[local] > 1) {
+            appendPlacementLocal(c, mut reason, function, truncate<u32>(local))?;
+            appendText(mut reason, " is assigned more than once")?;
+            return addDecision(decisions, context.file, start, what.view(), false, reason.view());
+        }
+    }
+    if (placementEscape(c, n, sources, context, flow, box, result, mut reason)?) {
+        return addDecision(decisions, context.file, start, what.view(), false, reason.view());
+    }
+    // One slot per site: in a loop, the box of one execution must be gone before the next (rule 1e, M9e).
+    if (inLoop(context.flow, block)) {
+        for (local in 0..flow.length) {
+            if (flow[local] && reachesSiteAlive(n, context.flow, function, block, site, truncate<u32>(local))) {
+                appendText(mut reason, "may outlive its loop iteration: ")?;
+                appendPlacementLocal(c, mut reason, function, truncate<u32>(local))?;
+                appendText(mut reason, " is not ended before the site runs again")?;
+                return addDecision(decisions, context.file, start, what.view(), false, reason.view());
+            }
+        }
+    }
+    if (context.slotBytes + size > maxFunctionSlots()) {
+        return addDecision(
+            decisions, context.file, start, what.view(), false,
+            "the function's stack-placed boxes would exceed 4096 bytes".bytes(),
+        );
+    }
+    context.slotBytes += size;
+    placement.sites.push(((site as u64) << 32) | placement.slots.length as u64)?;
+    placement.slots.push(contents)?;
+    for (local in 0..flow.length) {
+        if (flow[local] && function.locals[local].typ == box) {
+            placement.boxLocals[local] = true;
+        }
+    }
+    return addDecision(
+        decisions, context.file, start, what.view(), true,
+        "does not escape; SystemHeap is placement-transparent".bytes(),
+    );
+}
+
+/// Whether some path from just after the site comes back to it without a StorageDead of `local` (ReachesSiteAlive).
+fn reachesSiteAlive(
+    n: borrow NirProgram,
+    flow: borrow ControlFlow,
+    function: borrow NirFunction,
+    siteBlock: u32,
+    site: u32,
+    local: u32,
+) -> bool {
+    let statements = borrow function.blocks[siteBlock as usize].statements;
+    var start = statements.length;
+    for (k in 0..statements.length) {
+        if (start == statements.length && statements[k] == site) {
+            start = k;
+        }
+    }
+    for (k in (start + 1)..statements.length) {
+        if (isStorageDeadOf(n, statements[k], local)) {
+            return false;
+        }
+    }
+    var seen = Vector<bool>.create();
+    for (k in 0..function.blocks.length) {
+        seen.push(false)!;
+    }
+    var work = Vector<u32>.create();
+    successorIndices(flow, function, siteBlock, mut work)!;
+    while (work.length > 0) {
+        let block = work.pop()!;
+        if (seen[block as usize]) {
+            continue;
+        }
+        seen[block as usize] = true;
+        let blockStatements = borrow function.blocks[block as usize].statements;
+        let limit = if (block == siteBlock) start else blockStatements.length;
+        var ends = false;
+        for (k in 0..limit) {
+            if (isStorageDeadOf(n, blockStatements[k], local)) {
+                ends = true;
+            }
+        }
+        if (ends) {
+            continue; // the local ends on this path
+        }
+        if (block == siteBlock) {
+            return true; // back at the site with the local alive
+        }
+        successorIndices(flow, function, block, mut work)!;
+    }
+    return false;
+}
+
+fn isStorageDeadOf(n: borrow NirProgram, statement: u32, local: u32) -> bool =>
+    match (n.statements[statement as usize]) {
+        NirStatement.StorageDead(l) => l == local,
+        _ => false,
+    };
+
+/// The locals that may hold the site's box: the result, its copies, and the unpacked payloads (FlowSet).
+fn flowSet(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    function: borrow NirFunction,
+    result: u32,
+    box: u32,
+    resultType: u32,
+) -> Result<Vector<bool>, AllocError> {
+    var flow = Vector<bool>.create();
+    for (k in 0..function.locals.length) {
+        flow.push(false)?;
+    }
+    flow[result as usize] = true;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (block in function.blocks.view()) {
+            for (s in block.statements.view()) {
+                match (n.statements[s as usize]) {
+                    NirStatement.Assign(target, r) => {
+                        if (!placeIsLocal(n, target)) {
+                            continue;
+                        }
+                        match (n.rvalues[r as usize]) {
+                            NirRvalue.Use(o) => {
+                                let place = operandPlace(n, o);
+                                let t = n.operandTypes[o as usize];
+                                if (place != none() && flow[placeLocal(
+                                    n,
+                                    place,
+                                ) as usize] && (t == box || t == resultType) &&
+                                    !flow[placeLocal(n, target) as usize]) {
+                                    flow[placeLocal(n, target) as usize] = true;
+                                    changed = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    NirStatement.Unpack(source, _, targets) => {
+                        if (flow[placeLocal(n, source) as usize]) {
+                            for (k in 0..targets.count) {
+                                let target = n.at(targets, k);
+                                if (target != none() &&
+                                    function.locals[target as usize].typ == box && !flow[target as usize]) {
+                                    flow[target as usize] = true;
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    return Ok(flow);
+}
+
+fn carriesBox(n: borrow NirProgram, flow: borrow Vector<bool>, o: u32, box: u32, resultType: u32) -> bool {
+    let place = operandPlace(n, o);
+    let t = n.operandTypes[o as usize];
+    return place != none() && flow[placeLocal(n, place) as usize] && (t == box || t == resultType);
+}
+
+fn anyOperandCarries(
+    n: borrow NirProgram,
+    flow: borrow Vector<bool>,
+    r: u32,
+    box: u32,
+    resultType: u32,
+) -> Result<bool, AllocError> {
+    var operands = Vector<u32>.create();
+    rvalueOperands(n, r, mut operands)?;
+    for (o in operands.view()) {
+        if (carriesBox(n, flow, o, box, resultType)) {
+            return Ok(true);
+        }
+    }
+    return Ok(false);
+}
+
+/// How a value carrying the box uses it (Use).
+fn appendBoxUse(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    out: borrow mut Vector<u8>,
+    r: u32,
+) -> Result<void, AllocError> {
+    match (n.rvalues[r as usize]) {
+        NirRvalue.Call(callee, _) => {
+            appendText(out, "moved into call to '")?;
+            appendBytes(out, c.name(c.hir.functions[callee as usize].name))?;
+            appendText(out, "' at ")?;
+        }
+        NirRvalue.Builtin(b, _) => {
+            appendText(out, "passed to ")?;
+            appendText(out, builtinFunctionName(b))?;
+            appendText(out, " at ")?;
+        }
+        NirRvalue.Aggregate(_) => { appendText(out, "stored in an aggregate at ")?; }
+        NirRvalue.EnumAggregate(_, _) => { appendText(out, "stored in an aggregate at ")?; }
+        NirRvalue.Array(_) => { appendText(out, "stored in an aggregate at ")?; }
+        NirRvalue.ArrayRepeat(_) => { appendText(out, "stored in an aggregate at ")?; }
+        _ => { appendText(out, "used as a value at ")?; }
+    }
+    return Ok();
+}
+
+fn firstProjectionIsDeref(n: borrow NirProgram, place: u32) -> bool {
+    let p = n.places[place as usize];
+    return p.projections.count > 0 && isNirDeref(n.projections[p.projections.start as usize]);
+}
+
+/// The first way the box escapes its flow set (Escape, memory-model.md §5.1): true with `reason` written, or false.
+fn placementEscape(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    context: borrow PlacementContext,
+    flow: borrow Vector<bool>,
+    box: u32,
+    resultType: u32,
+    reason: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    let function = borrow n.functions[context.function as usize];
+    for (b in 0..function.blocks.length) {
+        let block = borrow function.blocks[b];
+        for (s in block.statements.view()) {
+            var here = Vector<u8>.create();
+            appendWhere(mut here, sources, context.file, n.statementSpans[s as usize].start)?;
+            match (n.statements[s as usize]) {
+                NirStatement.Assign(target, r) => {
+                    var handled = false;
+                    match (n.rvalues[r as usize]) {
+                        NirRvalue.Use(o) => {
+                            if (carriesBox(n, flow, o, box, resultType)) {
+                                if (!(placeIsLocal(n, target) && flow[placeLocal(n, target) as usize])) {
+                                    appendText(reason, "stored outside the function's own locals at ")?;
+                                    appendBytes(reason, here.view())?;
+                                    return Ok(true);
+                                }
+                                handled = true;
+                            }
+                        }
+                        NirRvalue.Ref(mutable, place) => {
+                            if (mutable && flow[placeLocal(n, place) as usize] &&
+                                nirPlaceType(c, n, function.locals, place) == box) {
+                                appendText(reason, "borrowed mutably as a box at ")?;
+                                appendBytes(reason, here.view())?;
+                                return Ok(true);
+                            }
+                        }
+                        _ => {}
+                    }
+                    if (handled) {
+                        continue;
+                    }
+                    if (anyOperandCarries(n, flow, r, box, resultType)?) {
+                        appendBoxUse(c, n, reason, r)?;
+                        appendBytes(reason, here.view())?;
+                        return Ok(true);
+                    }
+                    if (flow[placeLocal(
+                        n,
+                        target,
+                    ) as usize] && !placeIsLocal(n, target) && !firstProjectionIsDeref(n, target)) {
+                        appendText(reason, "assigned in part at ")?;
+                        appendBytes(reason, here.view())?;
+                        return Ok(true);
+                    }
+                }
+                NirStatement.Eval(r) => {
+                    if (anyOperandCarries(n, flow, r, box, resultType)?) {
+                        appendBoxUse(c, n, reason, r)?;
+                        appendBytes(reason, here.view())?;
+                        return Ok(true);
+                    }
+                }
+                NirStatement.Drop(place, _) => {
+                    // The whole box, or a part of its contents left after a move out, may be destroyed in place; so
+                    // may the result on its error path, where it holds no box (the `?` and `!` lowering).
+                    let local = placeLocal(n, place);
+                    let placeType = nirPlaceType(c, n, function.locals, place);
+                    let localType = function.locals[local as usize].typ;
+                    if (flow[local as usize] && !(placeIsLocal(n, place) && placeType == box) &&
+                        !(localType == box && firstProjectionIsDeref(n, place)) &&
+                        !(placeIsLocal(n, place) && placeType == resultType &&
+                            onlyOnErrorPath(n, context.flow, function, truncate<u32>(b), local))) {
+                        appendText(reason, "may be destroyed inside ")?;
+                        appendBytes(reason, c.types.name(localType))?;
+                        appendText(reason, " at ")?;
+                        appendBytes(reason, here.view())?;
+                        return Ok(true);
+                    }
+                }
+                _ => {}
+            }
+        }
+        match (n.terminators[block.terminator as usize]) {
+            NirTerminator.Return(value) => {
+                if (value != none() && carriesBox(n, flow, value, box, resultType)) {
+                    appendText(reason, "returned at ")?;
+                    appendWhere(reason, sources, context.file, n.terminatorSpans[block.terminator as usize].start)?;
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    return Ok(false);
+}
+
+/// Whether `block` is reached only through a non-Ok branch of a switch on `result`'s discriminant (OnlyOnErrorPath).
+fn onlyOnErrorPath(
+    n: borrow NirProgram,
+    flow: borrow ControlFlow,
+    function: borrow NirFunction,
+    block: u32,
+    result: u32,
+) -> bool {
+    for (sb in 0..function.blocks.length) {
+        let switchBlock = borrow function.blocks[sb];
+        var value = none();
+        var cases = Range { start: 0, count: 0 };
+        match (n.terminators[switchBlock.terminator as usize]) {
+            NirTerminator.Switch(v, cs, _) => {
+                value = v;
+                cases = cs;
+            }
+            _ => {}
+        }
+        if (value == none()) {
+            continue;
+        }
+        let tagPlace = operandPlace(n, value);
+        if (tagPlace == none() || !placeIsLocal(n, tagPlace)) {
+            continue;
+        }
+        let tag = placeLocal(n, tagPlace);
+        var discriminates = false;
+        for (s in switchBlock.statements.view()) {
+            match (n.statements[s as usize]) {
+                NirStatement.Assign(target, r) => {
+                    match (n.rvalues[r as usize]) {
+                        NirRvalue.Discriminant(of) => {
+                            if (placeIsLocal(n, target) && placeLocal(n, target) == tag && placeIsLocal(n, of) &&
+                                placeLocal(n, of) == result) {
+                                discriminates = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        if (!discriminates) {
+            continue;
+        }
+        var okTargets = Vector<u32>.create();
+        for (k in 0..cases.count) {
+            let case = n.cases[(cases.start + k) as usize];
+            if (case.value.magnitude == 0) {
+                okTargets.push(case.target)!;
+            }
+        }
+        var seen = Vector<u32>.create();
+        for (id in switchBlock.successors.view()) {
+            if (containsU32(seen, id) || containsU32(okTargets, id)) {
+                continue;
+            }
+            seen.push(id)!;
+            let target = blockIndexIn(flow, id);
+            var onlyFromSwitch = true;
+            for (p in flow.predecessors[target as usize].view()) {
+                if (p != truncate<u32>(sb)) {
+                    onlyFromSwitch = false;
+                }
+            }
+            if (onlyFromSwitch && dominates(flow, target, block)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// The `--explain-allocations` report (Explain): the package's own sites, not the libraries'.
+fn explainAllocations(
+    c: borrow Checker,
+    sources: borrow Vector<SourceText>,
+    analysis: borrow PlacementAnalysis,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    for (d in analysis.decisions.view()) {
+        if (c.fileIsLibrary[d.file as usize]) {
+            continue;
+        }
+        appendBytes(out, c.filePaths[d.file as usize].view())?;
+        out.push(':')?;
+        appendWhere(out, sources, d.file, d.start)?;
+        appendText(out, ": ")?;
+        appendBytes(out, d.what.view())?;
+        if (d.onStack) {
+            appendText(out, " placed on stack (")?;
+            appendBytes(out, d.reason.view())?;
+            appendText(out, ")\n")?;
+        } else {
+            appendText(out, " stays on heap: ")?;
+            appendBytes(out, d.reason.view())?;
+            out.push('\n')?;
+        }
+    }
+    return Ok();
+}
