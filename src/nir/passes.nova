@@ -11,6 +11,7 @@ fn analyzeProgram(c: borrow mut Checker) -> Result<NirProgram, AllocError> {
         if (!functionIsInstantiation(c, n.functions[k].source)) {
             checkInPlace(c, n, truncate<u32>(k))?;
             checkMoves(c, n, truncate<u32>(k))?;
+            checkBorrows(c, n, truncate<u32>(k))?;
         }
     }
     // An instance whose body does not check, with no other error to explain it, is N0222 at its use (§20.4).

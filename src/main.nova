@@ -258,6 +258,19 @@ fn render(out: borrow mut Vector<u8>, d: borrow Diagnostic, source: borrow Sourc
         out.push('^')?;
     }
     out.push('\n')?;
+    for (note in d.notes.view()) {
+        for (k in 0..gutter.length) {
+            out.push(' ')?;
+        }
+        appendText(out, " = note: ")?;
+        appendBytes(out, note.message.view())?;
+        appendText(out, " (")?;
+        let at = source.position(note.start as usize);
+        appendDecimal(out, at.line as u64)?;
+        out.push(':')?;
+        appendDecimal(out, at.column as u64)?;
+        appendText(out, ")\n")?;
+    }
     return Ok();
 }
 

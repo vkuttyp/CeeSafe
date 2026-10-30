@@ -93,6 +93,7 @@ struct Checker {
     frameMemory: u32;     // a scratch frame's region parts, as fields
     frameAllocation: u32;
     flowNames: Vector<Vector<u64>>;   // ResolveFlows' per-parameter names, while it runs
+    flowTypeParameters: Vector<u32>;  // ResolveFlows' type parameters (the function's and its struct's), while it runs
     typeEnvironment: Vector<EnvPair>; // the type parameters in scope (the reference's _typeEnvironment)
     envPairs: Vector<EnvPair>;        // stored environments, by range
     genericFunctions: Vector<GenericFunctionEntry>;

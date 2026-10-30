@@ -124,6 +124,7 @@ fn checkProgram(
         frameMemory: none(),
         frameAllocation: none(),
         flowNames: Vector<Vector<u64>>.create(),
+        flowTypeParameters: Vector<u32>.create(),
         typeEnvironment: Vector<EnvPair>.create(),
         envPairs: Vector<EnvPair>.create(),
         genericFunctions: Vector<GenericFunctionEntry>.create(),

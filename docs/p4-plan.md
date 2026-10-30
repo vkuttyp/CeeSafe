@@ -1,6 +1,6 @@
 # P4 plan: NIR and the safety passes
 
-Status: **in progress**: S0–S3 done (2026-10-30; pinned to novac 0.6.0); next S4.
+Status: **in progress**: S0–S4 done (2026-10-30; pinned to novac 0.6.0); next S5.
 
 P4 ports what runs after the type checker in `Compilation.CreateOnCompilerStack` (reference `v0.6.0`, `Compilation.cs`):
 
@@ -49,3 +49,4 @@ does (`src/hir/hir.nova`). The printer's text is the contract.
 | 2026-10-30 | S0, S2 | `src/nir/nir.nova` (arenas), `nir_printer.nova`, `nir_builder.nova` (the whole of NirBuilder, so S2 came with S0), `build --dump-nir`, `tools/compare_nir.py`; `gen_builtins.py` emits `builtinFunctionName` | before drops: 174 of 270 built programs identical, every difference a drop |
 | 2026-10-30 | S1 | `src/nir/move_paths.nova` (MovePath, InitState as bitsets, MoveData's FIFO dataflow), `src/nir/drops.nova` (DropElaborator; flags kept in creation order, as the reference's dictionary); HIR's never-set `isGeneric`/`isInstantiation` fields removed for `functionIsGeneric` (statics' constant-function loop too) | `compare_nir.py` over every corpus family: 474 files, 284 built by novac, **284 identical**; CeeSafe's own NIR (package mode) identical, 429,006 lines, ceesafec 0.30 s, 79 MB. Unchanged: check 266/322 and 84/84, parse 487/487, packages 7/7, `fmt --check` clean |
 | 2026-10-30 | S3 | `src/nir/move_check.nova` (InPlaceChecker, MoveChecker), `src/nir/passes.nova` (the pipeline after the checker: NIR, in-place and move checks on functions that are not instantiations, N0222, drops); `check` now runs it | check-pass/check-fail/run-pass **275**/322 (was 266); no N0212, N0222, N0250–N0253 or N0294 line differs in the 47 left (borrow checking, effects, novac's printer crashes, `offset-of`); other families 84/84; NIR 284/284; packages 7/7 |
+| 2026-10-30 | S4 | `src/nir/borrow.nova` (BorrowChecker: loans, points-to, through-writes and N0272, liveness, conflicts N0240–N0243 with notes, returns N0244/N0245; live sets enumerate as .NET's HashSet, free slots reused LIFO, since the reference's report order follows them); diagnostics gained notes (text `= note:` lines and JSON); P3 gap fixed: flow names for type parameters (`t:`, the function's and the receiver struct's), so generic functions' return sources and mutable flows match | check-pass/check-fail/run-pass **308**/322: the 14 left are N0295 (S5: 11), novac's printer crashes (enums, optionals, results) and `offset-of`; other families 84/84; NIR 284/284; packages 7/7; `ceesafec check` of CeeSafe itself clean, as with novac (0.88 s, 71 MB), HIR identical |

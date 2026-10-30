@@ -1,0 +1,1414 @@
+// The NLL borrow checker of docs/lifetimes.md on one NIR function (the reference's Analysis/BorrowChecker.cs): loans
+// and points-to sets (§3), accesses and conflicts (§4), liveness (§5), temporaries (§6), and returned references (§7).
+// Diagnostics are reported in the reference's order, which follows the iteration order of its .NET sets: points-to
+// sets only grow, so they keep insertion order; live sets also lose members, so they are kept as .NET's HashSet keeps
+// its entries (NetSet).
+
+fn writeWhileBorrowed() -> u32 => 240;
+fn conflictingBorrow() -> u32 => 241;
+fn readWhileMutablyBorrowed() -> u32 => 242;
+fn deadWhileBorrowed() -> u32 => 243;
+fn returnsLocalReference() -> u32 => 244;
+fn foreignLoanStored() -> u32 => 272;
+
+// Access kinds (AccessKind).
+fn accessRead() -> u32 => 0;
+fn accessWrite() -> u32 => 1;
+fn accessBorrowShared() -> u32 => 2;
+fn accessBorrowMut() -> u32 => 3;
+fn accessDead() -> u32 => 4;
+fn accessMove() -> u32 => 5; // a move out of a place: invalidates it like a write (type-system.md §14.3)
+
+/// A place as a local and its projections (NirProgram.projections), so a bare local needs no arena entry.
+struct PlaceRef {
+    local: u32;
+    projections: Range;
+}
+
+struct Access {
+    kind: u32;
+    place: PlaceRef;
+}
+
+/// A loan (Loan). `hasPlace` is false for the placeholder of a reference parameter.
+struct Loan {
+    isMutable: bool;
+    hasPlace: bool;
+    place: PlaceRef;
+    block: u32; // a block position, or none for a placeholder
+    index: u32;
+    span: Span;
+    parameterIndex: u32; // a placeholder's parameter, else none
+}
+
+/// A write of a value that may hold loans through the reference (or reference-holding value) `holder` (§25.7 rules
+/// 2–4): the loans also reach what the holder's mutable loans point to (ThroughWrite).
+struct ThroughWrite {
+    holder: u32;
+    sources: Vector<u32>;
+    shared: bool;
+    span: Span;
+}
+
+struct LoanEdge {
+    from: u32;
+    to: u32;
+}
+
+/// A set of locals that enumerates as .NET's HashSet<T> does: entries in slot order, a removed entry's slot reused
+/// first by the next add (its free list is a stack).
+struct NetSet {
+    values: Vector<u32>;
+    used: Vector<bool>;
+    free: Vector<u32>;
+
+    fn create() -> NetSet =>
+        NetSet { values: Vector<u32>.create(), used: Vector<bool>.create(), free: Vector<u32>.create() };
+
+    fn slotOf(borrow this, value: u32) -> usize {
+        for (k in 0..this.values.length) {
+            if (this.used[k] && this.values[k] == value) {
+                return k;
+            }
+        }
+        return this.values.length;
+    }
+
+    fn contains(borrow this, value: u32) -> bool => this.slotOf(value) < this.values.length;
+
+    fn add(borrow mut this, value: u32) -> Result<void, AllocError> {
+        if (this.contains(value)) {
+            return Ok();
+        }
+        if (this.free.length > 0) {
+            let slot = this.free.pop()!;
+            this.values[slot as usize] = value;
+            this.used[slot as usize] = true;
+            return Ok();
+        }
+        this.values.push(value)?;
+        return this.used.push(true);
+    }
+
+    fn remove(borrow mut this, value: u32) -> Result<void, AllocError> {
+        let slot = this.slotOf(value);
+        if (slot < this.values.length) {
+            this.used[slot] = false;
+            this.free.push(truncate<u32>(slot))?;
+        }
+        return Ok();
+    }
+
+    /// The members in enumeration order.
+    fn members(borrow this) -> Result<Vector<u32>, AllocError> {
+        var out = Vector<u32>.create();
+        for (k in 0..this.values.length) {
+            if (this.used[k]) {
+                out.push(this.values[k])?;
+            }
+        }
+        return Ok(out);
+    }
+
+    fn setEquals(borrow this, other: borrow NetSet) -> bool {
+        var count: usize = 0;
+        for (k in 0..this.values.length) {
+            if (this.used[k]) {
+                count += 1;
+                if (!other.contains(this.values[k])) {
+                    return false;
+                }
+            }
+        }
+        var otherCount: usize = 0;
+        for (k in 0..other.values.length) {
+            if (other.used[k]) {
+                otherCount += 1;
+            }
+        }
+        return count == otherCount;
+    }
+}
+
+struct Borrows {
+    function: u32;
+    file: u32;
+    parameterCount: u32;
+    loans: Vector<Loan>;
+    pointsTo: Vector<Vector<u32>>;     // by local: its loans in insertion order
+    pointsToBits: Vector<Vector<u64>>; // by local: membership, sized when every loan is known
+    loanAt: Vector<Vector<u32>>;       // by block position and statement: the loan made there, or none
+    throughWrites: Vector<ThroughWrite>;
+    blockOf: Vector<u32>;          // block id to position
+    reached: Vector<Vector<bool>>; // by loan: the blocks reachable from where it is made, once asked
+}
+
+fn toPlaceRef(n: borrow NirProgram, place: u32) -> PlaceRef =>
+    PlaceRef { local: n.places[place as usize].local, projections: n.places[place as usize].projections };
+
+fn barePlace(local: u32) -> PlaceRef => PlaceRef { local: local, projections: Range { start: 0, count: 0 } };
+
+fn localType(n: borrow NirProgram, b: borrow Borrows, local: u32) -> u32 =>
+    n.functions[b.function as usize].locals[local as usize].typ;
+
+/// A local that may hold loans (IsReference): of a scoped type, or in generic code of a type that mentions a type
+/// parameter (§25.7 rule 5).
+fn holdsLoans(c: borrow Checker, n: borrow NirProgram, b: borrow Borrows, local: u32) -> bool =>
+    mayHoldLoans(c, localType(n, b, local));
+
+fn isReferenceType(c: borrow Checker, typ: u32) -> bool => c.types.is(typ, TypeKind.Reference);
+
+fn isMutableReferenceType(c: borrow Checker, typ: u32) -> bool =>
+    c.types.is(typ, TypeKind.Reference) && c.types.info(typ).mutableReference;
+
+fn placeRefType(c: borrow Checker, n: borrow NirProgram, b: borrow Borrows, p: PlaceRef) -> u32 {
+    var typ = localType(n, b, p.local);
+    for (k in 0..p.projections.count) {
+        typ = applyNirProjection(c, typ, n.projections[(p.projections.start + k) as usize]);
+    }
+    return typ;
+}
+
+/// Does the place go through a reference (DerefsReference)? A box deref does not: the box owns what it points to.
+fn derefsReference(c: borrow Checker, n: borrow NirProgram, b: borrow Borrows, p: PlaceRef) -> bool {
+    var typ = localType(n, b, p.local);
+    for (k in 0..p.projections.count) {
+        let projection = n.projections[(p.projections.start + k) as usize];
+        if (isDerefProjectionN(projection) && isReferenceType(c, typ)) {
+            return true;
+        }
+        typ = applyNirProjection(c, typ, projection);
+    }
+    return false;
+}
+
+/// Is `written` a proper prefix of `loaned`, with a reference on the loaned path after it (ReferenceOnTheWay)? The
+/// write replaces a reference on the way, and the loaned object is beyond it (lifetimes.md §5, M11).
+fn referenceOnTheWay(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    b: borrow Borrows,
+    written: PlaceRef,
+    loaned: PlaceRef,
+) -> bool {
+    if (written.local != loaned.local || written.projections.count >= loaned.projections.count) {
+        return false;
+    }
+    var typ = localType(n, b, loaned.local);
+    for (k in 0..loaned.projections.count) {
+        let projection = n.projections[(loaned.projections.start + k) as usize];
+        if (k >= written.projections.count && isDerefProjectionN(projection) && isReferenceType(c, typ)) {
+            return true;
+        }
+        typ = applyNirProjection(c, typ, projection);
+    }
+    return false;
+}
+
+fn constantIndex(n: borrow NirProgram, operand: u32) -> bool => match (n.operands[operand as usize]) {
+    NirOperand.Const(_) => true,
+    _ => false,
+};
+
+fn constantValue(n: borrow NirProgram, operand: u32) -> IntValue => match (n.operands[operand as usize]) {
+    NirOperand.Const(v) => v,
+    _ => intValue(0),
+};
+
+/// Same root, and one projection list is a prefix of the other (elements at different constant indices excepted).
+fn overlap(n: borrow NirProgram, a: PlaceRef, b: PlaceRef) -> bool {
+    if (a.local != b.local) {
+        return false;
+    }
+    let common = if (a.projections.count < b.projections.count) a.projections.count else b.projections.count;
+    for (k in 0..common) {
+        let x = n.projections[(a.projections.start + k) as usize];
+        let y = n.projections[(b.projections.start + k) as usize];
+        if (projectionKindIndex(x.kind) != projectionKindIndex(y.kind)) {
+            return false;
+        }
+        let same = match (x.kind) {
+            ProjectionKind.Field => x.field == y.field,
+            ProjectionKind.Downcast => x.variant == y.variant,
+            // Two different constant indices name different elements (M13 G5, lifetimes.md §8).
+            ProjectionKind.Index => !(constantIndex(n, x.index) && constantIndex(n, y.index) &&
+                !sameIntValue(constantValue(n, x.index), constantValue(n, y.index))),
+            _ => true,
+        };
+        if (!same) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn projectionKindIndex(k: ProjectionKind) -> u32 => match (k) {
+    ProjectionKind.Field => 0,
+    ProjectionKind.Deref => 1,
+    ProjectionKind.Downcast => 2,
+    ProjectionKind.Index => 3,
+};
+
+fn sameIntValue(a: IntValue, b: IntValue) -> bool =>
+    a.magnitude == b.magnitude && (a.negative == b.negative || a.magnitude == 0);
+
+fn conflicts(loan: borrow Loan, access: u32) -> bool =>
+    loan.isMutable || access == accessWrite() || access == accessBorrowMut() || access == accessDead() ||
+        access == accessMove();
+
+// ---- §3 Loans and points-to sets ----
+
+fn addLoan(b: borrow mut Borrows, loan: Loan) -> Result<u32, AllocError> {
+    b.loans.push(loan)?;
+    return Ok(truncate<u32>(b.loans.length - 1));
+}
+
+fn loansContain(b: borrow Borrows, local: u32, loan: u32) -> bool {
+    let bits = borrow b.pointsToBits[local as usize];
+    let word = (loan / 64) as usize;
+    return word < bits.length && (bits[word] >> ((loan % 64) as u64)) & 1 == 1;
+}
+
+/// Adds `loan` to `local`'s points-to set; whether it was new.
+fn addPointsTo(b: borrow mut Borrows, local: u32, loan: u32) -> Result<bool, AllocError> {
+    if (loansContain(b, local, loan)) {
+        return Ok(false);
+    }
+    let word = (loan / 64) as usize;
+    while (b.pointsToBits[local as usize].length <= word) {
+        b.pointsToBits[local as usize].push(0)?;
+    }
+    b.pointsToBits[local as usize][word] = b.pointsToBits[local as usize][word] | (1u64 << ((loan % 64) as u64));
+    b.pointsTo[local as usize].push(loan)?;
+    return Ok(true);
+}
+
+fn addEdge(edges: borrow mut Vector<LoanEdge>, from: u32, to: u32) -> Result<void, AllocError> =>
+    edges.push(LoanEdge { from: from, to: to });
+
+/// The loan-carrying locals an operand list reads (Carriers): those of operands whose value may hold loans.
+fn carriers(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    b: borrow Borrows,
+    operands: borrow Vector<u32>,
+) -> Result<Vector<u32>, AllocError> {
+    var out = Vector<u32>.create();
+    for (o in operands.view()) {
+        match (n.operands[o as usize]) {
+            NirOperand.Place(place, _) => {
+                let local = n.places[place as usize].local;
+                if (mayHoldLoans(
+                    c,
+                    n.operandTypes[o as usize],
+                ) && holdsLoans(c, n, b, local) && !containsU32(out, local)) {
+                    out.push(local)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    return Ok(out);
+}
+
+fn recordWrite(
+    b: borrow mut Borrows,
+    edges: borrow mut Vector<LoanEdge>,
+    holder: u32,
+    sources: Vector<u32>,
+    throughReference: bool,
+    shared: bool,
+    span: Span,
+) -> Result<void, AllocError> {
+    if (sources.length == 0) {
+        return Ok();
+    }
+    for (source in sources.view()) {
+        addEdge(edges, source, holder)?;
+    }
+    if (throughReference) {
+        b.throughWrites.push(ThroughWrite { holder: holder, sources: sources, shared: shared, span: span })?;
+    }
+    return Ok();
+}
+
+fn operandPlaceLocal(n: borrow NirProgram, operand: u32) -> u32 {
+    let place = operandPlace(n, operand);
+    return if (place == none()) none() else n.places[place as usize].local;
+}
+
+/// Writes that store loans somewhere other than a fresh local (CollectWrites, §25.7 rules 1–4): into a place of a
+/// local, through a reference, into a collection, or into a `borrow mut` argument of a call.
+fn collectWrites(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    b: borrow mut Borrows,
+    s: u32,
+    edges: borrow mut Vector<LoanEdge>,
+) -> Result<void, AllocError> {
+    let span = n.statementSpans[s as usize];
+    let value = match (n.statements[s as usize]) {
+        NirStatement.Assign(_, v) => v,
+        NirStatement.Eval(v) => v,
+        _ => none(),
+    };
+    if (value == none()) {
+        return Ok();
+    }
+    // Rule 1/2: a value stored into a place that is not a whole local.
+    match (n.statements[s as usize]) {
+        NirStatement.Assign(target, _) => {
+            let t = toPlaceRef(n, target);
+            if (t.projections.count > 0 && mayHoldLoans(c, placeRefType(c, n, b, t))) {
+                var operands = Vector<u32>.create();
+                rvalueOperands(n, value, mut operands)?;
+                let sources = carriers(c, n, b, operands)?;
+                let through = derefsReference(c, n, b, t);
+                recordWrite(b, edges, t.local, sources, through, false, span)?;
+            }
+        }
+        _ => {}
+    }
+    match (n.rvalues[value as usize]) {
+        // Rule 3: collection writes store their argument through the receiver.
+        NirRvalue.Builtin(function, arguments) => {
+            if (function == bfVectorPush() || function == bfSlotMapInsert() || function == bfStableVectorPush()) {
+                let receiver = operandPlaceLocal(n, n.at(arguments, 0));
+                if (receiver != none()) {
+                    var operands = Vector<u32>.create();
+                    operands.push(n.at(arguments, 1))?;
+                    let sources = carriers(c, n, b, operands)?;
+                    recordWrite(b, edges, receiver, sources, true, function == bfStableVectorPush(), span)?;
+                }
+            }
+        }
+        // Rule 4: a call may store an argument's loans through a `borrow mut` argument (§25.6 flows).
+        NirRvalue.Call(callee, arguments) => {
+            let count = c.hir.functions[callee as usize].mutableFlows.length;
+            for (k in 0..count) {
+                let flow = c.hir.functions[callee as usize].mutableFlows[k];
+                let target = truncate<u32>(flow >> 32);
+                let source = truncate<u32>(flow & 0xFFFFFFFF);
+                if (target < arguments.count && source < arguments.count) {
+                    let receiver = operandPlaceLocal(n, n.at(arguments, target));
+                    if (receiver != none()) {
+                        var operands = Vector<u32>.create();
+                        operands.push(n.at(arguments, source))?;
+                        let sources = carriers(c, n, b, operands)?;
+                        recordWrite(b, edges, receiver, sources, true, false, span)?;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn propagate(b: borrow mut Borrows, edges: borrow Vector<LoanEdge>) -> Result<void, AllocError> {
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (edge in edges.view()) {
+            if (edge.from == edge.to) {
+                continue;
+            }
+            let count = b.pointsTo[edge.from as usize].length;
+            for (k in 0..count) {
+                let loan = b.pointsTo[edge.from as usize][k];
+                if (addPointsTo(b, edge.to, loan)?) {
+                    changed = true;
+                }
+            }
+        }
+    }
+    return Ok();
+}
+
+fn hasEdge(edges: borrow Vector<LoanEdge>, from: u32, to: u32) -> bool {
+    for (edge in edges.view()) {
+        if (edge.from == from && edge.to == to) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn computeLoans(c: borrow Checker, n: borrow NirProgram, b: borrow mut Borrows) -> Result<void, AllocError> {
+    // Placeholder loans for reference parameters.
+    for (i in 0..b.parameterCount) {
+        if (holdsLoans(c, n, b, i)) {
+            let isMutable = isMutableReferenceType(c, localType(n, b, i));
+            let loan = addLoan(
+                b,
+                Loan {
+                    isMutable: isMutable,
+                    hasPlace: false,
+                    place: barePlace(i),
+                    block: none(),
+                    index: none(),
+                    span: Span { start: 0, end: 0 },
+                    parameterIndex: i,
+                },
+            )?;
+            addPointsTo(b, i, loan)?;
+        }
+    }
+    var edges = Vector<LoanEdge>.create();
+    let blockCount = n.functions[b.function as usize].blocks.length;
+    for (position in 0..blockCount) {
+        let statementCount = n.functions[b.function as usize].blocks[position].statements.length;
+        for (i in 0..statementCount) {
+            let s = n.functions[b.function as usize].blocks[position].statements[i];
+            collectWrites(c, n, b, s, mut edges)?;
+            var assignTarget: u32 = none();
+            var assignValue: u32 = none();
+            match (n.statements[s as usize]) {
+                NirStatement.Unpack(source, _, targets) => {
+                    let sourceLocal = n.places[source as usize].local;
+                    if (holdsLoans(c, n, b, sourceLocal)) {
+                        // The payloads of a scoped result carry its loans (lifetimes.md §3, M4a).
+                        for (k in 0..targets.count) {
+                            let payload = n.at(targets, k);
+                            if (payload != none() && holdsLoans(c, n, b, payload)) {
+                                addEdge(mut edges, sourceLocal, payload)?;
+                            }
+                        }
+                        continue;
+                    }
+                }
+                NirStatement.Assign(target, value) => {
+                    assignTarget = target;
+                    assignValue = value;
+                }
+                _ => {}
+            }
+            if (assignTarget == none()) {
+                continue;
+            }
+            let t = toPlaceRef(n, assignTarget);
+            if (t.projections.count != 0 || !holdsLoans(c, n, b, t.local)) {
+                continue;
+            }
+            let span = n.statementSpans[s as usize];
+            var loanPlace: u32 = none();
+            var loanMutable = false;
+            match (n.rvalues[assignValue as usize]) {
+                NirRvalue.Ref(mutable, place) => {
+                    loanPlace = place;
+                    loanMutable = mutable;
+                }
+                NirRvalue.Slice(mutable, base, _, _) => {
+                    loanPlace = base;
+                    loanMutable = mutable;
+                }
+                _ => {}
+            }
+            if (loanPlace != none()) {
+                // A slice is a loan of the whole array or slice it views (type-system.md §16.3).
+                let place = toPlaceRef(n, loanPlace);
+                let loan = addLoan(
+                    b,
+                    Loan {
+                        isMutable: loanMutable,
+                        hasPlace: true,
+                        place: place,
+                        block: truncate<u32>(position),
+                        index: truncate<u32>(i),
+                        span: span,
+                        parameterIndex: none(),
+                    },
+                )?;
+                b.loanAt[position][i] = loan;
+                addPointsTo(b, t.local, loan)?;
+                // A reborrow through q, or a borrow of a scoped value of q, keeps q's loans alive while the new
+                // reference lives.
+                if (holdsLoans(c, n, b, place.local) &&
+                    (derefsReference(c, n, b, place) || c.types.isScoped(placeRefType(c, n, b, place)))) {
+                    addEdge(mut edges, place.local, t.local)?;
+                }
+                continue;
+            }
+            match (n.rvalues[assignValue as usize]) {
+                NirRvalue.Call(callee, arguments) => {
+                    let count = c.hir.functions[callee as usize].returnSources.length;
+                    for (k in 0..count) {
+                        let index = c.hir.functions[callee as usize].returnSources[k];
+                        if (index < arguments.count) {
+                            let argument = operandPlace(n, n.at(arguments, index));
+                            if (argument != none() && holdsLoans(c, n, b, n.places[argument as usize].local)) {
+                                addEdge(mut edges, n.places[argument as usize].local, t.local)?;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            // Copies, moves, payload reads, aggregates and built-in results take the loans of every scoped value
+            // they read. A region allocation borrows only from its region (argument 0), and the allocated value's
+            // loans are the allocation's too (§19.5, §25.4).
+            var sources = Vector<u32>.create();
+            match (n.rvalues[assignValue as usize]) {
+                NirRvalue.Builtin(function, arguments) => {
+                    if (function == bfArenaAlloc()) {
+                        sources.push(n.at(arguments, 0))?;
+                        sources.push(n.at(arguments, 1))?;
+                    } else if (function == bfArenaAllocArray()) {
+                        sources.push(n.at(arguments, 0))?;
+                    } else {
+                        rvalueOperands(n, assignValue, mut sources)?;
+                    }
+                }
+                _ => { rvalueOperands(n, assignValue, mut sources)?; }
+            }
+            for (o in sources.view()) {
+                let place = operandPlace(n, o);
+                if (place == none()) {
+                    continue;
+                }
+                let p = toPlaceRef(n, place);
+                if (holdsLoans(c, n, b, p.local) &&
+                    (c.types.isScoped(n.operandTypes[o as usize]) || derefsReference(c, n, b, p))) {
+                    addEdge(mut edges, p.local, t.local)?;
+                }
+            }
+        }
+    }
+    // Writes through references reach what the references' loans point to, which depends on the loans computed so
+    // far: iterate until nothing changes (§25.7 rule 2).
+    while (true) {
+        propagate(b, edges)?;
+        var added = false;
+        for (w in 0..b.throughWrites.length) {
+            let holder = b.throughWrites[w].holder;
+            let shared = b.throughWrites[w].shared;
+            let loanCount = b.pointsTo[holder as usize].length;
+            for (k in 0..loanCount) {
+                let loan = borrow b.loans[b.pointsTo[holder as usize][k] as usize];
+                if (!loan.hasPlace || !(loan.isMutable || shared)) {
+                    continue;
+                }
+                let to = loan.place.local;
+                for (source in b.throughWrites[w].sources.view()) {
+                    if (!hasEdge(edges, source, to)) {
+                        addEdge(mut edges, source, to)?;
+                        added = true;
+                    }
+                }
+            }
+        }
+        if (!added) {
+            break;
+        }
+    }
+    return Ok();
+}
+
+/// The parameter index if the place starts with a deref of a reference parameter; none otherwise (DerefOfParameter).
+fn derefOfParameter(c: borrow Checker, n: borrow NirProgram, b: borrow Borrows, p: PlaceRef) -> u32 =>
+    if (p.local < b.parameterCount && holdsLoans(c, n, b, p.local) && p.projections.count > 0 &&
+        isDerefProjectionN(n.projections[p.projections.start as usize])) p.local else none();
+
+fn loanOrigin(c: borrow Checker, n: borrow NirProgram, b: borrow Borrows, loan: borrow Loan) -> u32 =>
+    if (!loan.hasPlace) loan.parameterIndex else derefOfParameter(c, n, b, loan.place);
+
+fn appendLocalNameOr(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    b: borrow Borrows,
+    local: u32,
+    fallback: StringView,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    let name = n.functions[b.function as usize].locals[local as usize].name;
+    if (name == none()) {
+        return appendText(out, fallback);
+    }
+    return appendBytes(out, c.name(name));
+}
+
+/// N0272 (§25.7 rule 2): a write that reaches memory a `borrow mut` parameter refers to may only store loans of
+/// parameters that the signature lets flow into that parameter (CheckParameterWrites).
+fn checkParameterWrites(c: borrow mut Checker, n: borrow NirProgram, b: borrow Borrows) -> Result<void, AllocError> {
+    let source = n.functions[b.function as usize].source;
+    for (write in b.throughWrites.view()) {
+        var targets = Vector<u32>.create();
+        for (id in b.pointsTo[write.holder as usize].view()) {
+            let loan = borrow b.loans[id as usize];
+            if (!(loan.isMutable || write.shared)) {
+                continue;
+            }
+            let p = loanOrigin(c, n, b, loan);
+            if (p != none() && isMutableReferenceType(c, localType(n, b, p)) && !containsU32(targets, p)) {
+                targets.push(p)?;
+            }
+        }
+        if (targets.length == 0) {
+            continue;
+        }
+        var stored = Vector<u32>.create();
+        for (s in write.sources.view()) {
+            for (id in b.pointsTo[s as usize].view()) {
+                if (!containsU32(stored, id)) {
+                    stored.push(id)?;
+                }
+            }
+        }
+        for (target in targets.view()) {
+            var foreign: u32 = none();
+            for (id in stored.view()) {
+                let from = loanOrigin(c, n, b, b.loans[id as usize]);
+                let flow = (target as u64) << 32 | from as u64;
+                if (from == none() || !containsU64(c.hir.functions[source as usize].mutableFlows, flow)) {
+                    foreign = id;
+                    break;
+                }
+            }
+            if (foreign == none()) {
+                continue;
+            }
+            let loan = borrow b.loans[foreign as usize];
+            var name = Vector<u8>.create();
+            appendLocalNameOr(c, n, b, target, "?", mut name)?;
+            var message = Vector<u8>.create();
+            appendText(mut message, "this stores a value borrowed from ")?;
+            var notes = Vector<DiagnosticNote>.create();
+            if (!loan.hasPlace) {
+                appendText(mut message, "parameter '")?;
+                appendLocalNameOr(c, n, b, loan.parameterIndex, "?", mut message)?;
+                appendText(mut message, "'")?;
+            } else {
+                appendQuotedPlace(c, n, b, loan.place, mut message)?;
+                var note = Vector<u8>.create();
+                appendText(mut note, "borrowed here")?;
+                notes.push(DiagnosticNote { start: loan.span.start, end: loan.span.end, message: note })?;
+            }
+            appendText(mut message, " into what '")?;
+            appendBytes(mut message, name.view())?;
+            appendText(
+                mut message,
+                "' refers to, which outlives this call; the signature must let it flow there, e.g. with a shared region: 'fn f<region r>(",
+            )?;
+            appendBytes(mut message, name.view())?;
+            appendText(mut message, ": borrow mut X<r>, v: Y<r>)' (type-system.md §25.6)")?;
+            c.front.diagnostics.errorWithNotes(
+                foreignLoanStored(),
+                b.file,
+                write.span.start,
+                write.span.end,
+                message,
+                notes,
+            )?;
+            break;
+        }
+    }
+    return Ok();
+}
+
+fn containsU64(values: borrow Vector<u64>, value: u64) -> bool {
+    for (v in values.view()) {
+        if (v == value) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---- §4 Accesses ----
+
+fn operandAccess(n: borrow NirProgram, operand: u32, out: borrow mut Vector<Access>) -> Result<void, AllocError> {
+    if (operand == none()) {
+        return Ok();
+    }
+    match (n.operands[operand as usize]) {
+        NirOperand.Place(place, isMove) => {
+            out.push(Access { kind: if (isMove) accessMove() else accessRead(), place: toPlaceRef(n, place) })?;
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn operandsAccess(n: borrow NirProgram, operands: Range, out: borrow mut Vector<Access>) -> Result<void, AllocError> {
+    for (k in 0..operands.count) {
+        operandAccess(n, n.at(operands, k), out)?;
+    }
+    return Ok();
+}
+
+fn rvalueAccesses(n: borrow NirProgram, rvalue: u32, out: borrow mut Vector<Access>) -> Result<void, AllocError> {
+    match (n.rvalues[rvalue as usize]) {
+        NirRvalue.Use(o) => { operandAccess(n, o, out)?; }
+        NirRvalue.Binary(_, l, r) => {
+            operandAccess(n, l, out)?;
+            operandAccess(n, r, out)?;
+        }
+        NirRvalue.Unary(_, o) => { operandAccess(n, o, out)?; }
+        NirRvalue.Cast(o) => { operandAccess(n, o, out)?; }
+        NirRvalue.Truncate(o) => { operandAccess(n, o, out)?; }
+        NirRvalue.FloatToInt(o, _) => { operandAccess(n, o, out)?; }
+        NirRvalue.Aggregate(fields) => { operandsAccess(n, fields, out)?; }
+        NirRvalue.Call(_, arguments) => { operandsAccess(n, arguments, out)?; }
+        NirRvalue.Builtin(_, arguments) => { operandsAccess(n, arguments, out)?; }
+        NirRvalue.Ref(mutable, place) => {
+            out.push(
+                Access { kind: if (mutable) accessBorrowMut() else accessBorrowShared(), place: toPlaceRef(n, place) },
+            )?;
+        }
+        NirRvalue.Slice(mutable, base, low, high) => {
+            operandAccess(n, low, out)?;
+            operandAccess(n, high, out)?;
+            out.push(
+                Access { kind: if (mutable) accessBorrowMut() else accessBorrowShared(), place: toPlaceRef(n, base) },
+            )?;
+        }
+        NirRvalue.Length(place) => { out.push(Access { kind: accessRead(), place: toPlaceRef(n, place) })?; }
+        NirRvalue.Array(elements) => { operandsAccess(n, elements, out)?; }
+        NirRvalue.ArrayRepeat(o) => { operandAccess(n, o, out)?; }
+        NirRvalue.Discriminant(place) => { out.push(Access { kind: accessRead(), place: toPlaceRef(n, place) })?; }
+        NirRvalue.EnumAggregate(_, payload) => { operandsAccess(n, payload, out)?; }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn statementAccesses(n: borrow NirProgram, s: u32, out: borrow mut Vector<Access>) -> Result<void, AllocError> {
+    match (n.statements[s as usize]) {
+        NirStatement.Assign(target, value) => {
+            rvalueAccesses(n, value, out)?;
+            out.push(Access { kind: accessWrite(), place: toPlaceRef(n, target) })?;
+        }
+        NirStatement.Eval(value) => { rvalueAccesses(n, value, out)?; }
+        NirStatement.Unpack(source, _, targets) => {
+            out.push(Access { kind: accessMove(), place: toPlaceRef(n, source) })?;
+            for (k in 0..targets.count) {
+                let target = n.at(targets, k);
+                if (target != none()) {
+                    out.push(Access { kind: accessWrite(), place: barePlace(target) })?;
+                }
+            }
+        }
+        NirStatement.BoxFree(place, _) => { out.push(Access { kind: accessDead(), place: toPlaceRef(n, place) })?; }
+        NirStatement.BoundsCheck(index, length) => {
+            operandAccess(n, index, out)?;
+            operandAccess(n, length, out)?;
+        }
+        NirStatement.LengthCheck(left, right) => {
+            operandAccess(n, left, out)?;
+            operandAccess(n, right, out)?;
+        }
+        NirStatement.RangeCheck(low, high, length, _) => {
+            operandAccess(n, low, out)?;
+            operandAccess(n, high, out)?;
+            operandAccess(n, length, out)?;
+        }
+        NirStatement.StorageDead(local) => { out.push(Access { kind: accessDead(), place: barePlace(local) })?; }
+        NirStatement.Drop(place, _) => { out.push(Access { kind: accessDead(), place: toPlaceRef(n, place) })?; }
+    }
+    return Ok();
+}
+
+fn terminatorAccesses(
+    n: borrow NirProgram,
+    terminator: u32,
+    out: borrow mut Vector<Access>,
+) -> Result<void, AllocError> {
+    match (n.terminators[terminator as usize]) {
+        NirTerminator.Branch(condition, _, _) => { operandAccess(n, condition, out)?; }
+        NirTerminator.Switch(value, _, _) => { operandAccess(n, value, out)?; }
+        NirTerminator.Return(value) => { operandAccess(n, value, out)?; }
+        NirTerminator.Exit(code) => { operandAccess(n, code, out)?; }
+        _ => {}
+    }
+    return Ok();
+}
+
+/// The accesses at a position: a statement's, or the terminator's at index `statements.length`.
+fn accessesAt(
+    n: borrow NirProgram,
+    b: borrow Borrows,
+    position: usize,
+    i: usize,
+    out: borrow mut Vector<Access>,
+) -> Result<void, AllocError> {
+    let block = borrow n.functions[b.function as usize].blocks[position];
+    if (i < block.statements.length) {
+        return statementAccesses(n, block.statements[i], out);
+    }
+    return terminatorAccesses(n, block.terminator, out);
+}
+
+fn spanAt(n: borrow NirProgram, b: borrow Borrows, position: usize, i: usize) -> Span {
+    let block = borrow n.functions[b.function as usize].blocks[position];
+    return if (i <
+        block.statements.length) n.statementSpans[block.statements[i] as usize] else n.terminatorSpans[block.terminator as usize];
+}
+
+// ---- §5 Liveness ----
+
+/// The reference locals a list of accesses reads (Uses): its root, if it is a reference.
+fn accessUses(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    b: borrow Borrows,
+    accesses: borrow Vector<Access>,
+    out: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    for (a in accesses.view()) {
+        let local = a.place.local;
+        if (!holdsLoans(c, n, b, local)) {
+            continue;
+        }
+        if (a.kind == accessDead()) {
+            var visiting = Vector<u32>.create();
+            if (!c.types.dropReadsLoans(localType(n, b, local), mut visiting)?) { // §25.7 rule 6
+                continue;
+            }
+        }
+        if (a.kind == accessWrite() && a.place.projections.count == 0) {
+            continue;
+        }
+        out.push(local)?;
+    }
+    return Ok();
+}
+
+/// The reference locals a statement defines (Definitions): an assignment's target, or an Unpack's payload bindings.
+fn definitions(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    b: borrow Borrows,
+    s: u32,
+    out: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    match (n.statements[s as usize]) {
+        NirStatement.Assign(target, _) => {
+            let t = toPlaceRef(n, target);
+            if (t.projections.count == 0 && holdsLoans(c, n, b, t.local)) {
+                out.push(t.local)?;
+            }
+        }
+        NirStatement.Unpack(_, _, targets) => {
+            for (k in 0..targets.count) {
+                let target = n.at(targets, k);
+                if (target != none() && holdsLoans(c, n, b, target)) {
+                    out.push(target)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+/// Live-in sets per statement position, index `statements.length` the terminator's (ComputeLiveness).
+fn computeLiveness(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    b: borrow Borrows,
+) -> Result<Vector<Vector<Vector<u32>>>, AllocError> {
+    let blockCount = n.functions[b.function as usize].blocks.length;
+    var liveIn = Vector<NetSet>.create();
+    var positions = Vector<Vector<Vector<u32>>>.create();
+    for (k in 0..blockCount) {
+        liveIn.push(NetSet.create())?;
+        positions.push(Vector<Vector<u32>>.create())?;
+    }
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var position = blockCount;
+        while (position > 0) {
+            position -= 1;
+            var live = NetSet.create();
+            for (successor in n.functions[b.function as usize].blocks[position].successors.view()) {
+                let next = b.blockOf[successor as usize];
+                let members = liveIn[next as usize].members()?;
+                for (local in members.view()) {
+                    live.add(local)?;
+                }
+            }
+            let statementCount = n.functions[b.function as usize].blocks[position].statements.length;
+            var perPosition = Vector<Vector<u32>>.create();
+            for (k in 0..(statementCount + 1)) {
+                perPosition.push(Vector<u32>.create())?;
+            }
+            var accesses = Vector<Access>.create();
+            accessesAt(n, b, position, statementCount, mut accesses)?;
+            var uses = Vector<u32>.create();
+            accessUses(c, n, b, accesses, mut uses)?;
+            for (local in uses.view()) {
+                live.add(local)?;
+            }
+            perPosition[statementCount] = live.members()?;
+            var i = statementCount;
+            while (i > 0) {
+                i -= 1;
+                let s = n.functions[b.function as usize].blocks[position].statements[i];
+                var defined = Vector<u32>.create();
+                definitions(c, n, b, s, mut defined)?;
+                for (local in defined.view()) {
+                    live.remove(local)?;
+                }
+                var statementAccesses = Vector<Access>.create();
+                accessesAt(n, b, position, i, mut statementAccesses)?;
+                var used = Vector<u32>.create();
+                accessUses(c, n, b, statementAccesses, mut used)?;
+                for (local in used.view()) {
+                    live.add(local)?;
+                }
+                perPosition[i] = live.members()?;
+            }
+            positions[position] = perPosition;
+            if (!live.setEquals(liveIn[position])) {
+                liveIn[position] = live;
+                changed = true;
+            }
+        }
+    }
+    return Ok(positions);
+}
+
+/// Is position (`position`, `index`) reachable from where `loan` is made (Reached)? A loan does not exist before that,
+/// even in a holder that is live there (§25.7: holders such as a vector receive loans after they are defined).
+fn loanReached(
+    n: borrow NirProgram,
+    b: borrow mut Borrows,
+    loan: u32,
+    position: u32,
+    index: u32,
+) -> Result<bool, AllocError> {
+    let origin = b.loans[loan as usize].block;
+    if (origin == none()) {
+        return Ok(true);
+    }
+    if (position == origin && index > b.loans[loan as usize].index) {
+        return Ok(true);
+    }
+    if (b.reached[loan as usize].length == 0) {
+        let blockCount = n.functions[b.function as usize].blocks.length;
+        var reached = Vector<bool>.create();
+        for (k in 0..blockCount) {
+            reached.push(false)?;
+        }
+        var work = Vector<u32>.create();
+        var head: usize = 0;
+        for (successor in n.functions[b.function as usize].blocks[origin as usize].successors.view()) {
+            work.push(b.blockOf[successor as usize])?;
+        }
+        while (head < work.length) {
+            let next = work[head];
+            head += 1;
+            if (!reached[next as usize]) {
+                reached[next as usize] = true;
+                for (successor in n.functions[b.function as usize].blocks[next as usize].successors.view()) {
+                    work.push(b.blockOf[successor as usize])?;
+                }
+            }
+        }
+        b.reached[loan as usize] = reached;
+    }
+    return Ok(b.reached[loan as usize][position as usize]);
+}
+
+/// The live loans at a position (LiveLoans): those of its live locals, without the loan made there.
+fn liveLoans(
+    n: borrow NirProgram,
+    b: borrow mut Borrows,
+    live: borrow Vector<u32>,
+    created: u32,
+    position: u32,
+    index: u32,
+) -> Result<Vector<u32>, AllocError> {
+    var out = Vector<u32>.create();
+    var seen = Vector<u32>.create();
+    for (local in live.view()) {
+        let count = b.pointsTo[local as usize].length;
+        for (k in 0..count) {
+            let id = b.pointsTo[local as usize][k];
+            if (containsU32(seen, id)) {
+                continue;
+            }
+            seen.push(id)?;
+            if (b.loans[id as usize].hasPlace && id != created && loanReached(n, b, id, position, index)?) {
+                out.push(id)?;
+            }
+        }
+    }
+    return Ok(out);
+}
+
+fn checkConflicts(c: borrow mut Checker, n: borrow NirProgram, b: borrow mut Borrows) -> Result<void, AllocError> {
+    var anyPlaced = false;
+    for (loan in b.loans.view()) {
+        if (loan.hasPlace) {
+            anyPlaced = true;
+        }
+    }
+    if (!anyPlaced) {
+        return Ok();
+    }
+    let liveness = computeLiveness(c, n, b)?;
+    // Loans carried by a returned reference are judged by the return check (E1/E2, §7), not as "dropped while
+    // borrowed" when the function's locals end at the return.
+    var returned = Vector<u32>.create();
+    let blockCount = n.functions[b.function as usize].blocks.length;
+    for (position in 0..blockCount) {
+        let terminator = n.functions[b.function as usize].blocks[position].terminator;
+        match (n.terminators[terminator as usize]) {
+            NirTerminator.Return(value) => {
+                let local = if (value == none()) none() else operandPlaceLocal(n, value);
+                if (local != none()) {
+                    for (id in b.pointsTo[local as usize].view()) {
+                        if (!containsU32(returned, id)) {
+                            returned.push(id)?;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for (position in 0..blockCount) {
+        let statementCount = n.functions[b.function as usize].blocks[position].statements.length;
+        for (i in 0..(statementCount + 1)) {
+            var accesses = Vector<Access>.create();
+            accessesAt(n, b, position, i, mut accesses)?;
+            let span = spanAt(n, b, position, i);
+            let created = if (i < statementCount) b.loanAt[position][i] else none();
+            let live = liveLoans(n, b, liveness[position][i], created, truncate<u32>(position), truncate<u32>(i))?;
+            // An assignment writes its target after the value is computed: loans only used by the value
+            // (`a[0] = sum(a[..])`) have ended by then, so the write is judged after the statement.
+            var isAssign = false;
+            if (i < statementCount) {
+                let s = n.functions[b.function as usize].blocks[position].statements[i];
+                isAssign = match (n.statements[s as usize]) {
+                    NirStatement.Assign(_, _) => true,
+                    _ => false,
+                };
+            }
+            let liveAfter = if (isAssign) liveLoans(
+                n,
+                b,
+                liveness[position][i + 1],
+                created,
+                truncate<u32>(position),
+                truncate<u32>(i),
+            )? else Vector<u32>.create();
+            var reported = Vector<u32>.create();
+            for (a in 0..accesses.length) {
+                let access = accesses[a];
+                let isWrite = isAssign && a == accesses.length - 1;
+                let count = if (isWrite) liveAfter.length else live.length;
+                for (k in 0..count) {
+                    let id = if (isWrite) liveAfter[k] else live[k];
+                    let loanPlace = b.loans[id as usize].place;
+                    // A reference going out of scope does not end what it refers to.
+                    var throughReference = access.kind == accessDead() &&
+                        (derefsReference(c, n, b, loanPlace) || containsU32(returned, id));
+                    // Overwriting a reference is not a use of its referent (lifetimes.md §5, M11).
+                    if (access.kind == accessWrite() && referenceOnTheWay(c, n, b, access.place, loanPlace)) {
+                        throughReference = true;
+                    }
+                    if (!throughReference && overlap(n, loanPlace, access.place) &&
+                        conflicts(b.loans[id as usize], access.kind) && !containsU32(reported, id)) {
+                        reported.push(id)?;
+                        reportConflict(c, n, b, id, access, span, truncate<u32>(position), truncate<u32>(i))?;
+                    }
+                }
+            }
+        }
+    }
+    return Ok();
+}
+
+/// A place as the user wrote it (Describe): fields, and indices (`[2]` for a constant, else `[_]`).
+fn appendDescribedPlace(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    b: borrow Borrows,
+    p: PlaceRef,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    appendLocalNameOr(c, n, b, p.local, "a temporary", out)?;
+    for (k in 0..p.projections.count) {
+        let projection = n.projections[(p.projections.start + k) as usize];
+        match (projection.kind) {
+            ProjectionKind.Field => {
+                appendText(out, ".")?;
+                appendBytes(out, c.name(c.types.fields[projection.field as usize].name))?;
+            }
+            ProjectionKind.Index => {
+                if (constantIndex(n, projection.index)) {
+                    appendText(out, "[")?;
+                    appendIntValue(out, constantValue(n, projection.index))?;
+                    appendText(out, "]")?;
+                } else {
+                    appendText(out, "[_]")?;
+                }
+            }
+            _ => {}
+        }
+    }
+    return Ok();
+}
+
+/// The place in quotes, or "a temporary value" for an unnamed temporary (Quoted).
+fn appendQuotedPlace(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    b: borrow Borrows,
+    p: PlaceRef,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    if (n.functions[b.function as usize].locals[p.local as usize].name == none()) {
+        return appendText(out, "a temporary value");
+    }
+    appendText(out, "'")?;
+    appendDescribedPlace(c, n, b, p, out)?;
+    return appendText(out, "'");
+}
+
+fn reportConflict(
+    c: borrow mut Checker,
+    n: borrow NirProgram,
+    b: borrow Borrows,
+    loan: u32,
+    access: Access,
+    span: Span,
+    position: u32,
+    index: u32,
+) -> Result<void, AllocError> {
+    let loanPlace = b.loans[loan as usize].place;
+    let isMutable = b.loans[loan as usize].isMutable;
+    let loanSpan = b.loans[loan as usize].span;
+    let borrowKind = if (isMutable) "mutably borrowed" else "borrowed";
+    var message = Vector<u8>.create();
+    var code: u32 = 0;
+    let kind = access.kind;
+    if (kind == accessMove() || kind == accessWrite()) {
+        code = writeWhileBorrowed();
+        appendText(mut message, if (kind == accessMove()) "cannot move out of " else "cannot assign to ")?;
+        appendQuotedPlace(c, n, b, access.place, mut message)?;
+        appendText(mut message, " while ")?;
+        appendQuotedPlace(c, n, b, loanPlace, mut message)?;
+        appendText(mut message, " is ")?;
+        appendText(mut message, borrowKind)?;
+    } else if (kind == accessBorrowShared() || kind == accessBorrowMut()) {
+        code = conflictingBorrow();
+        appendText(mut message, "cannot borrow ")?;
+        appendQuotedPlace(c, n, b, access.place, mut message)?;
+        if (kind == accessBorrowMut()) {
+            appendText(mut message, " as mutable")?;
+        }
+        appendText(mut message, " while ")?;
+        appendQuotedPlace(c, n, b, loanPlace, mut message)?;
+        appendText(mut message, " is ")?;
+        appendText(mut message, borrowKind)?;
+    } else if (kind == accessRead()) {
+        code = readWhileMutablyBorrowed();
+        appendText(mut message, "cannot use ")?;
+        appendQuotedPlace(c, n, b, access.place, mut message)?;
+        appendText(mut message, " while ")?;
+        appendQuotedPlace(c, n, b, loanPlace, mut message)?;
+        appendText(mut message, " is mutably borrowed")?;
+    } else {
+        code = deadWhileBorrowed();
+        if (n.functions[b.function as usize].locals[access.place.local as usize].name == none()) {
+            appendText(
+                mut message,
+                "a temporary value is dropped at the end of this statement while still borrowed; bind it to a local first",
+            )?;
+        } else {
+            appendText(mut message, "'")?;
+            appendDescribedPlace(c, n, b, access.place, mut message)?;
+            appendText(mut message, "' goes out of scope while still borrowed")?;
+        }
+    }
+    var notes = Vector<DiagnosticNote>.create();
+    var first = Vector<u8>.create();
+    appendQuotedPlace(c, n, b, loanPlace, mut first)?;
+    appendText(mut first, " is ")?;
+    appendText(mut first, borrowKind)?;
+    appendText(mut first, " here")?;
+    notes.push(DiagnosticNote { start: loanSpan.start, end: loanSpan.end, message: first })?;
+    let later = findLaterUse(c, n, b, loan, position, index)?;
+    if (later.start != none()) {
+        var second = Vector<u8>.create();
+        appendText(mut second, "the borrow is used later here")?;
+        notes.push(DiagnosticNote { start: later.start, end: later.end, message: second })?;
+    }
+    return c.front.diagnostics.errorWithNotes(code, b.file, span.start, span.end, message, notes);
+}
+
+/// The first use, strictly after the given position, of a reference that may hold the loan (FindLaterUse); a span
+/// whose start is none if there is none.
+fn findLaterUse(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    b: borrow Borrows,
+    loan: u32,
+    position: u32,
+    index: u32,
+) -> Result<Span, AllocError> {
+    let blockCount = n.functions[b.function as usize].blocks.length;
+    var visited = Vector<bool>.create();
+    for (k in 0..blockCount) {
+        visited.push(false)?;
+    }
+    var work = Vector<u32>.create(); // pairs: block position, start
+    var head: usize = 0;
+    work.push(position)?;
+    work.push(index + 1)?;
+    while (head < work.length) {
+        let block = work[head] as usize;
+        let start = work[head + 1] as usize;
+        head += 2;
+        let statementCount = n.functions[b.function as usize].blocks[block].statements.length;
+        var i = start;
+        while (i <= statementCount) {
+            var accesses = Vector<Access>.create();
+            accessesAt(n, b, block, i, mut accesses)?;
+            var uses = Vector<u32>.create();
+            accessUses(c, n, b, accesses, mut uses)?;
+            for (local in uses.view()) {
+                if (loansContain(b, local, loan)) {
+                    return Ok(spanAt(n, b, block, i));
+                }
+            }
+            i += 1;
+        }
+        for (successor in n.functions[b.function as usize].blocks[block].successors.view()) {
+            let next = b.blockOf[successor as usize];
+            if (!visited[next as usize]) {
+                visited[next as usize] = true;
+                work.push(next)?;
+                work.push(0)?;
+            }
+        }
+    }
+    return Ok(Span { start: none(), end: none() });
+}
+
+// ---- §7 Returned references ----
+
+fn checkReturns(c: borrow mut Checker, n: borrow NirProgram, b: borrow Borrows) -> Result<void, AllocError> {
+    let source = n.functions[b.function as usize].source;
+    if (!mayHoldLoans(c, c.hir.functions[source as usize].returnType)) {
+        return Ok();
+    }
+    let blockCount = n.functions[b.function as usize].blocks.length;
+    for (position in 0..blockCount) {
+        let terminator = n.functions[b.function as usize].blocks[position].terminator;
+        let value = match (n.terminators[terminator as usize]) {
+            NirTerminator.Return(v) => v,
+            _ => none(),
+        };
+        if (value == none()) {
+            continue;
+        }
+        let place = operandPlace(n, value);
+        if (place == none() || n.places[place as usize].projections.count != 0) {
+            continue;
+        }
+        let span = n.terminatorSpans[terminator as usize];
+        // A reborrow of a local reference is reported through that reference's own loans, and one local loan per
+        // return is enough (an allocation and its region are both local).
+        var ids = copyU32s(b.pointsTo[n.places[place as usize].local as usize].view())?;
+        sortU32(mut ids);
+        var reportedLocal = false;
+        for (id in ids.view()) {
+            let loan = borrow b.loans[id as usize];
+            if (loan.hasPlace && derefsReference(c, n, b, loan.place) && loan.place.local >= b.parameterCount) {
+                continue;
+            }
+            let parameter = loanOrigin(c, n, b, loan);
+            if (parameter == none()) {
+                if (reportedLocal) {
+                    continue;
+                }
+                reportedLocal = true;
+                var message = Vector<u8>.create();
+                appendText(mut message, "cannot return a reference to ")?;
+                appendQuotedPlace(c, n, b, loan.place, mut message)?;
+                appendText(mut message, ", which is local to '")?;
+                appendBytes(mut message, c.name(c.hir.functions[source as usize].name))?;
+                appendText(mut message, "'")?;
+                var notes = Vector<DiagnosticNote>.create();
+                var note = Vector<u8>.create();
+                appendText(mut note, "borrowed here")?;
+                notes.push(DiagnosticNote { start: loan.span.start, end: loan.span.end, message: note })?;
+                c.front.diagnostics.errorWithNotes(
+                    returnsLocalReference(),
+                    b.file,
+                    span.start,
+                    span.end,
+                    message,
+                    notes,
+                )?;
+            } else if (!containsU32(c.hir.functions[source as usize].returnSources, parameter)) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "the returned reference may be derived from parameter '")?;
+                appendLocalNameOr(c, n, b, parameter, "?", mut message)?;
+                appendText(mut message, "', which the return type does not list")?;
+                c.front.diagnostics.error(returnSourceMismatch(), b.file, span.start, span.end, message)?;
+            }
+        }
+    }
+    return Ok();
+}
+
+fn copyU32s(values: Slice<u32>) -> Result<Vector<u32>, AllocError> {
+    var out = Vector<u32>.create();
+    for (v in values) {
+        out.push(v)?;
+    }
+    return Ok(out);
+}
+
+fn checkBorrows(c: borrow mut Checker, n: borrow NirProgram, function: u32) -> Result<void, AllocError> {
+    let localCount = n.functions[function as usize].locals.length;
+    let blockCount = n.functions[function as usize].blocks.length;
+    var b = Borrows {
+        function: function,
+        file: functionFile(c, n, function),
+        parameterCount: n.functions[function as usize].parameterCount,
+        loans: Vector<Loan>.create(),
+        pointsTo: Vector<Vector<u32>>.create(),
+        pointsToBits: Vector<Vector<u64>>.create(),
+        loanAt: Vector<Vector<u32>>.create(),
+        throughWrites: Vector<ThroughWrite>.create(),
+        blockOf: Vector<u32>.create(),
+        reached: Vector<Vector<bool>>.create(),
+    };
+    for (k in 0..localCount) {
+        b.pointsTo.push(Vector<u32>.create())?;
+        b.pointsToBits.push(Vector<u64>.create())?;
+    }
+    var maxId: u32 = 0;
+    for (position in 0..blockCount) {
+        var at = Vector<u32>.create();
+        for (k in 0..n.functions[function as usize].blocks[position].statements.length) {
+            at.push(none())?;
+        }
+        b.loanAt.push(at)?;
+        let id = n.functions[function as usize].blocks[position].id;
+        if (id > maxId) {
+            maxId = id;
+        }
+    }
+    for (k in 0..(maxId + 1)) {
+        b.blockOf.push(none())?;
+    }
+    for (position in 0..blockCount) {
+        b.blockOf[n.functions[function as usize].blocks[position].id as usize] = truncate<u32>(position);
+    }
+    computeLoans(c, n, mut b)?;
+    for (k in 0..b.loans.length) {
+        b.reached.push(Vector<bool>.create())?;
+    }
+    checkParameterWrites(c, n, b)?;
+    checkConflicts(c, n, mut b)?;
+    return checkReturns(c, n, b);
+}

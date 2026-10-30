@@ -45,6 +45,14 @@ struct Diagnostic {
     secondStart: u32;
     secondEnd: u32;
     secondText: Vector<u8>;
+    notes: Vector<DiagnosticNote>;
+}
+
+/// A note on a diagnostic, in the same file (DiagnosticNote).
+struct DiagnosticNote {
+    start: u32;
+    end: u32;
+    message: Vector<u8>;
 }
 
 /// Diagnostics in the order they are reported (DiagnosticBag).
@@ -77,6 +85,7 @@ struct Diagnostics {
             secondStart: 0,
             secondEnd: 0,
             secondText: Vector<u8>.create(),
+            notes: Vector<DiagnosticNote>.create(),
         })?;
         return Ok();
     }
@@ -108,6 +117,7 @@ struct Diagnostics {
             secondStart: 0,
             secondEnd: 0,
             secondText: Vector<u8>.create(),
+            notes: Vector<DiagnosticNote>.create(),
         })?;
         return Ok();
     }
@@ -141,6 +151,7 @@ struct Diagnostics {
             secondStart: 0,
             secondEnd: 0,
             secondText: Vector<u8>.create(),
+            notes: Vector<DiagnosticNote>.create(),
         })?;
         return Ok();
     }
@@ -176,7 +187,24 @@ struct Diagnostics {
             secondStart: secondStart,
             secondEnd: secondEnd,
             secondText: secondText,
+            notes: Vector<DiagnosticNote>.create(),
         })?;
+        return Ok();
+    }
+
+    /// An error with notes (DiagnosticBag.Error with notes).
+    fn errorWithNotes(
+        borrow mut this,
+        code: u32,
+        file: u32,
+        start: u32,
+        end: u32,
+        message: Vector<u8>,
+        notes: Vector<DiagnosticNote>,
+    ) -> Result<void, AllocError> {
+        this.error(code, file, start, end, message)?;
+        let last = this.items.length - 1;
+        this.items[last].notes = notes;
         return Ok();
     }
 
@@ -290,6 +318,16 @@ fn diagnosticsJson(
         json.string(summaryOf(d.code))?;
         json.name("notes")?;
         json.startArray()?;
+        for (note in d.notes.view()) {
+            json.startObject()?;
+            json.name("file")?;
+            json.stringBytes(source.path.view())?;
+            writePosition(mut json, "start", source, note.start)?;
+            writePosition(mut json, "end", source, note.end)?;
+            json.name("message")?;
+            json.stringBytes(note.message.view())?;
+            json.endObject()?;
+        }
         json.endArray()?;
         json.name("fixes")?;
         json.startArray()?;

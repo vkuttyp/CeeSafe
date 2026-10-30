@@ -348,6 +348,7 @@ fn elidedFlowName(i: usize) -> u64 => (2u64 << 32) | i as u64;
 fn isRegionOrElided(name: u64) -> bool => (name >> 32) == 1 || (name >> 32) == 2;
 fn isElided(name: u64) -> bool => (name >> 32) == 2;
 fn isTypeFlowName(name: u64) -> bool => (name >> 32) == 3;
+fn typeFlowName(symbol: u32) -> u64 => (3u64 << 32) | symbol as u64;
 
 fn addName(names: borrow mut Vector<u64>, name: u64) -> Result<void, AllocError> {
     for (n in names.view()) {
@@ -378,6 +379,9 @@ fn mayHoldLoans(c: borrow Checker, typ: u32) -> bool => c.types.isScoped(typ) ||
 fn resolveFlows(c: borrow mut Checker, f: u32, function: u32, owner: u32) -> Result<void, AllocError> {
     let decl = c.front.ast.functions[f as usize];
     var ownerRegions = Vector<u32>.create();
+    var ownerTypeParameters = Vector<u32>.create();
+    var typeParameters = Vector<u32>.create();
+    pushRegionNames(c, decl.typeParameters, mut typeParameters)?;
     if (owner != none()) {
         let definition = c.types.info(owner).structDef;
         let item = if (definition == none()) none() else c.types.structs[definition as usize].item;
@@ -385,11 +389,16 @@ fn resolveFlows(c: borrow mut Checker, f: u32, function: u32, owner: u32) -> Res
             match (c.front.ast.items[item as usize].kind) {
                 ItemKind.Struct(k) => {
                     pushRegionNames(c, c.front.ast.structs[k as usize].regionParameters, mut ownerRegions)?;
+                    pushRegionNames(c, c.front.ast.structs[k as usize].typeParameters, mut ownerTypeParameters)?;
                 }
                 _ => {}
             }
         }
     }
+    for (t in ownerTypeParameters.view()) {
+        typeParameters.push(t)?;
+    }
+    c.flowTypeParameters = typeParameters;
     let parameterCount = c.hir.functions[function as usize].parameters.length;
     let receiverOffset = parameterCount - decl.parameters.count as usize;
     var names = Vector<Vector<u64>>.create();
@@ -398,6 +407,9 @@ fn resolveFlows(c: borrow mut Checker, f: u32, function: u32, owner: u32) -> Res
         if (i < receiverOffset) {
             for (r in ownerRegions.view()) {
                 addName(mut set, regionFlowName(r))?;
+            }
+            for (t in ownerTypeParameters.view()) {
+                addName(mut set, typeFlowName(t))?;
             }
         } else {
             let p = c.front.ast.parameters[c.front.ast.at(decl.parameters, truncate<u32>(i - receiverOffset)) as usize];
@@ -484,6 +496,7 @@ fn resolveFlows(c: borrow mut Checker, f: u32, function: u32, owner: u32) -> Res
     }
     c.hir.functions[function as usize].mutableFlows = flows;
     c.flowNames = Vector<Vector<u64>>.create();
+    c.flowTypeParameters = Vector<u32>.create();
     return Ok();
 }
 
@@ -515,6 +528,15 @@ fn collectFlowNames(
                 }
             }
             return collectFlowNames(c, pointee, function, inResult, names);
+        }
+        TypeNode.Named(name) => {
+            if (name.parts.count == 1) {
+                let symbol = c.front.ast.idents[c.front.ast.at(name.parts, 0) as usize].symbol;
+                if (containsU32(c.flowTypeParameters, symbol)) {
+                    addName(names, typeFlowName(symbol))?;
+                }
+            }
+            return Ok();
         }
         TypeNode.Generic(name, arguments) => {
             if (name.parts.count != 1) {
