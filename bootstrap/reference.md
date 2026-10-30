@@ -57,3 +57,14 @@ equal the archived ones.
 
 - 2026-10-30, `1b1aae4`, novac 0.6.0: macOS arm64 (Apple clang 21) and Linux x86-64 (GCC 12), same C
   (`main.c` `40374dbf…`).
+
+## Bootstrap since the rename (Decision 0002, ROADMAP P6R)
+
+CeeSafe's own sources use CeeSafe's names since `8941c10`, so novac cannot build them. The last commit with Nova's
+names is the **bootstrap anchor**, `3d6ac40`: `tools/bootstrap.sh [NOVAC] [REVISION] [OUTPUT]` builds it with the
+pinned novac and builds REVISION with the ceesafec that makes. A re-pin of novac must still build the anchor; when
+it cannot, a new anchor is chosen and recorded here.
+
+- 2026-10-30, `8941c10`: fixed point on CeeSafe's names with a bootstrapped ceesafec as stage 0, on macOS arm64
+  (Apple clang 21) and Linux x86-64 (GCC 12): gen 1 = gen 2 = gen 3 = stage 0, C the same on both hosts
+  (`main.c` `4b73077c…`); manifests `bootstrap/fixed-point/2026-10-30-p6r-*.md`.

@@ -66,7 +66,7 @@ the markers, and never edit between them.
 ## Governing documents (in order of authority)
 
 1. `ROADMAP.md`: scope, phases P0–P9, the N track (upstream Nova M15), gates and the execution record.
-2. `docs/decisions/*.md`: CeeSafe's accepted decisions (0001: identity and bootstrap).
+2. `docs/decisions/*.md`: CeeSafe's accepted decisions (0001: identity and bootstrap; 0002: the rename cut-over).
 3. Nova's specifications in `~/Nova/docs/` (type system, ownership, C backend) and its ADRs: the port preserves their
    semantics. Nova's `AGENTS.md` rules (spec before code, safety first, determinism, target layout from `TargetInfo`
    only) apply here too.
@@ -74,11 +74,17 @@ the markers, and never edit between them.
 
 ## Bootstrap rules
 
-- Build only with the pinned stage-0 compiler named in `bootstrap/reference.md` (today `~/.nova/0.6.0/bin/novac`, 0.6.0).
-  `~/.nova/bin/novac` is 0.3.1, which CosmoOS's `make nova` still pins: leave it there.
-  The `novac` on `PATH` may be a development wrapper around `~/Nova`'s working tree and is not reproducible.
-- Until `ceesafec` compiles itself (ROADMAP P6R), sources are `.nova` files and the manifest is `nova.toml`, because
-  novac reads only those. Do not add `.cee` files or `ceesafe.toml` before then.
+- Since P6R (Decision 0002) CeeSafe's sources are `.cee` files and its manifest is `ceesafe.toml`; ceesafec builds
+  them (`out/ceesafec check`, `out/ceesafec build -o out/ceesafec`). novac cannot read these names.
+- Get a ceesafec from a fresh checkout with `tools/bootstrap.sh`: the pinned novac named in `bootstrap/reference.md`
+  (today `~/.nova/0.6.0/bin/novac`) builds the last legacy-named commit, whose ceesafec builds the tree. Keep a known
+  good `out/ceesafec` before changing the compiler, so a broken build can be rebuilt by the previous one.
+  `~/.nova/bin/novac` is 0.3.1, which CosmoOS's `make nova` still pins: leave it there. The `novac` on `PATH` may be a
+  development wrapper around `~/Nova`'s working tree and is not reproducible.
+- Formatting is still novac's until ceesafec has `fmt` (P8): `~/.nova/0.6.0/bin/novac fmt $(git ls-files 'src/*.cee')`
+  (`novac fmt` on a directory looks only for `.nova` files).
+- Legacy mode: ceesafec still reads `nova.toml` packages and `.nova` files (CosmoOS has not migrated), and Nova's
+  corpus and `tests/` stay `.nova`, compared with novac. Diagnostic codes keep the letter N.
 - A missing language or library feature is an upstream Nova task (ROADMAP's N track: spec and ADR in `~/Nova`, then a
   novac release and a re-pin). Pure library code (tables, interner, bignum, JSON) is written here in Nova. Never
   work around a gap with `unsafe`, C, or a weaker check where a safe design exists.
@@ -89,20 +95,24 @@ the markers, and never edit between them.
 
 ```sh
 python3 tools/run_corpus.py --compiler ~/.nova/0.6.0/bin/novac                 # Nova's corpus against a compiler
-python3 tools/run_corpus.py --compiler out/ceesafe --reference ~/.nova/0.6.0/bin/novac --family parse-pass
+python3 tools/run_corpus.py --compiler out/ceesafec --reference ~/.nova/0.6.0/bin/novac --family parse-pass
 python3 tools/run_corpus.py --compiler ~/.nova/0.6.0/bin/novac --corpus probes --family run-pass --family check-fail \
     --family parse-fail                                                  # the P1 probes
-W=""; for f in src/support/*.nova; do W="$W --with $f"; done                # zsh: then ${=W}
+W=""; for f in src/support/*.cee; do W="$W --with $f"; done                # zsh: then ${=W}
 python3 tools/run_corpus.py --compiler ~/.nova/0.6.0/bin/novac --corpus tests/support --family run-pass $W --check-leaks
-python3 tools/fault_sweep.py --compiler ~/.nova/0.6.0/bin/novac tests/support/fault/alloc-sweep.nova src/support/*.nova
+python3 tools/fault_sweep.py --compiler ~/.nova/0.6.0/bin/novac tests/support/fault/alloc-sweep.nova src/support/*.cee
 python3 tools/oracles/support_models.py                                  # oracle summaries for tests/support
 python3 tools/inventory.py                                               # regenerate docs/reference-inventory.md
-python3 tools/gen_catalog.py --nova <Nova at the pinned tag>            # regenerate src/diagnostics/catalog.nova
-python3 tools/compare_tokens.py --ceesafec out/ceesafe --oracle <token-dump> --root <Nova> lib tests/corpus
+python3 tools/gen_catalog.py --nova <Nova at the pinned tag>            # regenerate src/diagnostics/catalog.cee
+python3 tools/compare_tokens.py --ceesafec out/ceesafec --oracle <token-dump> --root <Nova> lib tests/corpus
                                                                         # the lexer against the reference (docs/p2-frontend.md §3)
-python3 tools/compare_parse.py --ceesafec out/ceesafe --novac ~/.nova/0.6.0/bin/novac --root <Nova> lib tests/corpus
+python3 tools/compare_parse.py --ceesafec out/ceesafec --novac ~/.nova/0.6.0/bin/novac --root <Nova> lib tests/corpus
                                                                         # trees and diagnostics against novac (§6)
 python3 tools/parser_fuzz.py <dir> 3000 <seed> <files>                  # broken variants for compare_parse.py
+python3 tools/contract_tests.py --ceesafec out/ceesafec --novac ~/.nova/0.6.0/bin/novac --root <Nova at the tag>
+                                                                        # every contract test (P2–P6R), one command
+python3 tools/fixed_point.py --stage0 out/ceesafec --work <dir> --manifest <file>
+                                                                        # the fixed point (docs/p6-fixed-point.md)
 ```
 
 Generated files say so in their first line (`tools/oracles/gen_*.py` writes them); edit the generator, never the

@@ -1,6 +1,6 @@
 # CeeSafe roadmap: port the Nova compiler to Nova, as CeeSafe
 
-Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P6 complete (P6 fixed point 2026-10-30, novac 0.6.0); next: P6R**.
+Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P6R complete (CeeSafe names since `8941c10`, 2026-10-30; stage 0 novac 0.6.0 via the `3d6ac40` anchor); next: P7**.
 The probes, `src/support/`, the limits, the fault sweep and the skeleton exist (`docs/p1-probes.md`). No compiler code has been ported.
 Repository: `~/dev/CeeSafe`. Reference: `vkuttyp/Nova` (C#/.NET 10), pinned in `bootstrap/reference.md`.
 
@@ -469,14 +469,22 @@ passes on gen 2 but the recorded divergences.
 
 Dependencies: P6.
 
-- [ ] `ceesafec` accepts `.cee`, `ceesafe.toml` and `$CEESAFE_HOME`. Decide, through a CeeSafe decision record,
-  whether `.nova` and `nova.toml` are kept as an explicit legacy mode.
-- [ ] Decide the diagnostic code letter and record the `N####` mapping. Corpus annotations get converted mechanically,
-  with a reviewed diff.
-- [ ] One commit renames CeeSafe's own sources and manifest. Rerun the P6 fixed point with `ceesafec` alone; novac is
-  no longer needed for routine builds.
+- [x] `ceesafec` accepts `.cee`, `ceesafe.toml` (and `ceesafe.lock`). `$CEESAFE_HOME` is named (Decision 0002); nothing
+  reads a home directory until P8's git and registry dependencies. `.nova` and `nova.toml` are kept as an explicit
+  legacy mode (Decision 0002, owner 2026-10-30: CosmoOS has yet to migrate).
+- [x] The diagnostic code letter stays **N** (Decision 0002: `C` would collide with MSVC's codes), so no mapping and
+  no corpus conversion is needed.
+- [x] One commit (`8941c10`) renames CeeSafe's own sources and manifest; `3d6ac40` is the bootstrap anchor that novac
+  still builds (`tools/bootstrap.sh`). The P6 fixed point reruns with ceesafec alone; novac is no longer needed for
+  routine builds (formatting waits for P8's `fmt`).
 
-Gate: the fixed point holds on CeeSafe names, and the legacy mode (if kept) is tested.
+Gate: the fixed point holds on CeeSafe names, and the legacy mode (if kept) is tested. **Passed (2026-10-30,
+`8941c10`)**: from `tools/bootstrap.sh` (novac 0.6.0 → `3d6ac40` → this tree), the fixed point with that ceesafec as
+stage 0 holds on macOS (Apple clang 21) and Linux (GCC 12): gen 1 = gen 2 = gen 3 = stage 0, the same C on both hosts,
+which differs from the legacy-named commit's only in the 80 `src/` file names; only the C compiler runs. Legacy mode:
+`compare_packages.py` passes the seven fixtures as they are (`nova.toml`), renamed (`ceesafe.toml`, `--renamed all`)
+and mixed (a CeeSafe root over legacy dependencies, `--renamed root`); a directory with both manifests is an error,
+and a legacy package ignores `.cee` files. `tools/contract_tests.py` passes on both hosts.
 
 ### P7 — Optimisations and production C
 
@@ -614,8 +622,9 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
    track has no open blocking item.
 2. P2–P5 are done (`docs/p2-frontend.md`, `docs/p3-plan.md`, `docs/p4-plan.md`, `docs/p5-plan.md`), pinned to
    novac 0.6.0; the C matrix is complete (P5). P6, the first verified fixed point, holds on macOS and Linux
-   (`docs/p6-fixed-point.md`). Next: P6R, the rename cut-over, which needs CeeSafe decisions on the legacy `.nova`
-   mode and the diagnostic code letter first.
+   (`docs/p6-fixed-point.md`). P6R is done (Decision 0002): CeeSafe's sources are `.cee` with `ceesafe.toml`,
+   legacy `.nova` packages still build, codes keep N, and `tools/bootstrap.sh` builds from novac. Next: P7,
+   optimisations and production C (the structured form, placement, check elimination, closure specialisation).
 4. Upstream (Nova #6, filed 2026-10-30): novac 0.6.0's `offsetOf<T>(field)` is 0 unless `T`'s layout was computed before (CheckOffsetOf reads
    `member.Offset` without `TypeTable.LayoutOf(measured)`); ceesafec gives the true offset.
 5. Owner's call: propose upstream that N0110 count `else if` links and `?` suffixes. novac's `--dump-ast` aborts on a
@@ -646,6 +655,7 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 | 2026-10-30 | P4: NIR (`src/nir/`: model, printer, builder, move paths, drop elaboration, move/in-place/borrow/effect checkers, `passes.nova`), `build --dump-nir`, diagnostic notes, `tools/compare_nir.py`, `tools/mutation_suite.py`, `docs/p4-evidence.md`; P3 gaps found and fixed (type-parameter flow names, `Box.create`'s `@placed` methods, HIR's dead `isGeneric`) | P4 gate passed: check programs 318/322, the 4 recorded divergences; other families 84/84; NIR 284/284 and CeeSafe's own package identical; mutations 1,152/1,152 against the oracle, as with novac; `check --dump-hir` identical on 186/186 check-pass and run-pass programs; packages 7/7; `ceesafec check` of CeeSafe clean (0.77 s); ceesafec under ASan+UBSan over 295 check-fail and run-pass programs (`build --dump-nir`) and its own package: no report, `live=0` |
 | 2026-10-30 | P5: the flat C backend (`src/backend/`), the runtime embedded (`tools/gen_runtime.py`), the toolchain and `build --emit c|exe|obj` with `-g`, `--split`, `--cc`, `--cflag`, `--ld` (`src/host/toolchain.nova`, `src/host/build.nova`); `tools/compare_c.py`, `tools/fault_injection.py`, `tools/collection_properties.py`, `tools/freestanding_check.py`; P3 gaps fixed (built-in items' `Used` marks, HirProgram's Structs and DynSignatures, InHostedLibrary), one NIR span fixed (an exhaustive match's Unreachable) | P5 gate passed: C identical for 284/284 programs in four forms (flat, split, `-g`, both) and for CeeSafe itself; run-pass 159/159, run-fail 40/40, ffi 8/8 under Apple clang 21, clang 18 and GCC 12 (`-O2`, `-O0`, overflow fallback, ASan+UBSan with leak checks, split, `-g`, `-Werror`) but one GCC report that novac's C shares; TSan 3/3; fault sweep 789 points on macOS and Linux, equal to novac's runs; collection properties 30/30 with 156 swept points; freestanding host and both triples clean; emit-c differences reviewed (P7's form); ceesafec built from its own C by GCC emits the same C on Linux |
 | 2026-10-30 | P6: `tools/fixed_point.py`, `tools/contract_tests.py`, `bootstrap/fixed-point/` | fixed point on macOS and Linux: C2 = C3 = C4, gen 2 = gen 3 bit for bit, in two directories, the same C on both hosts, only `cc` (and GCC's `as`, `ld`) started from gen 1 on; all contract tests pass on gen 2 but the recorded divergences |
+| 2026-10-30 | P6R: Decision 0002 (legacy `nova.toml`/`.nova` kept; codes keep N), `ceesafe.toml`/`.cee`/`ceesafe.lock` packages (`3d6ac40`), CeeSafe's own sources renamed (`8941c10`), `tools/bootstrap.sh`, `compare_packages.py --renamed` | gate passed: fixed point on CeeSafe names from a bootstrapped ceesafec on macOS and Linux, same C on both, only `src/` file names differ from the anchor's C; package fixtures legacy, renamed and mixed 7/7 each; contract tests pass on both hosts |
 
 **Tests run for the skeleton** (2026-10-30, novac 0.3.1, Apple clang 21.0.0):
 - `novac check` and `novac fmt --check`: clean.
@@ -699,4 +709,8 @@ checks pass on macOS and Linux.
 and gen 2 = gen 3 on macOS (Apple clang 21) and Linux (GCC 12), in two directories each, with the same C on both
 hosts; only the C compiler runs from gen 1 on; `tools/contract_tests.py` passes on gen 2 on both hosts.
 
-Not yet run: P6R or later.
+**P6R rename** (2026-10-30; Decision 0002): CeeSafe's sources renamed (`8941c10`), bootstrap anchor `3d6ac40`; the
+fixed point on CeeSafe names with a bootstrapped ceesafec as stage 0 on macOS and Linux, the same C on both; legacy,
+renamed and mixed package fixtures pass; contract tests pass on both hosts.
+
+Not yet run: P7 or later.
