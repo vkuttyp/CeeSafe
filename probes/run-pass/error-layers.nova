@@ -1,8 +1,8 @@
 // P1 probe: errors from different layers (I/O, allocation, the compiler's own) reaching one error type. `?` needs
 // the same error type on both sides and Nova has no `From` conversion (type-system §17.4), so each layer's errors are
 // lifted by a small generic function, keeping `?` at the call site (compare probes/check-fail/error-mismatch.nova).
-// `void` results go through non-generic copies: the generic ones crash novac 0.3.1 when T = void
-// (probes/upstream/void-result-rebuild-crash.nova).
+// `void` results go through non-generic copies: a generic copy with T = void does not check (`Result<void, E>.Ok` has
+// no payload), which novac 0.4.0 reports as N0222 (0.3.1 crashed; probes/check-fail/void-result-rebuild.nova).
 // expect-stdout: missing.nova: cannot read: No such file or directory
 // expect-stdout: ok: 3 lines
 // expect-stdout: empty.nova: empty source

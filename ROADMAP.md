@@ -252,36 +252,34 @@ Carried into later phases (`docs/parity.md` §3):
 Gate: another checkout reconstructs the pin and runs a representative fixture set with identical results, and the
 ledger has no unmapped items (inventory: 0 unmapped, 2026-10-30).
 
-### N — Upstream Nova: self-hosting prerequisites (proposed Nova milestone M15)
+### N — Upstream Nova: self-hosting prerequisites (Nova milestone M15)
 
 Each item is a Nova change approved by the owner and made under Nova's rules: spec and ADR first, then tests, docs,
 `roadmap.md` and `risks.md`. It ships in a novac release, and CeeSafe re-pins (`bootstrap/reference.md`). P1's probes
 (2026-10-30, `docs/p1-probes.md` §4) set this list and its order.
 
-- [ ] **N0. Fix the compiler crash** ([Nova #2](https://github.com/vkuttyp/Nova/issues/2)) on a generic `Result` rebuild instantiated with `T = void`
-  (`probes/upstream/void-result-rebuild-crash.nova`). This is a bug fix with a corpus regression, not a language
-  change. Until it lands, `void` results use non-generic lifts.
-- [ ] **N0b. Fix the missing drop** ([Nova #1](https://github.com/vkuttyp/Nova/issues/1)) of a temporary made in an `if` or `while` condition
-  (`probes/upstream/condition-temporary-not-dropped.nova`). Its regression test needs a leak check, which Nova's run
-  corpus lacks. **Before P4**, since drops are part of parity.
-- [ ] N0c. Fix two false rejections ([Nova #4](https://github.com/vkuttyp/Nova/issues/4), [#5](https://github.com/vkuttyp/Nova/issues/5)), each with a workaround:
-  - `truncate` is not two-phase, against §23.1;
-  - `borrow(this)` is ignored when the other parameter has a type-parameter type.
-- [ ] **N0d. Specify a nesting limit and its diagnostic** ([Nova #3](https://github.com/vkuttyp/Nova/issues/3)). novac crashes at 100,000 nested parentheses (SIGSEGV;
-  `docs/limits.md`). **Before P2's robustness gate.**
-- [ ] **N1a. Bytes to text.** Add `StringView.fromUtf8(Slice<u8>) -> StringView?` (validating), and a way to append
-  checked bytes to a `String`. Needed by P2 so that diagnostics can quote source names, and by P8 so that JSON, fixes
-  and LSP/MCP replies can be built. **Before P2.**
-- [ ] **N4a. Host services for `build` and packages:**
-  - captured stdout and stderr, and stdin input, for child processes (`CBackend.cs:257-259`);
-  - environment variables (`CC`, `PATH`, `NOVA_HOME`, `NOVA_INDEX`, `INCLUDE`);
-  - creating and listing directories;
-  - file existence;
-  - temporary directories (`Program.cs:614`);
-  - the working directory.
+All of N0–N4a shipped in **novac 0.4.0** (Nova M15, tag `v0.4.0` = `66b6bda`, 2026-10-30), and CeeSafe re-pinned to
+it the same day, then to the point release 0.4.1 (N7; `bootstrap/reference.md`). Each former
+`probes/upstream/` repro is now a regression probe that must keep passing.
 
-  **Before P5.**
-- [ ] **N4b. Stdin by line or length** (LSP/MCP framing). **Before P8.**
+- [x] **N0. The compiler crash** ([Nova #2](https://github.com/vkuttyp/Nova/issues/2)) on a generic `Result` rebuild
+  with `T = void` is now N0222, an error (`probes/check-fail/void-result-rebuild.nova`). The instance still does not
+  check, so `void` results keep their non-generic lifts.
+- [x] **N0b. The missing drop** ([Nova #1](https://github.com/vkuttyp/Nova/issues/1)) of a condition temporary is
+  fixed, and Nova's run corpus now requires `live=0` (`probes/run-pass/condition-temporaries.nova`).
+- [x] N0c. The two false rejections ([Nova #4](https://github.com/vkuttyp/Nova/issues/4),
+  [#5](https://github.com/vkuttyp/Nova/issues/5)) are fixed (`probes/run-pass/truncate-two-phase.nova`,
+  `probes/run-pass/generic-param-borrow.nova`); their workarounds in `src/support/` and `tests/support/` are gone.
+- [x] **N0d. A nesting limit** ([Nova #3](https://github.com/vkuttyp/Nova/issues/3)): 1,000 levels, N0110, with the
+  passes on a 256 MiB stack. CeeSafe's parser must reproduce N0110 at the same depth (P2).
+- [x] **N1a. Bytes to text**: `StringView.fromUtf8` (type-system §22.2), then `String.append`.
+- [x] **N4a. Host services** (ADR 0028, type-system §26.7–§26.10): `Process.capture` (stdout, stderr, stdin input),
+  `Environment.variable`, `Directory.create`/`list`/`remove`/`temporary`/`current` and
+  `File.kind`. `probes/run-pass/host-process.nova` uses them to drive `cc`.
+- [x] ~~N4b. Stdin by line or length~~: dropped; LSP/MCP framing can be buffered over `Console.read`.
+- [x] **N7. lib/std's helper names** (found by the 0.4.0 re-pin): 0.4.0's `lib/std/host.nova` declared top-level
+  helpers (`pathIn`, `fromAlloc`, `textOf` and others) that a program could not redeclare (N0201). Fixed in novac
+  **0.4.1** (point release from `release-0.4`, 2026-10-30), CeeSafe's pin since; the probes use those names again.
 - [ ] Optional ergonomics, none blocking:
   - N1b, `Vector` bulk append from a slice (performance);
   - N1c, text ordering, `clone`, `find`/`startsWith` and number parsing (until then, byte-wise functions in
@@ -293,13 +291,9 @@ Each item is a Nova change approved by the owner and made under Nova's rules: sp
   (`generic-impls`, `error-layers` probes).
 - [x] ~~N5 borrow precision~~: not needed. `splitAtMut`, copy-out and separate tables are accepted
   (`aliasing-workarounds` probe).
-- [x] N6. Drafted as Nova `docs/milestone-15.md` (2026-10-30, Nova `34ce40a`, proposed), citing OD-33. Its items map
-  to this list as follows:
-  - S1 is N0 (#2), S2 is N0b (#1), and S4 and S5 are N0c (#4, #5): fixes for novac 0.3.2;
-  - S3 is N0d (#3) and S6 is N1a: 0.4.0;
-  - S7 is N4a, after an ADR.
-
-  N4b dropped: framing can be buffered over `Console.read`.
+- [x] N6. Nova `docs/milestone-15.md` (drafted at `34ce40a`, implemented 2026-10-30), citing OD-33. Its items map to
+  this list as follows: S1 is N0 (#2), S2 is N0b (#1), S4 and S5 are N0c (#4, #5), S3 is N0d (#3), S6 is N1a and S7
+  (ADR 0028) is N4a. All shipped together in 0.4.0; the planned 0.3.2 was not needed.
 
 Gate per item: the novac release passes Nova's full suite, and CeeSafe's affected probes pass after the re-pin.
 
@@ -340,7 +334,8 @@ Dependencies: P0. Runs alongside the N track.
 
 Gate: probes and the support library pass under ASan and UBSan with the pinned novac. Every compiler bug found has a
 reduced reproducer filed upstream. Missing features block; they are never worked around by weakening checks.
-**Passed 2026-10-30 (§10).** The four reproducers in `probes/upstream/` and the nesting crash are filed as Nova #1–#5 (2026-10-30).
+**Passed 2026-10-30 (§10).** The four reproducers in `probes/upstream/` and the nesting crash were filed as Nova #1–#5 (2026-10-30), fixed in
+novac 0.4.0, and the reproducers became regression probes at the re-pin.
 
 ### P2 — Source frontend
 
@@ -493,11 +488,11 @@ publication are reported separately.
 ## 5. Bootstrap protocol (planned interfaces; none exist yet)
 
 ```text
-gen1: ~/.nova/bin/novac build                    (pinned stage-0, CeeSafe .nova sources)
+gen1: ~/.nova/0.4.1/bin/novac build              (pinned stage-0, CeeSafe .nova sources)
 gen2: out/gen1/ceesafec build -o out/gen2/ceesafec  --emit c kept in out/gen2/c/
 gen3: out/gen2/ceesafec build -o out/gen3/ceesafec  --emit c kept in out/gen3/c/
 tools/compare-stages out/gen2 out/gen3            (byte equality of C and resources)
-tools/run-fixtures --compiler out/gen2/ceesafec --reference ~/.nova/bin/novac
+tools/run-fixtures --compiler out/gen2/ceesafec --reference ~/.nova/0.4.1/bin/novac
 ```
 
 The primary artefacts are the generated C and the bundled resources. Binary equality also needs controlled linker,
@@ -564,10 +559,8 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
 
 ## 9. Immediate work queue
 
-1. **Nova M15 (S1–S7) is done on Nova `main`** (`4126457`, `61cb665`, `1d1f091`). Next: a novac release with it (owner's call); then re-pin here, remove the workarounds, update `text-gaps` and the host probe. The original order was:
-   - N0 (the crash) and N0b (the missing drop) first, since they are bugs;
-   - then N1a (bytes to text) and N0d (the nesting limit), which P2 needs;
-   - N4 (host services) later, before P5.
+1. **Pinned to novac 0.4.1** (2026-10-30): M15 S1–S7 and the N7 fix shipped, every P1 workaround removed. The N
+   track has no open blocking item.
 2. Alongside: the rest of the runner's C matrix (`-O0`, the overflow fallback, `--split`, TSan) and the package
    fixtures (`docs/parity.md` §3).
 3. P2, once N1a is released and re-pinned, or with an accepted decision to quote source names byte by byte until
@@ -595,6 +588,7 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 
 **Tests run for the skeleton** (2026-10-30, novac 0.3.1, Apple clang 21.0.0):
 - `novac check` and `novac fmt --check`: clean.
+| 2026-10-30 | Re-pinned to novac 0.4.0, then 0.4.1 (`80d8d8c`). 0.4.0 reserved its lib/std helper names (N7), fixed in Nova `24106b0` and released as the point release 0.4.1. All P1 workarounds removed; the four upstream reproducers became regression probes. Gates rerun with 0.4.1: macOS (Apple clang 21) and the Ryzen box (GCC 12; clang 18.1.8 -O2; clang 18.1.8 ASan+UBSan+LSan) | reference corpus at `v0.4.1` 467 pass, 3 partial, no leaks, on both; probes 16/16; support 6/6; fault sweep 573/573; skeleton builds; inventory regenerated, 0 unmapped |
 - `novac build`, then `./out/ceesafe --version`: printed `ceesafec 0.0.0-dev`, exit 0.
 - No arguments: exit 2. An unknown command: exit 2.
 - `novac run --interp -- --version` printed the same version.

@@ -47,8 +47,7 @@ fn main() -> i32 {
                 }
             }
         } else {
-            let probe = Word { value: key };
-            let found = map.get(probe);
+            let found = map.get(Word { value: key });
             match (modelFind(keys.view(), key)) {
                 Some(i) => {
                     hits += 1;

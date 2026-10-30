@@ -54,6 +54,12 @@ expectation was rechecked and the cause recorded; none of the disagreements was 
 | The formatter wraps chained `if` expressions inside `match` arms unreadably, with operands split across lines. | the first `phaseOf` in `src/main.nova` | low (formatter quality) |
 | There is no explicit panic or abort for internal-error assertions. | `src/support/bits.nova` | low (a missing feature: an assertion needs a deliberate index fault) |
 
+Status at the novac 0.4.0 re-pin (2026-10-30): the crash (now N0222), the missing drop, the `truncate` and
+`borrow(this)` rejections and the nesting crash (now N0110 at 1,000 levels) are fixed. The four `probes/upstream/`
+reproducers became `probes/check-fail/void-result-rebuild.nova`, `probes/run-pass/condition-temporaries.nova`,
+`truncate-two-phase.nova` and `generic-param-borrow.nova`. The low-severity rows are unchanged. N1a and N4a shipped in 0.4.0 as well; §4 below is the list as
+drafted, and `ROADMAP.md`'s N track has the current status.
+
 ## 4. Revised N-track list
 
 Priorities are by what blocks a phase. "Workaround" means the port can proceed without the item, at a stated cost.
@@ -83,8 +89,8 @@ ergonomics.
   tables are written. There are no references inside tables.
 - **Non-`Copy` elements** are matched with `match (borrow v[i])` and changed through `borrow mut v[i]`. Two elements
   of one table are reached at once with `splitAtMut`, or one is copied first.
-- **Source text is bytes** until N1a lands. Names are interned byte spans (first-seen IDs), and output goes through
-  `Console.writeBytes`.
+- **Source text is bytes.** Names are interned byte spans (first-seen IDs), and output goes through
+  `Console.writeBytes`. Since 0.4.0 (N1a), `StringView.fromUtf8` turns checked bytes into text where a `String` is needed.
 - **Maps** are CeeSafe's own insertion-ordered `Map<K: Key<K>, V>`. Iteration is insertion order, so output never
   depends on hashes.
 - **Errors**: one error enum per layer, lifted with small functions. `void` results use non-generic lifts until N0

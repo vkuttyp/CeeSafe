@@ -1,13 +1,12 @@
-// P1 probe: the text operations a compiler needs that Nova does not have (type-system §22.2, §23.2; ROADMAP N1).
-// Each line names what the port must do instead until N1 lands.
+// P1 probe: the text operations a compiler could use that Nova does not have (type-system §22.2, §23.2; ROADMAP N1c,
+// N1d). Bytes become text with `StringView.fromUtf8` since novac 0.4.0 (N1a), then `String.append`; the rest are
+// byte-wise functions in src/support/bytes.nova or `match` tables.
 
 fn main() {
     var bytes = Vector<u8>.create();
     bytes.push('a')!;
-    // Source read from a file is bytes; there is no checked conversion to text, so names stay byte slices.
-    let text = StringView.fromUtf8(bytes.view()); // error[N0200]
     var s = String.create();
-    // A diagnostic message cannot include a name from the source; it is printed piece by piece instead.
+    // No appendBytes: bytes go through StringView.fromUtf8 and append, which checks them.
     s.appendBytes(bytes.view())!; // error[N0200]
     // No copy of a `String`; copy the bytes into a new one.
     let copy = s.clone(); // error[N0200]

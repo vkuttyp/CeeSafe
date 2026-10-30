@@ -80,9 +80,7 @@ struct BigNat {
 
     fn trim(borrow mut this) {
         while (this.limbs.length > 0 && this.limbs[this.limbs.length - 1] == 0) {
-            // A local: `truncate` is not two-phase in novac 0.3.1 (probes/upstream/truncate-two-phase.nova).
-            let top = this.limbs.length - 1;
-            this.limbs.truncate(top);
+            this.limbs.truncate(this.limbs.length - 1);
         }
     }
 

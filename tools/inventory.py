@@ -31,6 +31,7 @@ PHASE_RULES = [
     ("Nova.Compiler/Semantics/", "P3"),
     ("Nova.Compiler/Hir/", "P3"),
     ("Nova.Compiler/Compilation.cs", "P3+P4"),
+    ("Nova.Compiler/CompilerThread.cs", "P2"),
     ("Nova.Compiler/Nir/ClosureSpecialisation.cs", "P7"),
     ("Nova.Compiler/Nir/", "P4"),
     ("Nova.Compiler/Analysis/CheckElimination.cs", "P7"),
@@ -74,7 +75,7 @@ TEST_PHASES = {
     "StructuredC": "P7", "CheckElimination": "P7", "Placement": "P7", "ClosureSpecialisation": "P7",
     "Msvc": "P9", "ToolchainReport": "P5", "Fuzz": "P9", "Interpreter": "P8", "Formatter": "P8", "Doc": "P8",
     "Cli": "P8", "Lsp": "P8", "Mcp": "P8", "Fix": "P8", "AgentFiles": "P8", "Debugger": "P8",
-    "InstallScript": "P9", "PackageManager": "P8", "Readme": "P5", "Site": "P8",
+    "InstallScript": "P9", "PackageManager": "P8", "Readme": "P5", "Site": "P8", "HostServices": "P5+P8",
 }
 
 # Corpus family -> phase whose gate requires it.

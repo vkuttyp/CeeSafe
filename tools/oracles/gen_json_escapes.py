@@ -5,7 +5,7 @@ The data file lists the BMP code points .NET's JavaScriptEncoder.UnsafeRelaxedJs
 Nova's DiagnosticJson); tools/oracles/JsonEscapes.cs extracts it from a .NET install. The generated table is a
 constant array of inclusive ranges searched by `jsonEscapesBmp`.
 
-usage: python3 tools/oracles/gen_json_escapes.py   (formats the output with $NOVAC, default ~/.nova/bin/novac)
+usage: python3 tools/oracles/gen_json_escapes.py   (formats the output with $NOVAC, default ~/.nova/0.4.1/bin/novac)
 """
 
 import os
@@ -50,7 +50,7 @@ fn jsonEscapesBmp(c: u32) -> bool {{
     path = os.path.join(ROOT, "src", "support", "json_escapes.nova")
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(source)
-    novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/bin/novac"))
+    novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/0.4.1/bin/novac"))
     subprocess.run([novac, "fmt", path], check=True)
     print(f"wrote {path} ({len(ranges)} ranges)")
 

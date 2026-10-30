@@ -6,7 +6,7 @@ System.Numerics.BigInteger as used by IntegerSemantics.cs: truncating division (
 remainder has the dividend's sign), Wrap (reduce modulo 2^bits, then read as signed or unsigned) and NovaType.Fits.
 
 usage: python3 tools/oracles/gen_bigint_cases.py   (rewrites the test and formats it with $NOVAC, default the pinned
-       ~/.nova/bin/novac; review the diff)
+       ~/.nova/0.4.1/bin/novac; review the diff)
 """
 
 import os
@@ -188,7 +188,7 @@ fn main() {{
                                          "bigint-cases.nova"))
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(source)
-    novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/bin/novac"))
+    novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/0.4.1/bin/novac"))
     subprocess.run([novac, "fmt", path], check=True)
     print(f"wrote {path} ({len(pairs)} pairs, {len(EDGES)} wrap values)")
 

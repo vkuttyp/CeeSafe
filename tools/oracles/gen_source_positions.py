@@ -8,7 +8,7 @@ against novac 0.3.1's columns, docs/p1-probes.md §6), lines start after "\\r\\n
 sequence) and the end, the test prints line, column and UTF-16 offset; the expected lines come from this model.
 
 usage: python3 tools/oracles/gen_source_positions.py   (rewrites the test and formats it with $NOVAC, default the
-       pinned ~/.nova/bin/novac; review the diff)
+       pinned ~/.nova/0.4.1/bin/novac; review the diff)
 """
 
 import os
@@ -120,7 +120,7 @@ def main():
     path = os.path.join(os.path.dirname(__file__), "..", "..", "tests", "support", "run-pass", "source-positions.nova")
     with open(os.path.normpath(path), "w", encoding="utf-8", newline="\n") as f:
         f.write(source)
-    novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/bin/novac"))
+    novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/0.4.1/bin/novac"))
     subprocess.run([novac, "fmt", os.path.normpath(path)], check=True)
     print(f"wrote {os.path.normpath(path)} ({len(CASES)} cases)")
 

@@ -74,7 +74,8 @@ the markers, and never edit between them.
 
 ## Bootstrap rules
 
-- Build only with the pinned stage-0 compiler named in `bootstrap/reference.md` (today `~/.nova/bin/novac`, 0.3.1).
+- Build only with the pinned stage-0 compiler named in `bootstrap/reference.md` (today `~/.nova/0.4.1/bin/novac`, 0.4.0).
+  `~/.nova/bin/novac` is 0.3.1, which CosmoOS's `make nova` still pins: leave it there.
   The `novac` on `PATH` may be a development wrapper around `~/Nova`'s working tree and is not reproducible.
 - Until `ceesafec` compiles itself (ROADMAP P6R), sources are `.nova` files and the manifest is `nova.toml`, because
   novac reads only those. Do not add `.cee` files or `ceesafe.toml` before then.
@@ -87,20 +88,20 @@ the markers, and never edit between them.
 ## Tools
 
 ```sh
-python3 tools/run_corpus.py --compiler ~/.nova/bin/novac                 # Nova's corpus against a compiler
-python3 tools/run_corpus.py --compiler out/ceesafe --reference ~/.nova/bin/novac --family parse-pass
-python3 tools/run_corpus.py --compiler ~/.nova/bin/novac --corpus probes --family run-pass --family check-fail \
+python3 tools/run_corpus.py --compiler ~/.nova/0.4.1/bin/novac                 # Nova's corpus against a compiler
+python3 tools/run_corpus.py --compiler out/ceesafe --reference ~/.nova/0.4.1/bin/novac --family parse-pass
+python3 tools/run_corpus.py --compiler ~/.nova/0.4.1/bin/novac --corpus probes --family run-pass --family check-fail \
     --family parse-fail                                                  # the P1 probes
 W=""; for f in src/support/*.nova; do W="$W --with $f"; done                # zsh: then ${=W}
-python3 tools/run_corpus.py --compiler ~/.nova/bin/novac --corpus tests/support --family run-pass $W --check-leaks
-python3 tools/fault_sweep.py --compiler ~/.nova/bin/novac tests/support/fault/alloc-sweep.nova src/support/*.nova
+python3 tools/run_corpus.py --compiler ~/.nova/0.4.1/bin/novac --corpus tests/support --family run-pass $W --check-leaks
+python3 tools/fault_sweep.py --compiler ~/.nova/0.4.1/bin/novac tests/support/fault/alloc-sweep.nova src/support/*.nova
 python3 tools/oracles/support_models.py                                  # oracle summaries for tests/support
 python3 tools/inventory.py                                               # regenerate docs/reference-inventory.md
 ```
 
 Generated files say so in their first line (`tools/oracles/gen_*.py` writes them); edit the generator, never the
 output. Expected values in `tests/support` come from oracles outside the code under test (Python, .NET, novac).
-Use `--check-leaks` for anything new: novac 0.3.1 can skip drops (`probes/upstream/`).
+Use `--check-leaks` for anything new: novac 0.3.1 skipped drops, and the probes keep a regression for it.
 
 `run_corpus.py` checks the corpus's own expectations (annotations, snapshots, expected output); `--reference`
 also requires identical observable outcomes. Its normalisations are listed in the script: never widen one to make a
@@ -120,7 +121,7 @@ src/                                    the compiler, in Nova
 docs/decisions/                         CeeSafe decisions
 bootstrap/                              stage-0 pin and reference manifest
 tools/                                  run_corpus.py (corpus runner), inventory.py (reference inventory)
-probes/                                 P1 capability probes in corpus format; upstream/ holds novac bug reproducers
+probes/                                 P1 capability probes in corpus format, and regression probes for fixed novac bugs
 src/support/ src/host/                  the support library (P1) and host services
 tests/support/                          support-library tests (run-pass, fault/)
 tools/oracles/                          independent oracles and generators for tests

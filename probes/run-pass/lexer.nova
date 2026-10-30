@@ -6,8 +6,8 @@
 // Without arguments it lexes a known line and its own source. With file arguments it lexes each file and prints its
 // counts (for runs over Nova's libraries and corpus; see docs/p1-probes.md).
 //
-// Source text stays bytes throughout: Nova has no way to turn bytes read from a file into a `StringView` or `String`
-// (type-system §22.2, §23.2), so names are printed with `Console.writeBytes`.
+// Source text stays bytes throughout, and names are printed with `Console.writeBytes`. (When this probe was written,
+// novac 0.3.1 had no way to turn bytes into text; 0.4.0 has `StringView.fromUtf8`, type-system §22.2.)
 // expect-stdout: line: 18 tokens (keyword 1, name 8, number 0, string 0, char 0, punct 9, unknown 0), 1 comments, 11 spaces, 4 names
 // expect-stdout: line: first-seen ids add=0 a=1 i32=2 b=3
 // expect-stdout: self: lossless

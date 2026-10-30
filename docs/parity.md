@@ -75,9 +75,9 @@ difference in `--reference` mode.
   byte, or through a mapping, is a P4 decision; `--dump-nir` works today.
 
 - **Leaks are not checked by Nova's run corpus.** `run_corpus.py --check-leaks` requires the runtime's `live=0` on a
-  normal exit. Nova's 199 run-pass, run-fail and ffi programs pass it (2026-10-30), yet novac 0.3.1 skips drops of
-  `if`/`while` condition temporaries (`probes/upstream/condition-temporary-not-dropped.nova`). CeeSafe's runs use
-  `--check-leaks`.
+  normal exit. novac 0.3.1 skipped drops of `if`/`while` condition temporaries (Nova #1), which its corpus did not
+  notice. Since 0.4.0 Nova's `RunCorpusTests` requires `live=0` itself, and `probes/run-pass/condition-temporaries.nova`
+  keeps the case. CeeSafe's runs still use `--check-leaks`.
 
 ## 4. Reference test suite
 
