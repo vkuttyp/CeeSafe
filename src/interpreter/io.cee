@@ -1,14 +1,60 @@
-// Program arguments, files, sockets and processes for the interpreter (the reference's Interpreter/IoRuntime.cs,
-// HostIo.cs; type-system.md §26, intermediate-representation.md §5.4).
+// Program arguments, files, sockets, processes, host services, the C library model and threads for the interpreter
+// (the reference's Interpreter/IoRuntime.cs, HostIo.cs, HostServices.cs, CLibrary.cs and Threads.cs; type-system.md
+// §26, §28.6, §38; intermediate-representation.md §5.4). Files and sockets are the host's, through lib/core's File,
+// TcpListener and TcpStream: a descriptor the program holds names an entry of the interpreter's table.
 
-/// The runtime's host state: the program's arguments (static memory, as argv is natively).
+/// A descriptor's host object.
+enum HostHandle {
+    Closed,
+    OpenFile(File),
+    Listener(TcpListener),
+    Stream(TcpStream),
+}
+
+/// A thread of the interpreted program (Threads.cs): its body, and what it waits for.
+struct InterpThread {
+    started: bool;
+    finished: bool;
+    waitingKind: u32; // 0 runnable, 1 a thread to finish, 2 a mutex to be free
+    waitingOn: u64;   // the thread's index, or the mutex's address
+    isClosure: bool;  // Thread.both's first closure, else a spawned body
+    function: u32;    // a spawned body's NIR function
+    data: u64;        // its environment, or the closure value's environment pointer
+    block: u64;       // the thread's record, where the result goes
+    resultType: u32;
+}
+
 struct InterpRuntime {
     argumentPointers: Vector<u64>;
     argumentLengths: Vector<u64>;
+    handles: Vector<HostHandle>; // descriptor d is handles[d - 3]
+    listingAddresses: Vector<u64>;
+    listings: Vector<Vector<Vector<u8>>>;
+    listingNext: Vector<usize>;
+    nextListing: u64;
+    threads: Vector<InterpThread>; // in spawn order; the main thread first
+    current: u32;
+    recordAddresses: Vector<u64>; // the runtime's thread records, by thread
+    recordThreads: Vector<u32>;
+    mutexAddresses: Vector<u64>;
+    mutexOwners: Vector<u32>; // the owning thread, or none
 }
 
-fn newInterpRuntime() -> InterpRuntime =>
-    InterpRuntime { argumentPointers: Vector<u64>.create(), argumentLengths: Vector<u64>.create() };
+fn newInterpRuntime() -> InterpRuntime => InterpRuntime {
+    argumentPointers: Vector<u64>.create(),
+    argumentLengths: Vector<u64>.create(),
+    handles: Vector<HostHandle>.create(),
+    listingAddresses: Vector<u64>.create(),
+    listings: Vector<Vector<Vector<u8>>>.create(),
+    listingNext: Vector<usize>.create(),
+    nextListing: 0x7E5700000000,
+    threads: Vector<InterpThread>.create(),
+    current: 0,
+    recordAddresses: Vector<u64>.create(),
+    recordThreads: Vector<u32>.create(),
+    mutexAddresses: Vector<u64>.create(),
+    mutexOwners: Vector<u32>.create(),
+};
 
 /// nova_rt_args: argv as static memory (never copied by the native runtime either).
 fn startRuntime(it: borrow mut Interp) -> Result<void, Stop> {
@@ -21,15 +67,202 @@ fn startRuntime(it: borrow mut Interp) -> Result<void, Stop> {
         it.runtime.argumentPointers.push(pointer)!;
         it.runtime.argumentLengths.push(bytes.length as u64)!;
     }
+    // The main thread (Threads.cs's Running, made at the first thread operation; first either way).
+    it.runtime.threads.push(
+        InterpThread {
+            started: true,
+            finished: false,
+            waitingKind: 0,
+            waitingOn: 0,
+            isClosure: false,
+            function: none(),
+            data: 0,
+            block: 0,
+            resultType: none(),
+        },
+    )!;
     return Ok();
 }
 
-fn hostIsX8664() -> bool => targetIsX8664Host();
+fn hostIsX8664() -> bool => Target.isX86_64();
 
-/// Whether the interpreter itself runs on x86-64 (RuntimeInformation.ProcessArchitecture).
-fn targetIsX8664Host() -> bool => Target.isX86_64();
+// ---- Errors (HostIo's errno numbers and Kind) ----
 
-fn closeDescriptor(it: borrow mut Interp, fd: i32) -> Result<void, Stop> => Ok();
+fn errnoInvalid() -> i64 => 22;
+fn errnoNoMemory() -> i64 => 12;
+fn errnoRange() -> i64 => 34;
+
+/// Whether the host is Linux (its errno numbers differ from macOS's for a few errors).
+fn isLinuxHost() -> bool => match (File.kind("/proc/self")) {
+    Ok(kind) => kind != null,
+    Err(_) => false,
+};
+
+/// The errno a lib/core IoError stands for (HostIo's numbers), so the program's nova_io_kind maps it back.
+fn errnoOf(error: IoError) -> i64 => match (error) {
+    IoError.NotFound => 2,
+    IoError.PermissionDenied => 13,
+    IoError.AlreadyExists => 17,
+    IoError.IsDirectory => 21,
+    IoError.NotDirectory => 20,
+    IoError.InvalidInput => 22,
+    IoError.BrokenPipe => 32,
+    IoError.ConnectionRefused => if (isLinuxHost()) 111i64 else 61i64,
+    IoError.AddressInUse => if (isLinuxHost()) 98i64 else 48i64,
+    IoError.OutOfMemory => 12,
+    IoError.Other(code) => code as i64,
+};
+
+/// HostIo.Kind: the IoError variant (by declaration order) for an errno.
+fn ioKindOf(error: i64) -> u64 {
+    let linux = isLinuxHost();
+    if (error == 2) {
+        return 0;
+    }
+    if (error == 13 || error == 1) {
+        return 1;
+    }
+    if (error == 17) {
+        return 2;
+    }
+    if (error == 21) {
+        return 3;
+    }
+    if (error == 20) {
+        return 4;
+    }
+    if (error == 22 || error == (if (linux) 36i64 else 63i64)) {
+        return 5;
+    }
+    if (error == 32) {
+        return 6;
+    }
+    if (error == (if (linux) 111i64 else 61i64)) {
+        return 7;
+    }
+    if (error == (if (linux) 98i64 else 48i64)) {
+        return 8;
+    }
+    if (error == 12) {
+        return 9;
+    }
+    return 10;
+}
+
+/// nvIOR_: Err with the IoError variant for the errno (its number kept for Other), or Ok with the value.
+fn interpIoResult(c: borrow Checker, result: u32, value: i64, error: i64) -> Result<Value, Stop> {
+    let ok = resultOkOf(c, result);
+    let errorType = resultErrOf(c, result);
+    if (error != 0) {
+        let variant = enumVariantAt(c, errorType, ioKindOf(error) as usize);
+        let payload = borrow c.types.variants[variant as usize].payload;
+        var values = Vector<Value>.create();
+        if (payload.length > 0) {
+            values.push(fromInteger(c, intValue(error), c.types.fields[payload[0] as usize].typ)?)!;
+        }
+        var errors = Vector<Value>.create();
+        errors.push(makeEnumValue(c, errorType, variant, values)?)!;
+        return makeEnumValue(c, result, enumVariantAt(c, result, 1), errors);
+    }
+    if (c.types.is(ok, TypeKind.Void)) {
+        return okValue(c, result, null);
+    }
+    return okValue(c, result, fromInteger(c, intValue(value), ok)?);
+}
+
+fn requireHostIo(it: borrow Interp) -> Result<void, Stop> {
+    if (it.options.sandboxed) {
+        return Err(fault("refused: the sandbox allows no files, sockets or processes"));
+    }
+    return Ok();
+}
+
+// ---- Descriptors ----
+
+fn addHandle(it: borrow mut Interp, handle: HostHandle) -> i64 {
+    for (k in 0..it.runtime.handles.length) {
+        let closed = match (borrow it.runtime.handles[k]) {
+            HostHandle.Closed => true,
+            _ => false,
+        };
+        if (closed) {
+            it.runtime.handles[k] = handle;
+            return truncate<i64>(k) + 3;
+        }
+    }
+    it.runtime.handles.push(handle)!;
+    return truncate<i64>(it.runtime.handles.length - 1) + 3;
+}
+
+fn handleIndex(it: borrow Interp, fd: i32) -> usize? {
+    if (fd < 3 || truncate<usize>(fd - 3) >= it.runtime.handles.length) {
+        return null;
+    }
+    return truncate<usize>(fd - 3);
+}
+
+/// The drop glue of File, TcpListener and TcpStream: closes the descriptor, ignoring errors.
+fn closeDescriptor(it: borrow mut Interp, fd: i32) -> Result<void, Stop> {
+    match (handleIndex(it, fd)) {
+        Some(k) => { it.runtime.handles[k] = HostHandle.Closed; }
+        null => {}
+    }
+    return Ok();
+}
+
+fn descriptorArgument(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow mut Frame,
+    arguments: Range,
+    k: u32,
+) -> Result<i32, Stop> {
+    let reference = argument(it, c, n, frame, arguments, k)?.bits(0, 8)?;
+    return Ok(truncate<i32>(truncate<u32>(it.memory.loadBits(reference, 4)?)));
+}
+
+/// The bytes a slice argument names must be live and in bounds; the host's buffer for them.
+fn readBuffer(it: borrow Interp, slice: borrow Value) -> Result<Vector<u8>, Stop> {
+    let pointer = slice.bits(0, 8)?;
+    let length = slice.bits(8, 8)?;
+    let size = if (length > 0x40000000) 0x40000000 else length;
+    if (size > 0) {
+        it.memory.load(pointer, size as usize)?; // the whole buffer must be live and in bounds
+    }
+    var buffer = Vector<u8>.create();
+    for (i in 0..size) {
+        buffer.push(0)!;
+    }
+    return Ok(buffer);
+}
+
+/// The bytes read become initialised.
+fn storeRead(
+    it: borrow mut Interp,
+    slice: borrow Value,
+    buffer: borrow Vector<u8>,
+    count: usize,
+) -> Result<void, Stop> {
+    if (count > 0) {
+        it.memory.store(slice.bits(0, 8)?, initialisedValue(buffer[0..count]))?;
+    }
+    return Ok();
+}
+
+fn ioMessage(kind: u64) -> StringView => match (kind) {
+    0 => "No such file or directory",
+    1 => "Permission denied",
+    2 => "File exists",
+    3 => "Is a directory",
+    4 => "Not a directory",
+    5 => "Invalid argument",
+    6 => "Broken pipe",
+    7 => "Connection refused",
+    8 => "Address already in use",
+    9 => "Out of memory",
+    _ => "Input/output error",
+};
 
 fn ioBuiltin(
     it: borrow mut Interp,
@@ -52,10 +285,650 @@ fn ioBuiltin(
         let k = index.magnitude as usize;
         return Ok(someValue(c, resultType, viewValue(it.runtime.argumentPointers[k], it.runtime.argumentLengths[k]))?);
     }
-    var m = copyBytes("unsupported: the built-in ".bytes())!;
+    if (b == bfIoErrorMessage()) {
+        let errorType = builtinArgumentType(n, arguments, 0);
+        let value = argument(it, c, n, frame, arguments, 0)?;
+        var kind = value.bits(0, enumTagSize(c, errorType))?;
+        if (kind > 10) {
+            kind = 10;
+        }
+        let text = ioMessage(kind);
+        let pointer = literal(it, text.bytes())?;
+        return Ok(viewValue(pointer, text.bytes().length as u64));
+    }
+    if (b == bfFileOpen() || b == bfFileCreate()) {
+        requireHostIo(it)?;
+        let pathValue = argument(it, c, n, frame, arguments, 0)?;
+        let path = bytesOf(it, pathValue)?;
+        let text = StringView.fromUtf8(path.view())!;
+        let opened = if (b == bfFileOpen()) File.open(text) else File.create(text);
+        match (opened) {
+            Ok(file) => {
+                let fd = addHandle(it, HostHandle.OpenFile(file));
+                return Ok(interpIoResult(c, resultType, fd, 0)?);
+            }
+            Err(e) => { return Ok(interpIoResult(c, resultType, 0, errnoOf(e))?); }
+        }
+    }
+    if (b == bfFileRemove()) {
+        requireHostIo(it)?;
+        let pathValue = argument(it, c, n, frame, arguments, 0)?;
+        let path = bytesOf(it, pathValue)?;
+        return match (File.remove(StringView.fromUtf8(path.view())!)) {
+            Ok() => Ok(interpIoResult(c, resultType, 0, 0)?),
+            Err(e) => Ok(interpIoResult(c, resultType, 0, errnoOf(e))?),
+        };
+    }
+    if (b == bfResourceRead()) {
+        requireHostIo(it)?;
+        let fd = descriptorArgument(it, c, n, frame, arguments, 0)?;
+        let slice = argument(it, c, n, frame, arguments, 1)?;
+        var buffer = readBuffer(it, slice)?;
+        var read: Result<usize, IoError> = Err(IoError.Other(9));
+        match (handleIndex(it, fd)) {
+            Some(k) => {
+                match (borrow mut it.runtime.handles[k]) {
+                    HostHandle.OpenFile(file) => { read = file.read(mut buffer[..]); }
+                    HostHandle.Stream(stream) => { read = stream.read(mut buffer[..]); }
+                    _ => {}
+                }
+            }
+            null => {}
+        }
+        match (read) {
+            Ok(count) => {
+                storeRead(it, slice, buffer, count)?;
+                return Ok(interpIoResult(c, resultType, truncate<i64>(count), 0)?);
+            }
+            Err(e) => { return Ok(interpIoResult(c, resultType, 0, errnoOf(e))?); }
+        }
+    }
+    if (b == bfConsoleRead()) {
+        let slice = argument(it, c, n, frame, arguments, 0)?;
+        var buffer = readBuffer(it, slice)?;
+        match (Console.read(mut buffer[..])) {
+            Ok(count) => {
+                storeRead(it, slice, buffer, count)?;
+                return Ok(interpIoResult(c, resultType, truncate<i64>(count), 0)?);
+            }
+            Err(e) => { return Ok(interpIoResult(c, resultType, 0, errnoOf(e))?); }
+        }
+    }
+    if (b == bfResourceWrite()) {
+        requireHostIo(it)?;
+        let fd = descriptorArgument(it, c, n, frame, arguments, 0)?;
+        let value = argument(it, c, n, frame, arguments, 1)?;
+        let bytes = bytesOf(it, value)?;
+        var written: Result<void, IoError> = Err(IoError.Other(9));
+        match (handleIndex(it, fd)) {
+            Some(k) => {
+                match (borrow mut it.runtime.handles[k]) {
+                    HostHandle.OpenFile(file) => { written = file.write(bytes.view()); }
+                    HostHandle.Stream(stream) => { written = stream.write(bytes.view()); }
+                    _ => {}
+                }
+            }
+            null => {}
+        }
+        return match (written) {
+            Ok() => Ok(interpIoResult(c, resultType, truncate<i64>(bytes.length), 0)?),
+            Err(e) => Ok(interpIoResult(c, resultType, 0, errnoOf(e))?),
+        };
+    }
+    if (b == bfTcpListen() || b == bfTcpConnect()) {
+        requireHostIo(it)?;
+        let addressValue = argument(it, c, n, frame, arguments, 0)?;
+        let addressText = bytesOf(it, addressValue)?;
+        let port = truncate<u16>(argumentInteger(it, c, n, frame, arguments, 1)?.magnitude);
+        let text = StringView.fromUtf8(addressText.view())!;
+        if (b == bfTcpListen()) {
+            match (TcpListener.bind(text, port)) {
+                Ok(listener) => {
+                    let fd = addHandle(it, HostHandle.Listener(listener));
+                    return Ok(interpIoResult(c, resultType, fd, 0)?);
+                }
+                Err(e) => { return Ok(interpIoResult(c, resultType, 0, errnoOf(e))?); }
+            }
+        }
+        match (TcpStream.connect(text, port)) {
+            Ok(stream) => {
+                let fd = addHandle(it, HostHandle.Stream(stream));
+                return Ok(interpIoResult(c, resultType, fd, 0)?);
+            }
+            Err(e) => { return Ok(interpIoResult(c, resultType, 0, errnoOf(e))?); }
+        }
+    }
+    if (b == bfTcpPort()) {
+        requireHostIo(it)?;
+        let fd = descriptorArgument(it, c, n, frame, arguments, 0)?;
+        var port: Result<u16, IoError> = Err(IoError.Other(9));
+        match (handleIndex(it, fd)) {
+            Some(k) => {
+                match (borrow mut it.runtime.handles[k]) {
+                    HostHandle.Listener(listener) => { port = listener.port(); }
+                    _ => {}
+                }
+            }
+            null => {}
+        }
+        return match (port) {
+            Ok(p) => Ok(interpIoResult(c, resultType, p as i64, 0)?),
+            Err(e) => Ok(interpIoResult(c, resultType, 0, errnoOf(e))?),
+        };
+    }
+    if (b == bfTcpAccept()) {
+        requireHostIo(it)?;
+        let fd = descriptorArgument(it, c, n, frame, arguments, 0)?;
+        var accepted: Result<TcpStream, IoError> = Err(IoError.Other(9));
+        match (handleIndex(it, fd)) {
+            Some(k) => {
+                match (borrow mut it.runtime.handles[k]) {
+                    HostHandle.Listener(listener) => { accepted = listener.accept(); }
+                    _ => {}
+                }
+            }
+            null => {}
+        }
+        match (accepted) {
+            Ok(stream) => {
+                let fd2 = addHandle(it, HostHandle.Stream(stream));
+                return Ok(interpIoResult(c, resultType, fd2, 0)?);
+            }
+            Err(e) => { return Ok(interpIoResult(c, resultType, 0, errnoOf(e))?); }
+        }
+    }
+    if (b == bfTcpShutdownWrite()) {
+        requireHostIo(it)?;
+        let fd = descriptorArgument(it, c, n, frame, arguments, 0)?;
+        var done: Result<void, IoError> = Err(IoError.Other(9));
+        match (handleIndex(it, fd)) {
+            Some(k) => {
+                match (borrow mut it.runtime.handles[k]) {
+                    HostHandle.Stream(stream) => { done = stream.shutdownWrite(); }
+                    _ => {}
+                }
+            }
+            null => {}
+        }
+        return match (done) {
+            Ok() => Ok(interpIoResult(c, resultType, 0, 0)?),
+            Err(e) => Ok(interpIoResult(c, resultType, 0, errnoOf(e))?),
+        };
+    }
+    if (b == bfProcessRun()) {
+        requireHostIo(it)?;
+        let program = argument(it, c, n, frame, arguments, 0)?;
+        let vector = argument(it, c, n, frame, arguments, 1)?.bits(0, 8)?;
+        let outcome = processRun(it, program, vector)?;
+        return Ok(interpIoResult(c, resultType, outcome.value, outcome.error)?);
+    }
+    var m = copyBytes("cannot interpret built-in ".bytes())!;
     appendText(mut m, builtinFunctionName(b))!;
-    appendText(mut m, " (not yet ported to the CeeSafe interpreter)")!;
     return Err(faultBytes(m.view()));
+}
+
+struct HostOutcome {
+    value: i64;
+    error: i64;
+}
+
+fn hostOk(value: i64) -> HostOutcome => HostOutcome { value: value, error: 0 };
+
+fn hostError(error: i64) -> HostOutcome => HostOutcome { value: 0, error: error };
+
+/// nova_process_run: the argument copies are counted allocations (argv, then each string, stopping at the first
+/// failure); standard output is flushed; the child's exit status, or 128 + its signal.
+fn processRun(it: borrow mut Interp, program: borrow Value, vector: u64) -> Result<HostOutcome, Stop> {
+    let count = it.memory.loadBits(vector + 8, 8)?;
+    if (count > 4096) {
+        return Ok(hostError(errnoInvalid()));
+    }
+    var texts = Vector<Vector<u8>>.create();
+    texts.push(bytesOf(it, program)?)!;
+    for (i in 0..count) {
+        let base = pointerAt(it, vector)?;
+        let view = it.memory.load(base + i * 16, 16)?;
+        texts.push(bytesOf(it, view)?)!;
+    }
+    let argv = alloc(it, (count + 2) * 8, allocSystem())?;
+    if (argv == 0) {
+        return Ok(hostError(errnoNoMemory()));
+    }
+    var made = Vector<u64>.create();
+    var error: i64 = 0;
+    for (text in texts.view()) {
+        var zero = false;
+        for (byte in text.view()) {
+            zero = zero || byte == 0;
+        }
+        if (zero) {
+            error = errnoInvalid();
+            break;
+        }
+        let copy = alloc(it, (text.length as u64) + 1, allocSystem())?;
+        if (copy == 0) {
+            error = errnoNoMemory();
+            break;
+        }
+        made.push(copy)!;
+    }
+    var result = hostError(error);
+    if (error == 0) {
+        flushOutput(it);
+        var views = Vector<StringView>.create();
+        for (k in 1..texts.length) {
+            views.push(StringView.fromUtf8(texts[k].view())!)!;
+        }
+        result = match (Process.run(StringView.fromUtf8(texts[0].view())!, views)) {
+            Ok(status) => hostOk(status as i64),
+            Err(e) => hostError(errnoOf(e)),
+        };
+    }
+    for (copy in made.view()) {
+        freeMemory(it, copy)?;
+    }
+    freeMemory(it, argv)?;
+    return Ok(result);
+}
+
+// ---- Host services (HostServices.cs; lib/std/host.nova's extern functions) ----
+
+fn hostResult(value: i64) -> Value => valueOf(truncate<u64>(value), 8);
+
+fn hostFailure(errno: i64) -> Value => hostResult(0 - errno);
+
+/// The bytes at arguments[pointer] of the length at arguments[length].
+fn hostBytes(
+    it: borrow Interp,
+    arguments: borrow Vector<Value>,
+    pointer: usize,
+    length: usize,
+) -> Result<Vector<u8>, Stop> {
+    let count = arguments[length].bits(0, 8)?;
+    if (count > 0x7FFFFFFF) {
+        return Err(fault("a host-service argument larger than the interpreter's memory"));
+    }
+    let value = it.memory.load(arguments[pointer].bits(0, 8)?, count as usize)?;
+    return Ok(value.data);
+}
+
+/// nova_c_path: no zero byte, at most 4,095 bytes, valid text; null otherwise.
+fn hostPath(
+    it: borrow Interp,
+    arguments: borrow Vector<Value>,
+    pointer: usize,
+    length: usize,
+) -> Result<Vector<u8>?, Stop> {
+    let bytes = hostBytes(it, arguments, pointer, length)?;
+    if (bytes.length >= 4096) {
+        return Ok(null);
+    }
+    for (b in bytes.view()) {
+        if (b == 0) {
+            return Ok(null);
+        }
+    }
+    if (StringView.fromUtf8(bytes.view()) == null) {
+        return Ok(null);
+    }
+    return Ok(bytes);
+}
+
+/// Writes text to the buffer at arguments[buffer] of the capacity at arguments[capacity] (ERANGE if it does not fit).
+fn hostOut(
+    it: borrow mut Interp,
+    arguments: borrow Vector<Value>,
+    text: Slice<u8>,
+    buffer: usize,
+    capacity: usize,
+) -> Result<Value, Stop> {
+    if ((text.length as u64) > arguments[capacity].bits(0, 8)?) {
+        return Ok(hostFailure(errnoRange()));
+    }
+    if (text.length > 0) {
+        it.memory.store(arguments[buffer].bits(0, 8)?, initialisedValue(text))?;
+    }
+    return Ok(hostResult(truncate<i64>(text.length)));
+}
+
+fn hostService(it: borrow mut Interp, name: Slice<u8>, arguments: borrow Vector<Value>) -> Result<Value, Stop> {
+    requireHostIo(it)?;
+    if (sameText(name, "nova_host_env")) {
+        let key = hostBytes(it, arguments, 0, 1)?;
+        var bad = key.length >= 4096;
+        for (b in key.view()) {
+            bad = bad || b == 0;
+        }
+        let keyText = StringView.fromUtf8(key.view());
+        if (bad || keyText == null) {
+            return Ok(hostFailure(errnoInvalid()));
+        }
+        match (Environment.variable(keyText!)) {
+            Some(value) => {
+                let pointer = literal(it, value.bytes())?;
+                it.memory.storeBits(arguments[2].bits(0, 8)?, pointer, 8)?;
+                it.memory.storeBits(arguments[3].bits(0, 8)?, value.bytes().length as u64, 8)?;
+                return Ok(hostResult(1));
+            }
+            null => { return Ok(hostResult(0)); }
+        }
+    }
+    if (sameText(name, "nova_host_path_kind")) {
+        let path = match (hostPath(it, arguments, 0, 1)?) {
+            Some(p) => p,
+            null => { return Ok(hostFailure(errnoInvalid())); }
+        };
+        let kind: i64 = match (File.kind(StringView.fromUtf8(path.view())!)) {
+            Ok(found) => match (found) {
+                Some(PathKind.Directory) => 2,
+                Some(_) => 1,
+                null => 0,
+            },
+            Err(_) => 0,
+        };
+        return Ok(hostResult(kind));
+    }
+    if (sameText(name, "nova_host_dir_create") || sameText(name, "nova_host_dir_remove")) {
+        let path = match (hostPath(it, arguments, 0, 1)?) {
+            Some(p) => p,
+            null => { return Ok(hostFailure(errnoInvalid())); }
+        };
+        let text = StringView.fromUtf8(path.view())!;
+        let done = if (sameText(name, "nova_host_dir_create")) Directory.create(text) else Directory.remove(text);
+        return match (done) {
+            Ok() => Ok(hostResult(0)),
+            Err(e) => Ok(hostFailure(errnoOf(e))),
+        };
+    }
+    if (sameText(name, "nova_host_dir_open")) {
+        let path = hostPath(it, arguments, 0, 1)?;
+        var error: i64 = 0;
+        var names = Vector<Vector<u8>>.create();
+        match (path) {
+            Some(p) => {
+                match (Directory.list(StringView.fromUtf8(p.view())!)) {
+                    Ok(listed) => {
+                        for (entry in listed.view()) {
+                            names.push(copyBytes(entry.view().bytes())!)!;
+                        }
+                    }
+                    Err(e) => { error = errnoOf(e); }
+                }
+            }
+            null => { error = errnoInvalid(); }
+        }
+        if (error != 0) {
+            it.memory.storeBits(arguments[2].bits(0, 8)?, truncate<u64>(error), 4)?;
+            return Ok(hostResult(0));
+        }
+        let listing = it.runtime.nextListing;
+        it.runtime.nextListing += 1;
+        it.runtime.listingAddresses.push(listing)!;
+        it.runtime.listings.push(names)!;
+        it.runtime.listingNext.push(0)!;
+        return Ok(hostResult(truncate<i64>(listing)));
+    }
+    if (sameText(name, "nova_host_dir_next") || sameText(name, "nova_host_dir_close")) {
+        let listing = arguments[0].bits(0, 8)?;
+        var index = it.runtime.listingAddresses.length;
+        for (k in 0..it.runtime.listingAddresses.length) {
+            if (it.runtime.listingAddresses[k] == listing) {
+                index = k;
+            }
+        }
+        if (index == it.runtime.listingAddresses.length) {
+            return Err(addressMessage("a directory listing that is not open (", listing, ")"));
+        }
+        if (sameText(name, "nova_host_dir_close")) {
+            it.runtime.listingAddresses[index] = 0;
+            return Ok(hostResult(0));
+        }
+        let next = it.runtime.listingNext[index];
+        if (next == it.runtime.listings[index].length) {
+            return Ok(hostResult(0));
+        }
+        it.runtime.listingNext[index] = next + 1;
+        let entry = copyBytes(it.runtime.listings[index][next].view())!;
+        let pointer = literal(it, entry.view())?;
+        it.memory.storeBits(arguments[1].bits(0, 8)?, pointer, 8)?;
+        it.memory.storeBits(arguments[2].bits(0, 8)?, entry.length as u64, 8)?;
+        return Ok(hostResult(1));
+    }
+    if (sameText(name, "nova_host_temporary")) {
+        return match (Directory.temporary()) {
+            Ok(path) => hostOut(it, arguments, path.view().bytes(), 0, 1),
+            Err(e) => Ok(hostFailure(errnoOf(e))),
+        };
+    }
+    if (sameText(name, "nova_host_current")) {
+        if (it.options.workingDirectory.length > 0) {
+            let directory = copyBytes(it.options.workingDirectory.view())!;
+            return hostOut(it, arguments, directory.view(), 0, 1);
+        }
+        return match (Directory.current()) {
+            Ok(path) => hostOut(it, arguments, path.view().bytes(), 0, 1),
+            Err(e) => Ok(hostFailure(errnoOf(e))),
+        };
+    }
+    // nova_host_spawn: argv as views, then the paths of standard input, output and error.
+    let count = arguments[1].bits(0, 8)?;
+    if (count == 0 || count > 4097) {
+        return Ok(hostFailure(errnoInvalid()));
+    }
+    var argv = Vector<Vector<u8>>.create();
+    for (i in 0..count) {
+        let view = it.memory.load(arguments[0].bits(0, 8)? + i * 16, 16)?;
+        let text = bytesOf(it, view)?;
+        for (b in text.view()) {
+            if (b == 0) {
+                return Ok(hostFailure(errnoInvalid()));
+            }
+        }
+        argv.push(text)!;
+    }
+    let input = hostPath(it, arguments, 2, 3)?;
+    let output = hostPath(it, arguments, 4, 5)?;
+    let errors = hostPath(it, arguments, 6, 7)?;
+    if (input == null || output == null || errors == null) {
+        return Ok(hostFailure(errnoInvalid()));
+    }
+    let inputPath = input!;
+    let outputPath = output!;
+    let errorsPath = errors!;
+    let stdinBytes = match (readFile(StringView.fromUtf8(inputPath.view())!)) {
+        Ok(bytes) => bytes,
+        Err(_) => Vector<u8>.create(),
+    };
+    flushOutput(it);
+    var views = Vector<StringView>.create();
+    for (k in 1..argv.length) {
+        views.push(StringView.fromUtf8(argv[k].view())!)!;
+    }
+    match (Process.capture(StringView.fromUtf8(argv[0].view())!, views, stdinBytes.view())) {
+        Ok(captured) => {
+            match (writeFile(StringView.fromUtf8(outputPath.view())!, captured.stdout.view())) {
+                Ok() => {}
+                Err(e) => { return Ok(hostFailure(errnoOf(e))); }
+            }
+            match (writeFile(StringView.fromUtf8(errorsPath.view())!, captured.stderr.view())) {
+                Ok() => {}
+                Err(e) => { return Ok(hostFailure(errnoOf(e))); }
+            }
+            return Ok(hostResult(captured.status as i64));
+        }
+        Err(e) => { return Ok(hostFailure(errnoOf(e))); }
+    }
+}
+
+// ---- The C library model (CLibrary.cs) ----
+
+/// The shapes of a modelled C function's parameters and result: P pointer, i int32_t, s uint64_t/size_t, u uint32_t,
+/// l int64_t, and the result after ':' ('-' for void). Null for a function the interpreter does not model.
+fn cLibraryShape(name: Slice<u8>) -> StringView? {
+    if (sameText(name, "strlen")) {
+        return "P:s";
+    }
+    if (sameText(name, "puts")) {
+        return "P:i";
+    }
+    if (sameText(name, "abs")) {
+        return "i:i";
+    }
+    if (sameText(name, "memcmp")) {
+        return "PPs:i";
+    }
+    if (sameText(name, "memcpy")) {
+        return "PPs:P";
+    }
+    if (sameText(name, "memset")) {
+        return "Pis:P";
+    }
+    if (sameText(name, "malloc")) {
+        return "s:P";
+    }
+    if (sameText(name, "free")) {
+        return "P:-";
+    }
+    if (sameText(name, "nova_host_env")) {
+        return "PsPP:l";
+    }
+    if (sameText(name, "nova_host_path_kind")) {
+        return "Ps:l";
+    }
+    if (sameText(name, "nova_host_dir_create")) {
+        return "Ps:l";
+    }
+    if (sameText(name, "nova_host_dir_remove")) {
+        return "Ps:l";
+    }
+    if (sameText(name, "nova_host_dir_open")) {
+        return "PsP:P";
+    }
+    if (sameText(name, "nova_host_dir_next")) {
+        return "PPP:l";
+    }
+    if (sameText(name, "nova_host_dir_close")) {
+        return "P:-";
+    }
+    if (sameText(name, "nova_host_temporary")) {
+        return "Ps:l";
+    }
+    if (sameText(name, "nova_host_current")) {
+        return "Ps:l";
+    }
+    if (sameText(name, "nova_host_spawn")) {
+        return "PsPsPsPs:l";
+    }
+    if (sameText(name, "nova_io_kind")) {
+        return "i:u";
+    }
+    if (sameText(name, "nova_mutex_create")) {
+        return ":P";
+    }
+    if (sameText(name, "nova_mutex_lock")) {
+        return "P:-";
+    }
+    if (sameText(name, "nova_mutex_unlock")) {
+        return "P:-";
+    }
+    if (sameText(name, "nova_mutex_destroy")) {
+        return "P:-";
+    }
+    if (sameText(name, "nova_atomic_load_u64")) {
+        return "P:s";
+    }
+    if (sameText(name, "nova_atomic_store_u64")) {
+        return "Ps:-";
+    }
+    if (sameText(name, "nova_atomic_swap_u64")) {
+        return "Ps:s";
+    }
+    if (sameText(name, "nova_atomic_cas_u64")) {
+        return "Pss:s";
+    }
+    if (sameText(name, "nova_atomic_add_u64")) {
+        return "Ps:s";
+    }
+    if (sameText(name, "nova_atomic_load_u32")) {
+        return "P:u";
+    }
+    if (sameText(name, "nova_atomic_store_u32")) {
+        return "Pu:-";
+    }
+    if (sameText(name, "nova_atomic_swap_u32")) {
+        return "Pu:u";
+    }
+    if (sameText(name, "nova_atomic_cas_u32")) {
+        return "Puu:u";
+    }
+    if (sameText(name, "nova_atomic_add_u32")) {
+        return "Pu:u";
+    }
+    if (sameText(name, "nova_atomic_load_ord_u64")) {
+        return "Pi:s";
+    }
+    if (sameText(name, "nova_atomic_store_ord_u64")) {
+        return "Psi:-";
+    }
+    if (sameText(name, "nova_atomic_swap_ord_u64")) {
+        return "Psi:s";
+    }
+    if (sameText(name, "nova_atomic_cas_ord_u64")) {
+        return "Pssi:s";
+    }
+    if (sameText(name, "nova_atomic_add_ord_u64")) {
+        return "Psi:s";
+    }
+    if (sameText(name, "nova_atomic_load_ord_u32")) {
+        return "Pi:u";
+    }
+    if (sameText(name, "nova_atomic_store_ord_u32")) {
+        return "Pui:-";
+    }
+    if (sameText(name, "nova_atomic_swap_ord_u32")) {
+        return "Pui:u";
+    }
+    if (sameText(name, "nova_atomic_cas_ord_u32")) {
+        return "Puui:u";
+    }
+    if (sameText(name, "nova_atomic_add_ord_u32")) {
+        return "Pui:u";
+    }
+    return null;
+}
+
+fn fitsShape(c: borrow Checker, t: u32, shape: u8) -> bool {
+    let info = c.types.info(t);
+    if (shape == 'P') {
+        return c.types.is(t, TypeKind.RawPointer);
+    }
+    let integer = c.types.is(t, TypeKind.Integer);
+    return match (shape) {
+        'i' => integer && info.bits == 32 && info.signed,
+        'u' => integer && info.bits == 32 && !info.signed,
+        'l' => integer && info.bits == 64 && info.signed,
+        _ => integer && info.bits == 64 && !info.signed,
+    };
+}
+
+fn modelFits(c: borrow Checker, function: borrow HirFunction, shape: StringView) -> bool {
+    let s = shape.bytes();
+    var colon: usize = 0;
+    while (s[colon] != ':') {
+        colon += 1;
+    }
+    if (colon != function.parameters.length) {
+        return false;
+    }
+    for (k in 0..colon) {
+        if (!fitsShape(c, c.hir.locals[function.parameters[k] as usize].typ, s[k])) {
+            return false;
+        }
+    }
+    if (s[colon + 1] == '-') {
+        return c.types.is(function.returnType, TypeKind.Void);
+    }
+    return fitsShape(c, function.returnType, s[colon + 1]);
 }
 
 fn callC(
@@ -65,10 +938,285 @@ fn callC(
     hir: u32,
     arguments: borrow Vector<Value>,
 ) -> Result<Value?, Stop> {
-    var m = copyBytes("unsupported: a call of the C function '".bytes())!;
-    appendBytes(mut m, c.name(c.hir.functions[hir as usize].name))!;
-    appendText(mut m, "' (not yet ported to the CeeSafe interpreter)")!;
-    return Err(faultBytes(m.view()));
+    let function = borrow c.hir.functions[hir as usize];
+    let name = copyBytes(c.name(function.name))!;
+    let fits = match (cLibraryShape(name.view())) {
+        Some(shape) => modelFits(c, function, shape),
+        null => false,
+    };
+    if (!fits) {
+        var m = copyBytes("unsupported: call to C function '".bytes())!;
+        appendBytes(mut m, name.view())!;
+        appendText(mut m, "' (the interpreter runs no C code)")!;
+        return Err(faultBytes(m.view()));
+    }
+    let n0 = name.view();
+    if (sameText(n0, "strlen")) {
+        let start = arguments[0].bits(0, 8)?;
+        var length: u64 = 0;
+        while (it.memory.loadBits(start + length, 1)? != 0) {
+            length += 1;
+        }
+        return Ok(valueOf(length, 8));
+    }
+    if (sameText(n0, "puts")) {
+        var bytes = Vector<u8>.create();
+        var at = arguments[0].bits(0, 8)?;
+        loop {
+            let b = it.memory.loadBits(at, 1)?;
+            if (b == 0) {
+                break;
+            }
+            bytes.push(truncate<u8>(b))!;
+            at += 1;
+        }
+        bytes.push('\n')!;
+        writeOutput(it, bytes.view());
+        return Ok(valueOf(0, 4));
+    }
+    if (sameText(n0, "abs")) {
+        // abs(INT_MIN) is undefined in C.
+        let v = truncate<i32>(truncate<u32>(arguments[0].bits(0, 4)?));
+        if (v == -2147483648) {
+            return Err(fault("abs of the minimum int (undefined in C)"));
+        }
+        return Ok(valueOf(truncate<u64>(if (v < 0) 0 - v else v), 4));
+    }
+    if (sameText(n0, "memcmp")) {
+        let count = arguments[2].bits(0, 8)?;
+        for (i in 0..count) {
+            let a = it.memory.loadBits(arguments[0].bits(0, 8)? + i, 1)?;
+            let b = it.memory.loadBits(arguments[1].bits(0, 8)? + i, 1)?;
+            if (a != b) {
+                return Ok(valueOf(if (a < b) 0xFFFFFFFF else 1, 4));
+            }
+        }
+        return Ok(valueOf(0, 4));
+    }
+    if (sameText(n0, "memcpy")) {
+        let to = arguments[0].bits(0, 8)?;
+        let from = arguments[1].bits(0, 8)?;
+        let count = arguments[2].bits(0, 8)?;
+        if (count > 0 && to < from + count && from < to + count) {
+            return Err(fault("memcpy with overlapping ranges (undefined in C)"));
+        }
+        if (count > 0) {
+            let value = it.memory.load(from, count as usize)?;
+            it.memory.store(to, value)?;
+        }
+        return Ok(valueOf(to, 8));
+    }
+    if (sameText(n0, "malloc")) {
+        // A heap allocation of the interpreter's memory (not counted as Nova's own: it is C's).
+        let size = arguments[0].bits(0, 8)?;
+        if (size == 0) {
+            return Ok(valueOf(0, 8));
+        }
+        return Ok(valueOf(it.memory.allocate(allocationHeap(), size as usize, false, "malloc".bytes())?, 8));
+    }
+    if (sameText(n0, "free")) {
+        let pointer = arguments[0].bits(0, 8)?;
+        if (pointer != 0) {
+            it.memory.free(pointer)?;
+        }
+        return Ok(null);
+    }
+    if (sameText(n0, "memset")) {
+        let to = arguments[0].bits(0, 8)?;
+        let count = arguments[2].bits(0, 8)?;
+        let fill = arguments[1].bits(0, 4)? & 0xFF;
+        for (i in 0..count) {
+            it.memory.store(to + i, valueOf(fill, 1))?;
+        }
+        return Ok(valueOf(to, 8));
+    }
+    if (sameText(n0, "nova_mutex_create")) {
+        return Ok(valueOf(mutexCreate(it)?, 8));
+    }
+    if (sameText(n0, "nova_mutex_lock")) {
+        mutexLock(it, c, n, arguments[0].bits(0, 8)?)?;
+        return Ok(null);
+    }
+    if (sameText(n0, "nova_mutex_unlock")) {
+        let address = arguments[0].bits(0, 8)?;
+        for (k in 0..it.runtime.mutexAddresses.length) {
+            if (it.runtime.mutexAddresses[k] == address) {
+                it.runtime.mutexOwners[k] = none();
+            }
+        }
+        return Ok(null);
+    }
+    if (sameText(n0, "nova_mutex_destroy")) {
+        let address = arguments[0].bits(0, 8)?;
+        for (k in 0..it.runtime.mutexAddresses.length) {
+            if (it.runtime.mutexAddresses[k] == address) {
+                it.runtime.mutexAddresses[k] = 0;
+            }
+        }
+        freeMemory(it, address)?;
+        return Ok(null);
+    }
+    if (sameText(n0, "nova_io_kind")) {
+        let error = truncate<i32>(truncate<u32>(arguments[0].bits(0, 4)?));
+        return Ok(valueOf(ioKindOf(error as i64), 4));
+    }
+    if (n0.length > 10 && sameText(n0[0..10], "nova_host_")) {
+        let result = hostService(it, n0, arguments)?;
+        return Ok(if (sameText(n0, "nova_host_dir_close")) null else result);
+    }
+    // nova_atomic_*: one thread runs at a time (§5), so every operation is atomic; the width is the name's suffix.
+    let size: usize = if (sameText(n0[n0.length - 3..], "u64")) 8 else 4;
+    let mask: u64 = if (size == 8) 0xFFFFFFFFFFFFFFFF else 0xFFFFFFFF;
+    let at = arguments[0].bits(0, 8)?;
+    let old = it.memory.loadBits(at, size)?;
+    let operation = n0[12..n0.length - 4];
+    let ordered = operation.length > 4 && sameText(operation[operation.length - 4..], "_ord");
+    let plain = operation[0..(if (ordered) operation.length - 4 else operation.length)];
+    if (sameText(plain, "store")) {
+        it.memory.storeBits(at, arguments[1].bits(0, size)?, size)?;
+        return Ok(null);
+    }
+    if (sameText(plain, "swap")) {
+        it.memory.storeBits(at, arguments[1].bits(0, size)?, size)?;
+    } else if (sameText(plain, "cas")) {
+        if (old == arguments[1].bits(0, size)?) {
+            it.memory.storeBits(at, arguments[2].bits(0, size)?, size)?;
+        }
+    } else if (sameText(plain, "add")) {
+        it.memory.storeBits(at, old.wrappingAdd(arguments[1].bits(0, size)?) & mask, size)?;
+    }
+    return Ok(valueOf(old, size));
+}
+
+// ---- Threads (Threads.cs): cooperative, one at a time, switching only when the running thread blocks ----
+
+fn mutexOwner(it: borrow Interp, address: u64) -> u32 {
+    for (k in 0..it.runtime.mutexAddresses.length) {
+        if (it.runtime.mutexAddresses[k] == address) {
+            return it.runtime.mutexOwners[k];
+        }
+    }
+    return none();
+}
+
+fn runnable(it: borrow Interp, k: usize) -> bool {
+    let t = borrow it.runtime.threads[k];
+    if (t.finished) {
+        return false;
+    }
+    if (t.waitingKind == 1) {
+        return it.runtime.threads[t.waitingOn as usize].finished;
+    }
+    if (t.waitingKind == 2) {
+        return mutexOwner(it, t.waitingOn) == none();
+    }
+    return true;
+}
+
+/// Waits until the running thread's wait is over: the baton goes to the first runnable thread in spawn order, which
+/// runs here until it ends. A thread that started and is blocked deeper in this host stack cannot be resumed out of
+/// order (docs/p8-plan.md, known differences); if no thread can run, it is a deadlock.
+fn waitHere(it: borrow mut Interp, c: borrow Checker, n: borrow NirProgram, kind: u32, on: u64) -> Result<void, Stop> {
+    let me = it.runtime.current;
+    it.runtime.threads[me as usize].waitingKind = kind;
+    it.runtime.threads[me as usize].waitingOn = on;
+    loop {
+        var next = none();
+        for (k in 0..it.runtime.threads.length) {
+            if (next == none() && runnable(it, k)) {
+                next = truncate<u32>(k);
+            }
+        }
+        if (next == me) {
+            break;
+        }
+        var startable = none();
+        if (next != none() && !it.runtime.threads[next as usize].started) {
+            startable = next;
+        } else {
+            for (k in 0..it.runtime.threads.length) {
+                if (startable == none() && runnable(it, k) && !it.runtime.threads[k].started) {
+                    startable = truncate<u32>(k);
+                }
+            }
+            if (startable == none() && runnable(it, me as usize)) {
+                break;
+            }
+        }
+        if (startable == none()) {
+            return Err(fault("deadlock: every thread is waiting for another (type-system.md §38)"));
+        }
+        runThread(it, c, n, startable)?;
+    }
+    it.runtime.threads[me as usize].waitingKind = 0;
+    it.runtime.current = me;
+    return Ok();
+}
+
+/// Runs a thread that has not started, here, until it ends.
+fn runThread(it: borrow mut Interp, c: borrow Checker, n: borrow NirProgram, k: u32) -> Result<void, Stop> {
+    let previous = it.runtime.current;
+    it.runtime.threads[k as usize].started = true;
+    it.runtime.current = k;
+    let t = it.runtime.threads[k as usize];
+    var arguments = Vector<Value>.create();
+    arguments.push(valueOf(t.data, 8))!;
+    if (t.isClosure) {
+        let code = it.memory.loadBits(t.data, 8)?;
+        callThrough(it, c, n, code, arguments)?;
+    } else {
+        match (callFunction(it, c, n, t.function, arguments)?) {
+            Some(value) => {
+                let offset = resultOffset(c, t.resultType)?;
+                it.memory.store(t.block + offset, value)?;
+            }
+            null => {}
+        }
+    }
+    it.runtime.threads[k as usize].finished = true;
+    it.runtime.current = previous;
+    return Ok();
+}
+
+/// The record of a thread: its runtime record, its closure (data, table), then the body's result.
+fn resultOffset(c: borrow Checker, result: u32) -> Result<u64, Stop> {
+    let align = typeAlign(c, result)?;
+    return Ok((24 + align - 1) / align * align);
+}
+
+fn threadRecordSize(c: borrow Checker, result: u32) -> Result<u64, Stop> {
+    if (c.types.is(result, TypeKind.Void)) {
+        return Ok(24);
+    }
+    return Ok(resultOffset(c, result)? + typeSize(c, result)? as u64);
+}
+
+fn addThread(it: borrow mut Interp, isClosure: bool, function: u32, data: u64, block: u64, resultType: u32) -> u32 {
+    it.runtime.threads.push(
+        InterpThread {
+            started: false,
+            finished: false,
+            waitingKind: 0,
+            waitingOn: 0,
+            isClosure: isClosure,
+            function: function,
+            data: data,
+            block: block,
+            resultType: resultType,
+        },
+    )!;
+    return truncate<u32>(it.runtime.threads.length - 1);
+}
+
+/// The first dyn table pairing an environment with a `dyn fn` (ThreadSpawn's dyn).
+fn dynFunctionTableOf(c: borrow Checker, implementation: u32) -> Result<usize, Stop> {
+    for (k in 0..c.dynTables.length) {
+        let table = borrow c.dynTables[k];
+        if (table.implementation == implementation && c.types.info(table.dynType).dynInterface == none()) {
+            return Ok(k);
+        }
+    }
+    return Err(fault("a thread body with no dyn table"));
 }
 
 fn threadBuiltin(
@@ -79,14 +1227,177 @@ fn threadBuiltin(
     r: u32,
     b: u32,
     arguments: Range,
-) -> Result<Value?, Stop> =>
-    Err(fault("unsupported: threads (not yet ported to the CeeSafe interpreter)"));
+) -> Result<Value?, Stop> {
+    let resultType = n.rvalueTypes[r as usize];
+    if (b == bfThreadSpawn()) {
+        // nvTS_: the environment into the heap, and a thread running it; the same three allocations as the C runtime.
+        let environment = argument(it, c, n, frame, arguments, 0)?;
+        let environmentType = builtinArgumentType(n, arguments, 0);
+        let thread = resultOkOf(c, resultType);
+        let result = elementOf(c, thread);
+        let table = dynFunctionTableOf(c, environmentType)?;
+        let block = alloc(it, threadRecordSize(c, result)?, allocSystem())?;
+        if (block == 0) {
+            destroyValue(it, c, n, environmentType, environment)?;
+            return Ok(outOfMemory(c, resultType)?);
+        }
+        let data = alloc(it, typeSize(c, environmentType)? as u64, allocSystem())?;
+        if (data == 0) {
+            freeMemory(it, block)?;
+            destroyValue(it, c, n, environmentType, environment)?;
+            return Ok(outOfMemory(c, resultType)?);
+        }
+        it.memory.store(data, environment)?;
+        let record = alloc(it, 8, allocSystem())?;
+        if (record == 0) {
+            if (c.types.needsDrop(environmentType)) {
+                destroy(it, c, n, environmentType, data)?;
+            }
+            freeMemory(it, data)?;
+            freeMemory(it, block)?;
+            return Ok(outOfMemory(c, resultType)?);
+        }
+        it.memory.storeBits(block, record, 8)?;
+        it.memory.storeBits(block + 8, data, 8)?;
+        it.memory.storeBits(block + 16, dynTableBase() + (table as u64) * 16, 8)?;
+        let body = nirFunctionOf(it, c.hir.at(c.dynTables[table].methods, 0), 0)?;
+        let started = addThread(it, false, body, data, block, result);
+        it.runtime.recordAddresses.push(record)!;
+        it.runtime.recordThreads.push(started)!;
+        return Ok(okValue(c, resultType, valueOf(block, 8))?);
+    }
+    if (b == bfThreadSpawnBoxed()) {
+        // nvTSB_: a thread running a boxed closure: the record and the runtime's thread record, as in C.
+        let closure = argument(it, c, n, frame, arguments, 0)?;
+        let box = builtinArgumentType(n, arguments, 0);
+        let result = elementOf(c, resultOkOf(c, resultType));
+        let block = alloc(it, threadRecordSize(c, result)?, allocSystem())?;
+        if (block == 0) {
+            destroyValue(it, c, n, box, closure)?;
+            return Ok(outOfMemory(c, resultType)?);
+        }
+        let record = alloc(it, 8, allocSystem())?;
+        if (record == 0) {
+            freeMemory(it, block)?;
+            destroyValue(it, c, n, box, closure)?;
+            return Ok(outOfMemory(c, resultType)?);
+        }
+        let data = closure.bits(0, 8)?;
+        let tableAddress = closure.bits(8, 8)?;
+        it.memory.storeBits(block, record, 8)?;
+        it.memory.storeBits(block + 8, data, 8)?;
+        it.memory.storeBits(block + 16, tableAddress, 8)?;
+        let table = dynTableAt(c, tableAddress)?;
+        let body = nirFunctionOf(it, c.hir.at(c.dynTables[table].methods, 0), 0)?;
+        let started = addThread(it, false, body, data, block, result);
+        it.runtime.recordAddresses.push(record)!;
+        it.runtime.recordThreads.push(started)!;
+        return Ok(okValue(c, resultType, valueOf(block, 8))?);
+    }
+    if (b == bfThreadBoth()) {
+        // Thread.both(a, b) (§38.6): a on a new thread, b here, then a wait; without a thread record both run here.
+        let a = argument(it, c, n, frame, arguments, 0)?;
+        let second = argument(it, c, n, frame, arguments, 1)?;
+        let record = alloc(it, 8, allocSystem())?;
+        if (record == 0) {
+            callClosureValue(it, c, n, a)?;
+            callClosureValue(it, c, n, second)?;
+            return Ok(null);
+        }
+        let started = addThread(it, true, none(), a.bits(0, 8)?, 0, none());
+        callClosureValue(it, c, n, second)?;
+        if (!it.runtime.threads[started as usize].finished) {
+            waitHere(it, c, n, 1, started as u64)?;
+        }
+        freeMemory(it, record)?;
+        return Ok(null);
+    }
+    // nvTJ_: waits for the thread, takes its result, and frees its record and closure.
+    let referenceType = builtinArgumentType(n, arguments, 0);
+    let threadType = if (c.types.is(referenceType, TypeKind.Thread)) referenceType else pointeeOf(c, referenceType);
+    let block = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+    return threadJoin(it, c, n, threadType, block);
+}
+
+/// Calls a closure with no parameters: its environment's first member is its code (§36.2).
+fn callClosureValue(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    closure: borrow Value,
+) -> Result<void, Stop> {
+    let code = it.memory.loadBits(closure.bits(0, 8)?, 8)?;
+    var arguments = Vector<Value>.create();
+    arguments.push(copyValue(closure))!;
+    callThrough(it, c, n, code, arguments)?;
+    return Ok();
+}
 
 fn threadJoin(
     it: borrow mut Interp,
     c: borrow Checker,
     n: borrow NirProgram,
     t: u32,
-    thread: u64,
-) -> Result<Value?, Stop> =>
-    Err(fault("unsupported: threads (not yet ported to the CeeSafe interpreter)"));
+    block: u64,
+) -> Result<Value?, Stop> {
+    let record = pointerAt(it, block)?;
+    var joined = none();
+    var index: usize = 0;
+    for (k in 0..it.runtime.recordAddresses.length) {
+        if (it.runtime.recordAddresses[k] == record) {
+            joined = it.runtime.recordThreads[k];
+            index = k;
+        }
+    }
+    if (joined == none()) {
+        return Err(addressMessage("join of a thread that is not running (", record, ")"));
+    }
+    if (!it.runtime.threads[joined as usize].finished) {
+        waitHere(it, c, n, 1, joined as u64)?;
+    }
+    let result = elementOf(c, t);
+    var value: Value? = null;
+    if (!c.types.is(result, TypeKind.Void)) {
+        value = it.memory.load(block + resultOffset(c, result)?, typeSize(c, result)?)?;
+    }
+    let data = pointerAt(it, block + 8)?;
+    let tableAddress = it.memory.loadBits(block + 16, 8)?;
+    let environment = c.dynTables[dynTableAt(c, tableAddress)?].implementation;
+    if (c.types.needsDrop(environment)) {
+        destroy(it, c, n, environment, data)?;
+    }
+    it.runtime.recordAddresses[index] = 0;
+    freeMemory(it, data)?;
+    freeMemory(it, record)?;
+    freeMemory(it, block)?;
+    return Ok(value);
+}
+
+fn mutexCreate(it: borrow mut Interp) -> Result<u64, Stop> {
+    let address = alloc(it, 8, allocSystem())?;
+    if (address != 0) {
+        it.runtime.mutexAddresses.push(address)!;
+        it.runtime.mutexOwners.push(none())!;
+    }
+    return Ok(address);
+}
+
+fn mutexLock(it: borrow mut Interp, c: borrow Checker, n: borrow NirProgram, address: u64) -> Result<void, Stop> {
+    var index = it.runtime.mutexAddresses.length;
+    for (k in 0..it.runtime.mutexAddresses.length) {
+        if (it.runtime.mutexAddresses[k] == address) {
+            index = k;
+        }
+    }
+    if (index == it.runtime.mutexAddresses.length) {
+        return Err(addressMessage("lock of a mutex that does not exist (", address, ")"));
+    }
+    if (it.runtime.mutexOwners[index] == it.runtime.current) {
+        return Err(fault("deadlock: a thread locks a mutex it already holds"));
+    }
+    if (it.runtime.mutexOwners[index] != none()) {
+        waitHere(it, c, n, 2, address)?;
+    }
+    it.runtime.mutexOwners[index] = it.runtime.current;
+    return Ok();
+}

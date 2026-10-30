@@ -7,7 +7,7 @@ Runs, against the pinned novac and the reference corpus at the pinned tag:
   the benchmarks and programs, the four optimisation reports, CeeSafe's own C, the package fixtures;
 - the corpus runner over run-pass, run-fail, ffi (and freestanding) under -Werror and ASan+UBSan with leak checks, and
   over the optimisation families and emit-c's snapshots, all in the default form;
-- the command line (usage, `explain`, `fix`), `fmt`, `doc` and the package commands (P8);
+- the command line (usage, `explain`, `fix`), `fmt`, `doc`, the package commands and `run --interp` (P8);
 - the M2 mutation suite, the M3 fault sweep, the collection properties and the freestanding checks.
 
 Each step's last line is printed; the expected results are the P2–P7 gates' (docs/p*-plan.md).
@@ -83,6 +83,7 @@ def main():
         ("fmt", py + [f"{HERE}/compare_fmt.py"] + common),
         ("doc", py + [f"{HERE}/compare_doc.py"] + common),
         ("package cmds", py + [f"{HERE}/compare_package_commands.py", "--ceesafec", cee, "--novac", novac]),
+        ("interp", py + [f"{HERE}/compare_interp.py"] + common),
         ("run -Werror", py + [f"{HERE}/run_corpus.py", "--compiler", cee, "--corpus", corpus] + run_families +
          ["--cflag=-Werror"]),
         ("run asan", py + [f"{HERE}/run_corpus.py", "--compiler", cee, "--corpus", corpus] + run_families +

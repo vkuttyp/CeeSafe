@@ -1,6 +1,6 @@
 # CeeSafe roadmap: port the Nova compiler to Nova, as CeeSafe
 
-Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P7 complete (CeeSafe names since `8941c10`; P7 production C 2026-10-30; stage 0 novac 0.6.0 via the `3d6ac40` anchor); P8 in progress (S0–S3 done 2026-10-31)**.
+Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P7 complete (CeeSafe names since `8941c10`; P7 production C 2026-10-30; stage 0 novac 0.6.0 via the `3d6ac40` anchor); P8 in progress (S0–S4 done 2026-10-31)**.
 The probes, `src/support/`, the limits, the fault sweep and the skeleton exist (`docs/p1-probes.md`). No compiler code has been ported.
 Repository: `~/dev/CeeSafe`. Reference: `vkuttyp/Nova` (C#/.NET 10), pinned in `bootstrap/reference.md`.
 
@@ -515,7 +515,7 @@ Dependencies: P7. Parser-only tools may start after P2, and semantic tools after
     ceesafec does not read Nova packages (Decision 0003).
 
   Local fixture repositories, no network.
-- [ ] Interpreter: values, memory, numerics, builtins, deterministic threads (`Interpreter/Threads.cs`) and the sandbox.
+- [x] Interpreter: values, memory, numerics, builtins, deterministic threads (`Interpreter/Threads.cs`) and the sandbox (S4; threads cooperative, docs/p8-plan.md).
 - [x] Formatter: trivia, recovery, `--check`/`--stdout`, idempotence. Format CeeSafe's own sources (S1).
 - [x] Docs and resources: `doc`, `explain`, the embedded specs and guide (S0, S2), and `new`/`agents` with CeeSafe
   templates and markers (S3).
@@ -637,8 +637,8 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
    legacy `.nova` packages still build, codes keep N, and `tools/bootstrap.sh` builds from novac. P7 is done
    (`docs/p7-plan.md`): ceesafec emits novac's production C (structured, placement, check elimination, closure
    specialisation) byte for byte, and reaches the fixed point in that form. P8 is in progress (`docs/p8-plan.md`):
-   `explain`, `fix`, `fmt`, `doc` and the package commands are identical to novac's (S0–S3); next S4, the
-   interpreter. The C prefix switch waits
+   `explain`, `fix`, `fmt`, `doc` and the package commands and `run --interp` are identical to novac's (S0–S4); next S5,
+   `lsp` and `mcp`. The C prefix switch waits
    for P8's fork point (Decision 0004).
 4. Upstream (Nova #6, filed 2026-10-30): novac 0.6.0's `offsetOf<T>(field)` is 0 unless `T`'s layout was computed before (CheckOffsetOf reads
    `member.Offset` without `TypeTable.LayoutOf(measured)`); ceesafec gives the true offset.

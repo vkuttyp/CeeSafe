@@ -66,6 +66,13 @@ Both are host-service items for Nova's N track (type-system.md §26); Windows ne
 
 ## Known differences
 
+- Threads in the interpreter: novac's run each Nova thread on a host thread holding a baton, so a blocked thread can be
+  resumed whenever its wait ends. ceesafec's are cooperative on one host thread: a thread runs when the running one
+  blocks, the first runnable in spawn order, until it ends; one that blocks again deeper in the host stack cannot be
+  resumed out of order, which no corpus program needs (a run that would need it reports a deadlock).
+- The reference's in-process interpreter tests that mutate NIR into unsafe code (the dynamic safety oracle) have no
+  command-line form, so they are not ported; the faults they check are the same code paths (`Memory`).
+
 - `run --interp` honours NOVA_ALLOC_REPORT and NOVA_FAIL_ALLOC_AT for the interpreted program, as novac does; but
   ceesafec is a Nova program, so its own runtime honours them too: with NOVA_ALLOC_REPORT it adds its own report line
   after the program's, and NOVA_FAIL_ALLOC_AT fails ceesafec's own allocation of that number. `tools/compare_interp.py`
@@ -86,3 +93,6 @@ Both are host-service items for Nova's N track (type-system.md §26); Windows ne
 | 2026-10-31 | S3 | packages (`src/packages/`): the TOML subset, versions and requirements, manifests, the workspace (path, git and registry dependencies, the lock, SHA-256 package hashes in `src/support/sha256.cee`, the git cache in `$CEESAFE_HOME/git`), the index and the backtracking version solver, `publish` and `index-check`, agent files; the commands `fetch`, `publish`, `index-check`, `new`, `agents`; package mode for `parse` too, and `check`/`build`/`fmt`/`doc`/`fix` through the new resolver; `tools/compare_package_commands.py` | 8 scenarios after PackageManagerTests and AgentFilesTests (31 bad manifests; path dependencies, lock out of date, conflicts, shared and cyclic graphs, missing and executable dependencies; git by tag, branch and rev, unknown tag, offline with an empty cache, a changed checkout; a local index with three versions, dependencies, `--update`, conflicts, a missing and an invalid entry, `index-check`; `publish` refusals and a published entry; agent files written, refreshed and left; `new`), each built with Nova's and CeeSafe's names: 382/382 runs identical after the mapping, the lock and agent files too; ceesafec's git package hashes equal the script's SHA-256 |
 | 2026-10-31 | S3 | the contract suite with the `package cmds` step | all 30 steps ok on macOS (Apple clang 21); CeeSafe's own C identical (461,390 lines; 538,065 with `--split -g`) |
 | 2026-10-31 | S4a | the interpreter's core (`src/interpreter/`: memory with initialised bits, frames, places, operands, rvalues, statements, statics, the runtime's heap, regions, pools, scratch frames, vectors, stable vectors, slot maps, drop glue, the builtins but I/O, C calls and threads; float printing as nova_format_f64); direct calls run on an explicit stack of activations, so deep recursion needs no deep native stack; `run --interp` with `--`, the optimisation switches, NOVA_ALLOC_REPORT and NOVA_FAIL_ALLOC_AT; `tools/compare_interp.py` | run-pass and run-fail 188/199 identical to novac's interpreter (plain, with NOVA_ALLOC_REPORT, and with every optimisation off); the other 11 need C calls, I/O or threads (S4b–S4d) |
+
+| 2026-10-31 | S4b–S4d | the C library model (strlen, puts, abs, memcmp, memcpy, memset, malloc, free, the atomics, lib/std's host services: environment, path kinds, directories, temporary and working directories, spawning with captured streams), files and sockets through lib/core's File, TcpListener and TcpStream behind a descriptor table, Process.run, program arguments, Console.read; threads (spawn, spawnBoxed, both, join, mutexes) cooperatively in spawn order (`src/interpreter/io.cee`) | run-pass and run-fail 199/199 identical to novac's interpreter, plain, with NOVA_ALLOC_REPORT and with every optimisation off |
+| 2026-10-31 | S4 | the contract suite with the `interp` step | all 31 steps ok on macOS (Apple clang 21); CeeSafe's own C identical (501,898 lines; 584,993 with `--split -g`) |
