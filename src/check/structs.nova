@@ -350,7 +350,11 @@ fn resolveStructMembers(c: borrow mut Checker, index: u32) -> Result<void, Alloc
     for (k in 0..s.functions.count) {
         let f = c.front.ast.at(s.functions, k);
         let id = c.front.ast.idents[c.front.ast.functions[f as usize].name as usize];
-        if (containsSymbol(memberNames, id.symbol)) {
+        let repeated = containsSymbol(memberNames, id.symbol);
+        if (!repeated) {
+            memberNames.push(id.symbol)?;
+        }
+        if (repeated || implMethodFor(c, entry.typ, id.symbol) != none()) {
             var message = Vector<u8>.create();
             appendQuotedType(mut message, c, entry.typ)?;
             appendText(mut message, " already has a member named ")?;
@@ -358,7 +362,6 @@ fn resolveStructMembers(c: borrow mut Checker, index: u32) -> Result<void, Alloc
             c.error(duplicateMember(), id.start, id.end, message)?;
             continue;
         }
-        memberNames.push(id.symbol)?;
         let function = declareFunctionIn(c, f, entry.typ, entry.environment)?;
         c.types.structs[definition as usize].functions.push(function)?;
         c.types.structs[definition as usize].functionNames.push(id.symbol)?;

@@ -61,8 +61,8 @@ struct HirPrinter {
         }
         for (f in 0..hir.functions.length) {
             let function = borrow hir.functions[f];
-            if (function.library) {
-                continue; // lib/core and the other libraries are left out (§29.2)
+            if (function.library || !function.registered) {
+                continue; // lib/core and the other libraries are left out (§29.2); signatures only too
             }
             this.open()?;
             this.text("(fn ")?;

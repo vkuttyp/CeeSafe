@@ -146,8 +146,10 @@ fn declareTypeParameters(
             } else if (undeclared && sameText(c.name(marker), "Share")) {
                 c.types.typeParameters[parameterInfo as usize].shareBound = true;
             } else {
-                let span = c.front.ast.typeSpans[bound as usize];
-                c.notPorted(span.start, span.end, "an interface bound", "S4c")?;
+                let resolved = resolveInterface(c, bound)?;
+                if (resolved != none()) {
+                    c.types.typeParameters[parameterInfo as usize].bounds.push(resolved)?;
+                }
             }
         }
     }
@@ -303,13 +305,42 @@ struct SpanIn {
 
 // ---- bounds ----
 
-/// CheckBounds' marker bounds (Copy, Send, Share); interface bounds are S4c's.
+/// Do `arguments` satisfy the bounds of `parameters` (CheckBounds, §21.2)? Reported as N0268 (N0334 for Send and
+/// Share); deferred until every impl is known.
 fn checkBounds(
     c: borrow mut Checker,
     parameters: Slice<u32>,
     arguments: Slice<u32>,
     span: Span,
 ) -> Result<void, AllocError> {
+    var anyBound = false;
+    for (p in parameters) {
+        let info = borrow c.types.typeParameters[c.types.info(p).typeParameter as usize];
+        if (info.copyBound || info.sendBound || info.shareBound || info.bounds.length > 0) {
+            anyBound = true;
+        }
+    }
+    if (!anyBound) {
+        return Ok();
+    }
+    if (!c.implsReady) {
+        let parameterList = c.types.addList(parameters)?;
+        let argumentList = c.types.addList(arguments)?;
+        let file = c.file;
+        return c.pendingBounds.push(
+            PendingBounds {
+                parameters: parameterList,
+                arguments: argumentList,
+                start: span.start,
+                end: span.end,
+                file: file,
+            },
+        );
+    }
+    var map = Vector<TypeMapping>.create();
+    for (k in 0..parameters.length) {
+        map.push(TypeMapping { from: parameters[k], to: arguments[k] })?;
+    }
     for (k in 0..parameters.length) {
         let parameter = parameters[k];
         let argument = arguments[k];
@@ -352,6 +383,29 @@ fn checkBounds(
             appendBytes(mut message, c.typeName(parameter))?;
             appendText(mut message, ": Share'; type-system.md §38.1)")?;
             c.error(notSend(), span.start, span.end, message)?;
+        }
+        let boundCount = c.types.typeParameters[c.types.info(parameter).typeParameter as usize].bounds.length;
+        for (b in 0..boundCount) {
+            let bound = c.types.typeParameters[c.types.info(parameter).typeParameter as usize].bounds[b];
+            let original = c.types.bounds[bound as usize];
+            var substituted = Vector<u32>.create();
+            for (a in 0..original.arguments.count) {
+                let argumentType = c.types.listAt(original.arguments, a);
+                substituted.push(substitute(c, argumentType, map.view())?)?;
+            }
+            var boundName = Vector<u8>.create();
+            appendBytes(mut boundName, c.types.rangeText(original.name))?;
+            let required = c.types.addBound(original.interfaceEntry, boundName.view(), substituted.view())?;
+            if (!implements(c, argument, required)) {
+                var message = Vector<u8>.create();
+                appendQuotedType(mut message, c, argument)?;
+                appendText(mut message, " does not implement ")?;
+                quotedBound(mut message, c, required)?;
+                appendText(mut message, ", which ")?;
+                appendQuotedType(mut message, c, parameter)?;
+                appendText(mut message, " requires")?;
+                c.error(boundNotSatisfied(), span.start, span.end, message)?;
+            }
         }
     }
     return Ok();

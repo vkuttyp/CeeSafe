@@ -379,16 +379,18 @@ fn checkMethodCall(
             return checkFloatMethod(c, member, arguments, number, function, span);
         }
     }
-    if (!c.types.is(readType, TypeKind.Struct) || c.types.info(readType).structDef == none()) {
-        return checkNonStructMethod(c, receiver, readType, member, arguments, span);
-    }
     let currentType = c.typeOf(receiver);
     let structType = if (c.types.is(
         currentType,
         TypeKind.Reference,
     )) c.types.info(currentType).pointee else currentType;
+    // Own methods, impl methods, or a type parameter's bound methods (§21).
+    let memberSpan = Span { start: memberIdent.start, end: memberIdent.end };
+    let function = findMethod(c, structType, memberIdent.symbol, memberSpan)?;
     let definition = c.types.info(structType).structDef;
-    let function = if (definition == none()) none() else findStructFunction(c, definition, memberIdent.symbol);
+    if (function == none() && (!c.types.is(readType, TypeKind.Struct) || c.types.info(readType).structDef == none())) {
+        return checkNonStructMethod(c, receiver, readType, member, arguments, span);
+    }
     if (function == none()) {
         var message = Vector<u8>.create();
         if (definition != none() && findField(c, definition, memberIdent.symbol) != none()) {
@@ -501,12 +503,10 @@ fn checkNonStructMethod(
         return c.errorResult(span.start, span.end);
     }
     let isParameter = c.types.is(structType, TypeKind.TypeParameter);
-    if (c.types.is(structType, TypeKind.Dyn) || (isParameter &&
-        c.types.typeParameters[c.types.info(structType).typeParameter as usize].bounds.length > 0)) {
-        c.notPorted(span.start, span.end, "a method through a bound or 'dyn'", "S4c/S4d")?;
+    if (c.types.is(structType, TypeKind.Dyn)) {
+        c.notPorted(span.start, span.end, "a method through 'dyn'", "S4d")?;
         return c.errorResult(span.start, span.end);
     }
-    // An enum's methods come only from `impl` blocks (S4c), which are not ported: none yet.
     var message = Vector<u8>.create();
     appendText(mut message, "type ")?;
     appendQuotedType(mut message, c, structType)?;

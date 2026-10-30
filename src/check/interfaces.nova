@@ -1,0 +1,661 @@
+// Interfaces, impls and bounds (the reference's DeclareInterface, ResolveInterface, ProcessImpls, ProcessImpl,
+// SignatureMismatch, CheckBounds' interface part, Implements, Substitute and FindMethod): P3 S4c (type-system.md §21).
+// Effect lists on interface and impl methods come with S6; `dyn` with S4d.
+
+fn implMismatch() -> u32 => 267;
+
+/// An interface (InterfaceEntry).
+struct InterfaceEntry {
+    item: u32;
+    file: u32;
+    parameters: Range; // its type parameters, in TypeTable.lists
+}
+
+/// An impl block waiting for ProcessImpls.
+struct ImplRef {
+    item: u32;
+    file: u32;
+}
+
+/// One `impl I<A> for T` (the reference's _implementations key).
+struct Implementation {
+    typ: u32;
+    interfaceEntry: u32;
+    arguments: Range; // in TypeTable.lists
+}
+
+/// A method an impl gives a type (the reference's _implMethods), in declaration order.
+struct ImplMethod {
+    typ: u32;
+    name: u32; // a symbol
+    function: u32;
+}
+
+/// A bound's method declared for a type parameter (the reference's _boundMethods).
+struct BoundMethod {
+    typ: u32;
+    bound: u32; // TypeTable.bounds
+    name: u32;
+    function: u32;
+}
+
+/// A bound check that waits until every impl is known (the reference's _pendingBoundChecks).
+struct PendingBounds {
+    parameters: Range; // in TypeTable.lists
+    arguments: Range;
+    start: u32;
+    end: u32;
+    file: u32;
+}
+
+/// An allocator to verify once every impl is known (the reference's _pendingAllocators).
+struct PendingAllocator {
+    typ: u32;
+    start: u32;
+    end: u32;
+    file: u32;
+}
+
+fn interfaceMethods(c: borrow Checker, entry: u32) -> Range =>
+    match (c.front.ast.items[c.interfaces[entry as usize].item as usize].kind) {
+        ItemKind.Interface(methods, _) => methods,
+        _ => emptyRange(),
+    };
+
+/// The interface method named `name`, or none (an Ast.functions index).
+fn interfaceMethod(c: borrow Checker, entry: u32, name: u32) -> u32 {
+    let methods = interfaceMethods(c, entry);
+    for (k in 0..methods.count) {
+        let f = c.front.ast.at(methods, k);
+        if (c.front.ast.idents[c.front.ast.functions[f as usize].name as usize].symbol == name) {
+            return f;
+        }
+    }
+    return none();
+}
+
+/// DeclareInterface (§21).
+fn declareInterface(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
+    let entry = c.front.ast.items[item as usize];
+    let ident = c.front.ast.idents[entry.name as usize];
+    if (isReservedName(c, entry.name)?) {
+        return Ok();
+    }
+    var text = Vector<u8>.create();
+    appendBytes(mut text, c.name(ident.symbol))?;
+    if (c.types.lookup(text.view()) != none() || isDeclared(c, ident.symbol)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, text.view())?;
+        appendText(mut message, "' is already defined")?;
+        return c.error(duplicateItem(), ident.start, ident.end, message);
+    }
+    let typeParameters = match (entry.kind) {
+        ItemKind.Interface(_, t) => t,
+        _ => emptyRange(),
+    };
+    c.interfaces.push(InterfaceEntry { item: item, file: c.file, parameters: emptyRange() })?;
+    let index = truncate<u32>(c.interfaces.length - 1);
+    ownItem(c, ident.symbol, Entity.Interface(index))?;
+    var parameters = Vector<u32>.create();
+    var pairs = Vector<EnvPair>.create();
+    declareTypeParameters(c, typeParameters, mut parameters, mut pairs)?;
+    c.interfaces[index as usize].parameters = c.types.addList(parameters.view())?;
+    let methods = interfaceMethods(c, index);
+    for (k in 0..methods.count) {
+        let f = c.front.ast.functions[c.front.ast.at(methods, k) as usize];
+        if (receiverIndex(f.receiver) == 0) {
+            let id = c.front.ast.idents[f.name as usize];
+            var message = Vector<u8>.create();
+            appendText(mut message, "interface method ")?;
+            appendQuotedName(mut message, c, id.symbol)?;
+            appendText(mut message, " needs a receiver: this, borrow this or borrow mut this")?;
+            c.error(implMismatch(), id.start, id.end, message)?;
+        }
+    }
+    for (k in 0..methods.count) {
+        let f = c.front.ast.functions[c.front.ast.at(methods, k) as usize];
+        if (f.attributes.count > 0) {
+            c.notPorted(f.start, f.end, "attributes on an interface method", "S6")?;
+        }
+    }
+    return Ok();
+}
+
+/// An interface reference `I` or `I<Args>` in a bound or an impl (ResolveInterface, §21); none after an error.
+fn resolveInterface(c: borrow mut Checker, syntax: u32) -> Result<u32, AllocError> {
+    let span = c.front.ast.typeSpans[syntax as usize];
+    var symbol = none();
+    var arguments = emptyRange();
+    match (c.front.ast.types[syntax as usize]) {
+        TypeNode.Named(q) => {
+            if (q.parts.count == 1) {
+                symbol = c.front.ast.idents[c.front.ast.at(q.parts, 0) as usize].symbol;
+            }
+        }
+        TypeNode.Generic(q, a) => {
+            if (q.parts.count == 1) {
+                symbol = c.front.ast.idents[c.front.ast.at(q.parts, 0) as usize].symbol;
+                arguments = a;
+            }
+        }
+        _ => {}
+    }
+    let entry = if (symbol == none()) none() else match (c.item(symbol)) {
+        Entity.Interface(i) => i,
+        _ => none(),
+    };
+    if (entry == none()) {
+        var message = Vector<u8>.create();
+        if (symbol == none()) {
+            appendText(mut message, "expected an interface")?;
+        } else {
+            appendQuotedName(mut message, c, symbol)?;
+            appendText(mut message, " is not an interface")?;
+        }
+        c.error(unknownType(), span.start, span.end, message)?;
+        return Ok(none());
+    }
+    let parameterCount = c.interfaces[entry as usize].parameters.count;
+    if (arguments.count != parameterCount) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "interface ")?;
+        appendQuotedName(mut message, c, symbol)?;
+        appendText(mut message, " takes ")?;
+        appendDecimal(mut message, parameterCount as u64)?;
+        appendText(mut message, " type argument(s), but ")?;
+        appendDecimal(mut message, arguments.count as u64)?;
+        appendText(mut message, " were given")?;
+        c.error(unknownType(), span.start, span.end, message)?;
+        return Ok(none());
+    }
+    var resolved = Vector<u32>.create();
+    var bottom = false;
+    for (k in 0..arguments.count) {
+        let argumentSyntax = c.front.ast.at(arguments, k);
+        let t = c.resolveType(argumentSyntax, false)?;
+        if (c.types.isBottom(t)) {
+            bottom = true;
+        }
+        resolved.push(t)?;
+    }
+    if (bottom) {
+        return Ok(none());
+    }
+    var name = Vector<u8>.create();
+    appendBytes(mut name, c.name(symbol))?;
+    return c.types.addBound(entry, name.view(), resolved.view());
+}
+
+fn boundText(out: borrow mut Vector<u8>, c: borrow Checker, bound: u32) -> Result<void, AllocError> =>
+    c.types.appendBound(out, bound);
+
+fn quotedBound(out: borrow mut Vector<u8>, c: borrow Checker, bound: u32) -> Result<void, AllocError> {
+    out.push('\'')?;
+    boundText(out, c, bound)?;
+    return out.push('\'');
+}
+
+/// Is `typ` known to implement `bound` (Implements): an impl, or for a type parameter, its own bounds?
+fn implements(c: borrow Checker, typ: u32, bound: u32) -> bool {
+    let b = c.types.bounds[bound as usize];
+    if (c.types.is(typ, TypeKind.TypeParameter)) {
+        for (ownBound in c.types.typeParameters[c.types.info(typ).typeParameter as usize].bounds.view()) {
+            let o = c.types.bounds[ownBound as usize];
+            if (o.interfaceEntry == b.interfaceEntry && sameLists(c, o.arguments, b.arguments)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    for (i in c.implementations.view()) {
+        if (i.typ == typ && i.interfaceEntry == b.interfaceEntry && sameLists(c, i.arguments, b.arguments)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn sameLists(c: borrow Checker, a: Range, b: Range) -> bool {
+    if (a.count != b.count) {
+        return false;
+    }
+    for (k in 0..a.count) {
+        if (c.types.listAt(a, k) != c.types.listAt(b, k)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ---- impls ----
+
+/// Every `impl I for T` (ProcessImpls, §21.1); then the bound checks and allocators that waited for them.
+fn processImpls(c: borrow mut Checker) -> Result<void, AllocError> {
+    let saved = c.file;
+    for (k in 0..c.impls.length) {
+        let pending = c.impls[k];
+        c.file = pending.file;
+        processImpl(c, pending.item)?;
+    }
+    c.implsReady = true;
+    for (k in 0..c.pendingBounds.length) {
+        let p = c.pendingBounds[k];
+        c.file = p.file;
+        var parameters = Vector<u32>.create();
+        listTypes(c, p.parameters, mut parameters)?;
+        var arguments = Vector<u32>.create();
+        listTypes(c, p.arguments, mut arguments)?;
+        checkBounds(c, parameters.view(), arguments.view(), Span { start: p.start, end: p.end })?;
+    }
+    for (k in 0..c.pendingAllocators.length) {
+        let p = c.pendingAllocators[k];
+        c.file = p.file;
+        verifyUserAllocator(c, p.typ, Span { start: p.start, end: p.end })?;
+    }
+    c.pendingBounds.truncate(0);
+    c.file = saved;
+    return Ok();
+}
+
+/// One impl (ProcessImpl): resolves both sides, declares the methods as methods of T, and checks them against the
+/// interface (N0267).
+fn processImpl(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
+    let entry = c.front.ast.items[item as usize];
+    let interfaceSyntax = match (entry.kind) {
+        ItemKind.Impl(i, _, _) => i,
+        _ => { return Ok(); }
+    };
+    let forSyntax = match (entry.kind) {
+        ItemKind.Impl(_, t, _) => t,
+        _ => none(),
+    };
+    let functions = match (entry.kind) {
+        ItemKind.Impl(_, _, f) => f,
+        _ => emptyRange(),
+    };
+    let forType = c.resolveType(forSyntax, false)?;
+    let bound = resolveInterface(c, interfaceSyntax)?;
+    if (c.types.isBottom(forType) || bound == none()) {
+        return Ok();
+    }
+    if (c.types.isGeneric(forType) || c.types.isScoped(forType)) {
+        let span = c.front.ast.typeSpans[forSyntax as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "'impl … for ")?;
+        appendBytes(mut message, c.typeName(forType))?;
+        appendText(mut message, "': v0 implements interfaces only for concrete, unscoped types")?;
+        return c.error(implMismatch(), span.start, span.end, message);
+    }
+    if (implements(c, forType, bound)) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, forType)?;
+        appendText(mut message, " already implements ")?;
+        quotedBound(mut message, c, bound)?;
+        return c.error(implMismatch(), entry.start, entry.end, message);
+    }
+    let b = c.types.bounds[bound as usize];
+    c.implementations.push(Implementation { typ: forType, interfaceEntry: b.interfaceEntry, arguments: b.arguments })?;
+    let interfaceEntry = b.interfaceEntry;
+    var arguments = Vector<u32>.create();
+    listTypes(c, b.arguments, mut arguments)?;
+    let interfaceItem = c.interfaces[interfaceEntry as usize].item;
+    let interfaceParameters = match (c.front.ast.items[interfaceItem as usize].kind) {
+        ItemKind.Interface(_, t) => t,
+        _ => emptyRange(),
+    };
+    var pairs = Vector<EnvPair>.create();
+    zipEnvironment(c, interfaceParameters, arguments.view(), mut pairs)?;
+    let environment = storeEnvironment(c, pairs.view())?;
+    var implemented = Vector<u32>.create(); // names
+    for (k in 0..functions.count) {
+        let f = c.front.ast.at(functions, k);
+        let decl = c.front.ast.functions[f as usize];
+        let id = c.front.ast.idents[decl.name as usize];
+        let signature = interfaceMethod(c, interfaceEntry, id.symbol);
+        if (signature == none()) {
+            var message = Vector<u8>.create();
+            quotedBound(mut message, c, bound)?;
+            appendText(mut message, " has no method ")?;
+            appendQuotedName(mut message, c, id.symbol)?;
+            appendText(mut message, "; an impl block holds only the interface's methods")?;
+            c.error(implMismatch(), id.start, id.end, message)?;
+            continue;
+        }
+        if (decl.attributes.count > 0) {
+            c.notPorted(decl.start, decl.end, "attributes on an impl method", "S6")?;
+        }
+        if (c.types.is(forType, TypeKind.Integer) && integerMethod(c.name(id.symbol)) != none()) {
+            var message = Vector<u8>.create();
+            appendQuotedName(mut message, c, id.symbol)?;
+            appendText(mut message, " is a built-in method of every integer type (type-system.md §6)")?;
+            c.error(duplicateMember(), id.start, id.end, message)?;
+            continue;
+        }
+        if (c.types.is(forType, TypeKind.Float) && isReservedFloatName(c.name(id.symbol))) {
+            var message = Vector<u8>.create();
+            appendQuotedName(mut message, c, id.symbol)?;
+            appendText(mut message, " is a built-in method of every float type (type-system.md §35.5, §35.8)")?;
+            c.error(duplicateMember(), id.start, id.end, message)?;
+            continue;
+        }
+        let hir = declareFunction(c, f, forType)?;
+        if (implMethodFor(c, forType, id.symbol) != none() || containsU32(implemented, id.symbol)) {
+            var message = Vector<u8>.create();
+            appendQuotedType(mut message, c, forType)?;
+            appendText(mut message, " already has a method named ")?;
+            appendQuotedName(mut message, c, id.symbol)?;
+            c.error(duplicateMember(), id.start, id.end, message)?;
+            continue;
+        }
+        c.implMethods.push(ImplMethod { typ: forType, name: id.symbol, function: hir })?;
+        implemented.push(id.symbol)?;
+        let expected = declareSignature(c, signature, forType, environment)?;
+        var problem = Vector<u8>.create();
+        signatureMismatch(c, expected, hir, mut problem)?;
+        if (problem.length > 0) {
+            var message = Vector<u8>.create();
+            appendQuotedName(mut message, c, id.symbol)?;
+            appendText(mut message, " does not match ")?;
+            quotedBound(mut message, c, bound)?;
+            appendText(mut message, ": ")?;
+            appendBytes(mut message, problem.view())?;
+            c.error(implMismatch(), id.start, id.end, message)?;
+        }
+    }
+    // A reserved integer or float method was reported above; it is not missing as well.
+    let methods = interfaceMethods(c, interfaceEntry);
+    let interfaceSpan = c.front.ast.typeSpans[interfaceSyntax as usize];
+    for (k in 0..methods.count) {
+        let m = c.front.ast.functions[c.front.ast.at(methods, k) as usize];
+        let name = c.front.ast.idents[m.name as usize].symbol;
+        let reserved = (c.types.is(forType, TypeKind.Integer) && integerMethod(c.name(name)) != none()) ||
+            (c.types.is(forType, TypeKind.Float) && isReservedFloatName(c.name(name)));
+        if (!containsU32(implemented, name) && !reserved) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "'impl ")?;
+            boundText(mut message, c, bound)?;
+            appendText(mut message, " for ")?;
+            appendBytes(mut message, c.typeName(forType))?;
+            appendText(mut message, "' is missing method ")?;
+            appendQuotedName(mut message, c, name)?;
+            c.error(implMismatch(), interfaceSpan.start, interfaceSpan.end, message)?;
+        }
+    }
+    return Ok();
+}
+
+fn isReservedFloatName(name: Slice<u8>) -> bool => sameText(name, "fromBits") || floatMethod(name) != none();
+
+fn implMethodFor(c: borrow Checker, typ: u32, name: u32) -> u32 {
+    for (m in c.implMethods.view()) {
+        if (m.typ == typ && m.name == name) {
+            return m.function;
+        }
+    }
+    return none();
+}
+
+fn receiverText(kind: ReceiverKind) -> StringView => match (kind) {
+    ReceiverKind.Borrow => "'borrow this'",
+    ReceiverKind.BorrowMut => "'borrow mut this'",
+    _ => "'this'",
+};
+
+/// Empty if `actual` has the interface's signature `expected`; else what differs (SignatureMismatch).
+fn signatureMismatch(
+    c: borrow Checker,
+    expected: u32,
+    actual: u32,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    let e = borrow c.hir.functions[expected as usize];
+    let a = borrow c.hir.functions[actual as usize];
+    let es = c.front.ast.functions[e.syntax as usize];
+    let as2 = c.front.ast.functions[a.syntax as usize];
+    if (es.isUnsafe != as2.isUnsafe) {
+        return appendText(out, if (as2.isUnsafe) "it must not be 'unsafe'" else "it must be 'unsafe'");
+    }
+    if (receiverIndex(es.receiver) != receiverIndex(as2.receiver)) {
+        appendText(out, "the receiver must be ")?;
+        appendText(out, receiverText(es.receiver))?;
+        appendText(out, ", not ")?;
+        return appendText(out, receiverText(as2.receiver));
+    }
+    if (e.parameters.length != a.parameters.length) {
+        appendText(out, "it must take ")?;
+        appendDecimal(out, truncate<u64>(e.parameters.length - 1))?;
+        return appendText(out, " parameter(s) besides the receiver");
+    }
+    for (i in 1..e.parameters.length) {
+        let et = c.hir.locals[e.parameters[i] as usize].typ;
+        let at = c.hir.locals[a.parameters[i] as usize].typ;
+        if (et != at) {
+            appendText(out, "parameter ")?;
+            appendDecimal(out, i as u64)?;
+            appendText(out, " must have type ")?;
+            appendQuotedType(out, c, et)?;
+            appendText(out, ", not ")?;
+            return appendQuotedType(out, c, at);
+        }
+    }
+    if (e.returnType != a.returnType) {
+        appendText(out, "it must return ")?;
+        appendQuotedType(out, c, e.returnType)?;
+        appendText(out, ", not ")?;
+        return appendQuotedType(out, c, a.returnType);
+    }
+    return Ok();
+}
+
+// ---- user allocators ----
+
+/// Checks a user allocator against lib/core's `Allocator` (VerifyUserAllocator, §30.2).
+fn verifyUserAllocator(c: borrow mut Checker, typ: u32, span: Span) -> Result<bool, AllocError> {
+    let definition = c.types.info(typ).structDef;
+    if (c.types.structs[definition as usize].allocateMethod != none()) {
+        return Ok(true);
+    }
+    let allocatorName = c.intern("Allocator")?;
+    let entry = match (c.item(allocatorName)) {
+        Entity.Interface(i) => i,
+        _ => none(),
+    };
+    if (entry != none()) {
+        let noArguments = Vector<u32>.create();
+        let bound = c.types.addBound(entry, "Allocator".bytes(), noArguments.view())?;
+        let allocateName = c.intern("allocate")?;
+        let deallocateName = c.intern("deallocate")?;
+        let allocate = implMethodFor(c, typ, allocateName);
+        let deallocate = implMethodFor(c, typ, deallocateName);
+        if (implements(c, typ, bound) && allocate != none() && deallocate != none()) {
+            c.types.structs[definition as usize].allocateMethod = allocate;
+            c.types.structs[definition as usize].deallocateMethod = deallocate;
+            return Ok(true);
+        }
+    }
+    var message = Vector<u8>.create();
+    appendQuotedType(mut message, c, typ)?;
+    appendText(mut message, " is not an allocator type: it does not implement 'Allocator' (type-system.md §30.2)")?;
+    c.error(notAnAllocator(), span.start, span.end, message)?;
+    return Ok(false);
+}
+
+// ---- methods ----
+
+/// The methods a value of `typ` has (FindMethod, §21): its own, those of its impls, or for a type parameter, its
+/// bounds'. None if there is none of that name; reports an ambiguous bound.
+fn findMethod(c: borrow mut Checker, typ: u32, name: u32, span: Span) -> Result<u32, AllocError> {
+    let definition = c.types.info(typ).structDef;
+    if (definition != none()) {
+        let ownBound = findStructFunction(c, definition, name);
+        if (ownBound != none()) {
+            return Ok(ownBound);
+        }
+    }
+    let implemented = implMethodFor(c, typ, name);
+    if (implemented != none()) {
+        return Ok(implemented);
+    }
+    if (!c.types.is(typ, TypeKind.TypeParameter)) {
+        return Ok(none());
+    }
+    var candidates = Vector<u32>.create(); // bounds
+    var signatures = Vector<u32>.create();
+    for (bound in c.types.typeParameters[c.types.info(typ).typeParameter as usize].bounds.view()) {
+        let signature = interfaceMethod(c, c.types.bounds[bound as usize].interfaceEntry, name);
+        if (signature != none()) {
+            candidates.push(bound)?;
+            signatures.push(signature)?;
+        }
+    }
+    if (candidates.length > 1) {
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, name)?;
+        appendText(mut message, " is ambiguous: both ")?;
+        quotedBound(mut message, c, candidates[0])?;
+        appendText(mut message, " and ")?;
+        quotedBound(mut message, c, candidates[1])?;
+        appendText(mut message, " declare it")?;
+        c.error(implMismatch(), span.start, span.end, message)?;
+    }
+    if (candidates.length == 0) {
+        return Ok(none());
+    }
+    let bound = candidates[0];
+    let b = c.types.bounds[bound as usize];
+    for (m in c.boundMethods.view()) {
+        if (m.typ == typ && m.name == name && c.types.bounds[m.bound as usize].interfaceEntry == b.interfaceEntry &&
+            sameLists(c, c.types.bounds[m.bound as usize].arguments, b.arguments)) {
+            return Ok(m.function);
+        }
+    }
+    let entry = c.interfaces[b.interfaceEntry as usize];
+    let interfaceParameters = match (c.front.ast.items[entry.item as usize].kind) {
+        ItemKind.Interface(_, t) => t,
+        _ => emptyRange(),
+    };
+    var arguments = Vector<u32>.create();
+    listTypes(c, b.arguments, mut arguments)?;
+    var pairs = Vector<EnvPair>.create();
+    zipEnvironment(c, interfaceParameters, arguments.view(), mut pairs)?;
+    let environment = storeEnvironment(c, pairs.view())?;
+    let savedFile = c.file;
+    c.file = entry.file;
+    let function = declareSignature(c, signatures[0], typ, environment)?;
+    c.file = savedFile;
+    c.boundMethods.push(BoundMethod { typ: typ, bound: bound, name: name, function: function })?;
+    return Ok(function);
+}
+
+// ---- substitution ----
+
+struct TypeMapping {
+    from: u32;
+    to: u32;
+}
+
+/// A type with type parameters replaced by `map` (Substitute, for bounds such as `Comparable<T>`).
+fn substitute(c: borrow mut Checker, typ: u32, map: Slice<TypeMapping>) -> Result<u32, AllocError> {
+    for (m in map) {
+        if (m.from == typ) {
+            return Ok(m.to);
+        }
+    }
+    if (!c.types.isGeneric(typ)) {
+        return Ok(typ);
+    }
+    let t = c.types.info(typ);
+    if (c.types.is(typ, TypeKind.Reference)) {
+        let p = substitute(c, t.pointee, map)?;
+        return c.types.referenceTo(p, t.mutableReference);
+    }
+    if (c.types.is(typ, TypeKind.RawPointer)) {
+        let p = substitute(c, t.pointee, map)?;
+        return c.types.pointerTo(p, t.mutablePointer);
+    }
+    if (c.types.is(typ, TypeKind.Array)) {
+        let e = substitute(c, t.element, map)?;
+        return c.types.arrayOf(e, t.arrayLength);
+    }
+    if (c.types.is(typ, TypeKind.Box)) {
+        let p = substitute(c, t.pointee, map)?;
+        return boxOf(c, p, t.allocator);
+    }
+    if (c.types.is(typ, TypeKind.Enum)) {
+        let resultOkType = c.types.enums[t.enumDef as usize].resultOk;
+        let resultErrType = c.types.enums[t.enumDef as usize].resultErr;
+        let optionValue = c.types.enums[t.enumDef as usize].optionType;
+        let enumItem = c.types.enums[t.enumDef as usize].item;
+        let enumArguments = c.types.enums[t.enumDef as usize].typeArguments;
+        if (resultOkType != none()) {
+            let ok = substitute(c, resultOkType, map)?;
+            let err = substitute(c, resultErrType, map)?;
+            return resultOf(c, ok, err);
+        }
+        if (optionValue != none()) {
+            let v = substitute(c, optionValue, map)?;
+            return optionOf(c, v);
+        }
+        if (enumItem != none()) {
+            var template = none();
+            for (k in 0..c.enums.length) {
+                if (c.enums[k].item == enumItem && c.enums[k].template == none()) {
+                    template = truncate<u32>(k);
+                }
+            }
+            if (template != none()) {
+                var arguments = Vector<u32>.create();
+                for (k in 0..enumArguments.count) {
+                    let a = c.types.listAt(enumArguments, k);
+                    arguments.push(substitute(c, a, map)?)?;
+                }
+                let entry = instantiateEnum(c, template, arguments.view(), Span { start: 0, end: 0 })?;
+                return Ok(c.enums[entry as usize].typ);
+            }
+        }
+        return Ok(typ);
+    }
+    if (c.types.is(typ, TypeKind.Vector)) {
+        let elementType = c.types.info(t.pointee).element;
+        let element = if (c.types.isString(typ)) none() else substitute(c, elementType, map)?;
+        return vectorType(c, element, t.allocator);
+    }
+    if (c.types.is(typ, TypeKind.StableVector)) {
+        let elementType = c.types.info(t.pointee).element;
+        let e = substitute(c, elementType, map)?;
+        return containerType(c, false, e, t.allocator);
+    }
+    if (c.types.is(typ, TypeKind.SlotMap)) {
+        let e = substitute(c, t.element, map)?;
+        return containerType(c, true, e, t.allocator);
+    }
+    if (c.types.is(typ, TypeKind.Handle)) {
+        let e = substitute(c, t.element, map)?;
+        return c.types.handleOf(e);
+    }
+    if (c.types.is(typ, TypeKind.Struct)) {
+        let structItem = c.types.structs[t.structDef as usize].item;
+        let structArguments = c.types.structs[t.structDef as usize].typeArguments;
+        if (structItem != none()) {
+            var template = none();
+            for (k in 0..c.structs.length) {
+                if (c.structs[k].item == structItem && c.structs[k].template == none()) {
+                    template = truncate<u32>(k);
+                }
+            }
+            if (template != none()) {
+                var arguments = Vector<u32>.create();
+                for (k in 0..structArguments.count) {
+                    let a = c.types.listAt(structArguments, k);
+                    arguments.push(substitute(c, a, map)?)?;
+                }
+                let entry = instantiateStruct(c, template, arguments.view(), Span { start: 0, end: 0 })?;
+                return Ok(c.structs[entry as usize].typ);
+            }
+        }
+        return Ok(typ);
+    }
+    // Function, closure and thread types come with S6.
+    return Ok(typ);
+}

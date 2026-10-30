@@ -44,8 +44,12 @@ fn checkBoxAllocator(c: borrow mut Checker, typ: u32, span: Span) -> Result<bool
         return Ok(true);
     }
     if (isFieldlessStruct(c, typ)) {
-        c.notPorted(span.start, span.end, "a user-defined allocator", "S4")?;
-        return Ok(false);
+        if (c.implsReady) {
+            return verifyUserAllocator(c, typ, span);
+        }
+        let file = c.file;
+        c.pendingAllocators.push(PendingAllocator { typ: typ, start: span.start, end: span.end, file: file })?;
+        return Ok(true);
     }
     var message = Vector<u8>.create();
     appendQuotedType(mut message, c, typ)?;

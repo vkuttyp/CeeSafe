@@ -1,0 +1,34 @@
+interface Shape { fn area(borrow this) -> i64; }
+interface Pair<T> { fn get(borrow this) -> T; }
+interface Free { fn make() -> i32; }
+interface Two { fn area(borrow this) -> i64; }
+struct Square { side: i64; fn area(borrow this) -> i64 => 1; }
+struct Plain { x: i32; }
+struct Box2<T> { v: T; }
+struct Other { y: i32; }
+struct Holds<T: Shape> { v: T; }
+
+impl Shape for Square { fn area(borrow this) -> i64 => 1; }
+impl Shape for Plain { fn area(this) -> i32 => 1; fn extra(borrow this) {} }
+impl Shape for Plain { fn area(borrow this) -> i64 => 1; }
+impl Pair for Plain {}
+impl Pair<i32, i32> for Plain {}
+impl Plain for Square {}
+impl Shape for borrow Plain {}
+impl Shape for i32 { fn wrappingAdd(borrow this) -> i64 => 1; }
+impl Two for Plain {}
+
+fn needs<S: Shape>(s: S) -> i64 => s.area();
+fn both<T: Shape + Two>(t: borrow T) -> i64 => t.area();
+fn none<T: Shape>(t: borrow T) { t.fly(); }
+fn badBound<T: Plain>(t: T) {}
+fn badArgs<T: Pair>(t: T) {}
+
+fn main() {
+    let a = needs(Plain { x: 1 });
+    let b = needs(5);
+    let c = Shape;
+    let d = needs(Other { y: 1 });
+    let e = Holds { v: Other { y: 2 } };
+    let f: Holds<Other> = Holds { v: Other { y: 3 } };
+}

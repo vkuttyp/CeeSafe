@@ -202,6 +202,7 @@ struct HirFunction {
     siteFile: u32; // where an instance was made, or none
     siteStart: u32;
     siteEnd: u32;
+    registered: bool; // false for a signature only (an interface method's): not in the reference's _functions
 }
 
 struct HirConstant {
@@ -240,6 +241,7 @@ struct HirProgram {
     patterns: Vector<HirPattern>;
     locals: Vector<HirLocal>;
     functions: Vector<HirFunction>;
+    registeredFunctions: u32; // the reference's _functions.Count: ids count registered functions only
     constants: Vector<HirConstant>;
     statics: Vector<HirStatic>;
 
@@ -260,6 +262,7 @@ struct HirProgram {
         patterns: Vector<HirPattern>.create(),
         locals: Vector<HirLocal>.create(),
         functions: Vector<HirFunction>.create(),
+        registeredFunctions: 0,
         constants: Vector<HirConstant>.create(),
         statics: Vector<HirStatic>.create(),
     };
@@ -338,8 +341,12 @@ struct HirProgram {
         file: u32,
         syntax: u32,
         library: bool,
+        registered: bool,
     ) -> Result<u32, AllocError> {
-        let id = truncate<u32>(this.functions.length);
+        let id = if (registered) this.registeredFunctions else 0xFFFFFFFF;
+        if (registered) {
+            this.registeredFunctions += 1;
+        }
         this.functions.push(HirFunction {
             id: id,
             name: name,
@@ -370,8 +377,9 @@ struct HirProgram {
             siteFile: 0xFFFFFFFF,
             siteStart: 0,
             siteEnd: 0,
+            registered: registered,
         })?;
-        return Ok(id);
+        return Ok(truncate<u32>(this.functions.length - 1));
     }
 
     fn addPlace(borrow mut this, root: u32, projections: Slice<HirProjection>, typ: u32) -> Result<u32, AllocError> {

@@ -126,6 +126,15 @@ fn checkProgram(
         instantiating: 0,
         recursionState: Vector<u8>.create(),
         copyDone: Vector<bool>.create(),
+        interfaces: Vector<InterfaceEntry>.create(),
+        impls: Vector<ImplRef>.create(),
+        implsReady: false,
+        registerNext: true,
+        implementations: Vector<Implementation>.create(),
+        implMethods: Vector<ImplMethod>.create(),
+        boundMethods: Vector<BoundMethod>.create(),
+        pendingBounds: Vector<PendingBounds>.create(),
+        pendingAllocators: Vector<PendingAllocator>.create(),
         pendingElements: Vector<PendingElement>.create(),
         letKeywords: Vector<LetKeyword>.create(),
     };
@@ -151,7 +160,7 @@ fn checkProgram(
         for (k in 0..items.count) {
             let item = c.front.ast.at(items, k);
             match (c.front.ast.items[item as usize].kind) {
-                ItemKind.Interface(_, _) => { declareTypeItem(mut c, item, "an interface", "S4")?; }
+                ItemKind.Interface(_, _) => { declareInterface(mut c, item)?; }
                 _ => {}
             }
         }
@@ -200,6 +209,7 @@ fn checkProgram(
         }
     }
 
+    processImpls(mut c)?;
     resolveAllMembers(mut c)?;
     checkStructRecursion(mut c)?;
     computeCopyAndDrop(mut c)?;
@@ -212,7 +222,7 @@ fn checkProgram(
     // The body pass: every function in creation order; library bodies wait for S5.
     var f: usize = 0;
     while (f < c.hir.functions.length) {
-        if (!c.hir.functions[f].library) {
+        if (!c.hir.functions[f].library && c.hir.functions[f].registered) {
             let function = truncate<u32>(f);
             if (functionIsInstantiation(c, function)) {
                 // Its generic version reports (§20.3); a scoped type argument the body cannot take is N0274.
@@ -350,7 +360,7 @@ fn declare(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
     }
     match (entry.kind) {
         ItemKind.Impl(_, _, _) => {
-            c.notPorted(entry.start, entry.end, "an impl block", "S4")?;
+            c.impls.push(ImplRef { item: item, file: c.file })?; // processed once every item is declared (§21.1)
             return Ok();
         }
         ItemKind.Extern(_, _, _) => {
@@ -462,6 +472,15 @@ fn receiverIndex(kind: ReceiverKind) -> u32 => match (kind) {
 fn declareFunction(c: borrow mut Checker, f: u32, owner: u32) -> Result<u32, AllocError> =>
     declareFunctionIn(c, f, owner, emptyRange());
 
+/// A signature only (an interface method's, DeclareFunction with `register: false`): checked, never compiled, not
+/// printed, and not counted in function ids.
+fn declareSignature(c: borrow mut Checker, f: u32, owner: u32, environment: Range) -> Result<u32, AllocError> {
+    c.registerNext = false;
+    let function = declareFunctionIn(c, f, owner, environment)?;
+    c.registerNext = true;
+    return Ok(function);
+}
+
 /// DeclareFunction with a type environment (Checker.envPairs): a generic version's or an instance's.
 fn declareFunctionIn(c: borrow mut Checker, f: u32, owner: u32, environment: Range) -> Result<u32, AllocError> {
     var scope = Vector<u32>.create();
@@ -512,7 +531,7 @@ fn declareFunctionCore(c: borrow mut Checker, f: u32, owner: u32, environment: R
     )?;
     let name = c.front.ast.idents[decl.name as usize].symbol;
     let library = isLibraryFile(c);
-    let function = c.hir.addFunction(name, owner, returnType, c.file, f, library)?;
+    let function = c.hir.addFunction(name, owner, returnType, c.file, f, library, c.registerNext)?;
     c.hir.functions[function as usize].environment = env;
     if (owner != none() && receiverIndex(decl.receiver) != 0) {
         // `this` is an immutable binding: the struct by value, or a reference to it (§12, §13.2).

@@ -290,13 +290,8 @@ fn synthName(c: borrow mut Checker, name: u32, span: Span) -> Result<u32, AllocE
             appendText(mut message, " is not a value")?;
             c.error(notCallable(), span.start, span.end, message)?;
         }
-        Entity.None => {
-            var message = Vector<u8>.create();
-            appendText(mut message, "cannot find ")?;
-            appendQuotedName(mut message, c, symbol)?;
-            appendText(mut message, " in this scope")?;
-            c.error(undefinedName(), span.start, span.end, message)?;
-        }
+        Entity.None => { cannotFind(c, symbol, span)?; }
+        Entity.Interface(_) => { cannotFind(c, symbol, span)?; }
     }
     return c.errorResult(span.start, span.end);
 }
@@ -1295,4 +1290,12 @@ fn notAValue(c: borrow mut Checker, symbol: u32, member: u32, span: Span) -> Res
     appendText(mut message, "' is not a value; call it with '(...)'")?;
     c.error(notCallable(), span.start, span.end, message)?;
     return c.errorResult(span.start, span.end);
+}
+
+fn cannotFind(c: borrow mut Checker, symbol: u32, span: Span) -> Result<void, AllocError> {
+    var message = Vector<u8>.create();
+    appendText(mut message, "cannot find ")?;
+    appendQuotedName(mut message, c, symbol)?;
+    appendText(mut message, " in this scope")?;
+    return c.error(undefinedName(), span.start, span.end, message);
 }

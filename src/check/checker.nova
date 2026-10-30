@@ -18,6 +18,7 @@ enum Entity {
     Enum(u32),            // Checker.enums
     Builtin(u32),         // Console, Process, ... (the reference's Builtin enum, by declaration index)
     GenericFunction(u32), // Checker.genericFunctions
+    Interface(u32),       // Checker.interfaces
 }
 
 /// The reference's Builtin enum members S1 uses, by declaration index.
@@ -85,6 +86,15 @@ struct Checker {
     instantiating: u32;
     recursionState: Vector<u8>; // by type id: 0 new, 1 on the stack, 2 done (kept across runs)
     copyDone: Vector<bool>;     // by type id (kept across runs)
+    interfaces: Vector<InterfaceEntry>;
+    impls: Vector<ImplRef>; // every impl, processed once every item is declared (§21.1)
+    implsReady: bool;
+    registerNext: bool; // false while declaring a signature only
+    implementations: Vector<Implementation>;
+    implMethods: Vector<ImplMethod>;
+    boundMethods: Vector<BoundMethod>;
+    pendingBounds: Vector<PendingBounds>;
+    pendingAllocators: Vector<PendingAllocator>;
     pendingElements: Vector<PendingElement>;
     letKeywords: Vector<LetKeyword>;
 
