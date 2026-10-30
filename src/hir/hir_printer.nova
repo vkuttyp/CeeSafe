@@ -1,0 +1,770 @@
+// `check --dump-hir` (the reference's Hir/HirPrinter.cs): HIR as indented S-expressions with types. The format is the
+// reference's byte for byte, quirks included (docs/p3-plan.md §1):
+// - a builtin call prints its name only for Console.write and Console.writeLine, and `Process.exit` for every other
+//   builtin, with no type suffix;
+// - bool constants and casts have no type suffix;
+// - strings escape only `\`, `"` and newline;
+// - floats use .NET's "R" format (src/support/dotnet_double.nova).
+// Library functions are left out; every constant is printed.
+
+struct HirPrinter {
+    out: Vector<u8>;
+    indent: u32;
+
+    fn create() -> HirPrinter => HirPrinter { out: Vector<u8>.create(), indent: 0 };
+
+    fn text(borrow mut this, text: StringView) -> Result<void, AllocError> => appendText(mut this.out, text);
+
+    fn bytes(borrow mut this, bytes: Slice<u8>) -> Result<void, AllocError> => appendBytes(mut this.out, bytes);
+
+    fn open(borrow mut this) -> Result<void, AllocError> {
+        for (k in 0..this.indent * 2) {
+            this.out.push(' ')?;
+        }
+        return Ok();
+    }
+
+    fn close(borrow mut this) -> Result<void, AllocError> {
+        this.out.push('\n')?;
+        return Ok();
+    }
+
+    fn line(borrow mut this, text: StringView) -> Result<void, AllocError> {
+        this.open()?;
+        this.text(text)?;
+        return this.close();
+    }
+
+    fn printProgram(
+        borrow mut this,
+        hir: borrow HirProgram,
+        types: borrow TypeTable,
+        symbols: borrow Interner,
+    ) -> Result<void, AllocError> {
+        this.line("(program")?;
+        this.indent += 1;
+        for (c in 0..hir.constants.length) {
+            let constant = hir.constants[c];
+            this.open()?;
+            this.text("(const ")?;
+            this.bytes(symbols.name(Symbol { id: constant.name }))?;
+            this.text(": ")?;
+            this.bytes(types.name(constant.typ))?;
+            this.text(" = ")?;
+            if (constant.value == none()) {
+                this.text("?")?;
+            } else {
+                this.expr(hir, types, symbols, constant.value)?;
+            }
+            this.text(")")?;
+            this.close()?;
+        }
+        for (f in 0..hir.functions.length) {
+            let function = borrow hir.functions[f];
+            if (function.library) {
+                continue; // lib/core and the other libraries are left out (§29.2)
+            }
+            this.open()?;
+            this.text("(fn ")?;
+            if (function.owner != none()) {
+                this.bytes(types.name(function.owner))?;
+                this.text(".")?;
+            }
+            this.bytes(symbols.name(Symbol { id: function.name }))?;
+            this.text(" (")?;
+            for (k in 0..function.parameters.length) {
+                if (k > 0) {
+                    this.text(" ")?;
+                }
+                let p = function.parameters[k];
+                this.text("(")?;
+                this.local(hir, symbols, p)?;
+                this.text(": ")?;
+                this.bytes(types.name(hir.locals[p as usize].typ))?;
+                this.text(")")?;
+            }
+            this.text(") -> ")?;
+            this.bytes(types.name(function.returnType))?;
+            this.close()?;
+            this.indent += 1;
+            if (function.body != none()) {
+                this.stmt(hir, types, symbols, function.body)?;
+            }
+            this.indent -= 1;
+            this.line(")")?;
+        }
+        this.indent -= 1;
+        return this.line(")");
+    }
+
+    /// `name#id`.
+    fn local(
+        borrow mut this,
+        hir: borrow HirProgram,
+        symbols: borrow Interner,
+        local: u32,
+    ) -> Result<void, AllocError> {
+        let l = hir.locals[local as usize];
+        this.bytes(symbols.name(Symbol { id: l.name }))?;
+        this.text("#")?;
+        return appendDecimal(mut this.out, l.id as u64);
+    }
+
+    /// A place: the root local wrapped by each projection in turn, so it is built in its own buffer.
+    fn place(
+        borrow mut this,
+        hir: borrow HirProgram,
+        types: borrow TypeTable,
+        symbols: borrow Interner,
+        place: u32,
+    ) -> Result<void, AllocError> {
+        let p = hir.places[place as usize];
+        var current = HirPrinter.create();
+        current.local(hir, symbols, p.root)?;
+        for (k in 0..p.projections.count) {
+            let projection = hir.projections[(p.projections.start + k) as usize];
+            var next = HirPrinter.create();
+            match (projection.kind) {
+                ProjectionKind.Deref => {
+                    next.text("(*")?;
+                    next.bytes(current.out.view())?;
+                    next.text(")")?;
+                }
+                ProjectionKind.Field => {
+                    next.bytes(current.out.view())?;
+                    next.text(".")?;
+                    next.bytes(symbols.name(Symbol { id: types.fields[projection.field as usize].name }))?;
+                }
+                ProjectionKind.Downcast => {
+                    next.text("(")?;
+                    next.bytes(current.out.view())?;
+                    next.text(" as ")?;
+                    next.bytes(symbols.name(Symbol { id: types.variants[projection.variant as usize].name }))?;
+                    next.text(")")?;
+                }
+                ProjectionKind.Index => {
+                    next.bytes(current.out.view())?;
+                    next.text("[")?;
+                    if (projection.index == none()) {
+                        next.text("?")?;
+                    } else {
+                        next.expr(hir, types, symbols, projection.index)?;
+                    }
+                    next.text("]")?;
+                }
+            }
+            current = next;
+        }
+        return this.bytes(current.out.view());
+    }
+
+    /// `(<head>`, the child statements, `)`.
+    fn nested(
+        borrow mut this,
+        hir: borrow HirProgram,
+        types: borrow TypeTable,
+        symbols: borrow Interner,
+        head: borrow Vector<u8>,
+        child: u32,
+    ) -> Result<void, AllocError> {
+        this.open()?;
+        this.text("(")?;
+        this.bytes(head.view())?;
+        this.close()?;
+        this.indent += 1;
+        if (child != none()) {
+            this.stmt(hir, types, symbols, child)?;
+        }
+        this.indent -= 1;
+        return this.line(")");
+    }
+
+    /// An expression printed into a separate buffer, for a head line.
+    fn exprText(
+        borrow this,
+        hir: borrow HirProgram,
+        types: borrow TypeTable,
+        symbols: borrow Interner,
+        expr: u32,
+    ) -> Result<Vector<u8>, AllocError> {
+        var p = HirPrinter.create();
+        p.expr(hir, types, symbols, expr)?;
+        return Ok(p.out);
+    }
+
+    fn stmt(
+        borrow mut this,
+        hir: borrow HirProgram,
+        types: borrow TypeTable,
+        symbols: borrow Interner,
+        id: u32,
+    ) -> Result<void, AllocError> {
+        match (hir.stmts[id as usize]) {
+            HirStmt.Block(statements) => {
+                if (statements.count == 0) {
+                    return this.line("(block)");
+                }
+                this.line("(block")?;
+                this.indent += 1;
+                for (k in 0..statements.count) {
+                    this.stmt(hir, types, symbols, hir.at(statements, k))?;
+                }
+                this.indent -= 1;
+                this.line(")")?;
+            }
+            HirStmt.LocalDecl(local, initializer) => {
+                let l = hir.locals[local as usize];
+                this.open()?;
+                this.text(if (l.isUsing) "(using " else if (l.mutable) "(var " else "(let ")?;
+                this.local(hir, symbols, local)?;
+                this.text(": ")?;
+                this.bytes(types.name(l.typ))?;
+                if (initializer == none()) {
+                    this.text(")")?;
+                } else {
+                    this.text(" = ")?;
+                    this.expr(hir, types, symbols, initializer)?;
+                    this.text(")")?;
+                }
+                this.close()?;
+            }
+            HirStmt.Assign(place, op, value) => {
+                this.open()?;
+                this.text("(")?;
+                if (op == 0) {
+                    this.text("=")?;
+                } else {
+                    this.text(hirOpText(op - 1))?;
+                    this.text("=")?;
+                }
+                this.text(" ")?;
+                this.place(hir, types, symbols, place)?;
+                this.text(" ")?;
+                this.expr(hir, types, symbols, value)?;
+                this.text(")")?;
+                this.close()?;
+            }
+            HirStmt.If(condition, then, otherwise) => {
+                var head = Vector<u8>.create();
+                appendText(mut head, "if ")?;
+                let condText = this.exprText(hir, types, symbols, condition)?;
+                appendBytes(mut head, condText.view())?;
+                if (otherwise == none()) {
+                    return this.nested(hir, types, symbols, head, then);
+                }
+                this.open()?;
+                this.text("(")?;
+                this.bytes(head.view())?;
+                this.close()?;
+                this.indent += 1;
+                this.stmt(hir, types, symbols, then)?;
+                var elseHead = Vector<u8>.create();
+                appendText(mut elseHead, "else")?;
+                this.nested(hir, types, symbols, elseHead, otherwise)?;
+                this.indent -= 1;
+                this.line(")")?;
+            }
+            HirStmt.While(condition, body) => {
+                var head = Vector<u8>.create();
+                appendText(mut head, "while ")?;
+                let condText = this.exprText(hir, types, symbols, condition)?;
+                appendBytes(mut head, condText.view())?;
+                this.nested(hir, types, symbols, head, body)?;
+            }
+            HirStmt.Loop(body) => {
+                var head = Vector<u8>.create();
+                appendText(mut head, "loop")?;
+                this.nested(hir, types, symbols, head, body)?;
+            }
+            HirStmt.For(variable, start, end, body) => {
+                var p = HirPrinter.create();
+                p.text("for ")?;
+                p.local(hir, symbols, variable)?;
+                p.text(" in ")?;
+                p.expr(hir, types, symbols, start)?;
+                if (end != none()) {
+                    p.text(" .. ")?;
+                    p.expr(hir, types, symbols, end)?;
+                }
+                this.nested(hir, types, symbols, p.out, body)?;
+            }
+            HirStmt.Break => { this.line("(break)")?; }
+            HirStmt.Continue => { this.line("(continue)")?; }
+            HirStmt.Return(value) => {
+                if (value == none()) {
+                    return this.line("(return)");
+                }
+                this.open()?;
+                this.text("(return ")?;
+                this.expr(hir, types, symbols, value)?;
+                this.text(")")?;
+                this.close()?;
+            }
+            HirStmt.Expression(expr) => {
+                this.open()?;
+                this.text("(expr ")?;
+                this.expr(hir, types, symbols, expr)?;
+                this.text(")")?;
+                this.close()?;
+            }
+            HirStmt.Yield(value) => {
+                this.open()?;
+                this.text("(yield ")?;
+                this.expr(hir, types, symbols, value)?;
+                this.text(")")?;
+                this.close()?;
+            }
+            HirStmt.Defer(body) => {
+                var head = Vector<u8>.create();
+                appendText(mut head, "defer")?;
+                this.nested(hir, types, symbols, head, body)?;
+            }
+            HirStmt.Match(scrutinee, arms, consumes, _) => {
+                this.open()?;
+                this.text(if (consumes) "(match-consume " else "(match ")?;
+                this.expr(hir, types, symbols, scrutinee)?;
+                this.close()?;
+                this.indent += 1;
+                for (k in 0..arms.count) {
+                    let arm = hir.arms[hir.at(arms, k) as usize];
+                    var head = HirPrinter.create();
+                    head.text("arm ")?;
+                    if (arm.pattern != none()) {
+                        head.patternText(hir, types, symbols, arm.pattern)?; // a nested match (M11)
+                        this.nested(hir, types, symbols, head.out, arm.body)?;
+                        continue;
+                    }
+                    match (arm.kind) {
+                        HirPatternKind.Wildcard => { head.text("_")?; }
+                        HirPatternKind.Variant => {
+                            // The reference throws here when the variant is unknown (check-fail enums, optionals,
+                            // results); this port prints `?` instead (docs/p3-plan.md §1).
+                            if (arm.variant == none()) {
+                                head.text("?")?;
+                            } else {
+                                head.bytes(symbols.name(Symbol { id: types.variants[arm.variant as usize].name }))?;
+                            }
+                        }
+                        HirPatternKind.Bool => {
+                            head.text(if (arm.value.magnitude != 0) "true" else "false")?;
+                        }
+                        HirPatternKind.IntegerLiteral => { appendIntValue(mut head.out, arm.value)?; }
+                    }
+                    for (b in 0..arm.bindings.count) {
+                        let binding = hir.armBindings[(arm.bindings.start + b) as usize];
+                        let l = hir.locals[binding.local as usize];
+                        head.text(" (")?;
+                        if (l.mutable) {
+                            head.text("var ")?;
+                        }
+                        head.local(hir, symbols, binding.local)?;
+                        head.text(": ")?;
+                        head.bytes(types.name(l.typ))?;
+                        head.text(" = payload ")?;
+                        appendDecimal(mut head.out, binding.payloadIndex as u64)?;
+                        head.text(")")?;
+                    }
+                    this.nested(hir, types, symbols, head.out, arm.body)?;
+                }
+                this.indent -= 1;
+                this.line(")")?;
+            }
+        }
+        return Ok();
+    }
+
+    fn patternText(
+        borrow mut this,
+        hir: borrow HirProgram,
+        types: borrow TypeTable,
+        symbols: borrow Interner,
+        id: u32,
+    ) -> Result<void, AllocError> {
+        match (hir.patterns[id as usize]) {
+            HirPattern.Wildcard => { this.text("_")?; }
+            HirPattern.Binding(local) => {
+                let l = hir.locals[local as usize];
+                this.text("(")?;
+                if (l.mutable) {
+                    this.text("var ")?;
+                }
+                this.local(hir, symbols, local)?;
+                this.text(": ")?;
+                this.bytes(types.name(l.typ))?;
+                this.text(")")?;
+            }
+            HirPattern.Literal(value) => { appendIntValue(mut this.out, value)?; }
+            HirPattern.Variant(variant, hasPayload, payload) => {
+                this.bytes(symbols.name(Symbol { id: types.variants[variant as usize].name }))?;
+                if (hasPayload) {
+                    this.text("(")?;
+                    for (k in 0..payload.count) {
+                        if (k > 0) {
+                            this.text(", ")?;
+                        }
+                        this.patternText(hir, types, symbols, hir.at(payload, k))?;
+                    }
+                    this.text(")")?;
+                }
+            }
+        }
+        return Ok();
+    }
+
+    /// A statement on one line, for an `if` or `match` expression (Inline): its lines trimmed and joined by spaces,
+    /// with no space before a line that starts with ')'.
+    fn inline(
+        borrow mut this,
+        hir: borrow HirProgram,
+        types: borrow TypeTable,
+        symbols: borrow Interner,
+        id: u32,
+    ) -> Result<void, AllocError> {
+        var inner = HirPrinter.create();
+        inner.stmt(hir, types, symbols, id)?;
+        var first = true;
+        var i: usize = 0;
+        while (i < inner.out.length) {
+            var end = i;
+            while (end < inner.out.length && inner.out[end] != '\n') {
+                end += 1;
+            }
+            var from = i;
+            var to = end;
+            while (from < to && isTrimmed(inner.out[from])) {
+                from += 1;
+            }
+            while (to > from && isTrimmed(inner.out[to - 1])) {
+                to -= 1;
+            }
+            if (to > from) {
+                if (!first && inner.out[from] != ')') {
+                    this.out.push(' ')?;
+                }
+                appendBytes(mut this.out, inner.out[from..to])?;
+                first = false;
+            }
+            i = end + 1;
+        }
+        return Ok();
+    }
+
+    /// `:Type`.
+    fn typed(borrow mut this, hir: borrow HirProgram, types: borrow TypeTable, id: u32) -> Result<void, AllocError> {
+        this.text(":")?;
+        return this.bytes(types.name(hir.exprTypes[id as usize]));
+    }
+
+    /// ` a b c`.
+    fn args(
+        borrow mut this,
+        hir: borrow HirProgram,
+        types: borrow TypeTable,
+        symbols: borrow Interner,
+        arguments: Range,
+    ) -> Result<void, AllocError> {
+        for (k in 0..arguments.count) {
+            this.text(" ")?;
+            this.expr(hir, types, symbols, hir.at(arguments, k))?;
+        }
+        return Ok();
+    }
+
+    /// `"…"` with only `\`, `"` and newline escaped (HirStringConst and HirStaticCString).
+    fn quoted(borrow mut this, value: Slice<u8>) -> Result<void, AllocError> {
+        this.out.push('"')?;
+        for (b in value) {
+            if (b == '\\') {
+                this.text("\\\\")?;
+            } else if (b == '"') {
+                this.text("\\\"")?;
+            } else if (b == '\n') {
+                this.text("\\n")?;
+            } else {
+                this.out.push(b)?;
+            }
+        }
+        this.out.push('"')?;
+        return Ok();
+    }
+
+    fn expr(
+        borrow mut this,
+        hir: borrow HirProgram,
+        types: borrow TypeTable,
+        symbols: borrow Interner,
+        id: u32,
+    ) -> Result<void, AllocError> {
+        match (hir.exprs[id as usize]) {
+            HirExpr.StmtValue(statement) => {
+                this.text("(value ")?;
+                this.inline(hir, types, symbols, statement)?;
+                this.text(")")?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.Closure(function, captures) => {
+                let f = borrow hir.functions[function as usize];
+                this.text("(closure ")?;
+                appendDecimal(mut this.out, f.id as u64)?;
+                this.text(" (")?;
+                for (k in 0..captures.count) {
+                    if (k > 0) {
+                        this.text(" ")?;
+                    }
+                    let c = hir.captures[(captures.start + k) as usize];
+                    this.text(match (c.mode) {
+                        CaptureMode.Shared => "shared ",
+                        CaptureMode.Mutable => "mutable ",
+                        CaptureMode.Copy => "copy ",
+                        CaptureMode.Move => "move ",
+                    })?;
+                    this.local(hir, symbols, c.local)?;
+                    if (c.field != none()) {
+                        this.text(".")?;
+                        this.bytes(symbols.name(Symbol { id: types.fields[c.field as usize].name }))?;
+                    }
+                }
+                this.text(") ")?;
+                this.inline(hir, types, symbols, f.body)?;
+                this.text(")")?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.IntConst(value) => {
+                appendIntValue(mut this.out, value)?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.FloatConst(value) => {
+                appendDotNetDouble(mut this.out, value)?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.BoolConst(value) => { this.text(if (value) "true" else "false")?; }
+            HirExpr.StringConst(value) => { this.quoted(hir.textOf(value))?; }
+            HirExpr.LocalRef(local) => { this.local(hir, symbols, local)?; }
+            HirExpr.Unary(op, operand) => {
+                this.text(match (op) {
+                    UnaryOp.Negate => "(neg ",
+                    UnaryOp.Not => "(not ",
+                })?;
+                this.expr(hir, types, symbols, operand)?;
+                this.text(")")?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.Binary(op, left, right) => {
+                this.text("(")?;
+                this.text(binaryOpText(op))?;
+                this.text(" ")?;
+                this.expr(hir, types, symbols, left)?;
+                this.text(" ")?;
+                this.expr(hir, types, symbols, right)?;
+                this.text(")")?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.Cast(operand) => {
+                this.text("(as ")?;
+                this.expr(hir, types, symbols, operand)?;
+                this.text(" ")?;
+                this.bytes(types.name(hir.exprTypes[id as usize]))?;
+                this.text(")")?;
+            }
+            HirExpr.Truncate(operand) => {
+                this.text("(truncate ")?;
+                this.bytes(types.name(hir.exprTypes[id as usize]))?;
+                this.text(" ")?;
+                this.expr(hir, types, symbols, operand)?;
+                this.text(")")?;
+            }
+            HirExpr.FloatToInt(operand, mode) => {
+                this.text(match (mode) {
+                    FloatToIntMode.Panic => "(panic-truncate ",
+                    FloatToIntMode.Checked => "(checked-truncate ",
+                    FloatToIntMode.Saturating => "(saturating-truncate ",
+                })?;
+                this.bytes(types.name(hir.exprTypes[id as usize]))?;
+                this.text(" ")?;
+                this.expr(hir, types, symbols, operand)?;
+                this.text(")")?;
+            }
+            HirExpr.Call(function, arguments) => {
+                let f = borrow hir.functions[function as usize];
+                this.text("(call ")?;
+                if (f.owner != none()) {
+                    this.bytes(types.name(f.owner))?;
+                    this.text(".")?;
+                }
+                this.bytes(symbols.name(Symbol { id: f.name }))?;
+                this.args(hir, types, symbols, arguments)?;
+                this.text(")")?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.BuiltinCall(builtin, arguments) => {
+                this.text(
+                    if (builtin == 0) "(Console.write" else if (builtin == 1) "(Console.writeLine" else "(Process.exit",
+                )?;
+                this.args(hir, types, symbols, arguments)?;
+                this.text(")")?;
+            }
+            HirExpr.FieldAccess(target, field) => {
+                this.text("(. ")?;
+                this.expr(hir, types, symbols, target)?;
+                this.text(" ")?;
+                this.bytes(symbols.name(Symbol { id: types.fields[field as usize].name }))?;
+                this.text(")")?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.StructLiteral(fields) => {
+                this.text("(new ")?;
+                this.bytes(types.name(hir.exprTypes[id as usize]))?;
+                for (k in 0..fields.count) {
+                    let fv = hir.fieldValues[(fields.start + k) as usize];
+                    this.text(" (")?;
+                    this.bytes(symbols.name(Symbol { id: types.fields[fv.field as usize].name }))?;
+                    this.text(" ")?;
+                    this.expr(hir, types, symbols, fv.value)?;
+                    this.text(")")?;
+                }
+                this.text(")")?;
+            }
+            HirExpr.Borrow(mutable, place) => {
+                this.text(if (mutable) "(borrow-mut " else "(borrow ")?;
+                this.place(hir, types, symbols, place)?;
+                this.text(")")?;
+            }
+            HirExpr.BorrowTemp(mutable, value) => {
+                this.text(if (mutable) "(borrow-mut-temp " else "(borrow-temp ")?;
+                this.expr(hir, types, symbols, value)?;
+                this.text(")")?;
+            }
+            HirExpr.FunctionAddress(function) => {
+                this.text("(address ")?;
+                this.bytes(symbols.name(Symbol { id: hir.functions[function as usize].name }))?;
+                this.text(")")?;
+            }
+            HirExpr.StaticAddress(s) => {
+                this.text("(static-address ")?;
+                this.bytes(symbols.name(Symbol { id: hir.statics[s as usize].name }))?;
+                this.text(")")?;
+            }
+            HirExpr.Here => { this.text("(here)")?; }
+            HirExpr.StaticCString(value) => {
+                this.text("(c-string ")?;
+                this.quoted(hir.textOf(value))?;
+                this.text(")")?;
+            }
+            HirExpr.BorrowPath(mutable, path) => {
+                this.text(if (mutable) "(borrow-mut-path " else "(borrow-path ")?;
+                this.expr(hir, types, symbols, path)?;
+                this.text(")")?;
+            }
+            HirExpr.Reborrow(mutable, reference) => {
+                this.text(if (mutable) "(reborrow-mut " else "(reborrow ")?;
+                this.expr(hir, types, symbols, reference)?;
+                this.text(")")?;
+            }
+            HirExpr.Deref(reference) => {
+                this.text("(deref ")?;
+                this.expr(hir, types, symbols, reference)?;
+                this.text(")")?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.Move(place) => {
+                this.text("(move ")?;
+                this.place(hir, types, symbols, place)?;
+                this.text(")")?;
+            }
+            HirExpr.EnumValue(variant, payload) => {
+                this.text("(")?;
+                this.bytes(types.name(hir.exprTypes[id as usize]))?;
+                this.text(".")?;
+                this.bytes(symbols.name(Symbol { id: types.variants[variant as usize].name }))?;
+                this.args(hir, types, symbols, payload)?;
+                this.text(")")?;
+            }
+            HirExpr.ArrayLiteral(elements) => {
+                this.text("(array")?;
+                this.args(hir, types, symbols, elements)?;
+                this.text(")")?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.ArrayRepeat(value) => {
+                this.text("(array-repeat ")?;
+                this.expr(hir, types, symbols, value)?;
+                this.text(")")?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.Index(target, index) => {
+                this.text("(index ")?;
+                this.expr(hir, types, symbols, target)?;
+                this.text(" ")?;
+                this.expr(hir, types, symbols, index)?;
+                this.text(")")?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.Slice(mutable, base, low, high) => {
+                this.text(if (mutable) "(slice-mut " else "(slice ")?;
+                this.place(hir, types, symbols, base)?;
+                this.text(" ")?;
+                if (low == none()) {
+                    this.text("_")?;
+                } else {
+                    this.expr(hir, types, symbols, low)?;
+                }
+                this.text(" ")?;
+                if (high == none()) {
+                    this.text("_")?;
+                } else {
+                    this.expr(hir, types, symbols, high)?;
+                }
+                this.text(")")?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.SliceLength(slice) => {
+                this.text("(length ")?;
+                this.expr(hir, types, symbols, slice)?;
+                this.text(")")?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.Try(operand) => {
+                this.text("(try ")?;
+                this.expr(hir, types, symbols, operand)?;
+                this.text(")")?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.Unwrap(operand) => {
+                this.text("(unwrap ")?;
+                this.expr(hir, types, symbols, operand)?;
+                this.text(")")?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.IsNull(reference, isNull) => {
+                this.text(if (isNull) "(is-null " else "(is-some ")?;
+                this.expr(hir, types, symbols, reference)?;
+                this.text(")")?;
+                this.typed(hir, types, id)?;
+            }
+            HirExpr.Error => { this.text("<error>")?; }
+        }
+        return Ok();
+    }
+}
+
+/// An operator's text from its index in BinaryOp's declaration (an assignment's compound operator).
+fn hirOpText(index: u32) -> StringView => match (index) {
+    0 => "||",
+    1 => "&&",
+    2 => "==",
+    3 => "!=",
+    4 => "<",
+    5 => "<=",
+    6 => ">",
+    7 => ">=",
+    8 => "|",
+    9 => "^",
+    10 => "&",
+    11 => "<<",
+    12 => ">>",
+    13 => "+",
+    14 => "-",
+    15 => "*",
+    16 => "/",
+    _ => "%",
+};

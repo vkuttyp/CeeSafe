@@ -1,0 +1,368 @@
+// The typed HIR (the reference's Hir/Hir.cs), as tables like the AST's (docs/p2-frontend.md §5): every node is a
+// `Copy` value found by its index, children are indexes or ranges of `Hir.lists`, and none() marks an absent child.
+// Every expression carries its type (a TypeTable index). Locals are numbered per function, as the dump prints them
+// (`name#id`). Function, local, constant and static records are in their own tables.
+
+/// An integer constant: the reference's Int128 values always fit their (at most 64-bit) type.
+struct IntValue {
+    negative: bool;
+    magnitude: u64;
+}
+
+fn intValue(value: i64) -> IntValue =>
+    if (value < 0) IntValue {
+        negative: true,
+        magnitude: (0u64).wrappingSub(truncate<u64>(value)),
+    } else IntValue { negative: false, magnitude: truncate<u64>(value) };
+
+fn appendIntValue(out: borrow mut Vector<u8>, v: IntValue) -> Result<void, AllocError> {
+    if (v.negative && v.magnitude != 0) {
+        out.push('-')?;
+    }
+    return appendDecimal(out, v.magnitude);
+}
+
+enum ProjectionKind {
+    Field,
+    Deref,
+    Downcast,
+    Index,
+}
+
+/// One step of a place: a field, a deref, an enum variant, or an element (Types.cs `Projection`).
+struct HirProjection {
+    kind: ProjectionKind;
+    field: u32;   // TypeTable.fields
+    variant: u32; // TypeTable.variants
+    index: u32;   // an expression, or none
+}
+
+/// A local followed by projections (HirPlace).
+struct HirPlace {
+    root: u32;          // Hir.locals
+    projections: Range; // Hir.projections, as a run
+    typ: u32;
+}
+
+enum CaptureMode {
+    Shared,
+    Mutable,
+    Copy,
+    Move,
+}
+
+struct HirCapture {
+    local: u32;
+    mode: CaptureMode;
+    value: u32; // an expression, or none
+    field: u32; // TypeTable.fields, or none
+    throughReference: bool;
+}
+
+enum FloatToIntMode {
+    Panic,
+    Checked,
+    Saturating,
+}
+
+enum HirExpr {
+    IntConst(IntValue),
+    BoolConst(bool),
+    StringConst(Range), // Hir.text, UTF-8
+    LocalRef(u32),
+    Unary(UnaryOp, u32),
+    Binary(BinaryOp, u32, u32),
+    Cast(u32),
+    Truncate(u32),
+    Call(u32, Range),        // function, arguments
+    BuiltinCall(u32, Range), // the builtin's number (Builtins), arguments
+    FieldAccess(u32, u32),   // target, field
+    EnumValue(u32, Range),   // variant, payload
+    StructLiteral(Range),    // Hir.fieldValues
+    Borrow(bool, u32),       // mutable, place
+    BorrowTemp(bool, u32),
+    FunctionAddress(u32),
+    BorrowPath(bool, u32),
+    Reborrow(bool, u32),
+    Move(u32),          // place
+    StaticAddress(u32), // Hir.statics
+    StaticCString(Range),
+    Here,
+    Deref(u32),
+    ArrayLiteral(Range),
+    ArrayRepeat(u32),
+    Index(u32, u32),
+    Slice(bool, u32, u32, u32), // mutable, place, low or none, high or none
+    SliceLength(u32),
+    Try(u32),
+    Unwrap(u32),
+    IsNull(u32, bool),   // reference, is-null
+    StmtValue(u32),      // a statement
+    Closure(u32, Range), // function, captures (Hir.captures)
+    FloatConst(f64),
+    FloatToInt(u32, FloatToIntMode),
+    Error,
+}
+
+/// One initialiser of a struct literal.
+struct HirFieldValue {
+    field: u32;
+    value: u32;
+}
+
+enum HirPatternKind {
+    Wildcard,
+    Variant,
+    IntegerLiteral,
+    Bool,
+}
+
+/// A pattern of a nested match (HirPattern).
+enum HirPattern {
+    Wildcard,
+    Binding(u32), // a local
+    Literal(IntValue),
+    Variant(u32, bool, Range), // variant, whether there is a payload list, payload patterns
+}
+
+struct HirArmBinding {
+    local: u32;
+    payloadIndex: u32;
+}
+
+struct HirArm {
+    kind: HirPatternKind;
+    variant: u32; // or none
+    value: IntValue;
+    bindings: Range; // Hir.armBindings
+    body: u32;       // a block statement
+    start: u32;
+    end: u32;
+    listsPayloads: bool;
+    pattern: u32; // a nested match's whole pattern, or none
+}
+
+enum HirStmt {
+    Block(Range),
+    LocalDecl(u32, u32),   // local, initialiser or none
+    Assign(u32, u32, u32), // place, operator (binaryOpIndex + 1, or 0 for '='), value
+    If(u32, u32, u32),     // condition, then (a block), else or none
+    While(u32, u32),
+    Loop(u32),
+    For(u32, u32, u32, u32), // variable, start, end or none, body
+    Break,
+    Continue,
+    Return(u32), // value or none
+    Expression(u32),
+    Yield(u32),
+    Defer(u32),
+    Match(u32, Range, bool, bool), // scrutinee, arms, consumes, nested
+}
+
+struct HirLocal {
+    id: u32;   // its index in its function
+    name: u32; // a symbol
+    typ: u32;
+    mutable: bool;
+    parameter: bool;
+    isUsing: bool;
+    start: u32;
+    end: u32;
+}
+
+/// A function (HirFunction). Only what P3 sets and the dump and later passes read; the reference's other flags
+/// are added with the passes that need them.
+struct HirFunction {
+    id: u32;
+    name: u32;  // a symbol
+    owner: u32; // a struct type, or none
+    returnType: u32;
+    file: u32;
+    syntax: u32;             // Ast.functions
+    library: bool;           // from lib/core, lib/std or lib/kernel: not printed
+    parameters: Vector<u32>; // Hir.locals
+    locals: Vector<u32>;     // every local, parameters included; locals[i] has id i
+    body: u32;               // a block statement, or none
+    typeArguments: Range;    // TypeTable.lists
+    isGeneric: bool;
+    isInstantiation: bool;
+    isClosure: bool;
+    closureEnvironment: u32;
+    isDynMethod: bool;
+    dynSlot: u32;
+    isConstant: bool;
+    isCallback: bool;
+    hasInstanceError: bool;
+    instanceError: Vector<u8>;
+}
+
+struct HirConstant {
+    name: u32;
+    typ: u32;
+    file: u32;
+    start: u32;
+    end: u32;
+    value: u32; // an expression, or none ("?")
+}
+
+struct HirStatic {
+    name: u32;
+    typ: u32;
+    mutable: bool;
+    file: u32;
+    start: u32;
+    end: u32;
+    value: u32;
+}
+
+struct HirProgram {
+    lists: Vector<u32>;
+    text: Vector<u8>;
+    exprs: Vector<HirExpr>;
+    exprTypes: Vector<u32>;
+    exprSpans: Vector<Span>;
+    stmts: Vector<HirStmt>;
+    stmtSpans: Vector<Span>;
+    places: Vector<HirPlace>;
+    projections: Vector<HirProjection>;
+    fieldValues: Vector<HirFieldValue>;
+    captures: Vector<HirCapture>;
+    arms: Vector<HirArm>;
+    armBindings: Vector<HirArmBinding>;
+    patterns: Vector<HirPattern>;
+    locals: Vector<HirLocal>;
+    functions: Vector<HirFunction>;
+    constants: Vector<HirConstant>;
+    statics: Vector<HirStatic>;
+
+    fn create() -> HirProgram => HirProgram {
+        lists: Vector<u32>.create(),
+        text: Vector<u8>.create(),
+        exprs: Vector<HirExpr>.create(),
+        exprTypes: Vector<u32>.create(),
+        exprSpans: Vector<Span>.create(),
+        stmts: Vector<HirStmt>.create(),
+        stmtSpans: Vector<Span>.create(),
+        places: Vector<HirPlace>.create(),
+        projections: Vector<HirProjection>.create(),
+        fieldValues: Vector<HirFieldValue>.create(),
+        captures: Vector<HirCapture>.create(),
+        arms: Vector<HirArm>.create(),
+        armBindings: Vector<HirArmBinding>.create(),
+        patterns: Vector<HirPattern>.create(),
+        locals: Vector<HirLocal>.create(),
+        functions: Vector<HirFunction>.create(),
+        constants: Vector<HirConstant>.create(),
+        statics: Vector<HirStatic>.create(),
+    };
+
+    fn list(borrow mut this, ids: Slice<u32>) -> Result<Range, AllocError> {
+        let start = truncate<u32>(this.lists.length);
+        for (id in ids) {
+            this.lists.push(id)?;
+        }
+        return Ok(Range { start: start, count: truncate<u32>(ids.length) });
+    }
+
+    fn at(borrow this, r: Range, k: u32) -> u32 => this.lists[(r.start + k) as usize];
+
+    fn addText(borrow mut this, bytes: Slice<u8>) -> Result<Range, AllocError> {
+        let start = truncate<u32>(this.text.length);
+        appendBytes(mut this.text, bytes)?;
+        return Ok(Range { start: start, count: truncate<u32>(bytes.length) });
+    }
+
+    fn textOf(borrow this, r: Range) -> Slice<u8> => this.text[(r.start as usize)..((r.start + r.count) as usize)];
+
+    fn addExpr(borrow mut this, node: HirExpr, typ: u32, start: u32, end: u32) -> Result<u32, AllocError> {
+        this.exprs.push(node)?;
+        this.exprTypes.push(typ)?;
+        this.exprSpans.push(Span { start: start, end: end })?;
+        return Ok(truncate<u32>(this.exprs.length - 1));
+    }
+
+    fn addStmt(borrow mut this, node: HirStmt, start: u32, end: u32) -> Result<u32, AllocError> {
+        this.stmts.push(node)?;
+        this.stmtSpans.push(Span { start: start, end: end })?;
+        return Ok(truncate<u32>(this.stmts.length - 1));
+    }
+
+    fn typeOf(borrow this, expr: u32) -> u32 => this.exprTypes[expr as usize];
+
+    /// A new local of `function` (HirFunction.AddLocal): its id is the function's local count.
+    fn addLocal(
+        borrow mut this,
+        function: u32,
+        name: u32,
+        typ: u32,
+        mutable: bool,
+        parameter: bool,
+        start: u32,
+        end: u32,
+    ) -> Result<u32, AllocError> {
+        let id = truncate<u32>(this.functions[function as usize].locals.length);
+        this.locals.push(HirLocal {
+            id: id,
+            name: name,
+            typ: typ,
+            mutable: mutable,
+            parameter: parameter,
+            isUsing: false,
+            start: start,
+            end: end,
+        })?;
+        let local = truncate<u32>(this.locals.length - 1);
+        this.functions[function as usize].locals.push(local)?;
+        return Ok(local);
+    }
+
+    /// A new function; its id is the number of functions so far (the reference's `_functions.Count`).
+    fn addFunction(
+        borrow mut this,
+        name: u32,
+        owner: u32,
+        returnType: u32,
+        file: u32,
+        syntax: u32,
+        library: bool,
+    ) -> Result<u32, AllocError> {
+        let id = truncate<u32>(this.functions.length);
+        this.functions.push(HirFunction {
+            id: id,
+            name: name,
+            owner: owner,
+            returnType: returnType,
+            file: file,
+            syntax: syntax,
+            library: library,
+            parameters: Vector<u32>.create(),
+            locals: Vector<u32>.create(),
+            body: none(),
+            typeArguments: emptyRange(),
+            isGeneric: false,
+            isInstantiation: false,
+            isClosure: false,
+            closureEnvironment: none(),
+            isDynMethod: false,
+            dynSlot: 0,
+            isConstant: false,
+            isCallback: false,
+            hasInstanceError: false,
+            instanceError: Vector<u8>.create(),
+        })?;
+        return Ok(id);
+    }
+
+    fn addPlace(borrow mut this, root: u32, projections: Slice<HirProjection>, typ: u32) -> Result<u32, AllocError> {
+        let start = truncate<u32>(this.projections.length);
+        for (p in projections) {
+            this.projections.push(p)?;
+        }
+        this.places.push(HirPlace {
+            root: root,
+            projections: Range { start: start, count: truncate<u32>(projections.length) },
+            typ: typ,
+        })?;
+        return Ok(truncate<u32>(this.places.length - 1));
+    }
+}

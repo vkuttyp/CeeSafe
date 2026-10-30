@@ -1,0 +1,113 @@
+// .NET's `double.ToString("R", CultureInfo.InvariantCulture)`, which the reference's HIR dump uses for float constants
+// (HirPrinter.cs:203). The digits are the shortest that read back, taken from Nova's own formatting (exact, Schubfach in
+// the runtime; type-system §35.7), and re-laid out as .NET does: plain digits for decimal exponents -4 to 16 (.NET formats "R" like "G17"), else
+// `d.dddE+XX` with at least two exponent digits; `NaN`, `Infinity`, `-Infinity`, `-0`.
+// .NET's shortest search differs from the exact one in two places: of all 2,098 powers of two, 2^-25 and 2^-958 get a
+// 16-digit text that does not read back (FloatSemantics.cs notes 2^-25); every other value checked agrees
+// (tests/support/run-pass/dotnet-double.nova, against .NET 10). Those two are spelled as .NET spells them.
+
+fn appendDotNetDouble(out: borrow mut Vector<u8>, value: f64) -> Result<void, AllocError> {
+    if (value.bits() == 0x8000000000000000) {
+        return appendText(out, "-0"); // Nova's text drops the sign of zero; .NET keeps it
+    }
+    let magnitude = value.bits() & 0x7FFFFFFFFFFFFFFF;
+    if (magnitude == 0x3E60000000000000 || magnitude == 0x0410000000000000) {
+        if (value.bits() != magnitude) {
+            out.push('-')?;
+        }
+        return appendText(
+            out,
+            if (magnitude == 0x3E60000000000000) "2.980232238769531E-08" else "4.104536801298376E-289",
+        );
+    }
+    var text = String.create();
+    text.appendNumber(value)?;
+    let t = text.view().bytes();
+    // Nova's text: [-]digits[.digits][e(+|-)digits], "NaN", "Infinity" or "-Infinity" (ECMAScript layout).
+    if (sameText(t, "NaN") || sameText(t, "Infinity") || sameText(t, "-Infinity")) {
+        return appendBytes(out, t);
+    }
+    var i: usize = 0;
+    let negative = t.length > 0 && t[0] == '-';
+    if (negative) {
+        i = 1;
+    }
+    var digits = Vector<u8>.create();
+    var pointAt: i64 = -1; // the number of digits before the '.', if there is one
+    var exponent: i64 = 0;
+    while (i < t.length && t[i] != 'e') {
+        if (t[i] == '.') {
+            pointAt = truncate<i64>(digits.length);
+        } else {
+            digits.push(t[i])?;
+        }
+        i += 1;
+    }
+    if (i < t.length) {
+        i += 1; // 'e'
+        var sign: i64 = 1;
+        if (t[i] == '-') {
+            sign = -1;
+        }
+        i += 1; // the sign
+        while (i < t.length) {
+            exponent = exponent * 10 + (t[i] - '0') as i64;
+            i += 1;
+        }
+        exponent *= sign;
+    }
+    if (pointAt < 0) {
+        pointAt = truncate<i64>(digits.length);
+    }
+    // Leading zeros (0.000123) and trailing zeros (1200) are not significant.
+    var first: usize = 0;
+    while (first + 1 < digits.length && digits[first] == '0') {
+        first += 1;
+    }
+    var last = digits.length;
+    while (last > first + 1 && digits[last - 1] == '0') {
+        last -= 1;
+    }
+    if (negative) {
+        out.push('-')?;
+    }
+    if (digits[first] == '0') {
+        return appendText(out, "0"); // zero (and -0)
+    }
+    // The value is 0.d1…dk × 10^n with d1 = digits[first]; its scientific exponent is n - 1.
+    let n = pointAt - truncate<i64>(first) + exponent;
+    let e = n - 1;
+    let significant = digits[first..last];
+    if (e >= 17 || e < -4) {
+        out.push(significant[0])?;
+        if (significant.length > 1) {
+            out.push('.')?;
+            appendBytes(out, significant[1..])?;
+        }
+        out.push('E')?;
+        out.push(if (e < 0) '-' else '+')?;
+        let size = if (e < 0) 0 - e else e;
+        if (size < 10) {
+            out.push('0')?;
+        }
+        return appendDecimal(out, truncate<u64>(size));
+    }
+    if (n <= 0) {
+        appendText(out, "0.")?;
+        for (k in 0..(0 - n)) {
+            out.push('0')?;
+        }
+        return appendBytes(out, significant);
+    }
+    let whole = truncate<usize>(n);
+    if (significant.length <= whole) {
+        appendBytes(out, significant)?;
+        for (k in significant.length..whole) {
+            out.push('0')?;
+        }
+        return Ok();
+    }
+    appendBytes(out, significant[..whole])?;
+    out.push('.')?;
+    return appendBytes(out, significant[whole..]);
+}
