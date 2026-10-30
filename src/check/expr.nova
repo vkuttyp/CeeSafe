@@ -541,6 +541,12 @@ fn coerce(c: borrow mut Checker, e: u32, expected: u32, span: Span) -> Result<u3
     ) && h.mutableReference && !x.mutableReference && h.pointee == x.pointee) {
         return c.expr(HirExpr.Reborrow(false, e), expected, span.start, span.end);
     }
+    // `borrow Box<T>` to `borrow T` (and mut to mut or shared): a reborrow of the box's contents (§18.2).
+    if (c.types.is(expected, TypeKind.Reference) && h.pointee != none() && c.types.is(h.pointee, TypeKind.Box) &&
+        c.types.info(h.pointee).pointee == x.pointee && (h.mutableReference || !x.mutableReference)) {
+        let contents = c.expr(HirExpr.Deref(e), h.pointee, span.start, span.end)?;
+        return c.expr(HirExpr.Reborrow(x.mutableReference, contents), expected, span.start, span.end);
+    }
     if (!c.types.is(
         expected,
         TypeKind.Reference,
@@ -668,6 +674,9 @@ fn synthCall(
                         }
                         match (entity) {
                             Entity.Builtin(b) => {
+                                if (b == builtinBox()) {
+                                    return checkBoxCreate(c, member, arguments, expected, span);
+                                }
                                 if (b == builtinConsole() || b == builtinProcess() || b == 23 || b == 24) {
                                     return checkBuiltinMemberCall(c, b, targetName, member, arguments, span);
                                 }

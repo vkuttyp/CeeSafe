@@ -1,0 +1,21 @@
+struct Point { x: i32; y: i32; }
+struct Empty { }
+
+fn a(b: Box<borrow i32>) {}
+fn c(b: Box<i32, Point>) {}
+fn d(b: Box<i32, i32>) {}
+fn e(b: Box<i32, Empty, Empty>) {}
+fn f(s: StringView) -> Result<Box<StringView>, AllocError> => Box.create(s);
+
+fn main() {
+    let x = Box.make(1);
+    let y = Box.create();
+    let z = Box.create(1, 2);
+    let w = Box.createIn(1);
+    let v = Box.createIn(Point { x: 1, y: 2 }, 5);
+    let u = Box.create(main());
+    FailingAllocator.failAfter();
+    FailingAllocator.reset(1);
+    FailingAllocator.failAfter(true);
+    let q = FailingAllocator.other();
+}

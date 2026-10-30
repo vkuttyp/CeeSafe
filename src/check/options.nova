@@ -92,6 +92,9 @@ fn resolveGenericType(
         let mutable = sameText(n, "SliceMut");
         return resolveSliceType(c, element, mutable);
     }
+    if (sameText(n, "Box") && (arguments.count == 1 || arguments.count == 2)) {
+        return resolveBoxType(c, arguments);
+    }
     let one = arguments.count == 1;
     let oneOrTwo = arguments.count == 1 || arguments.count == 2;
     let known = (sameText(

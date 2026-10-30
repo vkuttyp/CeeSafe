@@ -1,0 +1,216 @@
+// Boxes and the built-in allocators (the reference's BoxOf, the Box case of ResolveTypeCore, CheckBoxAllocator,
+// CheckBoxCreate, and FailingAllocator's static functions in CheckStaticCall): P3 S3a. `Box.intoRaw` and
+// `Box.fromRaw` come with raw pointers (S7), user allocators with impls (S4), `Box<dyn …>` with S4 and S6.
+
+fn notAnAllocator() -> u32 => 263;
+
+fn builtinBox() -> u32 => 7;
+
+/// The SystemHeap and FailingAllocator types (IsAllocatorType).
+fn isAllocatorType(c: borrow Checker, typ: u32) -> bool => typ == c.systemHeapType || typ == c.structs[1].typ;
+
+fn boxOf(c: borrow mut Checker, contents: u32, allocator: u32) -> Result<u32, AllocError> {
+    let systemHeap = c.systemHeapType;
+    return c.types.boxOf(contents, allocator, allocator == systemHeap);
+}
+
+/// `Box<T>` and `Box<T, A>`.
+fn resolveBoxType(c: borrow mut Checker, arguments: Range) -> Result<u32, AllocError> {
+    let contentsSyntax = c.front.ast.at(arguments, 0);
+    let contents = c.resolveType(contentsSyntax, false)?; // C-laid-out contents (§33.1) or a `dyn I` (§37.1): S7, S4
+    if (c.types.isScoped(contents)) {
+        let span = c.front.ast.typeSpans[contentsSyntax as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "a 'Box' cannot hold a reference or slice in v0")?;
+        c.error(referenceNotAllowed(), span.start, span.end, message)?;
+        return Ok(c.types.error);
+    }
+    let lastSyntax = c.front.ast.at(arguments, arguments.count - 1);
+    let allocator = if (arguments.count == 2) c.resolveType(lastSyntax, false)? else c.systemHeapType;
+    let lastSpan = c.front.ast.typeSpans[lastSyntax as usize];
+    if (!c.types.isBottom(allocator) && !checkBoxAllocator(c, allocator, lastSpan)?) {
+        return Ok(c.types.error);
+    }
+    if (c.types.isBottom(contents) || c.types.isBottom(allocator)) {
+        return Ok(c.types.error);
+    }
+    return boxOf(c, contents, allocator);
+}
+
+/// Can `typ` be a box's allocator (CheckBoxAllocator, §30.2)? A built-in one; a struct without fields that implements
+/// lib/core's `Allocator` is S4's.
+fn checkBoxAllocator(c: borrow mut Checker, typ: u32, span: Span) -> Result<bool, AllocError> {
+    if (isAllocatorType(c, typ)) {
+        return Ok(true);
+    }
+    if (isFieldlessStruct(c, typ)) {
+        c.notPorted(span.start, span.end, "a user-defined allocator", "S4")?;
+        return Ok(false);
+    }
+    var message = Vector<u8>.create();
+    appendQuotedType(mut message, c, typ)?;
+    appendText(
+        mut message,
+        " is not an allocator type: use 'SystemHeap', 'FailingAllocator', or a struct without fields that implements 'Allocator' (type-system.md §30.2)",
+    )?;
+    c.error(notAnAllocator(), span.start, span.end, message)?;
+    return Ok(false);
+}
+
+/// `Box.create(v)` / `Box.createIn(a, v)` (CheckBoxCreate, §18.2): a `Result<Box<T, A>, AllocError>`. The expected
+/// type, if it is such a result, gives the type hint for `v`.
+fn checkBoxCreate(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    expected: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let ident = c.front.ast.idents[member as usize];
+    let text = c.name(ident.symbol);
+    let withAllocator = sameText(text, "createIn");
+    if (sameText(text, "intoRaw") || sameText(text, "fromRaw")) {
+        c.notPorted(span.start, span.end, "'Box.intoRaw' and 'Box.fromRaw'", "S7")?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (!withAllocator && !sameText(text, "create")) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'Box' has no function ")?;
+        appendQuotedName(mut message, c, ident.symbol)?;
+        appendText(
+            mut message,
+            "; use 'Box.create(v)', 'Box.createIn(allocator, v)', 'Box.intoRaw(b)' or 'Box.fromRaw(p)'",
+        )?;
+        c.error(undefinedName(), ident.start, ident.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (arguments.count != (if (withAllocator) 2u32 else 1u32)) {
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            if (withAllocator) "'Box.createIn' takes an allocator and a value: 'Box.createIn(allocator, v)'" else "'Box.create' takes one value: 'Box.create(v)'",
+        )?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var values = Vector<u32>.create();
+    var allocator = c.systemHeapType;
+    let valueSyntax = c.front.ast.at(arguments, arguments.count - 1);
+    if (withAllocator) {
+        let allocatorSyntax = c.front.ast.at(arguments, 0);
+        let synthesized = synth(c, allocatorSyntax, none())?;
+        let allocatorValue = autoDeref(c, synthesized)?;
+        if (c.isBottom(allocatorValue)) {
+            synth(c, valueSyntax, none())?;
+            return c.errorResult(span.start, span.end);
+        }
+        let allocatorSpan = c.front.ast.exprSpans[allocatorSyntax as usize];
+        let allocatorType = c.typeOf(allocatorValue);
+        if (!checkBoxAllocator(c, allocatorType, allocatorSpan)?) {
+            synth(c, valueSyntax, none())?;
+            return c.errorResult(span.start, span.end);
+        }
+        allocator = c.typeOf(allocatorValue);
+        values.push(allocatorValue)?;
+    }
+    // A `Box<dyn I>` expected gives no hint: the box holds the value's own type, coerced afterwards (§37.2).
+    var hint = none();
+    if (expected != none() && isResultType(c, expected)) {
+        let ok = resultOk(c, expected);
+        if (c.types.is(ok, TypeKind.Box) && !c.types.isDyn(c.types.info(ok).pointee)) {
+            hint = c.types.info(ok).pointee;
+        }
+    }
+    let isMoveLiteral = match (c.front.ast.exprs[valueSyntax as usize]) {
+        ExprNode.Closure(closure) => c.front.ast.closures[closure as usize].isMove,
+        _ => false,
+    };
+    if (isMoveLiteral) {
+        c.notPorted(span.start, span.end, "a boxed 'move' closure", "S6")?;
+        return c.errorResult(span.start, span.end);
+    }
+    var value = none();
+    if (hint != none()) {
+        value = checkExpr(c, valueSyntax, hint)?;
+    } else {
+        value = synth(c, valueSyntax, none())?;
+        let valueSpan = c.front.ast.exprSpans[valueSyntax as usize];
+        let ownType = c.typeOf(value);
+        value = coerce(c, value, ownType, valueSpan)?; // a `borrow mut` variable is reborrowed
+    }
+    let valueType = c.typeOf(value);
+    if (c.types.isBottom(valueType)) {
+        return c.errorResult(span.start, span.end);
+    }
+    let scoped = c.types.isScoped(valueType);
+    if (c.types.is(valueType, TypeKind.Void) || c.types.is(valueType, TypeKind.Never) || scoped) {
+        let valueSpan = c.front.ast.exprSpans[valueSyntax as usize];
+        var message = Vector<u8>.create();
+        if (scoped) {
+            appendText(mut message, "a 'Box' cannot hold a reference or slice in v0")?;
+        } else {
+            appendText(mut message, "this expression has no value (its type is ")?;
+            appendQuotedType(mut message, c, valueType)?;
+            appendText(mut message, ")")?;
+        }
+        c.error(if (scoped) referenceNotAllowed() else voidValue(), valueSpan.start, valueSpan.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    values.push(value)?;
+    let box = boxOf(c, valueType, allocator)?;
+    let allocError = c.allocErrorType;
+    let result = resultOf(c, box, allocError)?;
+    let list = c.hir.list(values.view())?;
+    return c.expr(HirExpr.BuiltinCall(bfBoxCreate(), list), result, span.start, span.end);
+}
+
+/// `FailingAllocator.failAfter(n)` and `FailingAllocator.reset()` (CheckStaticCall's first case).
+fn checkFailingAllocatorCall(
+    c: borrow mut Checker,
+    failAfter: bool,
+    arguments: Range,
+    span: Span,
+) -> Result<u32, AllocError> {
+    if (arguments.count != (if (failAfter) 1u32 else 0u32)) {
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            if (failAfter) "'FailingAllocator.failAfter' takes one 'u64'" else "'FailingAllocator.reset' takes no arguments",
+        )?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var values = Vector<u32>.create();
+    if (failAfter) {
+        let u64Type = c.types.u64;
+        let argument = c.front.ast.at(arguments, 0);
+        values.push(checkExpr(c, argument, u64Type)?)?;
+    }
+    let list = c.hir.list(values.view())?;
+    let voidType = c.types.voidType;
+    let function = if (failAfter) bfFailAfter() else bfFailReset();
+    return c.expr(HirExpr.BuiltinCall(function, list), voidType, span.start, span.end);
+}
+
+/// A non-generic declared struct whose declaration has no fields, type parameters or region parameters.
+fn isFieldlessStruct(c: borrow Checker, typ: u32) -> bool {
+    let definition = c.types.info(typ).structDef;
+    if (definition == none() || c.types.structs[definition as usize].typeArguments.count > 0) {
+        return false;
+    }
+    let item = c.types.structs[definition as usize].item;
+    if (item == none()) {
+        return false;
+    }
+    match (c.front.ast.items[item as usize].kind) {
+        ItemKind.Struct(k) => {
+            let s = c.front.ast.structs[k as usize];
+            return s.fields.count == 0 && s.typeParameters.count == 0 && s.regionParameters.count == 0;
+        }
+        _ => { return false; }
+    }
+}

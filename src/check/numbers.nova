@@ -175,7 +175,7 @@ fn checkFunctionValueCall(c: borrow mut Checker, callee: u32, arguments: Range, 
         return c.errorResult(span.start, span.end);
     }
     let list = c.hir.list(values.view())?;
-    return c.expr(HirExpr.BuiltinCall(bfOther(), list), info.result, span.start, span.end);
+    return c.expr(HirExpr.BuiltinCall(bfCallFunction(), list), info.result, span.start, span.end);
 }
 
 /// `checkedTruncate<T>(f)`, `saturatingTruncate<T>(f)` (a float to an integer) and `round<T>(e)` (any number to a
@@ -309,5 +309,5 @@ fn checkFromBits(
     }
     let codes = [bits];
     let list = c.hir.list(codes[..])?;
-    return c.expr(HirExpr.BuiltinCall(bfOther(), list), floatType, span.start, span.end);
+    return c.expr(HirExpr.BuiltinCall(bfFloatFromBits(), list), floatType, span.start, span.end);
 }

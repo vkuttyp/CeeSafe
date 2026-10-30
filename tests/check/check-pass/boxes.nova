@@ -1,0 +1,30 @@
+struct Node { value: i32; next: Box<Node>?; }
+struct Wrapper { inner: Box<i32, SystemHeap>; }
+
+fn sum(n: borrow Node) -> i32 => n.value;
+fn bump(n: borrow mut Node) {
+    n.value += 1;
+}
+
+fn make(v: i32) -> Result<Box<Node>, AllocError> => Box.create(Node { value: v, next: null });
+
+fn chain() -> Result<Node, AllocError> {
+    let tail = Box.create(Node { value: 2, next: null })?;
+    return Ok(Node { value: 1, next: tail });
+}
+
+fn main() {
+    var b = make(3)!;
+    let s = sum(b);
+    bump(mut b);
+    let w = Wrapper { inner: Box.create(5)! };
+    let x: i32 = w.inner;
+    let f = Box.createIn(FailingAllocator {}, [1u8, 2u8, 3u8])!;
+    let first = f[0];
+    FailingAllocator.failAfter(2);
+    FailingAllocator.reset();
+    let n = chain()!;
+    let r = borrow b;
+    let s2 = sum(r);
+    let boxed: Result<Box<u64>, AllocError> = Box.create(7);
+}

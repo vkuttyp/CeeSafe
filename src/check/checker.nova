@@ -23,13 +23,8 @@ enum Entity {
 fn builtinConsole() -> u32 => 0;
 fn builtinProcess() -> u32 => 1;
 
-/// BuiltinFunction members: only ConsoleWrite (0) and ConsoleWriteLine (1) print by name (HirPrinter.BuiltinName).
-fn bfConsoleWrite() -> u32 => 0;
-fn bfConsoleWriteLine() -> u32 => 1;
-fn bfProcessExit() -> u32 => 2;
-fn bfArgumentCount() -> u32 => 3;
-fn bfArgument() -> u32 => 4;
-fn bfOther() -> u32 => 99;
+// BuiltinFunction members are in src/hir/builtins.nova (generated); only ConsoleWrite (0) and ConsoleWriteLine (1)
+// print by name (HirPrinter.BuiltinName).
 
 struct ScopeEntry {
     symbol: u32;

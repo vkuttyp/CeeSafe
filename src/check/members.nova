@@ -197,8 +197,8 @@ fn checkStaticCall(
         c.name(memberIdent.symbol),
         "failAfter",
     ) || sameText(c.name(memberIdent.symbol), "reset"))) {
-        c.notPorted(span.start, span.end, "FailingAllocator's functions", "S3")?;
-        return c.errorResult(span.start, span.end);
+        let failAfter = sameText(c.name(memberIdent.symbol), "failAfter");
+        return checkFailingAllocatorCall(c, failAfter, arguments, span);
     }
     let definition = c.types.info(typ).structDef;
     let function = findStructFunction(c, definition, memberIdent.symbol);
