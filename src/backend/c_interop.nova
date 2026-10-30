@@ -366,8 +366,15 @@ fn appendCallbackName(c: borrow Checker, out: borrow mut Vector<u8>, function: u
     return appendBytes(out, text[4..]);
 }
 
-fn appendCallbackSignature(c: borrow Checker, out: borrow mut Vector<u8>, function: u32) -> Result<void, AllocError> {
-    appendText(out, "static ")?;
+fn appendCallbackSignature(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    function: u32,
+    split: bool,
+) -> Result<void, AllocError> {
+    if (!split) {
+        appendText(out, "static ")?;
+    }
     appendBoundaryType(c, out, c.hir.functions[function as usize].returnType, false)?;
     out.push(' ')?;
     appendCallbackName(c, out, function)?;
@@ -443,7 +450,7 @@ fn emitCallbacks(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirProgram
     var callbacks = Vector<u32>.create();
     emittedCallbacks(e, c, n, mut callbacks)?;
     for (function in callbacks.view()) {
-        appendCallbackSignature(c, mut e.buf, function)?;
+        appendCallbackSignature(c, mut e.buf, function, e.split)?;
         e.t(" {")?;
         e.emit()?;
         var call = Vector<u8>.create();
@@ -554,7 +561,7 @@ fn emitExportPrototypes(e: borrow mut CEmitter, c: borrow Checker, n: borrow Nir
     var callbacks = Vector<u32>.create();
     emittedCallbacks(e, c, n, mut callbacks)?;
     for (function in callbacks.view()) {
-        appendCallbackSignature(c, mut e.buf, function)?;
+        appendCallbackSignature(c, mut e.buf, function, e.split)?;
         e.t(";")?;
         e.emit()?;
     }

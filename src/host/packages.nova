@@ -32,6 +32,8 @@ struct PackageManifest {
     floatAllowed: bool;
     kernel: bool;
     trusted: bool;
+    object: bool;               // kind = "object": `build` makes a relocatable object (cosmoos/profiles.md §4.3)
+    cFiles: Vector<Vector<u8>>; // `c = [...]`, relative to the package (type-system.md §28.6)
 }
 
 /// A package of the build: its manifest and its Nova files (absolute paths), in the reference's order.
@@ -426,6 +428,8 @@ fn readManifest(directory: Slice<u8>, problem: borrow mut Vector<u8>) -> Result<
         floatAllowed: true,
         kernel: false,
         trusted: false,
+        object: false,
+        cFiles: Vector<Vector<u8>>.create(),
     };
     var sourcesGiven = false;
     for (e in entries.view()) {
@@ -439,6 +443,12 @@ fn readManifest(directory: Slice<u8>, problem: borrow mut Vector<u8>) -> Result<
                 manifest.floatAllowed = e.boolValue;
             } else if (sameText(key, "kernel") && e.isString) {
                 manifest.kernel = true;
+            } else if (sameText(key, "kind") && e.isString) {
+                manifest.object = sameText(e.text.view(), "object");
+            } else if (sameText(key, "c") && e.isArray) {
+                for (s in e.strings.view()) {
+                    manifest.cFiles.push(copyBytes(s.view())?)?;
+                }
             } else if (sameText(key, "trusted") && e.isBool) {
                 manifest.trusted = e.boolValue;
             } else if (sameText(key, "sources") && e.isArray) {

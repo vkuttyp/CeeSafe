@@ -223,7 +223,8 @@ fn emitDropGluePrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<v
     for (k in 0..e.aggregates.length) {
         let t = e.aggregates[k];
         if (c.types.needsDrop(t)) {
-            e.t("static NV_UNUSED void ")?;
+            e.helperProto()?;
+            e.t("void ")?;
             appendDropGlueName(c, mut e.buf, t)?;
             e.t("(")?;
             appendCTypeName(c, mut e.buf, t)?;
@@ -411,7 +412,8 @@ fn emitDropGlueHead(
     t: u32,
     parameter: StringView,
 ) -> Result<void, AllocError> {
-    e.t("static void ")?;
+    e.helper()?;
+    e.t("void ")?;
     appendDropGlueName(c, mut e.buf, t)?;
     e.t("(")?;
     appendCTypeName(c, mut e.buf, t)?;
@@ -671,7 +673,7 @@ fn emitPoolTake(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Alloc
         let box = resultOkOf(c, result);
         let pointee = c.types.info(box).pointee;
         let contents = cTypeName(c, pointee)?;
-        e.t("static ")?;
+        e.helper()?;
         appendPoolTakeSignature(c, mut e.buf, result)?;
         e.t(" {")?;
         e.emit()?;
@@ -758,7 +760,7 @@ fn emitArenaHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Resul
     for (k in 0..e.composites.length) {
         let result = e.composites[k];
         if (isArenaResult(c, result)) {
-            e.t("static NV_UNUSED ")?;
+            e.helperProto()?;
             appendArenaHelperSignature(c, mut e.buf, result)?;
             e.t(";")?;
             e.emit()?;
@@ -777,7 +779,7 @@ fn emitArenaHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, A
         let ok = resultOkOf(c, result);
         var error = Vector<u8>.create();
         appendAllocErrorResult(e, c, mut error, result)?;
-        e.t("static ")?;
+        e.helper()?;
         appendArenaHelperSignature(c, mut e.buf, result)?;
         e.t(" {")?;
         e.emit()?;
@@ -887,7 +889,7 @@ fn emitBoxCreatePrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<
             continue;
         }
         let contents = c.types.info(resultOkOf(c, result)).pointee;
-        e.t("static NV_UNUSED ")?;
+        e.helperProto()?;
         appendCTypeName(c, mut e.buf, result)?;
         e.t(" ")?;
         appendBoxCreateName(c, mut e.buf, result)?;
@@ -896,7 +898,7 @@ fn emitBoxCreatePrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<
         e.t(");")?;
         e.emit()?;
         if (inSet(e.inPlaceResults, result)) {
-            e.t("static NV_UNUSED ")?;
+            e.helperProto()?;
             appendCTypeName(c, mut e.buf, contents)?;
             e.t(" *")?;
             appendBoxAllocateName(c, mut e.buf, result)?;
@@ -907,7 +909,8 @@ fn emitBoxCreatePrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<
     var boxes = Vector<u32>.create();
     userAllocatedBoxes(e, c, mut boxes)?;
     for (box in boxes.view()) {
-        e.t("static NV_UNUSED void ")?;
+        e.helperProto()?;
+        e.t("void ")?;
         appendBoxFreeName(c, mut e.buf, box)?;
         e.t("(")?;
         appendCTypeName(c, mut e.buf, box)?;
@@ -978,7 +981,8 @@ fn emitBoxFree(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocE
     for (box in boxes.view()) {
         let allocator = c.types.info(box).allocator;
         let deallocate = c.types.structs[c.types.info(allocator).structDef as usize].deallocateMethod;
-        e.t("static void ")?;
+        e.helper()?;
+        e.t("void ")?;
         appendBoxFreeName(c, mut e.buf, box)?;
         e.t("(")?;
         appendCTypeName(c, mut e.buf, box)?;
@@ -1055,7 +1059,8 @@ fn emitPlacedHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirPro
     var types = Vector<u32>.create();
     placedTypes(e, c, n, mut types)?;
     for (t in types.view()) {
-        e.t("static void ")?;
+        e.helper()?;
+        e.t("void ")?;
         appendPlacedName(c, mut e.buf, t)?;
         e.t("(")?;
         appendCTypeName(c, mut e.buf, t)?;
@@ -1063,7 +1068,8 @@ fn emitPlacedHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirPro
         e.emit()?;
     }
     for (t in types.view()) {
-        e.t("static void ")?;
+        e.helper()?;
+        e.t("void ")?;
         appendPlacedName(c, mut e.buf, t)?;
         e.t("(")?;
         appendCTypeName(c, mut e.buf, t)?;
@@ -1103,7 +1109,7 @@ fn emitBoxCreate(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Allo
         }
         let box = resultOkOf(c, result);
         let contents = c.types.info(box).pointee;
-        e.t("static ")?;
+        e.helper()?;
         appendCTypeName(c, mut e.buf, result)?;
         e.t(" ")?;
         appendBoxCreateName(c, mut e.buf, result)?;
@@ -1143,7 +1149,7 @@ fn emitBoxCreate(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Allo
         e.line("")?;
         if (inSet(e.inPlaceResults, result)) {
             // The allocation alone, for a box built in place (§2): the caller constructs the contents.
-            e.t("static ")?;
+            e.helper()?;
             appendCTypeName(c, mut e.buf, contents)?;
             e.t(" *")?;
             appendBoxAllocateName(c, mut e.buf, result)?;
@@ -1213,7 +1219,7 @@ fn emitIoHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<v
     for (k in 0..e.composites.length) {
         let result = e.composites[k];
         if (isIoResult(c, result)) {
-            e.t("static NV_UNUSED ")?;
+            e.helperProto()?;
             appendCTypeName(c, mut e.buf, result)?;
             e.t(" ")?;
             appendIoHelper(c, mut e.buf, result)?;
@@ -1223,7 +1229,7 @@ fn emitIoHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<v
     }
     let option = optionOfView(e, c);
     if (option != none()) {
-        e.t("static NV_UNUSED ")?;
+        e.helperProto()?;
         appendCTypeName(c, mut e.buf, option)?;
         e.t(" nvARG(uint64_t);")?;
         e.emit()?;
@@ -1243,7 +1249,7 @@ fn emitIoHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Allo
         let name = cTypeName(c, result)?;
         let variants = borrow c.types.enums[c.types.info(error).enumDef as usize].variants;
         let other = variants[variants.length - 1];
-        e.t("static ")?;
+        e.helper()?;
         e.b(name.view())?;
         e.t(" ")?;
         appendIoHelper(c, mut e.buf, result)?;
@@ -1291,7 +1297,7 @@ fn emitIoHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Allo
     let option = optionOfView(e, c);
     if (option != none()) {
         let name = cTypeName(c, option)?;
-        e.t("static ")?;
+        e.helper()?;
         e.b(name.view())?;
         e.t(" nvARG(uint64_t index) {")?;
         e.emit()?;
@@ -1332,7 +1338,7 @@ fn emitContainerHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> R
         let m = mangled(c, t)?;
         if (c.types.is(t, TypeKind.StableVector)) {
             let element = cTypeName(c, c.types.info(c.types.info(t).pointee).element)?;
-            e.t("static NV_UNUSED ")?;
+            e.helperProto()?;
             e.b(element.view())?;
             e.t(" *nvSVE_")?;
             e.b(m.view())?;
@@ -1340,7 +1346,7 @@ fn emitContainerHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> R
             e.b(name.view())?;
             e.t(" *, uint64_t);")?;
             e.emit()?;
-            e.t("static NV_UNUSED ")?;
+            e.helperProto()?;
             let pushResult = resultOfOk(e, c, c.types.usize);
             appendCTypeName(c, mut e.buf, pushResult)?;
             e.t(" nvSVP_")?;
@@ -1354,13 +1360,14 @@ fn emitContainerHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> R
             continue;
         }
         let value = c.types.info(t).element;
-        e.t("static NV_UNUSED bool nvKV_")?;
+        e.helperProto()?;
+        e.t("bool nvKV_")?;
         e.b(m.view())?;
         e.t("(const ")?;
         e.b(name.view())?;
         e.t(" *, nv_handle);")?;
         e.emit()?;
-        e.t("static NV_UNUSED ")?;
+        e.helperProto()?;
         let insertResult = resultOfOk(e, c, handleTypeOf(c, value));
         appendCTypeName(c, mut e.buf, insertResult)?;
         e.t(" nvKI_")?;
@@ -1371,7 +1378,7 @@ fn emitContainerHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> R
         appendCTypeName(c, mut e.buf, value)?;
         e.t(");")?;
         e.emit()?;
-        e.t("static NV_UNUSED ")?;
+        e.helperProto()?;
         appendCTypeName(c, mut e.buf, optionFor(c, referenceTypeTo(c, value, false)))?;
         e.t(" nvKG_")?;
         e.b(m.view())?;
@@ -1379,7 +1386,7 @@ fn emitContainerHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> R
         e.b(name.view())?;
         e.t(" *, nv_handle);")?;
         e.emit()?;
-        e.t("static NV_UNUSED ")?;
+        e.helperProto()?;
         appendCTypeName(c, mut e.buf, optionFor(c, referenceTypeTo(c, value, true)))?;
         e.t(" nvKM_")?;
         e.b(m.view())?;
@@ -1387,7 +1394,7 @@ fn emitContainerHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> R
         e.b(name.view())?;
         e.t(" *, nv_handle);")?;
         e.emit()?;
-        e.t("static NV_UNUSED ")?;
+        e.helperProto()?;
         appendCTypeName(c, mut e.buf, optionFor(c, value))?;
         e.t(" nvKR_")?;
         e.b(m.view())?;
@@ -1414,7 +1421,7 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
             let elementType = c.types.info(c.types.info(t).pointee).element;
             let element = cTypeName(c, elementType)?;
             let result = resultOfOk(e, c, c.types.usize);
-            e.t("static ")?;
+            e.helper()?;
             e.b(element.view())?;
             e.t(" *nvSVE_")?;
             e.b(m.view())?;
@@ -1430,7 +1437,7 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
             e.emit()?;
             e.line("}")?;
             e.line("")?;
-            e.t("static ")?;
+            e.helper()?;
             appendCTypeName(c, mut e.buf, result)?;
             e.t(" nvSVP_")?;
             e.b(m.view())?;
@@ -1487,7 +1494,8 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
         var slot = Vector<u8>.create();
         appendSlotName(c, mut slot, t)?;
         let insertResult = resultOfOk(e, c, handleTypeOf(c, valueType));
-        e.t("static bool nvKV_")?;
+        e.helper()?;
+        e.t("bool nvKV_")?;
         e.b(m.view())?;
         e.t("(const ")?;
         e.b(name.view())?;
@@ -1496,7 +1504,7 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
         e.line("    return h.index < map->len && map->ptr[h.index].gen == h.gen;")?;
         e.line("}")?;
         e.line("")?;
-        e.t("static ")?;
+        e.helper()?;
         appendCTypeName(c, mut e.buf, insertResult)?;
         e.t(" nvKI_")?;
         e.b(m.view())?;
@@ -1564,7 +1572,7 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
         e.line("")?;
         for (mutable in [false, true]) {
             let optionType = optionFor(c, referenceTypeTo(c, valueType, mutable));
-            e.t("static ")?;
+            e.helper()?;
             appendCTypeName(c, mut e.buf, optionType)?;
             e.t(if (mutable) " nvKM_" else " nvKG_")?;
             e.b(m.view())?;
@@ -1590,7 +1598,7 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
             e.line("")?;
         }
         let removedType = optionFor(c, valueType);
-        e.t("static ")?;
+        e.helper()?;
         appendCTypeName(c, mut e.buf, removedType)?;
         e.t(" nvKR_")?;
         e.b(m.view())?;
@@ -1635,7 +1643,7 @@ fn emitVectorHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Resu
         let m = mangled(c, vector)?;
         let elementType = c.types.info(c.types.info(vector).pointee).element;
         if (c.types.isString(vector)) {
-            e.t("static NV_UNUSED ")?;
+            e.helperProto()?;
             appendCTypeName(c, mut e.buf, voidResult)?;
             e.t(" nvVA_")?;
             e.b(m.view())?;
@@ -1644,7 +1652,7 @@ fn emitVectorHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Resu
             e.t(" *, nv_str);")?;
             e.emit()?;
         } else {
-            e.t("static NV_UNUSED ")?;
+            e.helperProto()?;
             appendCTypeName(c, mut e.buf, voidResult)?;
             e.t(" nvVP_")?;
             e.b(m.view())?;
@@ -1654,7 +1662,7 @@ fn emitVectorHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Resu
             appendCTypeName(c, mut e.buf, elementType)?;
             e.t(");")?;
             e.emit()?;
-            e.t("static NV_UNUSED ")?;
+            e.helperProto()?;
             appendCTypeName(c, mut e.buf, optionFor(c, elementType))?;
             e.t(" nvVO_")?;
             e.b(m.view())?;
@@ -1663,7 +1671,8 @@ fn emitVectorHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Resu
             e.t(" *);")?;
             e.emit()?;
         }
-        e.t("static NV_UNUSED void nvVC_")?;
+        e.helperProto()?;
+        e.t("void nvVC_")?;
         e.b(m.view())?;
         e.t("(")?;
         e.b(name.view())?;
@@ -1673,7 +1682,7 @@ fn emitVectorHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Resu
     for (k in 0..e.composites.length) {
         let result = e.composites[k];
         if (isVectorWithCapacityResult(c, result)) {
-            e.t("static NV_UNUSED ")?;
+            e.helperProto()?;
             appendCTypeName(c, mut e.buf, result)?;
             e.t(" nvVW_")?;
             appendMangle(c, mut e.buf, resultOkOf(c, result))?;
@@ -1701,7 +1710,7 @@ fn emitVectorHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, 
         var error = Vector<u8>.create();
         appendAllocErrorResult(e, c, mut error, voidResult)?;
         if (c.types.isString(vector)) {
-            e.t("static ")?;
+            e.helper()?;
             e.b(result.view())?;
             e.t(" nvVA_")?;
             e.b(m.view())?;
@@ -1738,7 +1747,7 @@ fn emitVectorHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, 
         } else {
             let element = cTypeName(c, elementType)?;
             let optionType = optionFor(c, elementType);
-            e.t("static ")?;
+            e.helper()?;
             e.b(result.view())?;
             e.t(" nvVP_")?;
             e.b(m.view())?;
@@ -1788,7 +1797,7 @@ fn emitVectorHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, 
             e.emit()?;
             e.line("}")?;
             e.line("")?;
-            e.t("static ")?;
+            e.helper()?;
             appendCTypeName(c, mut e.buf, optionType)?;
             e.t(" nvVO_")?;
             e.b(m.view())?;
@@ -1812,7 +1821,8 @@ fn emitVectorHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, 
             e.line("}")?;
             e.line("")?;
         }
-        e.t("static void nvVC_")?;
+        e.helper()?;
+        e.t("void nvVC_")?;
         e.b(m.view())?;
         e.t("(")?;
         e.b(name.view())?;
@@ -1841,7 +1851,7 @@ fn emitVectorHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, 
         let vector = resultOkOf(c, resultType);
         let name = cTypeName(c, resultType)?;
         let element = cTypeName(c, c.types.info(c.types.info(vector).pointee).element)?;
-        e.t("static ")?;
+        e.helper()?;
         e.b(name.view())?;
         e.t(" nvVW_")?;
         appendMangle(c, mut e.buf, vector)?;

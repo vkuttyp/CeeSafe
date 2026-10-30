@@ -910,7 +910,7 @@ fn lowerNestedMatch(
         b.current = next;
     }
     if (b.current != none()) {
-        b.span = stmtSpan(c, s);
+        // The reference's Terminate gives it the current span, not the match's it was made with.
         terminate(n, b, NirTerminator.Unreachable)?;
     }
     b.current = if (joinReached) join else none();

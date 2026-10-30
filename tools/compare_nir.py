@@ -40,7 +40,9 @@ def compare(arguments):
                                    cwd=root, capture_output=True)
     if reference.returncode != 0:
         return path, None  # novac does not build it: nothing to compare
-    ours = subprocess.run([ceesafec, "build", "--dump-nir"] + OFF + options + [path], cwd=root, capture_output=True)
+    with tempfile.TemporaryDirectory() as out:
+        ours = subprocess.run([ceesafec, "build", "--emit", "c", "-o", out, "--dump-nir"] + OFF + options + [path],
+                              cwd=root, capture_output=True)
     return path, ours.returncode == 0 and ours.stdout == reference.stdout
 
 

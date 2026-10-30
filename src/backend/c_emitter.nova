@@ -54,8 +54,9 @@ struct CEmitter {
     mappedLine: u32;
     wantedFile: u32; // the line the current statement wants, or none
     wantedLine: u32;
-    pendingLabel: Vector<u8>;  // with directives, a label shares the next statement's line
-    paths: Vector<Vector<u8>>; // by source: its path, as #line names it
+    pendingLabel: Vector<u8>;      // with directives, a label shares the next statement's line
+    paths: Vector<Vector<u8>>;     // by source: its path, as #line names it
+    unitNames: Vector<Vector<u8>>; // split mode: by source, its unit's name, or empty
     hasPendingLabel: bool;
 
     fn create(trial: bool) -> CEmitter => CEmitter {
@@ -89,8 +90,44 @@ struct CEmitter {
         wantedLine: 0,
         pendingLabel: Vector<u8>.create(),
         paths: Vector<Vector<u8>>.create(),
+        unitNames: Vector<Vector<u8>>.create(),
         hasPendingLabel: false,
     };
+
+    /// Starts writing the named file (Into, split mode); a file named twice is continued.
+    fn into(borrow mut this, name: Slice<u8>) -> Result<void, AllocError> {
+        if (!this.split) {
+            return Ok();
+        }
+        var found = this.files.length;
+        for (k in 0..this.files.length) {
+            if (found == this.files.length && sameBytes(this.files[k].name.view(), name)) {
+                found = k;
+            }
+        }
+        if (found == this.files.length) {
+            this.files.push(CFile { name: copyBytes(name)?, text: Vector<u8>.create() })?;
+        }
+        this.current = found;
+        this.mappedFile = none(); // each file maps its own lines (§7)
+        return Ok();
+    }
+
+    /// The linkage of a function defined in a unit or in nova_instances.c (Fn): external when split.
+    fn fnPrefix(borrow mut this) -> Result<void, AllocError> =>
+        if (this.split) Ok() else appendText(mut this.buf, "static ");
+
+    /// The same for a prototype (FnProto).
+    fn fnProto(borrow mut this) -> Result<void, AllocError> =>
+        appendText(mut this.buf, if (this.split) "NV_UNUSED " else "static NV_UNUSED ");
+
+    /// The linkage of a per-type helper (Helper): `static inline` in the header when split (ADR 0022 §3.2).
+    fn helper(borrow mut this) -> Result<void, AllocError> =>
+        appendText(mut this.buf, if (this.split) "static inline " else "static ");
+
+    /// The same for a prototype (HelperProto).
+    fn helperProto(borrow mut this) -> Result<void, AllocError> =>
+        appendText(mut this.buf, if (this.split) "static inline NV_UNUSED " else "static NV_UNUSED ");
 
     /// Appends text to the line being built.
     fn t(borrow mut this, text: StringView) -> Result<void, AllocError> => appendText(mut this.buf, text);

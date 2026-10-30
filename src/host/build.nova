@@ -1,0 +1,148 @@
+// `build` after checking (the reference's Program.Build): C files for `--emit c`, else the C compiler run on them in a
+// temporary directory for `--emit exe` (the default) or `--emit obj`.
+
+/// The name without its directory and extension (Path.GetFileNameWithoutExtension).
+fn appendStem(out: borrow mut Vector<u8>, path: Slice<u8>) -> Result<void, AllocError> {
+    var start = path.length;
+    while (start > 0 && path[start - 1] != '/') {
+        start -= 1;
+    }
+    var end = path.length;
+    while (end > start && path[end - 1] != '.') {
+        end -= 1;
+    }
+    return appendBytes(out, path[start..(if (end > start + 1) end - 1 else path.length)]);
+}
+
+/// The directory part of a path, or empty.
+fn directoryOf(path: Slice<u8>) -> Slice<u8> {
+    var end = path.length;
+    while (end > 0 && path[end - 1] != '/') {
+        end -= 1;
+    }
+    return if (end > 1) path[..(end - 1)] else path[..end];
+}
+
+fn failBytes(message: Slice<u8>) -> i32 => fail(StringView.fromUtf8(message)!);
+
+/// Writes a tool's output to standard error, as novac does: its standard output, then its standard error.
+fn relayTool(outcome: borrow ToolOutcome) {
+    Console.writeError(StringView.fromUtf8(outcome.stdout.view())!);
+    Console.writeError(StringView.fromUtf8(outcome.stderr.view())!);
+}
+
+fn buildFiles(
+    options: borrow Options,
+    files: borrow Vector<CFile>,
+    firstNova: Slice<u8>,
+) -> i32 {
+    var defaultName = Vector<u8>.create();
+    if (options.defaultOutput.length > 0) {
+        appendBytes(mut defaultName, options.defaultOutput.view())!;
+        if (options.output.length == 0) {
+            match (makeDirectories(directoryOf(defaultName.view()))) {
+                Ok() => {}
+                Err(e) => { return fail(e.message()); }
+            }
+        }
+    } else {
+        appendStem(mut defaultName, firstNova)!;
+    }
+    if (sameText(options.emit.view(), "c")) {
+        var directory = copyBytes(options.output.view())!;
+        if (directory.length == 0) {
+            appendBytes(mut directory, defaultName.view())!;
+            appendText(mut directory, "-c")!;
+        }
+        match (writeFilesUnder(directory.view(), files)) {
+            Ok() => { return 0; }
+            Err(e) => {
+                var message = copyBytes("cannot write the C: ".bytes())!;
+                appendText(mut message, e.message())!;
+                return failBytes(message.view());
+            }
+        }
+    }
+    let object = sameText(options.emit.view(), "obj");
+    var output = copyBytes(options.output.view())!;
+    if (output.length == 0) {
+        appendBytes(mut output, defaultName.view())!;
+        if (object) {
+            appendText(mut output, ".o")!;
+        }
+    }
+    match (makeDirectories(directoryOf(output.view()))) {
+        Ok() => {}
+        Err(e) => { return fail(e.message()); }
+    }
+    let compiler = if (options.cc.length > 0) copyBytes(options.cc.view())! else copyBytes("cc".bytes())!;
+    let work = match (Directory.temporary()) {
+        Ok(d) => d,
+        Err(e) => { return fail(e.message()); }
+    };
+    let workBytes = copyBytes(work.view().bytes())!;
+    let status = compileIn(options, files, workBytes.view(), compiler.view(), output.view(), object);
+    removeTree(workBytes.view());
+    return status;
+}
+
+fn compileIn(
+    options: borrow Options,
+    files: borrow Vector<CFile>,
+    work: Slice<u8>,
+    compiler: Slice<u8>,
+    output: Slice<u8>,
+    object: bool,
+) -> i32 {
+    match (writeFilesUnder(work, files)) {
+        Ok() => {}
+        Err(e) => {
+            var message = copyBytes("cannot write the C: ".bytes())!;
+            appendText(mut message, e.message())!;
+            return failBytes(message.view());
+        }
+    }
+    // Run in the current directory: the source paths in #line directives are relative to it (c-backend.md §7).
+    var flags = Vector<Vector<u8>>.create();
+    pushText(mut flags, if (options.debug) "-g" else "-O2")!;
+    if (options.debug) {
+        pushText(mut flags, "-O0")!;
+    }
+    for (flag in options.cflags.view()) {
+        pushBytes(mut flags, flag.view())!;
+    }
+    let outcome = if (object) compileObject(
+        compiler,
+        work,
+        files,
+        output,
+        flags,
+        options.freestanding,
+        options.linker.view(),
+    )! else compileExecutable(compiler, work, files, output, options.debug, options.cflags, options.freestanding)!;
+    if (!outcome.started) {
+        var message = copyBytes("cannot run the C compiler '".bytes())!;
+        appendBytes(mut message, compiler)!;
+        appendText(mut message, "': ")!;
+        appendText(mut message, outcome.error.message())!;
+        return failBytes(message.view());
+    }
+    relayTool(outcome);
+    if (outcome.status != 0) {
+        var message = copyBytes("the C compiler '".bytes())!;
+        appendBytes(mut message, compiler)!;
+        appendText(mut message, "' failed (exit code ")!;
+        if (outcome.status < 0) {
+            message.push('-')!;
+        }
+        appendDecimal(
+            mut message,
+            truncate<u64>(if (outcome.status < 0) 0 - (outcome.status as i64) else outcome.status as i64),
+        )!;
+        appendText(mut message, ")")!;
+        Console.writeError("novac: ");
+        Console.writeErrorLine(StringView.fromUtf8(message.view())!);
+        return 1;
+    }
+    return 0;
+}

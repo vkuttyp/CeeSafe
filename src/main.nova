@@ -52,6 +52,17 @@ struct Options {
     emit: Vector<u8>;          // --emit c|exe|obj (build)
     output: Vector<u8>;        // -o (build), or empty
     exportsHeader: Vector<u8>; // --exports-header (build)
+    emitGiven: bool;
+    lineDirectives: bool;       // --line-directives or -g (build)
+    debug: bool;                // -g (build)
+    split: bool;                // --split (build)
+    programName: Vector<u8>;    // --program (build), or the package's name
+    cc: Vector<u8>;             // --cc, else $CC (build)
+    cflags: Vector<Vector<u8>>; // --cflag (build)
+    linker: Vector<u8>;         // --ld (build --emit obj)
+    cNames: Vector<Vector<u8>>; // C files given or the manifest's (type-system.md §28.6): names
+    cTexts: Vector<Vector<u8>>; // and texts
+    defaultOutput: Vector<u8>;  // package mode: <package>/out/<name>
     files: Vector<String>;
 }
 
@@ -96,7 +107,15 @@ fn readOptions(options: borrow mut Options) -> i32 {
             options.dumpHir = true;
         } else if (options.building && arg == "--dump-nir") {
             options.dumpNir = true;
-        } else if (options.building && (arg == "--emit" || arg == "-o" || arg == "--exports-header")) {
+        } else if (options.building && arg == "--line-directives") {
+            options.lineDirectives = true;
+        } else if (options.building && arg == "-g") {
+            options.lineDirectives = true;
+            options.debug = true;
+        } else if (options.building && arg == "--split") {
+            options.split = true;
+        } else if (options.building && (arg == "--emit" || arg == "-o" || arg == "--exports-header" || arg == "--cc" ||
+            arg == "--cflag" || arg == "--ld" || arg == "--program")) {
             let value = match (Process.argument(a)) {
                 Some(v) => v,
                 null => {
@@ -117,8 +136,17 @@ fn readOptions(options: borrow mut Options) -> i32 {
                     return fail(message.view());
                 }
                 options.emit = copyBytes(value.bytes())!;
+                options.emitGiven = true;
             } else if (arg == "-o") {
                 options.output = copyBytes(value.bytes())!;
+            } else if (arg == "--cc") {
+                options.cc = copyBytes(value.bytes())!;
+            } else if (arg == "--cflag") {
+                options.cflags.push(copyBytes(value.bytes())!)!;
+            } else if (arg == "--ld") {
+                options.linker = copyBytes(value.bytes())!;
+            } else if (arg == "--program") {
+                options.programName = copyBytes(value.bytes())!;
             } else {
                 options.exportsHeader = copyBytes(value.bytes())!;
             }
@@ -317,6 +345,20 @@ fn parseCommand() -> i32 {
         emit: copyBytes("exe".bytes())!,
         output: Vector<u8>.create(),
         exportsHeader: copyBytes("nova_exports.h".bytes())!,
+        emitGiven: false,
+        lineDirectives: false,
+        debug: false,
+        split: false,
+        programName: Vector<u8>.create(),
+        cc: match (Environment.variable("CC")) {
+            Some(v) => copyBytes(v.bytes())!,
+            null => Vector<u8>.create(),
+        },
+        cflags: Vector<Vector<u8>>.create(),
+        linker: Vector<u8>.create(),
+        cNames: Vector<Vector<u8>>.create(),
+        cTexts: Vector<Vector<u8>>.create(),
+        defaultOutput: Vector<u8>.create(),
         files: Vector<String>.create(),
     };
     let status = readOptions(mut options);
@@ -448,6 +490,24 @@ fn loadPackage(
     if (loaded[0].manifest.kernel) {
         options.kernel = true;
     }
+    if (!options.emitGiven && loaded[0].manifest.object) {
+        options.emit = copyBytes("obj".bytes())!;
+    }
+    options.defaultOutput = joinPath(loaded[0].manifest.directory.view(), "out".bytes())!;
+    options.defaultOutput.push('/')!;
+    appendBytes(mut options.defaultOutput, loaded[0].manifest.name.view())!;
+    if (options.programName.length == 0) {
+        options.programName = copyBytes(loaded[0].manifest.name.view())!;
+    }
+    for (p in loaded.view()) {
+        for (c in p.manifest.cFiles.view()) {
+            let path = joinPath(p.manifest.directory.view(), c.view())!;
+            let status = addCFile(mut options, path.view());
+            if (status != 0) {
+                return status;
+            }
+        }
+    }
     for (p in loaded.view()) {
         var dependencies = Vector<Vector<u8>>.create();
         for (d in p.manifest.dependencies.view()) {
@@ -491,11 +551,42 @@ fn fileCommand(building: bool) -> i32 {
         emit: copyBytes("exe".bytes())!,
         output: Vector<u8>.create(),
         exportsHeader: copyBytes("nova_exports.h".bytes())!,
+        emitGiven: false,
+        lineDirectives: false,
+        debug: false,
+        split: false,
+        programName: Vector<u8>.create(),
+        cc: match (Environment.variable("CC")) {
+            Some(v) => copyBytes(v.bytes())!,
+            null => Vector<u8>.create(),
+        },
+        cflags: Vector<Vector<u8>>.create(),
+        linker: Vector<u8>.create(),
+        cNames: Vector<Vector<u8>>.create(),
+        cTexts: Vector<Vector<u8>>.create(),
+        defaultOutput: Vector<u8>.create(),
         files: Vector<String>.create(),
     };
     let status = readOptions(mut options);
     if (status != 0) {
         return status;
+    }
+    // C sources go to the C compiler with the generated code (type-system.md §28.6).
+    var novaFiles = Vector<String>.create();
+    for (k in 0..options.files.length) {
+        let file = copyText(options.files[k].view());
+        let bytes = file.view().bytes();
+        if (bytes.length > 2 && bytes[bytes.length - 2] == '.' && bytes[bytes.length - 1] == 'c') {
+            let added = addCFile(mut options, bytes);
+            if (added != 0) {
+                return added;
+            }
+        } else {
+            novaFiles.push(file)!;
+        }
+    }
+    if (options.files.length > 0 && novaFiles.length == 0) {
+        return fail("no Nova input files");
     }
     var sources = Vector<SourceText>.create();
     var fileIsLibrary = Vector<bool>.create();
@@ -528,7 +619,7 @@ fn fileCommand(building: bool) -> i32 {
         filePackage.push(0xFFFFFFFF)!;
     }
     if (options.files.length > 0) {
-        let loaded = loadFiles(options.files, mut sources);
+        let loaded = loadFiles(novaFiles, mut sources);
         if (loaded != 0) {
             return loaded;
         }
@@ -612,53 +703,43 @@ fn fileCommand(building: bool) -> i32 {
             var out = Vector<u8>.create();
             printNir(checker, nir, mut out)!;
             Console.writeBytes(out.view());
-            if (!sameText(options.emit.view(), "c")) {
-                return report(options.json, checker.front.diagnostics, sources);
+        }
+        // The name split mode's external C names carry: --program, the package's, or the first file's.
+        var programName = copyBytes(options.programName.view())!;
+        if (programName.length == 0) {
+            if (options.files.length > 0) {
+                appendStem(mut programName, options.files[0].view().bytes())!;
+            } else {
+                appendText(mut programName, "program")!;
             }
         }
-        if (!sameText(options.emit.view(), "c")) {
-            return fail("'build --emit exe' and '--emit obj' are not implemented yet (ROADMAP P5 S2); use '--emit c'");
-        }
+        // With C files, `main` may be in C (type-system.md §28.6).
+        let requireMain = sameText(options.emit.view(), "exe") && options.cNames.length == 0 && !options.freestanding;
         var files = Vector<CFile>.create();
         if (!generateC(
             mut checker,
             nir,
             sources,
-            false,
+            requireMain,
             options.freestanding,
+            options.lineDirectives,
+            options.split,
+            programName.view(),
             options.exportsHeader.view(),
             mut files,
         )!) {
             return report(options.json, checker.front.diagnostics, sources);
         }
-        var directory = copyBytes(options.output.view())!;
-        if (directory.length == 0) {
-            // The first input's name with `-c` (novac's default for --emit c).
-            var user: usize = 0;
-            while (user + 1 < sources.length && checker.fileIsLibrary[user]) {
-                user += 1;
-            }
-            let first = sources[user].path.view();
-            var start = first.length;
-            while (start > 0 && first[start - 1] != '/') {
-                start -= 1;
-            }
-            var end = first.length;
-            while (end > start && first[end - 1] != '.') {
-                end -= 1;
-            }
-            appendBytes(mut directory, first[start..(if (end > start) end - 1 else first.length)])!;
-            appendText(mut directory, "-c")!;
+        for (k in 0..options.cNames.length) {
+            var name = copyBytes("c/".bytes())!;
+            appendBytes(mut name, options.cNames[k].view())!;
+            files.push(CFile { name: name, text: copyBytes(options.cTexts[k].view())! })!;
         }
-        match (writeFilesUnder(directory.view(), files)) {
-            Ok() => {}
-            Err(e) => {
-                var message = String.create();
-                message.append("cannot write the C: ")!;
-                message.append(e.message())!;
-                return fail(message.view());
-            }
+        var user: usize = 0;
+        while (user + 1 < sources.length && checker.fileIsLibrary[user]) {
+            user += 1;
         }
+        return buildFiles(options, files, sources[user].path.view());
     }
     return report(options.json, checker.front.diagnostics, sources);
 }
@@ -705,4 +786,34 @@ fn main() -> i32 {
             return fail(message.view());
         }
     }
+}
+
+/// A C file for the C compiler: its name and text; two files may not share a name.
+fn addCFile(options: borrow mut Options, path: Slice<u8>) -> i32 {
+    var name = Vector<u8>.create();
+    var start = path.length;
+    while (start > 0 && path[start - 1] != '/') {
+        start -= 1;
+    }
+    appendBytes(mut name, path[start..])!;
+    for (other in options.cNames.view()) {
+        if (sameBytes(other.view(), name.view())) {
+            var message = copyBytes("two C files are named '".bytes())!;
+            appendBytes(mut message, name.view())!;
+            message.push('\'')!;
+            return failBytes(message.view());
+        }
+    }
+    let text = match (readFile(StringView.fromUtf8(path)!)) {
+        Ok(t) => t,
+        Err(_) => {
+            var message = copyBytes("cannot read '".bytes())!;
+            appendBytes(mut message, path)!;
+            message.push('\'')!;
+            return failBytes(message.view());
+        }
+    };
+    options.cNames.push(name)!;
+    options.cTexts.push(text)!;
+    return 0;
 }

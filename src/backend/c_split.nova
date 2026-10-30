@@ -1,0 +1,234 @@
+// Split mode (the reference's CEmitter: NameUnits, UnitOf, SplitFiles; ADR 0022, c-backend.md §2.4): the C as
+// nova_program.h, one unit per Nova file and nova_instances.c, with external names carrying the program's name.
+
+/// Inserts a name into a sorted list (ordinal order), once.
+fn insertSorted(list: borrow mut Vector<Vector<u8>>, name: Vector<u8>) -> Result<void, AllocError> {
+    var at = list.length;
+    for (k in 0..list.length) {
+        let order = compareBytes(list[k].view(), name.view());
+        if (order == 0) {
+            return Ok();
+        }
+        if (at == list.length && order > 0) {
+            at = k;
+        }
+    }
+    list.push(name)?;
+    var k = list.length - 1;
+    while (k > at) {
+        list.swap(k - 1, k);
+        k -= 1;
+    }
+    return Ok();
+}
+
+fn isAsciiLetterOrDigit(b: u8) -> bool => (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9');
+
+/// Appends text with every character that is not an ASCII letter or digit as `_`, one per UTF-16 unit.
+fn appendIdentifierText(out: borrow mut Vector<u8>, text: Slice<u8>) -> Result<void, AllocError> {
+    var i: usize = 0;
+    while (i < text.length) {
+        if (text[i] < 0x80) {
+            out.push(if (isAsciiLetterOrDigit(text[i])) text[i] else '_')?;
+            i += 1;
+            continue;
+        }
+        let decoded = decodeUtf8(text, i);
+        for (unit in 0..decoded.utf16Units()) {
+            out.push('_')?;
+        }
+        i += decoded.length as usize;
+    }
+    return Ok();
+}
+
+/// A unit's name from its file's path: the stem, with `depth` directories before it (NameUnits' Base).
+fn unitBaseName(path: Slice<u8>, depth: usize) -> Result<Vector<u8>, AllocError> {
+    var starts = Vector<usize>.create();
+    var ends = Vector<usize>.create();
+    var start: usize = 0;
+    for (k in 0..path.length) {
+        if (path[k] == '/' || path[k] == '\\') {
+            starts.push(start)?;
+            ends.push(k)?;
+            start = k + 1;
+        }
+    }
+    var joined = Vector<u8>.create();
+    let directories = starts.length;
+    let first = if (directories > depth) directories - depth else 0;
+    for (k in first..directories) {
+        appendBytes(mut joined, path[starts[k]..ends[k]])?;
+        joined.push('_')?;
+    }
+    appendStem(mut joined, path[start..])?;
+    var name = Vector<u8>.create();
+    appendIdentifierText(mut name, joined.view())?;
+    appendText(mut name, ".c")?;
+    return Ok(name);
+}
+
+/// Each user file's unit (NameUnits): its stem, with as many directories as needed for the names to differ.
+fn nameUnits(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocError> {
+    var depth: usize = 0;
+    loop {
+        var names = Vector<Vector<u8>>.create();
+        for (file in 0..c.filePaths.length) {
+            let named = e.fileIds[file] != none() && !c.fileIsLibrary[file];
+            names.push(if (named) unitBaseName(c.filePaths[file].view(), depth)? else Vector<u8>.create())?;
+        }
+        var clash = false;
+        for (a in 0..names.length) {
+            if (names[a].length == 0) {
+                continue;
+            }
+            if (sameText(names[a].view(), "nova_instances.c")) {
+                clash = true;
+            }
+            for (b in (a + 1)..names.length) {
+                if (sameBytes(names[a].view(), names[b].view())) {
+                    clash = true;
+                }
+            }
+        }
+        if (!clash || depth > 32) {
+            e.unitNames = names;
+            return Ok();
+        }
+        depth += 1;
+    }
+}
+
+/// The unit a function is defined in (UnitOf): its Nova file's, or nova_instances.c for the libraries and instances.
+fn unitOf(e: borrow CEmitter, c: borrow Checker, n: borrow NirProgram, f: u32) -> Result<Vector<u8>, AllocError> {
+    let source = n.functions[f as usize].source;
+    let file = c.hir.functions[source as usize].file;
+    if (!e.split || isLibraryFunction(c, source) || functionIsInstantiation(c, source) ||
+        (file as usize) >= e.unitNames.length || e.unitNames[file as usize].length == 0) {
+        return copyBytes("nova_instances.c".bytes());
+    }
+    return copyBytes(e.unitNames[file as usize].view());
+}
+
+fn isLineSpace(b: u8) -> bool => b == ' ' || b == '\t' || b == '\r';
+
+/// The function a definition line defines (SplitFiles' pattern): a line not starting with `static `, `typedef `, `#`
+/// or a space, whose first `(` follows an identifier starting with `nv`, with no `;` after it, ending `) {`.
+fn definedNameRange(line: Slice<u8>) -> Range {
+    let missing = Range { start: 0, count: 0 };
+    if (line.length == 0 || line[0] == '#' || isLineSpace(line[0]) || line[0] == '\n' ||
+        (line.length >= 7 && sameText(line[..7], "static ")) || (line.length >= 8 && sameText(line[..8], "typedef "))) {
+        return missing;
+    }
+    var open = line.length;
+    for (k in 0..line.length) {
+        if (open == line.length && line[k] == '(') {
+            open = k;
+        }
+    }
+    if (open == line.length) {
+        return missing;
+    }
+    var start = open;
+    while (start > 0 && (isAsciiLetterOrDigit(line[start - 1]) || line[start - 1] == '_')) {
+        start -= 1;
+    }
+    if (open - start < 2 || line[start] != 'n' || line[start + 1] != 'v') {
+        return missing;
+    }
+    for (k in open..line.length) {
+        if (line[k] == ';') {
+            return missing;
+        }
+    }
+    var end = line.length;
+    while (end > open && isLineSpace(line[end - 1])) {
+        end -= 1;
+    }
+    if (end == open || line[end - 1] != '{') {
+        return missing;
+    }
+    end -= 1;
+    while (end > open && isLineSpace(line[end - 1])) {
+        end -= 1;
+    }
+    if (end == open || line[end - 1] != ')') {
+        return missing;
+    }
+    return Range { start: truncate<u32>(start), count: truncate<u32>(open - start) };
+}
+
+/// The split files (SplitFiles): every function a unit or nova_instances.c defines is renamed with the program's name
+/// by a `#define` in the header, so two programs linked into one image never collide.
+fn splitFiles(e: borrow CEmitter, out: borrow mut Vector<CFile>) -> Result<void, AllocError> {
+    var defined = Vector<Vector<u8>>.create();
+    for (name in e.splitData.view()) {
+        insertSorted(mut defined, copyBytes(name.view())?)?;
+    }
+    for (k in 1..e.files.length) {
+        let text = e.files[k].text.view();
+        var start: usize = 0;
+        for (i in 0..(text.length + 1)) {
+            if (i == text.length || text[i] == '\n') {
+                let line = text[start..i];
+                let name = definedNameRange(line);
+                if (name.count > 0) {
+                    insertSorted(
+                        mut defined,
+                        copyBytes(line[(name.start as usize)..((name.start + name.count) as usize)])?,
+                    )?;
+                }
+                start = i + 1;
+            }
+        }
+    }
+    var program = Vector<u8>.create();
+    appendIdentifierText(mut program, e.programName.view())?;
+    var names = Vector<u8>.create();
+    for (name in defined.view()) {
+        appendText(mut names, "#define ")?;
+        appendBytes(mut names, name.view())?;
+        names.push(' ')?;
+        var at = name.length;
+        for (k in 0..name.length) {
+            if (at == name.length && name[k] == '_') {
+                at = k;
+            }
+        }
+        let text = name.view();
+        if (at == name.length) {
+            appendBytes(mut names, text)?;
+            names.push('_')?;
+            appendBytes(mut names, program.view())?;
+        } else {
+            appendBytes(mut names, text[..(at + 1)])?;
+            appendBytes(mut names, program.view())?;
+            names.push('_')?;
+            appendBytes(mut names, text[(at + 1)..])?;
+        }
+        names.push('\n')?;
+    }
+    var guard = copyBytes("NOVA_PROGRAM_".bytes())?;
+    for (b in program.view()) {
+        guard.push(if (b >= 'a' && b <= 'z') b - 32 else b)?;
+    }
+    appendText(mut guard, "_H")?;
+    var header = copyBytes("#ifndef ".bytes())?;
+    appendBytes(mut header, guard.view())?;
+    appendText(mut header, "\n#define ")?;
+    appendBytes(mut header, guard.view())?;
+    header.push('\n')?;
+    appendBytes(mut header, names.view())?;
+    header.push('\n')?;
+    appendBytes(mut header, e.files[0].text.view())?;
+    appendText(mut header, "#endif\n")?;
+    out.push(CFile { name: copyBytes("nova_program.h".bytes())?, text: header })?;
+    for (k in 1..e.files.length) {
+        var text = copyBytes("/* Generated by ".bytes())?;
+        appendText(mut text, compilerBanner())?;
+        appendText(mut text, ". Do not edit. */\n#include \"nova_program.h\"\n\n")?;
+        appendBytes(mut text, e.files[k].text.view())?;
+        out.push(CFile { name: copyBytes(e.files[k].name.view())?, text: text })?;
+    }
+    return Ok();
+}

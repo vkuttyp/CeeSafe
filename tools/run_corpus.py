@@ -167,7 +167,7 @@ class Runner:
         return Outcome([exe], status, stdout, stderr, {}, time.monotonic() - start)
 
     def cflags(self):
-        result = []
+        result = list(self.args.build_option)
         for flag in self.args.cflag:
             result += ["--cflag", flag]
         return result
@@ -358,6 +358,8 @@ def main():
     parser.add_argument("--timeout", type=float, default=60.0, help="seconds per command or program run")
     parser.add_argument("--cc", help="C compiler (sets $CC for the compiler)")
     parser.add_argument("--cflag", action="append", default=[], help="extra C flag for builds (repeatable)")
+    parser.add_argument("--build-option", action="append", default=[],
+                        help="extra compiler option for builds, e.g. --build-option=--split (repeatable)")
     parser.add_argument("--check-leaks", action="store_true",
                         help="run programs with NOVA_ALLOC_REPORT=1 and require live=0 on a normal exit")
     parser.add_argument("--with", dest="with_files", action="append", default=[],

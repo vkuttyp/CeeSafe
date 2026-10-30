@@ -7,7 +7,7 @@ banner's compiler name and version are made the same. Only the files novac build
 `// profile:` and `// option:` lines are passed as in compare_parse.py.
 
 usage: python3 tools/compare_c.py --ceesafec out/ceesafec --novac ~/.nova/0.6.0/bin/novac --root <Nova>
-           [--list FILE] [--show N] paths...
+           [--extra=--split] [--extra=-g] [--list FILE] [--show N] paths...
 """
 import argparse
 import concurrent.futures
@@ -37,8 +37,8 @@ def read_tree(directory):
 
 
 def compare(arguments):
-    root, ceesafec, novac, path = arguments
-    options = options_of(root, path)
+    root, ceesafec, novac, path, extra = arguments
+    options = options_of(root, path) + extra
     with tempfile.TemporaryDirectory() as out:
         reference_dir = os.path.join(out, "novac")
         ours_dir = os.path.join(out, "ceesafec")
@@ -73,12 +73,14 @@ def main():
     parser.add_argument("--root", required=True)
     parser.add_argument("--jobs", type=int, default=os.cpu_count())
     parser.add_argument("--list", help="write every differing file's path to FILE, sorted, one per line")
+    parser.add_argument("--extra", action="append", default=[],
+                        help="another switch for both compilers, e.g. --extra=--split or --extra=-g (repeatable)")
     parser.add_argument("--show", type=int, default=0, help="print the first lines of N differing files' diffs")
     parser.add_argument("paths", nargs="+")
     args = parser.parse_args()
     ceesafec = os.path.abspath(args.ceesafec)
     novac = os.path.expanduser(args.novac)
-    work = [(args.root, ceesafec, novac, path) for path in files(args.root, args.paths)]
+    work = [(args.root, ceesafec, novac, path, args.extra) for path in files(args.root, args.paths)]
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
         results = list(pool.map(compare, work))
     built = [(p, same, d) for p, same, d in results if same is not None]

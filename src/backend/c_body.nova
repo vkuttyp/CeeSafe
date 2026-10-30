@@ -111,7 +111,7 @@ fn emitFunction(
     let nameStart = functionNameStart(c, source);
     let syntax = c.front.ast.functions[c.hir.functions[source as usize].syntax as usize];
     mapTo(e, c, n, sources, nameStart, c.front.ast.idents[syntax.name as usize].end);
-    e.t("static ")?;
+    e.fnPrefix()?;
     appendSignature(e, c, n, f, true)?;
     e.t(" {")?;
     e.emit()?;

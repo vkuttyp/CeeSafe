@@ -37,6 +37,9 @@ fn generateC(
     sources: borrow Vector<SourceText>,
     requireMain: bool,
     freestanding: bool,
+    lineDirectives: bool,
+    split: bool,
+    programName: Slice<u8>,
     exportsHeaderName: Slice<u8>,
     out: borrow mut Vector<CFile>,
 ) -> Result<bool, AllocError> {
@@ -59,10 +62,16 @@ fn generateC(
     computeLayouts(c);
     // Twice: the location constants come before the code that uses them, and only emitting the code finds them.
     var trial = CEmitter.create(true);
+    trial.lineDirectives = lineDirectives;
+    trial.split = split;
+    trial.programName = copyBytes(programName)?;
     trial.exportsHeader = copyBytes(exportsHeaderName)?;
     setUpEmitter(mut trial, c, n)?;
     emitProgram(mut trial, c, n, sources)?;
     var emitter = CEmitter.create(false);
+    emitter.lineDirectives = lineDirectives;
+    emitter.split = split;
+    emitter.programName = copyBytes(programName)?;
     emitter.exportsHeader = copyBytes(exportsHeaderName)?;
     emitter.sites = trial.sites;
     emitter.siteList = trial.siteList;
@@ -71,13 +80,21 @@ fn generateC(
     emitter.usedTypes = trial.usedTypes;
     setUpEmitter(mut emitter, c, n)?;
     emitProgram(mut emitter, c, n, sources)?;
+    var program = Vector<CFile>.create();
+    if (split) {
+        splitFiles(emitter, mut program)?;
+    } else {
+        for (file in emitter.files.view()) {
+            program.push(CFile { name: copyBytes(file.name.view())?, text: copyBytes(file.text.view())? })?;
+        }
+    }
     var mainText = Vector<u8>.create();
-    for (file in emitter.files.view()) {
+    for (file in program.view()) {
         appendBytes(mut mainText, file.text.view())?; // what the runtime selection below looks for
     }
     var header = Vector<u8>.create();
     let hasHeader = exportsHeader(c, n, exportsHeaderName, mut header)?;
-    for (file in emitter.files.view()) {
+    for (file in program.view()) {
         out.push(CFile { name: copyBytes(file.name.view())?, text: copyBytes(file.text.view())? })?;
     }
     out.push(runtimeFile(0, "")?)?;

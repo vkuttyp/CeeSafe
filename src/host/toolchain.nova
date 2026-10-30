@@ -1,0 +1,207 @@
+// Running the C compiler (the reference's Backend.C/CBackend.cs Toolchain and Backend.C/CCompilers.cs): the strict
+// warning set, the flags the generated code's meaning depends on, an executable in one compile, an object as one `-c`
+// per file joined with `-r`. POSIX hosts only: CCompilers' Windows discovery and MSVC's dialect are P9's.
+
+/// Default warning set: generated code must compile cleanly under it (StrictWarnings, c-backend.md §1).
+fn strictWarningCount() -> usize => 13;
+
+fn strictWarning(k: usize) -> StringView => match (k) {
+    0 => "-std=c11",
+    1 => "-Wall",
+    2 => "-Wextra",
+    3 => "-Wpedantic",
+    4 => "-Wshadow",
+    5 => "-Wconversion",
+    6 => "-Wsign-conversion",
+    7 => "-Wmissing-prototypes",
+    8 => "-Wstrict-prototypes",
+    9 => "-Wvla",
+    10 => "-Wcast-qual",
+    11 => "-Wundef",
+    _ => "-Wimplicit-fallthrough",
+};
+
+fn pushText(arguments: borrow mut Vector<Vector<u8>>, text: StringView) -> Result<void, AllocError> =>
+    arguments.push(copyBytes(text.bytes())?);
+
+fn pushBytes(arguments: borrow mut Vector<Vector<u8>>, bytes: Slice<u8>) -> Result<void, AllocError> =>
+    arguments.push(copyBytes(bytes)?);
+
+/// The warnings, `-I` on the output directory, the semantic flags (SemanticFlags: no contraction, no errno from math
+/// builtins, §35.6, §35.8) and the profile's flags (ProfileFlags, cosmoos/profiles.md §4.3).
+fn pushCommonFlags(
+    arguments: borrow mut Vector<Vector<u8>>,
+    directory: Slice<u8>,
+    freestanding: bool,
+) -> Result<void, AllocError> {
+    for (k in 0..strictWarningCount()) {
+        pushText(arguments, strictWarning(k))?;
+    }
+    pushText(arguments, "-I")?;
+    pushBytes(arguments, directory)?;
+    pushText(arguments, "-ffp-contract=off")?;
+    pushText(arguments, "-fno-math-errno")?;
+    if (freestanding) {
+        pushText(arguments, "-ffreestanding")?;
+        pushText(arguments, "-fno-stack-protector")?;
+        pushText(arguments, "-fno-asynchronous-unwind-tables")?;
+        pushText(arguments, "-fno-unwind-tables")?;
+    }
+    return Ok();
+}
+
+/// A tool's outcome (ToolResult).
+struct ToolOutcome {
+    started: bool; // false: it could not be started (`error` says why)
+    status: i32;
+    stdout: Vector<u8>;
+    stderr: Vector<u8>;
+    error: IoError;
+}
+
+/// Runs `program` with `arguments`, capturing its output (Toolchain.Run).
+fn runTool(program: Slice<u8>, arguments: borrow Vector<Vector<u8>>) -> Result<ToolOutcome, AllocError> {
+    var views = Vector<StringView>.create();
+    for (a in arguments.view()) {
+        views.push(StringView.fromUtf8(a.view())!)?;
+    }
+    match (Process.capture(StringView.fromUtf8(program)!, views, null)) {
+        Ok(output) => {
+            return Ok(ToolOutcome {
+                started: true,
+                status: output.status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                error: IoError.Other(0),
+            });
+        }
+        Err(e) => {
+            return Ok(ToolOutcome {
+                started: false,
+                status: -1,
+                stdout: Vector<u8>.create(),
+                stderr: Vector<u8>.create(),
+                error: e,
+            });
+        }
+    }
+}
+
+/// The generated `.c` files (CProgram.SourceFiles), in output order.
+fn isCSourceName(name: Slice<u8>) -> bool =>
+    name.length > 2 && name[name.length - 2] == '.' && name[name.length - 1] == 'c';
+
+/// `novac build`'s compile of an executable (CompileExecutable, GNU dialect): `debug` is `-g -O0`, else `-O2`.
+fn compileExecutable(
+    compiler: Slice<u8>,
+    directory: Slice<u8>,
+    files: borrow Vector<CFile>,
+    output: Slice<u8>,
+    debug: bool,
+    userFlags: borrow Vector<Vector<u8>>,
+    freestanding: bool,
+) -> Result<ToolOutcome, AllocError> {
+    var arguments = Vector<Vector<u8>>.create();
+    pushCommonFlags(mut arguments, directory, freestanding)?;
+    if (debug) {
+        pushText(mut arguments, "-g")?;
+        pushText(mut arguments, "-O0")?;
+    } else {
+        pushText(mut arguments, "-O2")?;
+    }
+    for (flag in userFlags.view()) {
+        pushBytes(mut arguments, flag.view())?;
+    }
+    for (file in files.view()) {
+        if (isCSourceName(file.name.view())) {
+            arguments.push(joinPath(directory, file.name.view())?)?;
+        }
+    }
+    pushText(mut arguments, "-o")?;
+    pushBytes(mut arguments, output)?;
+    return runTool(compiler, arguments);
+}
+
+/// Compiles each C file with `-c` and joins the objects into one relocatable object with `-r` (CompileObject,
+/// cosmoos/profiles.md §4.3): by `linker` if given, else by the compiler with the target flag.
+fn compileObject(
+    compiler: Slice<u8>,
+    directory: Slice<u8>,
+    files: borrow Vector<CFile>,
+    output: Slice<u8>,
+    flags: borrow Vector<Vector<u8>>,
+    freestanding: bool,
+    linker: Slice<u8>,
+) -> Result<ToolOutcome, AllocError> {
+    var objects = Vector<Vector<u8>>.create();
+    for (file in files.view()) {
+        if (!isCSourceName(file.name.view())) {
+            continue;
+        }
+        let source = joinPath(directory, file.name.view())?;
+        var object = copyBytes(source.view())?;
+        appendText(mut object, ".o")?;
+        var arguments = Vector<Vector<u8>>.create();
+        pushCommonFlags(mut arguments, directory, freestanding)?;
+        for (flag in flags.view()) {
+            pushBytes(mut arguments, flag.view())?;
+        }
+        pushText(mut arguments, "-c")?;
+        pushBytes(mut arguments, source.view())?;
+        pushText(mut arguments, "-o")?;
+        pushBytes(mut arguments, object.view())?;
+        let compiled = runTool(compiler, arguments)?;
+        if (!compiled.started || compiled.status != 0) {
+            return Ok(compiled);
+        }
+        objects.push(object)?;
+    }
+    var link = Vector<Vector<u8>>.create();
+    if (linker.length == 0) {
+        for (flag in flags.view()) {
+            let text = flag.view();
+            if (text.length >= 9 && sameText(text[..9], "--target=")) {
+                pushBytes(mut link, flag.view())?;
+            }
+        }
+        pushText(mut link, "-nostdlib")?;
+    }
+    pushText(mut link, "-r")?;
+    pushText(mut link, "-o")?;
+    pushBytes(mut link, output)?;
+    for (object in objects.view()) {
+        pushBytes(mut link, object.view())?;
+    }
+    return runTool(if (linker.length == 0) compiler else linker, link);
+}
+
+/// Removes a directory and everything under it, ignoring what cannot be removed.
+fn removeTree(path: Slice<u8>) {
+    let text = match (StringView.fromUtf8(path)) {
+        Some(t) => t,
+        null => { return; }
+    };
+    match (File.kind(text)) {
+        Ok(kind) => {
+            match (kind) {
+                Some(PathKind.Directory) => {
+                    match (Directory.list(text)) {
+                        Ok(names) => {
+                            for (name in names.view()) {
+                                match (joinPath(path, name.view().bytes())) {
+                                    Ok(child) => { removeTree(child.view()); }
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                    let removed = Directory.remove(text);
+                }
+                Some(_) => { let removed = File.remove(text); }
+                null => {}
+            }
+        }
+        Err(_) => {}
+    }
+}
