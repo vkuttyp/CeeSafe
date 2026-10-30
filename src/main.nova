@@ -1,11 +1,73 @@
 /// ceesafec: the CeeSafe compiler, being ported from Nova's C# novac (ROADMAP.md).
-/// This is the P0 skeleton: it answers `--version` and `--help`, and compiles nothing yet.
+/// The P1 skeleton: it knows the reference's commands, loads the files a command names into source texts, and says
+/// which phase implements the command. It compiles nothing yet.
 fn usage() {
-    Console.writeLine("usage: ceesafec <command> [options]");
+    Console.writeLine("usage: ceesafec <command> [options] <file.nova>...");
     Console.writeLine("");
-    Console.writeLine("No commands are implemented yet; see ROADMAP.md.");
+    Console.writeLine(
+        "The commands are novac's (docs/reference-inventory.md §2); none is implemented yet, see ROADMAP.md.",
+    );
     Console.writeLine("  --version    print the version");
     Console.writeLine("  -h, --help   print this text");
+}
+
+/// The roadmap phase that brings a command to parity, or null if novac has no such command.
+fn phaseOf(command: StringView) -> StringView? {
+    if (command == "parse") {
+        return "P2";
+    }
+    if (command == "check") {
+        return "P4";
+    }
+    if (command == "build") {
+        return "P5";
+    }
+    if (command == "run" || command == "fmt" || command == "new" || command == "agents" || command == "fetch" ||
+        command == "publish" || command == "index-check" || command == "lsp" || command == "mcp" || command == "fix" ||
+        command == "explain" || command == "doc") {
+        return "P8";
+    }
+    return null;
+}
+
+/// Loads every argument after the command that is not an option, as the commands that take files will.
+fn loadFiles(sources: borrow mut Vector<SourceText>) -> i32 {
+    for (a in 2..Process.argumentCount()) {
+        let path = Process.argument(a)!;
+        if (path.length > 0 && path[0] == '-') {
+            continue;
+        }
+        let bytes = match (readFile(path)) {
+            Ok(b) => b,
+            Err(ReadError.Io(e)) => {
+                Console.writeError("ceesafec: cannot read '");
+                Console.writeError(path);
+                Console.writeError("': ");
+                Console.writeErrorLine(e.message());
+                return 1;
+            }
+            Err(ReadError.Memory) => {
+                Console.writeErrorLine("ceesafec: out of memory");
+                return 1;
+            }
+        };
+        match (SourceText.create(path.bytes(), bytes.view())) {
+            Ok(s) => {
+                match (sources.push(s)) {
+                    Ok() => {}
+                    Err(_) => {
+                        Console.writeErrorLine("ceesafec: out of memory");
+                        return 1;
+                    }
+                }
+            }
+            Err(_) => {
+                Console.writeErrorLine("ceesafec: out of memory");
+                return 1;
+            }
+        }
+    }
+    return 0;
 }
 
 fn main() -> i32 {
@@ -23,7 +85,34 @@ fn main() -> i32 {
         usage();
         return 0;
     }
-    Console.writeError("ceesafec: unknown command: ");
-    Console.writeErrorLine(command);
+    let phase = match (phaseOf(command)) {
+        Some(p) => p,
+        null => {
+            Console.writeError("ceesafec: unknown command: ");
+            Console.writeErrorLine(command);
+            return 2;
+        }
+    };
+    var sources = Vector<SourceText>.create();
+    let status = loadFiles(mut sources);
+    if (status != 0) {
+        return status;
+    }
+    var lines: usize = 0;
+    for (s in sources) {
+        lines += s.lineCount();
+    }
+    Console.writeError("ceesafec: '");
+    Console.writeError(command);
+    Console.writeError("' is not implemented yet (ROADMAP ");
+    Console.writeError(phase);
+    // Console.writeError takes text only: the counts are formatted into a String.
+    var counts = String.create();
+    counts.append("); read ")!;
+    counts.appendNumber(sources.length)!;
+    counts.append(" files, ")!;
+    counts.appendNumber(lines)!;
+    counts.append(" lines")!;
+    Console.writeErrorLine(counts.view());
     return 2;
 }

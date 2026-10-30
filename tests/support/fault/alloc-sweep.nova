@@ -1,0 +1,186 @@
+// Allocation-failure behaviour of src/support (ROADMAP §3.1: "Failure during compilation must terminate with a
+// controlled diagnostic"). tools/fault_sweep.py runs this once to count allocation attempts (NOVA_ALLOC_REPORT),
+// then once per attempt with that attempt failing (NOVA_FAIL_ALLOC_AT). Every failure must come back as an
+// AllocError, with no panic, and leave the structure it hit consistent: everything added before is still there, and
+// nothing half-added is visible. The program prints "consistent" and the step it stopped at, or "complete".
+
+enum Step {
+    Map,
+    Interner,
+    Bits,
+    BigInt,
+    Source,
+    Json,
+}
+
+fn stepName(step: Step) -> StringView => match (step) {
+    Step.Map => "map",
+    Step.Interner => "interner",
+    Step.Bits => "bits",
+    Step.BigInt => "bigint",
+    Step.Source => "source",
+    Step.Json => "json",
+};
+
+// A failed step: where, and whether the structure was still consistent.
+struct Stop {
+    step: Step;
+    consistent: bool;
+}
+
+fn lcg(x: u64) -> u64 => x.wrappingMul(6364136223846793005).wrappingAdd(1442695040888963407);
+
+fn mapStep() -> Stop? {
+    var map = Map<Word, u64>.create();
+    var added = Vector<u64>.create();
+    var x: u64 = 5;
+    for (i in 0..300u64) {
+        x = lcg(x);
+        let key = (x >> 33) % 1000;
+        match (map.put(Word { value: key }, i)) {
+            Ok(_) => {}
+            Err(_) => {
+                // Every key added before the failure is found, and the count matches.
+                var ok = true;
+                for (j in 0..added.length) {
+                    let probe = Word { value: added[j] };
+                    ok = ok && map.find(probe) != null;
+                }
+                let failed = Word { value: key };
+                let present = map.find(failed) != null;
+                // The failed key is present only if it had been added before.
+                var before = false;
+                for (j in 0..added.length) {
+                    before = before || added[j] == key;
+                }
+                return Stop {
+                    step: Step.Map,
+                    consistent: ok && present == before && map.keys.length == map.values.length,
+                };
+            }
+        }
+        match (added.push(key)) {
+            Ok() => {}
+            Err(_) => { return Stop { step: Step.Map, consistent: true }; }
+        }
+    }
+    return null;
+}
+
+fn internerStep() -> Stop? {
+    var interner = Interner.create();
+    var name = Vector<u8>.create();
+    var x: u64 = 9;
+    for (i in 0..400) {
+        x = lcg(x);
+        name.clear();
+        for (k in 0..(1 + (x >> 40) % 7)) {
+            x = lcg(x);
+            match (name.push('a' + truncate<u8>((x >> 50) % 5))) {
+                Ok() => {}
+                Err(_) => { return Stop { step: Step.Interner, consistent: true }; }
+            }
+        }
+        let before = interner.count();
+        let existed = interner.find(name.view()) != null;
+        match (interner.intern(name.view())) {
+            Ok(_) => {}
+            Err(_) => {
+                // Nothing half-added: the count is unchanged, the name is findable only if it existed, and every
+                // symbol still names text that interns back to itself.
+                var ok = interner.count() == before && (interner.find(name.view()) != null) == existed;
+                for (id in 0..interner.count()) {
+                    let symbol = Symbol { id: truncate<u32>(id) };
+                    let found = interner.find(interner.name(symbol));
+                    ok = ok && found != null && found!.id == symbol.id;
+                }
+                return Stop { step: Step.Interner, consistent: ok };
+            }
+        }
+    }
+    return null;
+}
+
+fn bitsStep() -> Stop? {
+    var a = match (Bits.create(5000)) {
+        Ok(b) => b,
+        Err(_) => { return Stop { step: Step.Bits, consistent: true }; }
+    };
+    for (i in 0..5000usize) {
+        if (i % 7 == 0) {
+            a.set(i);
+        }
+    }
+    let copy = match (a.copyOf()) {
+        Ok(b) => b,
+        Err(_) => { return Stop { step: Step.Bits, consistent: a.count() == 715 }; }
+    };
+    if (!copy.equals(a)) {
+        return Stop { step: Step.Bits, consistent: false };
+    }
+    return null;
+}
+
+fn bigintStep() -> Stop? {
+    var p = match (BigNat.power10(80)) {
+        Ok(n) => n,
+        Err(_) => { return Stop { step: Step.BigInt, consistent: true }; }
+    };
+    let q = match (BigNat.fromU64(97)) {
+        Ok(n) => n,
+        Err(_) => { return Stop { step: Step.BigInt, consistent: true }; }
+    };
+    match (BigNat.divRem(p, q)) {
+        Ok(d) => {
+            var digits = Vector<u8>.create();
+            match (d.remainder.appendDecimal(mut digits)) {
+                Ok() => {}
+                Err(_) => { return Stop { step: Step.BigInt, consistent: true }; }
+            }
+        }
+        Err(_) => { return Stop { step: Step.BigInt, consistent: true }; }
+    }
+    return null;
+}
+
+fn sourceStep() -> Stop? {
+    let text: StringView = "fn main() {\r\n    é = 1;\n    😀\r}\n";
+    match (SourceText.create("a.nova".bytes(), text.bytes())) {
+        Ok(s) => {
+            let p = s.position(text.length);
+            if (p.line != 5 || p.column != 1) {
+                return Stop { step: Step.Source, consistent: false };
+            }
+        }
+        Err(_) => { return Stop { step: Step.Source, consistent: true }; }
+    }
+    return null;
+}
+
+fn jsonStep() -> Stop? {
+    var w = JsonWriter.create();
+    for (i in 0..200) {
+        match (w.string("a string with \"quotes\" and é")) {
+            Ok() => {}
+            Err(_) => { return Stop { step: Step.Json, consistent: true }; }
+        }
+    }
+    return null;
+}
+
+fn main() {
+    var stop: Stop? = mapStep();
+    if (stop == null) { stop = internerStep(); }
+    if (stop == null) { stop = bitsStep(); }
+    if (stop == null) { stop = bigintStep(); }
+    if (stop == null) { stop = sourceStep(); }
+    if (stop == null) { stop = jsonStep(); }
+    match (stop) {
+        Some(s) => {
+            Console.write(if (s.consistent) "consistent" else "INCONSISTENT");
+            Console.write(", stopped at ");
+            Console.writeLine(stepName(s.step));
+        }
+        null => { Console.writeLine("complete"); }
+    }
+}

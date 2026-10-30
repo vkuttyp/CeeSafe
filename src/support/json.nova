@@ -1,0 +1,162 @@
+// A JSON writer producing the reference's bytes (Nova's Tooling/DiagnosticJson.cs: Utf8JsonWriter with
+// JavaScriptEncoder.UnsafeRelaxedJsonEscaping, compact, keys in the order written). Strings are UTF-8 bytes:
+// - `"` and `\` are escaped, and \b \f \n \r \t use their short forms;
+// - other code points .NET escapes (json_escapes.nova) become \uXXXX with uppercase hex;
+// - code points above the BMP become an escaped surrogate pair;
+// - ill-formed UTF-8 is written as U+FFFD, raw, as .NET's decoded text holds it.
+// The reader (for LSP and MCP) comes with P8.
+
+struct JsonWriter {
+    out: Vector<u8>;
+    needComma: bool; // inside a container, after a value
+
+    fn create() -> JsonWriter => JsonWriter { out: Vector<u8>.create(), needComma: false };
+
+    fn separate(borrow mut this) -> Result<void, AllocError> {
+        if (this.needComma) {
+            this.out.push(',')?;
+        }
+        this.needComma = false;
+        return Ok();
+    }
+
+    fn startObject(borrow mut this) -> Result<void, AllocError> {
+        this.separate()?;
+        this.out.push('{')?;
+        return Ok();
+    }
+
+    fn endObject(borrow mut this) -> Result<void, AllocError> {
+        this.out.push('}')?;
+        this.needComma = true;
+        return Ok();
+    }
+
+    fn startArray(borrow mut this) -> Result<void, AllocError> {
+        this.separate()?;
+        this.out.push('[')?;
+        return Ok();
+    }
+
+    fn endArray(borrow mut this) -> Result<void, AllocError> {
+        this.out.push(']')?;
+        this.needComma = true;
+        return Ok();
+    }
+
+    /// A property name; the value follows.
+    fn name(borrow mut this, key: StringView) -> Result<void, AllocError> {
+        this.separate()?;
+        this.quoted(key.bytes())?;
+        this.out.push(':')?;
+        return Ok();
+    }
+
+    fn stringBytes(borrow mut this, value: Slice<u8>) -> Result<void, AllocError> {
+        this.separate()?;
+        this.quoted(value)?;
+        this.needComma = true;
+        return Ok();
+    }
+
+    fn string(borrow mut this, value: StringView) -> Result<void, AllocError> => this.stringBytes(value.bytes());
+
+    fn number(borrow mut this, value: i64) -> Result<void, AllocError> {
+        this.separate()?;
+        if (value < 0) {
+            this.out.push('-')?;
+        }
+        let bits = truncate<u64>(value);
+        let magnitude: u64 = if (value < 0) (0u64).wrappingSub(bits) else bits;
+        this.digits(magnitude)?;
+        this.needComma = true;
+        return Ok();
+    }
+
+    fn boolean(borrow mut this, value: bool) -> Result<void, AllocError> {
+        this.separate()?;
+        appendText(mut this.out, if (value) "true" else "false")?;
+        this.needComma = true;
+        return Ok();
+    }
+
+    fn nothing(borrow mut this) -> Result<void, AllocError> {
+        this.separate()?;
+        appendText(mut this.out, "null")?;
+        this.needComma = true;
+        return Ok();
+    }
+
+    fn digits(borrow mut this, value: u64) -> Result<void, AllocError> {
+        var buffer = [0u8; 20];
+        var n: usize = 0;
+        var v = value;
+        loop {
+            buffer[n] = '0' + truncate<u8>(v % 10);
+            n += 1;
+            v /= 10;
+            if (v == 0) {
+                break;
+            }
+        }
+        while (n > 0) {
+            n -= 1;
+            this.out.push(buffer[n])?;
+        }
+        return Ok();
+    }
+
+    fn quoted(borrow mut this, text: Slice<u8>) -> Result<void, AllocError> {
+        this.out.push('"')?;
+        var i: usize = 0;
+        while (i < text.length) {
+            let d = decodeUtf8(text, i);
+            let length = d.length as usize;
+            let c = d.scalar;
+            if (c == '"' as u32 || c == '\\' as u32) {
+                this.out.push('\\')?;
+                this.out.push(text[i])?;
+            } else if (c == 0x08 || c == 0x0C || c == 0x0A || c == 0x0D || c == 0x09) {
+                this.out.push('\\')?;
+                this.out.push(match (c) {
+                    0x08 => 'b',
+                    0x0C => 'f',
+                    0x0A => 'n',
+                    0x0D => 'r',
+                    _ => 't',
+                })?;
+            } else if (!d.valid) {
+                // U+FFFD, raw.
+                this.out.push(0xEF)?;
+                this.out.push(0xBF)?;
+                this.out.push(0xBD)?;
+            } else if (c >= 0x10000) {
+                let v = c - 0x10000;
+                this.escape(0xD800 + (v >> 10))?;
+                this.escape(0xDC00 + (v & 0x3FF))?;
+            } else if (jsonEscapesBmp(c)) {
+                this.escape(c)?;
+            } else {
+                appendBytes(mut this.out, text[i..(i + length)])?;
+            }
+            i += length;
+        }
+        this.out.push('"')?;
+        return Ok();
+    }
+
+    fn escape(borrow mut this, unit: u32) -> Result<void, AllocError> {
+        this.out.push('\\')?;
+        this.out.push('u')?;
+        var shift: u32 = 12;
+        loop {
+            let nibble = truncate<u8>((unit >> shift) & 0xF);
+            this.out.push(if (nibble < 10) '0' + nibble else 'A' + nibble - 10)?;
+            if (shift == 0) {
+                break;
+            }
+            shift -= 4;
+        }
+        return Ok();
+    }
+}

@@ -1,0 +1,420 @@
+// Exact integers (ROADMAP §3.2), replacing the reference's System.Numerics.BigInteger. Two users:
+// - constant evaluation (IntegerSemantics.cs, CheckElimination.cs): operands fit their types (at most 64 bits), so
+//   intermediates stay within a 128-bit magnitude, but the code below is not bounded;
+// - shortest float formatting (FloatSemantics.ShortestDigits): powers of ten up to about 10^340 scaled by
+//   2^±1074, so arbitrary precision is required.
+// Bitwise operators are not here: on operands that fit 64-bit types, BigInteger's infinite two's complement agrees
+// with u64/i64 arithmetic, which the port uses directly.
+
+/// A natural number: 32-bit limbs, least significant first, with no high zero limbs (zero has none).
+struct BigNat {
+    limbs: Vector<u32>;
+
+    fn zero() -> BigNat => BigNat { limbs: Vector<u32>.create() };
+
+    fn fromU64(value: u64) -> Result<BigNat, AllocError> {
+        var n = BigNat.zero();
+        var v = value;
+        while (v != 0) {
+            n.limbs.push(truncate<u32>(v))?;
+            v >>= 32;
+        }
+        return Ok(n);
+    }
+
+    fn copyOf(borrow this) -> Result<BigNat, AllocError> {
+        var limbs = Vector<u32>.withCapacity(this.limbs.length)?;
+        for (l in this.limbs) {
+            limbs.push(l)?;
+        }
+        return Ok(BigNat { limbs: limbs });
+    }
+
+    fn isZero(borrow this) -> bool => this.limbs.length == 0;
+
+    fn isEven(borrow this) -> bool => this.limbs.length == 0 || this.limbs[0] % 2 == 0;
+
+    /// The value, if it fits in 64 bits.
+    fn toU64(borrow this) -> u64? {
+        if (this.limbs.length > 2) {
+            return null;
+        }
+        var v: u64 = 0;
+        for (i in 0..this.limbs.length) {
+            v |= (this.limbs[i] as u64) << truncate<u32>(32 * i);
+        }
+        return v;
+    }
+
+    fn bitLength(borrow this) -> usize {
+        if (this.limbs.length == 0) {
+            return 0;
+        }
+        var top = this.limbs[this.limbs.length - 1];
+        var bits: usize = 0;
+        while (top != 0) {
+            top >>= 1;
+            bits += 1;
+        }
+        return (this.limbs.length - 1) * 32 + bits;
+    }
+
+    fn bit(borrow this, i: usize) -> bool {
+        let limb = i / 32;
+        return limb < this.limbs.length && (this.limbs[limb] >> truncate<u32>(i % 32)) & 1 == 1;
+    }
+
+    fn compare(borrow this, other: borrow BigNat) -> i32 {
+        if (this.limbs.length != other.limbs.length) {
+            return if (this.limbs.length < other.limbs.length) -1 else 1;
+        }
+        var i = this.limbs.length;
+        while (i > 0) {
+            i -= 1;
+            if (this.limbs[i] != other.limbs[i]) {
+                return if (this.limbs[i] < other.limbs[i]) -1 else 1;
+            }
+        }
+        return 0;
+    }
+
+    fn trim(borrow mut this) {
+        while (this.limbs.length > 0 && this.limbs[this.limbs.length - 1] == 0) {
+            // A local: `truncate` is not two-phase in novac 0.3.1 (probes/upstream/truncate-two-phase.nova).
+            let top = this.limbs.length - 1;
+            this.limbs.truncate(top);
+        }
+    }
+
+    fn add(a: borrow BigNat, b: borrow BigNat) -> Result<BigNat, AllocError> {
+        let n = if (a.limbs.length > b.limbs.length) a.limbs.length else b.limbs.length;
+        var r = BigNat { limbs: Vector<u32>.withCapacity(n + 1)? };
+        var carry: u64 = 0;
+        for (i in 0..n) {
+            let x: u64 = if (i < a.limbs.length) a.limbs[i] as u64 else 0;
+            let y: u64 = if (i < b.limbs.length) b.limbs[i] as u64 else 0;
+            let s = x + y + carry;
+            r.limbs.push(truncate<u32>(s))?;
+            carry = s >> 32;
+        }
+        if (carry != 0) {
+            r.limbs.push(truncate<u32>(carry))?;
+        }
+        return Ok(r);
+    }
+
+    /// a - b, for a >= b.
+    fn sub(a: borrow BigNat, b: borrow BigNat) -> Result<BigNat, AllocError> {
+        var r = BigNat { limbs: Vector<u32>.withCapacity(a.limbs.length)? };
+        var borrowed: u64 = 0;
+        for (i in 0..a.limbs.length) {
+            let x = a.limbs[i] as u64;
+            let y: u64 = (if (i < b.limbs.length) b.limbs[i] as u64 else 0) + borrowed;
+            if (x >= y) {
+                r.limbs.push(truncate<u32>(x - y))?;
+                borrowed = 0;
+            } else {
+                r.limbs.push(truncate<u32>(x + 0x100000000 - y))?;
+                borrowed = 1;
+            }
+        }
+        r.trim();
+        return Ok(r);
+    }
+
+    fn mul(a: borrow BigNat, b: borrow BigNat) -> Result<BigNat, AllocError> {
+        if (a.isZero() || b.isZero()) {
+            return Ok(BigNat.zero());
+        }
+        var r = BigNat { limbs: Vector<u32>.withCapacity(a.limbs.length + b.limbs.length)? };
+        for (i in 0..(a.limbs.length + b.limbs.length)) {
+            r.limbs.push(0)?;
+        }
+        for (i in 0..a.limbs.length) {
+            var carry: u64 = 0;
+            let x = a.limbs[i] as u64;
+            for (j in 0..b.limbs.length) {
+                // x * y + r + carry < 2^64: (2^32 - 1)^2 + 2 (2^32 - 1) = 2^64 - 1.
+                let t = x * (b.limbs[j] as u64) + (r.limbs[i + j] as u64) + carry;
+                r.limbs[i + j] = truncate<u32>(t);
+                carry = t >> 32;
+            }
+            r.limbs[i + b.limbs.length] = truncate<u32>(carry);
+        }
+        r.trim();
+        return Ok(r);
+    }
+
+    fn mulSmall(a: borrow BigNat, m: u32) -> Result<BigNat, AllocError> {
+        var r = BigNat { limbs: Vector<u32>.withCapacity(a.limbs.length + 1)? };
+        var carry: u64 = 0;
+        for (l in a.limbs) {
+            let t = (l as u64) * (m as u64) + carry;
+            r.limbs.push(truncate<u32>(t))?;
+            carry = t >> 32;
+        }
+        if (carry != 0) {
+            r.limbs.push(truncate<u32>(carry))?;
+        }
+        r.trim();
+        return Ok(r);
+    }
+
+    fn addSmall(a: borrow BigNat, m: u32) -> Result<BigNat, AllocError> {
+        let b = BigNat.fromU64(m as u64)?;
+        return BigNat.add(a, b);
+    }
+
+    fn shiftLeft(a: borrow BigNat, bits: usize) -> Result<BigNat, AllocError> {
+        if (a.isZero()) {
+            return Ok(BigNat.zero());
+        }
+        let whole = bits / 32;
+        let part = truncate<u32>(bits % 32);
+        var r = BigNat { limbs: Vector<u32>.withCapacity(a.limbs.length + whole + 1)? };
+        for (i in 0..whole) {
+            r.limbs.push(0)?;
+        }
+        var carry: u32 = 0;
+        for (l in a.limbs) {
+            if (part == 0) {
+                r.limbs.push(l)?;
+            } else {
+                r.limbs.push((l << part) | carry)?;
+                carry = l >> (32 - part);
+            }
+        }
+        if (carry != 0) {
+            r.limbs.push(carry)?;
+        }
+        return Ok(r);
+    }
+
+    /// The low `bits` bits: the value modulo 2^bits.
+    fn lowBits(a: borrow BigNat, bits: usize) -> Result<BigNat, AllocError> {
+        var r = BigNat { limbs: Vector<u32>.create() };
+        for (i in 0..a.limbs.length) {
+            if (i * 32 >= bits) {
+                break;
+            }
+            let keep = bits - i * 32;
+            r.limbs.push(if (keep >= 32) a.limbs[i] else a.limbs[i] & ((1u32 << truncate<u32>(keep)) - 1))?;
+        }
+        r.trim();
+        return Ok(r);
+    }
+
+    /// 2^bits.
+    fn power2(bits: usize) -> Result<BigNat, AllocError> {
+        let one = BigNat.fromU64(1)?;
+        return BigNat.shiftLeft(one, bits);
+    }
+
+    /// 10^n.
+    fn power10(n: u32) -> Result<BigNat, AllocError> {
+        var r = BigNat.fromU64(1)?;
+        for (i in 0..n) {
+            r = BigNat.mulSmall(r, 10)?;
+        }
+        return Ok(r);
+    }
+
+    /// Quotient and remainder, by binary long division (a quotient bit per step); `b` is not zero.
+    fn divRem(a: borrow BigNat, b: borrow BigNat) -> Result<NatDivision, AllocError> {
+        var quotient = BigNat.zero();
+        var remainder = BigNat.zero();
+        if (a.compare(b) < 0) {
+            return Ok(NatDivision { quotient: quotient, remainder: a.copyOf()? });
+        }
+        let n = a.bitLength();
+        for (k in 0..((n + 31) / 32)) {
+            quotient.limbs.push(0)?;
+        }
+        var i = n;
+        while (i > 0) {
+            i -= 1;
+            remainder = BigNat.shiftLeft(remainder, 1)?;
+            if (a.bit(i)) {
+                if (remainder.limbs.length == 0) {
+                    remainder.limbs.push(1)?;
+                } else {
+                    remainder.limbs[0] |= 1;
+                }
+            }
+            if (remainder.compare(b) >= 0) {
+                remainder = BigNat.sub(remainder, b)?;
+                quotient.limbs[i / 32] |= 1u32 << truncate<u32>(i % 32);
+            }
+        }
+        quotient.trim();
+        return Ok(NatDivision { quotient: quotient, remainder: remainder });
+    }
+
+    /// Divides by a small divisor in place and returns the remainder.
+    fn divSmallInPlace(borrow mut this, d: u32) -> u32 {
+        var rest: u64 = 0;
+        var i = this.limbs.length;
+        while (i > 0) {
+            i -= 1;
+            let cur = (rest << 32) | this.limbs[i] as u64;
+            this.limbs[i] = truncate<u32>(cur / d as u64);
+            rest = cur % d as u64;
+        }
+        this.trim();
+        return truncate<u32>(rest);
+    }
+
+    /// Appends the decimal digits.
+    fn appendDecimal(borrow this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        if (this.isZero()) {
+            out.push('0')?;
+            return Ok();
+        }
+        var n = this.copyOf()?;
+        var digits = Vector<u8>.create();
+        while (!n.isZero()) {
+            digits.push('0' + truncate<u8>(n.divSmallInPlace(10)))?;
+        }
+        var i = digits.length;
+        while (i > 0) {
+            i -= 1;
+            out.push(digits[i])?;
+        }
+        return Ok();
+    }
+
+    /// Parses digits of a radix from 2 to 16 (no sign, prefix or separators); null if a byte is not a digit of it.
+    fn parse(digits: Slice<u8>, radix: u32) -> Result<BigNat?, AllocError> {
+        var n = BigNat.zero();
+        for (c in digits) {
+            let d: u32 =
+                if (c >= '0' &&
+                    c <= '9') (c - '0') as u32 else if (c >= 'a' &&
+                    c <= 'f') (c - 'a') as u32 + 10 else if (c >= 'A' && c <= 'F') (c - 'A') as u32 + 10 else 99;
+            if (d >= radix) {
+                return Ok(null);
+            }
+            n = BigNat.mulSmall(n, radix)?;
+            n = BigNat.addSmall(n, d)?;
+        }
+        return Ok(n);
+    }
+}
+
+struct NatDivision {
+    quotient: BigNat;
+    remainder: BigNat;
+}
+
+/// A signed integer: sign and magnitude; zero is never negative.
+struct BigInt {
+    negative: bool;
+    magnitude: BigNat;
+
+    fn of(negative: bool, magnitude: BigNat) -> BigInt => BigInt {
+        negative: negative && !magnitude.isZero(),
+        magnitude: magnitude,
+    };
+
+    fn fromI64(value: i64) -> Result<BigInt, AllocError> {
+        // |i64.MIN| = 2^63 does not fit in i64: negate the two's complement bits in u64.
+        let bits = truncate<u64>(value);
+        let magnitude: u64 = if (value < 0) (0u64).wrappingSub(bits) else bits;
+        return Ok(BigInt.of(value < 0, BigNat.fromU64(magnitude)?));
+    }
+
+    fn fromU64(value: u64) -> Result<BigInt, AllocError> => Ok(BigInt.of(false, BigNat.fromU64(value)?));
+
+    fn copyOf(borrow this) -> Result<BigInt, AllocError> => Ok(BigInt.of(this.negative, this.magnitude.copyOf()?));
+
+    fn isZero(borrow this) -> bool => this.magnitude.isZero();
+
+    fn compare(borrow this, other: borrow BigInt) -> i32 {
+        if (this.negative != other.negative) {
+            return if (this.negative) -1 else 1;
+        }
+        let c = this.magnitude.compare(other.magnitude);
+        return if (this.negative) -c else c;
+    }
+
+    fn negate(a: borrow BigInt) -> Result<BigInt, AllocError> => Ok(BigInt.of(!a.negative, a.magnitude.copyOf()?));
+
+    fn add(a: borrow BigInt, b: borrow BigInt) -> Result<BigInt, AllocError> {
+        if (a.negative == b.negative) {
+            return Ok(BigInt.of(a.negative, BigNat.add(a.magnitude, b.magnitude)?));
+        }
+        // Different signs: subtract the smaller magnitude from the larger; the larger's sign wins.
+        if (a.magnitude.compare(b.magnitude) >= 0) {
+            return Ok(BigInt.of(a.negative, BigNat.sub(a.magnitude, b.magnitude)?));
+        }
+        return Ok(BigInt.of(b.negative, BigNat.sub(b.magnitude, a.magnitude)?));
+    }
+
+    fn sub(a: borrow BigInt, b: borrow BigInt) -> Result<BigInt, AllocError> {
+        let negated = BigInt.negate(b)?;
+        return BigInt.add(a, negated);
+    }
+
+    fn mul(a: borrow BigInt, b: borrow BigInt) -> Result<BigInt, AllocError> => Ok(BigInt.of(
+        a.negative != b.negative,
+        BigNat.mul(a.magnitude, b.magnitude)?,
+    ));
+
+    /// Truncating division and remainder (C#'s BigInteger.Divide and Remainder): the quotient rounds toward zero and
+    /// the remainder has the dividend's sign. `b` is not zero.
+    fn divRem(a: borrow BigInt, b: borrow BigInt) -> Result<IntDivision, AllocError> {
+        var d = BigNat.divRem(a.magnitude, b.magnitude)?;
+        let quotient = BigInt.of(a.negative != b.negative, d.quotient);
+        let remainder = BigInt.of(a.negative, d.remainder);
+        return Ok(IntDivision { quotient: quotient, remainder: remainder });
+    }
+
+    /// The value reduced modulo 2^bits and read as a `bits`-bit integer, signed or not (IntegerSemantics.Wrap).
+    fn wrap(a: borrow BigInt, bits: usize, signed: bool) -> Result<BigInt, AllocError> {
+        let modulus = BigNat.power2(bits)?;
+        var r = BigNat.lowBits(a.magnitude, bits)?;
+        if (a.negative && !r.isZero()) {
+            r = BigNat.sub(modulus, r)?;
+        }
+        if (signed && r.bit(bits - 1)) {
+            return Ok(BigInt.of(true, BigNat.sub(modulus, r)?));
+        }
+        return Ok(BigInt.of(false, r));
+    }
+
+    /// Whether the value fits a `bits`-bit integer type (NovaType.Fits).
+    fn fits(borrow this, bits: usize, signed: bool) -> bool {
+        let n = this.magnitude.bitLength();
+        if (!signed) {
+            return !this.negative && n <= bits;
+        }
+        if (!this.negative) {
+            return n < bits;
+        }
+        // -2^(bits-1) fits: its magnitude has bitLength bits and only the top bit set.
+        if (n < bits) {
+            return true;
+        }
+        if (n > bits) {
+            return false;
+        }
+        for (i in 0..(bits - 1)) {
+            if (this.magnitude.bit(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn appendDecimal(borrow this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        if (this.negative) {
+            out.push('-')?;
+        }
+        return this.magnitude.appendDecimal(out);
+    }
+}
+
+struct IntDivision {
+    quotient: BigInt;
+    remainder: BigInt;
+}

@@ -1,0 +1,166 @@
+// src/support/json.nova against two oracles:
+// - the sweep: one JSON string per BMP scalar value, every 997th astral one, and fixed strings (escapes, ill-formed
+//   UTF-8), compared by length and FNV-1a with .NET 10.0.12's Utf8JsonWriter on the same strings
+//   (tools/oracles/JsonSweep.cs, run 2026-10-30: 418506 bytes, fnv 10205824560866192387);
+// - two diagnostics documents written by novac 0.3.1 --diagnostics-format=json (a fix; notes), rebuilt byte for byte.
+// expect-stdout: json sweep: 418506 bytes, fnv 10205824560866192387
+// expect-stdout: {"version":1,"errors":1,"warnings":0,"diagnostics":[{"code":"N0211","severity":"error","file":"doc.nova","start":{"line":3,"column":5},"end":{"line":3,"column":6},"message":"cannot assign to 'x': 'x' was declared with 'let'; use 'var' for a mutable variable","summary":"Assignment to an immutable binding (`let`, parameter, constant, function)","notes":[],"fixes":[{"title":"declare 'x' with 'var'","edits":[{"file":"doc.nova","start":{"line":2,"column":5},"end":{"line":2,"column":8},"newText":"var"}]}]}]}
+// expect-stdout: {"version":1,"errors":1,"warnings":0,"diagnostics":[{"code":"N0241","severity":"error","file":"notes.nova","start":{"line":4,"column":5},"end":{"line":4,"column":6},"message":"cannot borrow 'v' as mutable while 'v' is borrowed","summary":"Borrow conflicting with a live borrow","notes":[{"file":"notes.nova","start":{"line":3,"column":5},"end":{"line":3,"column":22},"message":"'v' is borrowed here"},{"file":"notes.nova","start":{"line":5,"column":5},"end":{"line":5,"column":22},"message":"the borrow is used later here"}],"fixes":[]}]}
+
+fn encodeUtf8(out: borrow mut Vector<u8>, c: u32) {
+    if (c < 0x80) {
+        out.push(truncate<u8>(c))!;
+    } else if (c < 0x800) {
+        out.push(truncate<u8>(0xC0 | (c >> 6)))!;
+        out.push(truncate<u8>(0x80 | (c & 0x3F)))!;
+    } else if (c < 0x10000) {
+        out.push(truncate<u8>(0xE0 | (c >> 12)))!;
+        out.push(truncate<u8>(0x80 | ((c >> 6) & 0x3F)))!;
+        out.push(truncate<u8>(0x80 | (c & 0x3F)))!;
+    } else {
+        out.push(truncate<u8>(0xF0 | (c >> 18)))!;
+        out.push(truncate<u8>(0x80 | ((c >> 12) & 0x3F)))!;
+        out.push(truncate<u8>(0x80 | ((c >> 6) & 0x3F)))!;
+        out.push(truncate<u8>(0x80 | (c & 0x3F)))!;
+    }
+}
+
+fn sweep() {
+    var w = JsonWriter.create();
+    var text = Vector<u8>.create();
+    w.startArray()!;
+    for (c in 0..0x10000u32) {
+        if (c >= 0xD800 && c <= 0xDFFF) {
+            continue;
+        }
+        text.clear();
+        encodeUtf8(mut text, c);
+        w.stringBytes(text.view())!;
+    }
+    var c: u32 = 0x10000;
+    while (c <= 0x10FFFF) {
+        text.clear();
+        encodeUtf8(mut text, c);
+        w.stringBytes(text.view())!;
+        c += 997;
+    }
+    w.string("tab\there \"q\" back\\slash é € 😀 \u{2028}")!;
+    text.clear();
+    appendText(mut text, "ill-formed: ")!;
+    let bad = [0x80u8, '|', 0xE2, 0x82, '|', 0xF0, 0x9F, 0x98, '|', 0xC0];
+    appendBytes(mut text, bad[..])!;
+    w.stringBytes(text.view())!;
+    w.endArray()!;
+    Console.write("json sweep: ");
+    Console.write(w.out.length);
+    Console.write(" bytes, fnv ");
+    Console.writeLine(hashBytes(w.out.view()));
+}
+
+fn position(w: borrow mut JsonWriter, name: StringView, line: i64, column: i64) {
+    w.name(name)!;
+    w.startObject()!;
+    w.name("line")!;
+    w.number(line)!;
+    w.name("column")!;
+    w.number(column)!;
+    w.endObject()!;
+}
+
+fn range(w: borrow mut JsonWriter, file: StringView, l1: i64, c1: i64, l2: i64, c2: i64) {
+    w.name("file")!;
+    w.string(file)!;
+    position(w, "start", l1, c1);
+    position(w, "end", l2, c2);
+}
+
+fn header(w: borrow mut JsonWriter) {
+    w.startObject()!;
+    w.name("version")!;
+    w.number(1)!;
+    w.name("errors")!;
+    w.number(1)!;
+    w.name("warnings")!;
+    w.number(0)!;
+    w.name("diagnostics")!;
+    w.startArray()!;
+    w.startObject()!;
+}
+
+fn footer(w: borrow mut JsonWriter) {
+    w.endObject()!;
+    w.endArray()!;
+    w.endObject()!;
+    Console.writeBytes(w.out.view());
+    Console.writeLine("");
+}
+
+fn documentWithFix() {
+    var w = JsonWriter.create();
+    header(mut w);
+    w.name("code")!;
+    w.string("N0211")!;
+    w.name("severity")!;
+    w.string("error")!;
+    range(mut w, "doc.nova", 3, 5, 3, 6);
+    w.name("message")!;
+    w.string("cannot assign to 'x': 'x' was declared with 'let'; use 'var' for a mutable variable")!;
+    w.name("summary")!;
+    w.string("Assignment to an immutable binding (`let`, parameter, constant, function)")!;
+    w.name("notes")!;
+    w.startArray()!;
+    w.endArray()!;
+    w.name("fixes")!;
+    w.startArray()!;
+    w.startObject()!;
+    w.name("title")!;
+    w.string("declare 'x' with 'var'")!;
+    w.name("edits")!;
+    w.startArray()!;
+    w.startObject()!;
+    range(mut w, "doc.nova", 2, 5, 2, 8);
+    w.name("newText")!;
+    w.string("var")!;
+    w.endObject()!;
+    w.endArray()!;
+    w.endObject()!;
+    w.endArray()!;
+    footer(mut w);
+}
+
+fn documentWithNotes() {
+    var w = JsonWriter.create();
+    header(mut w);
+    w.name("code")!;
+    w.string("N0241")!;
+    w.name("severity")!;
+    w.string("error")!;
+    range(mut w, "notes.nova", 4, 5, 4, 6);
+    w.name("message")!;
+    w.string("cannot borrow 'v' as mutable while 'v' is borrowed")!;
+    w.name("summary")!;
+    w.string("Borrow conflicting with a live borrow")!;
+    w.name("notes")!;
+    w.startArray()!;
+    w.startObject()!;
+    range(mut w, "notes.nova", 3, 5, 3, 22);
+    w.name("message")!;
+    w.string("'v' is borrowed here")!;
+    w.endObject()!;
+    w.startObject()!;
+    range(mut w, "notes.nova", 5, 5, 5, 22);
+    w.name("message")!;
+    w.string("the borrow is used later here")!;
+    w.endObject()!;
+    w.endArray()!;
+    w.name("fixes")!;
+    w.startArray()!;
+    w.endArray()!;
+    footer(mut w);
+}
+
+fn main() {
+    sweep();
+    documentWithFix();
+    documentWithNotes();
+}

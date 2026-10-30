@@ -1,0 +1,9 @@
+// Upstream disagreement between spec and checker (novac 0.3.1 and 07d561f): type-system.md §23.1 says the arguments
+// of `push`, `pop`, `clear` and `truncate` are evaluated before the mutable loan starts (two-phase, lifetimes.md §5),
+// and `v.push(…v.length…)` is accepted, but `v.truncate(v.length - 1)` is rejected with N0242. Expected: accepted.
+// Workaround: compute the length into a local first. Found by P1, 2026-10-30.
+fn main() {
+    var v = Vector<u32>.create();
+    v.push(1)!;
+    v.truncate(v.length - 1);
+}

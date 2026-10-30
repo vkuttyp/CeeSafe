@@ -1,0 +1,31 @@
+// Reading input files (ROADMAP §3.2: host services behind a small layer). Today's library reads files in chunks;
+// directories, environment, temporary files and captured processes wait for N4a (docs/p1-probes.md §4).
+
+enum ReadError {
+    Io(IoError),
+    Memory,
+}
+
+/// The whole file as bytes.
+fn readFile(path: StringView) -> Result<Vector<u8>, ReadError> {
+    var file = match (File.open(path)) {
+        Ok(f) => f,
+        Err(e) => { return Err(ReadError.Io(e)); }
+    };
+    var bytes = Vector<u8>.create();
+    var buffer = [0u8; 65536];
+    loop {
+        let n = match (file.read(mut buffer[..])) {
+            Ok(n) => n,
+            Err(e) => { return Err(ReadError.Io(e)); }
+        };
+        if (n == 0) {
+            break;
+        }
+        match (appendBytes(mut bytes, buffer[..n])) {
+            Ok() => {}
+            Err(_) => { return Err(ReadError.Memory); }
+        }
+    }
+    return Ok(bytes);
+}
