@@ -159,7 +159,7 @@ def main():
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(source)
-    novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/0.4.1/bin/novac"))
+    novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/0.5.0/bin/novac"))
     subprocess.run([novac, "fmt", path], check=True)
     print(f"wrote {path} ({out.count(chr(10))} expected lines)")
 

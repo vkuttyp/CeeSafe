@@ -88,7 +88,7 @@ Quirks the port must reproduce:
 
 ## 2. How each slice is checked
 
-- `run_corpus.py --reference ~/.nova/0.4.1/bin/novac --family check-pass` compares the HIR snapshot, the diagnostics,
+- `run_corpus.py --reference ~/.nova/0.5.0/bin/novac --family check-pass` compares the HIR snapshot, the diagnostics,
   and novac's exact output.
 - `compare_parse.py --command check` compares `check --dump-hir --diagnostics-format=json` and text `check` over any
   file set. The sets are:
@@ -133,3 +133,4 @@ Ownership negatives wait for P4.
 | 2026-10-30 | S1a | `src/check/` (checker, declare, body, expr, consts), `src/library/sources.nova` (generated), `ceesafec check --dump-hir`; `compare_parse.py --command check` against novac 0.4.1 | the 11 S1 check-pass files identical (HIR, JSON and text); 16 of the 20 S1 check-fail files identical; over the corpus, 83 of 320 check programs identical (56 of the 159 run-pass). ASan+UBSan, `live=0` |
 | 2026-10-30 | S1b | char and float literals; `src/support/decimal_float.nova` (exact decimal→f64/f32) against .NET's `double.Parse`/`float.Parse` through `tools/oracles/decimal-parse` (`tests/support/run-pass/decimal-float.nova`, generated: halfway cases, subnormals, range ends, random); float folding; `--no-float`; function values and calls through them; `round`/`checkedTruncate`/`saturatingTruncate`/`fromBits`; `compare_parse.py` passes each file's `// option:` lines | 680/680 parses bit-identical; S1 check-fail 18/20 identical (2 blocked on S2/S4 constructs, their HIR identical); 85 of 320 corpus check programs identical; ASan+UBSan clean, `live=0` |
 | 2026-10-30 | S2a | structs: declaration, the built-in items as real types (AllocError, IoError, SystemHeap, FailingAllocator), members (fields, drop, methods), recursion (N0227), Copy and drop, struct literals, field access, `this`, method and static calls, assignment through places (`src/check/places.nova`, `structs.nova`, `members.nova`) | check-pass `structs` and check-fail `structs`, `no-float` identical; 99 of 320 corpus check programs |
+| 2026-10-30 | — | re-pinned to novac 0.5.0 (`bootstrap/reference.md`); the reference checkout and the `TypeChecker.cs` copy moved to `v0.5.0` | `check` over the corpus: 99/320 identical, the same as with 0.4.1 |

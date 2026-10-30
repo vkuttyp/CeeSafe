@@ -101,12 +101,12 @@ the reference's.
 ## 6. How the parser is checked
 
 ```sh
-python3 tools/run_corpus.py --compiler out/ceesafe --reference ~/.nova/0.4.1/bin/novac --corpus <Nova>/tests/corpus \
+python3 tools/run_corpus.py --compiler out/ceesafe --reference ~/.nova/0.5.0/bin/novac --corpus <Nova>/tests/corpus \
     --family parse-pass --family parse-fail
-python3 tools/compare_parse.py --ceesafec out/ceesafe --novac ~/.nova/0.4.1/bin/novac --root <Nova> \
+python3 tools/compare_parse.py --ceesafec out/ceesafe --novac ~/.nova/0.5.0/bin/novac --root <Nova> \
     lib tests/corpus programs benchmarks integrations site editors templates
 python3 tools/parser_fuzz.py <dir>/mut 3000 20261030 <Nova's lib and corpus files>
-python3 tools/compare_parse.py --ceesafec out/ceesafe --novac ~/.nova/0.4.1/bin/novac --root <dir>/mut .
+python3 tools/compare_parse.py --ceesafec out/ceesafe --novac ~/.nova/0.5.0/bin/novac --root <dir>/mut .
 ```
 
 `compare_parse.py` runs `parse --dump-ast --diagnostics-format=json` and `parse` (text diagnostics) with both

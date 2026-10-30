@@ -572,7 +572,7 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
 
 ## 9. Immediate work queue
 
-1. **Pinned to novac 0.4.1** (2026-10-30): M15 S1–S7 and the N7 fix shipped, every P1 workaround removed. The N
+1. **Pinned to novac 0.5.0** (2026-10-30; 0.4.1 before it): M15 S1–S7 and the N7 fix shipped, every P1 workaround removed. The N
    track has no open blocking item.
 2. Alongside: the rest of the runner's C matrix (`-O0`, the overflow fallback, `--split`, TSan) and the package
    fixtures (`docs/parity.md` §3).
@@ -600,6 +600,7 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 | 2026-10-30 | Nova M15 S1–S6 implemented and pushed (Nova `4126457`, CI green); issues #1–#5 closed; ADR 0028 (S7) proposed. Checked against this repository with novac at `4126457`: probes 11/12 (the 12th, `text-gaps`, expects `StringView.fromUtf8` to be missing), support tests 6/6, fault sweep 573/573 | awaiting a release (0.3.2 / 0.4.0) to re-pin |
 | 2026-10-30 | Nova M15 S7 implemented (ADR 0028 accepted; Nova `61cb665`, `1d1f091`, CI green on Linux and Windows; `c3.py` passes in a CosmoOS aarch64 guest): `Process.capture`, `File.kind`, `Environment.variable`, `Directory` | M15 complete; re-pin waits for a release |
 | 2026-10-30 | Re-pinned to novac 0.4.0, then 0.4.1 (`80d8d8c`). 0.4.0 reserved its lib/std helper names (N7), fixed in Nova `24106b0` and released as the point release 0.4.1. All P1 workarounds removed; the four upstream reproducers became regression probes. Gates rerun with 0.4.1: macOS (Apple clang 21) and the Ryzen box (GCC 12; clang 18.1.8 -O2; clang 18.1.8 ASan+UBSan+LSan) | reference corpus at `v0.4.1` 467 pass, 3 partial, no leaks, on both; probes 16/16; support 6/6; fault sweep 573/573; skeleton builds; inventory regenerated, 0 unmapped |
+| 2026-10-30 | Re-pinned to novac 0.5.0 (`af071d4`, ADR 0029) at P3 S2b, before any S2b code. lib/ unchanged, the checker change is S7's (FFI). Gates rerun on macOS (Apple clang 21) only; the Ryzen box keeps 0.4.1 until its next gate run | probes 16/16; support 8/8; type table 1/1 with no leaks; reference corpus at `v0.5.0` 468 pass, 3 partial; parse 483/483 identical; check 99/320 identical (as with 0.4.1); fault sweep 573/573 |
 | 2026-10-30 | P2: lexer, diagnostics and JSON, AST tables, parser and `--dump-ast` (`src/syntax/`, `src/diagnostics/`); token-dump oracle from the reference's `Lexer`; `compare_tokens.py`, `compare_parse.py`, `lexer_fuzz.py`, `parser_fuzz.py`, `gen_catalog.py` | gate passed on macOS and Linux (`docs/p2-frontend.md` §4): parse families 68/68 with no reference difference, 540/540 reference files identical, 5,000 mutated and 3,000 random inputs identical, sanitizers clean, `live=0` |
 
 **Tests run for the skeleton** (2026-10-30, novac 0.3.1, Apple clang 21.0.0):

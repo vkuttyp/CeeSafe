@@ -123,7 +123,7 @@ fn libraryText(k: usize) -> Result<Vector<u8>, AllocError> {{
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(source)
-    novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/0.4.1/bin/novac"))
+    novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/0.5.0/bin/novac"))
     subprocess.run([novac, "fmt", path], check=True)
     print(f"gen_library: wrote {path} ({len(files)} files from Nova {head})")
 
