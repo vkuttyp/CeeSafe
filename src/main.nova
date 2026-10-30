@@ -442,14 +442,14 @@ fn loadPackage(
     };
     let directory = match (findManifestDirectory(cwd.view().bytes())!) {
         Some(d) => d,
-        null => { return fail("no Nova input files, and no nova.toml here or above"); }
+        null => { return fail("no Nova input files, and no ceesafe.toml or nova.toml here or above"); }
     };
     var problem = Vector<u8>.create();
     var loaded = Vector<LoadedPackage>.create();
-    let manifestPath = joinPath(directory.view(), "nova.toml".bytes())!;
     match (readManifest(directory.view(), mut problem)!) {
         Some(root) => {
-            let lock = joinPath(directory.view(), "nova.lock".bytes())!;
+            let manifestPath = joinPath(directory.view(), manifestName(root.legacy).bytes())!;
+            let lock = joinPath(directory.view(), lockName(root.legacy).bytes())!;
             if (root.dependencies.length > 0 && !fileExists(lock.view())) {
                 // The manifest is the file the error names (Workspace.Resolve, N0324).
                 let text = readFile(StringView.fromUtf8(manifestPath.view())!)!;
@@ -458,7 +458,10 @@ fn loadPackage(
                 sources.push(SourceText.create(name.view(), text.view())!)!;
                 var diagnostics = Diagnostics.create();
                 var message = Vector<u8>.create();
-                appendText(mut message, "there is no nova.lock: run 'novac fetch'")!;
+                appendText(
+                    mut message,
+                    if (root.legacy) "there is no nova.lock: run 'novac fetch'" else "there is no ceesafe.lock: run 'ceesafec fetch'",
+                )!;
                 diagnostics.error(324, 0, 0, 0, message)!;
                 return report(options.json, diagnostics, sources);
             }
@@ -472,7 +475,7 @@ fn loadPackage(
         var message = String.create();
         message.append("package '")!;
         message.append(StringView.fromUtf8(loaded[0].manifest.name.view())!)!;
-        message.append("' has no .nova files under ")!;
+        message.append(if (loaded[0].manifest.legacy) "' has no .nova files under " else "' has no .cee files under ")!;
         for (k in 0..loaded[0].manifest.sources.length) {
             if (k > 0) {
                 message.append(", ")!;
