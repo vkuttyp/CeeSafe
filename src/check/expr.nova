@@ -711,6 +711,16 @@ fn synthCall(
                                 if (b == builtinBox()) {
                                     return checkBoxCreate(c, member, arguments, expected, span);
                                 }
+                                if (b == builtinArena()) {
+                                    return checkArenaCreate(c, member, arguments, span);
+                                }
+                                if (b == builtinPool()) {
+                                    return checkPoolCreate(c, member, arguments, expected, span);
+                                }
+                                if (b == builtinFixedBufferAllocator() || b == builtinScratch()) {
+                                    let isScratch = b == builtinScratch();
+                                    return checkRegionConstructor(c, member, arguments, isScratch, span);
+                                }
                                 if (b == builtinConsole() || b == builtinProcess() || b == 23 || b == 24) {
                                     return checkBuiltinMemberCall(c, b, targetName, member, arguments, span);
                                 }

@@ -79,9 +79,7 @@ fn declareStruct(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
         ItemKind.Struct(index) => c.front.ast.structs[index as usize],
         _ => { return Ok(); }
     };
-    if (s.regionParameters.count > 0) {
-        c.notPorted(ident.start, ident.end, "a struct with region parameters", "S3")?;
-    }
+    checkRegionParameters(c, s.regionParameters, s.typeParameters)?;
     if (!checkTypeItemName(c, ident)?) {
         return Ok();
     }
@@ -113,21 +111,26 @@ fn declareEnum(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
         return Ok();
     }
     let parameters = match (entry.kind) {
-        ItemKind.Enum(_, typeParameters, regionParameters) => typeParameters.count + regionParameters.count,
+        ItemKind.Enum(_, typeParameters, _) => typeParameters,
         _ => { return Ok(); }
     };
+    let regions = match (entry.kind) {
+        ItemKind.Enum(_, _, regionParameters) => regionParameters,
+        _ => emptyRange(),
+    };
+    checkRegionParameters(c, regions, parameters)?;
     if (!checkTypeItemName(c, ident)?) {
         return Ok();
     }
-    if (parameters > 0) {
-        c.notPorted(ident.start, ident.end, "a generic enum or one with region parameters", "S3/S4")?;
+    if (parameters.count > 0) {
+        c.notPorted(ident.start, ident.end, "a generic enum", "S4")?;
         ownItem(c, ident.symbol, Entity.LibraryItem(item))?;
         return Ok();
     }
     if (entry.attributes.count > 0) {
         c.notPorted(entry.start, entry.end, "attributes on an enum", "S7")?;
     }
-    let t = c.types.createEnum(c.front.symbols.name(Symbol { id: ident.symbol }), item, c.file, false)?;
+    let t = c.types.createEnum(c.front.symbols.name(Symbol { id: ident.symbol }), item, c.file, regions.count > 0)?;
     c.enums.push(EnumEntry { item: item, file: c.file, typ: t, builtin: none() })?;
     let index = truncate<u32>(c.enums.length - 1);
     ownItem(c, ident.symbol, Entity.Enum(index))?;
@@ -209,6 +212,7 @@ fn checkMemberType(
     what: StringView,
     container: StringView,
     declaration: u32,
+    hasRegions: bool,
 ) -> Result<u32, AllocError> {
     if (c.types.holdsRegionValue(typ)) {
         var message = Vector<u8>.create();
@@ -219,7 +223,7 @@ fn checkMemberType(
         c.error(referenceNotAllowed(), span.start, span.end, message)?;
         return Ok(c.types.error);
     }
-    if (c.types.isScoped(typ)) {
+    if (c.types.isScoped(typ) && !hasRegions) {
         var message = Vector<u8>.create();
         appendText(
             mut message,
@@ -254,12 +258,16 @@ fn resolveStructMembers(c: borrow mut Checker, index: u32) -> Result<void, Alloc
         ItemKind.Struct(k) => c.front.ast.structs[k as usize],
         _ => { return Ok(); }
     };
+    var scope = Vector<u32>.create();
+    pushRegionNames(c, s.regionParameters, mut scope)?;
+    let savedRegions = swapRegions(c, scope)?;
+    let hasRegions = s.regionParameters.count > 0;
     var memberNames = Vector<u32>.create();
     for (k in 0..s.fields.count) {
         let field = c.front.ast.fields[c.front.ast.at(s.fields, k) as usize];
         let typeSpan = c.front.ast.typeSpans[field.typ as usize];
         let resolved = c.resolveType(field.typ, false)?;
-        let typ = checkMemberType(c, resolved, typeSpan, "a struct field", "struct", declarationName)?;
+        let typ = checkMemberType(c, resolved, typeSpan, "a struct field", "struct", declarationName, hasRegions)?;
         let id = c.front.ast.idents[field.name as usize];
         if (containsSymbol(memberNames, id.symbol)) {
             var message = Vector<u8>.create();
@@ -321,6 +329,7 @@ fn resolveStructMembers(c: borrow mut Checker, index: u32) -> Result<void, Alloc
         c.types.structs[definition as usize].functions.push(function)?;
         c.types.structs[definition as usize].functionNames.push(id.symbol)?;
     }
+    swapRegions(c, savedRegions)?;
     c.file = savedFile;
     return Ok();
 }
@@ -428,6 +437,13 @@ fn resolveEnumVariants(c: borrow mut Checker, index: u32) -> Result<void, AllocE
         ItemKind.Enum(v, _, _) => v,
         _ => emptyRange(),
     };
+    let regionParameters = match (item.kind) {
+        ItemKind.Enum(_, _, r) => r,
+        _ => emptyRange(),
+    };
+    var scope = Vector<u32>.create();
+    pushRegionNames(c, regionParameters, mut scope)?;
+    let savedRegions = swapRegions(c, scope)?;
     for (k in 0..variants.count) {
         let v = c.front.ast.variants[c.front.ast.at(variants, k) as usize];
         let id = c.front.ast.idents[v.name as usize];
@@ -444,10 +460,19 @@ fn resolveEnumVariants(c: borrow mut Checker, index: u32) -> Result<void, AllocE
             let typeSyntax = c.front.ast.at(v.payload, p);
             let typeSpan = c.front.ast.typeSpans[typeSyntax as usize];
             let resolved = c.resolveType(typeSyntax, false)?;
-            let typ = checkMemberType(c, resolved, typeSpan, "an enum payload", "enum", declarationName)?;
+            let typ = checkMemberType(
+                c,
+                resolved,
+                typeSpan,
+                "an enum payload",
+                "enum",
+                declarationName,
+                regionParameters.count > 0,
+            )?;
             addPayload(c, variant, p, typ, typeSpan.start, typeSpan.end)?;
         }
     }
+    swapRegions(c, savedRegions)?;
     c.file = savedFile;
     return Ok();
 }

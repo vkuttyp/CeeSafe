@@ -73,6 +73,10 @@ struct Checker {
     loopDepth: u32;
     deferDepth: u32;
     copyKnown: bool;
+    regions: Vector<u32>; // the region names in scope (the reference's _regions)
+    frameMemory: u32;     // a scratch frame's region parts, as fields
+    frameAllocation: u32;
+    flowNames: Vector<Vector<u64>>; // ResolveFlows' per-parameter names, while it runs
     pendingElements: Vector<PendingElement>;
     letKeywords: Vector<LetKeyword>;
 

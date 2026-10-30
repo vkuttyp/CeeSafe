@@ -115,6 +115,10 @@ fn checkProgram(
         loopDepth: 0,
         deferDepth: 0,
         copyKnown: false,
+        regions: Vector<u32>.create(),
+        frameMemory: none(),
+        frameAllocation: none(),
+        flowNames: Vector<Vector<u64>>.create(),
         pendingElements: Vector<PendingElement>.create(),
         letKeywords: Vector<LetKeyword>.create(),
     };
@@ -130,6 +134,7 @@ fn checkProgram(
         let symbol = c.intern(reservedName(k))?;
         c.reserved.push(symbol)?;
     }
+    declareFrameFields(mut c)?;
     declareBuiltinItems(mut c)?;
 
     // Interfaces, then structs and enums, then every other item, unit by unit (Check()).
@@ -417,7 +422,26 @@ fn receiverIndex(kind: ReceiverKind) -> u32 => match (kind) {
 
 /// DeclareFunction for a top-level function without type parameters: its signature, and its parameters as locals.
 fn declareFunction(c: borrow mut Checker, f: u32, owner: u32) -> Result<u32, AllocError> {
+    var scope = Vector<u32>.create();
+    regionScope(c, f, owner, mut scope)?;
+    let saved = swapRegions(c, scope)?;
+    let function = declareFunctionCore(c, f, owner)?;
+    swapRegions(c, saved)?;
+    return Ok(function);
+}
+
+fn declareFunctionCore(c: borrow mut Checker, f: u32, owner: u32) -> Result<u32, AllocError> {
     let decl = c.front.ast.functions[f as usize];
+    if (owner != none() && decl.regionParameters.count > 0) {
+        let first = c.front.ast.typeParameters[c.front.ast.at(decl.regionParameters, 0) as usize];
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            "methods cannot declare region parameters of their own; use the struct's regions (type-system.md §25.1)",
+        )?;
+        c.error(unsupported(), first.start, first.end, message)?;
+    }
+    checkRegionParameters(c, decl.regionParameters, decl.typeParameters)?;
     let returnType = if (decl.returnType == none()) c.types.voidType else c.resolveTypeWith(
         decl.returnType,
         true,
@@ -464,7 +488,7 @@ fn declareFunction(c: borrow mut Checker, f: u32, owner: u32) -> Result<u32, All
         let local = c.hir.addLocal(function, id.symbol, t, false, true, id.start, id.end)?;
         c.hir.functions[function as usize].parameters.push(local)?;
     }
-    resolveFlows(c, f, function)?;
+    resolveFlows(c, f, function, owner)?;
     return Ok(function);
 }
 

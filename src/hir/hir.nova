@@ -195,6 +195,7 @@ struct HirFunction {
     hasInstanceError: bool;
     instanceError: Vector<u8>;
     returnSources: Vector<u32>; // the parameters (by index) a scoped result may borrow from
+    mutableFlows: Vector<u64>;  // (i << 32) | j: parameter j's loans may be stored through `borrow mut` parameter i
 }
 
 struct HirConstant {
@@ -356,6 +357,7 @@ struct HirProgram {
             hasInstanceError: false,
             instanceError: Vector<u8>.create(),
             returnSources: Vector<u32>.create(),
+            mutableFlows: Vector<u64>.create(),
         })?;
         return Ok(id);
     }

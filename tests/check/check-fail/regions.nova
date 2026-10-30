@@ -1,0 +1,47 @@
+struct Twice<region r, region r> { a: StringView<r>; }
+struct NoRegion { s: StringView; }
+enum NoRegionEnum { A(borrow i32) }
+struct Unknown { s: StringView<q>; }
+struct Point { x: i32; }
+struct HoldsArena { a: Arena; }
+struct Res { n: i32; drop { } }
+
+fn methods() {}
+struct M<region r> {
+    v: StringView<r>;
+    fn mine<region s>(borrow this) {}
+}
+
+fn a(x: Point<r>) {}
+fn b<region r>(x: Point<r>) {}
+fn c(x: borrow(q) i32) {}
+fn d(x: Slice<q, u8>) {}
+fn e(p: Pool<borrow i32>) {}
+fn f(p: Pool<StringView>) {}
+
+fn main() {
+    let x = Arena.create(5, 1);
+    let y = Arena.make(SystemHeap {}, 1);
+    let z = Arena.create(SystemHeap {});
+    using arena = Arena.create(SystemHeap {}, 64);
+    let r1 = arena.alloc(Res { n: 1 });
+    let r2 = arena.allocArray(2, Res { n: 1 });
+    let r3 = arena.fly(1);
+    let r4 = arena.alloc();
+    let r5 = arena.reset(1);
+    let shared = borrow arena;
+    shared.reset();
+    let p1 = Pool.create(SystemHeap {}, 4);
+    let p2: i32 = Pool.create(SystemHeap {}, 4);
+    using pool: Pool<i32> = Pool.create(3, 4);
+    let t1 = pool.give(1);
+    let t2 = pool.take(true);
+    let s1 = Scratch.begin();
+    let s2 = Scratch.enter(1);
+    let storage = [0u8; 4];
+    let f1 = FixedBufferAllocator.over(storage);
+    let f2 = FixedBufferAllocator.over(mut storage);
+    var bad = [1u32; 2];
+    let f3 = FixedBufferAllocator.over(mut bad);
+    let fr = Scratch.enter().alloc(1);
+}

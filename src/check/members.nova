@@ -304,6 +304,15 @@ fn checkMethodCall(
     if (c.types.isStringView(c.typeOf(view))) {
         return checkViewMethod(c, member, arguments, view, span);
     }
+    let ownType = c.typeOf(receiver);
+    let ownPointee = c.types.info(ownType).pointee;
+    let regionCandidate = if (ownPointee != none()) ownPointee else ownType;
+    if (regionIndex(c.types.info(regionCandidate).region) == 4) {
+        return checkPoolTake(c, member, arguments, receiver, regionCandidate, targetSpan, span);
+    }
+    if (c.types.is(regionCandidate, TypeKind.Region)) {
+        return checkArenaMethod(c, member, arguments, receiver, targetSpan, span);
+    }
     if (!c.types.is(readType, TypeKind.Struct) || c.types.info(readType).structDef == none()) {
         return checkNonStructMethod(c, receiver, readType, member, arguments, span);
     }

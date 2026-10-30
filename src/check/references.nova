@@ -24,21 +24,20 @@ fn resolveReferenceType(
                 namesStatic = true;
             }
         }
-        if (namesStatic) {
-            // Each must name a region (CheckRegionArgument); declared regions come with S3.
-            for (k in 0..sources.count) {
-                let ident = c.front.ast.idents[c.front.ast.at(sources, k) as usize];
-                if (!sameText(c.name(ident.symbol), "static")) {
-                    unknownRegionError(c, ident)?;
-                }
-            }
-        } else {
+        if (c.regions.length == 0 && !namesStatic) {
             var message = Vector<u8>.create();
             appendText(
                 mut message,
                 "a source list 'borrow(...)' is only allowed in a function's return type, or naming regions (type-system.md §25.2)",
             )?;
             c.error(referenceNotAllowed(), span.start, span.end, message)?;
+        } else {
+            for (k in 0..sources.count) {
+                let ident = c.front.ast.idents[c.front.ast.at(sources, k) as usize];
+                if (!isRegionSymbol(c, ident.symbol)) {
+                    unknownRegionError(c, ident)?;
+                }
+            }
         }
     }
     let isFunction = match (c.front.ast.types[pointeeSyntax as usize]) {
@@ -297,73 +296,226 @@ fn mutArgumentError(c: borrow mut Checker, value: u32, span: Span, message: Vect
 
 // ---- flows ----
 
-/// ResolveFlows for a signature without regions or type parameters: the parameters the result may borrow from (its
-/// return sources, §13.5, lifetimes.md §7), as parameter indexes. Each scoped parameter has a region of its own.
-fn resolveFlows(c: borrow mut Checker, f: u32, function: u32) -> Result<void, AllocError> {
-    let returnType = c.hir.functions[function as usize].returnType;
-    if (!c.types.isScoped(returnType)) {
-        return Ok();
-    }
-    let decl = c.front.ast.functions[f as usize];
-    let parameterCount = c.hir.functions[function as usize].parameters.length;
-    let receiverOffset = parameterCount - decl.parameters.count as usize;
-    // The result's names: the parameters a `borrow(p)` in it names, when they are scoped.
-    var named = Vector<u32>.create();
-    collectSourceParameters(c, decl.returnType, function, receiverOffset, mut named)?;
-    let hasSources = match (c.front.ast.types[decl.returnType as usize]) {
-        TypeNode.Reference(_, hasSourceList, _, _) => hasSourceList,
-        _ => false,
-    };
-    var sources = Vector<u32>.create();
-    for (i in named.view()) {
-        if (!containsU32(sources, i)) {
-            sources.push(i)?;
+// Flow names (CollectFlowNames, §25.6): a region a type names (`r:name`, not `static`), a scoped parameter's own
+// elided region (`#i`), and a type parameter (`t:name`, S4). Each is a u64: the kind in the high half.
+fn regionFlowName(symbol: u32) -> u64 => (1u64 << 32) | symbol as u64;
+fn elidedFlowName(i: usize) -> u64 => (2u64 << 32) | i as u64;
+fn isRegionOrElided(name: u64) -> bool => (name >> 32) == 1 || (name >> 32) == 2;
+fn isElided(name: u64) -> bool => (name >> 32) == 2;
+fn isTypeFlowName(name: u64) -> bool => (name >> 32) == 3;
+
+fn addName(names: borrow mut Vector<u64>, name: u64) -> Result<void, AllocError> {
+    for (n in names.view()) {
+        if (n == name) {
+            return Ok();
         }
     }
-    if (hasSources || named.length == 0) {
-        var resolved = Vector<u32>.create();
-        resolveReturnSources(c, f, function, mut resolved)?;
-        for (i in resolved.view()) {
-            if (!containsU32(sources, i)) {
-                sources.push(i)?;
+    return names.push(name);
+}
+
+fn overlaps(a: borrow Vector<u64>, b: borrow Vector<u64>) -> bool {
+    for (x in a.view()) {
+        for (y in b.view()) {
+            if (x == y) {
+                return true;
             }
         }
     }
-    sortU32(mut sources);
-    c.hir.functions[function as usize].returnSources = sources;
+    return false;
+}
+
+/// Can a value of this type carry loans (MayHoldLoans)? Scoped types, and in generic code anything mentioning a type
+/// parameter (§25.7).
+fn mayHoldLoans(c: borrow Checker, typ: u32) -> bool => c.types.isScoped(typ) || c.types.isGeneric(typ);
+
+/// The flows of a signature (ResolveFlows, §25.6): which parameters' loans the result may carry (its return sources)
+/// and which parameters' loans the callee may store through each `borrow mut` parameter.
+fn resolveFlows(c: borrow mut Checker, f: u32, function: u32, owner: u32) -> Result<void, AllocError> {
+    let decl = c.front.ast.functions[f as usize];
+    var ownerRegions = Vector<u32>.create();
+    if (owner != none()) {
+        let definition = c.types.info(owner).structDef;
+        let item = if (definition == none()) none() else c.types.structs[definition as usize].item;
+        if (item != none()) {
+            match (c.front.ast.items[item as usize].kind) {
+                ItemKind.Struct(k) => {
+                    pushRegionNames(c, c.front.ast.structs[k as usize].regionParameters, mut ownerRegions)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    let parameterCount = c.hir.functions[function as usize].parameters.length;
+    let receiverOffset = parameterCount - decl.parameters.count as usize;
+    var names = Vector<Vector<u64>>.create();
+    for (i in 0..parameterCount) {
+        var set = Vector<u64>.create();
+        if (i < receiverOffset) {
+            for (r in ownerRegions.view()) {
+                addName(mut set, regionFlowName(r))?;
+            }
+        } else {
+            let p = c.front.ast.parameters[c.front.ast.at(decl.parameters, truncate<u32>(i - receiverOffset)) as usize];
+            collectFlowNames(c, p.typ, function, false, mut set)?;
+        }
+        let local = c.hir.functions[function as usize].parameters[i];
+        var hasRegion = false;
+        for (n in set.view()) {
+            if ((n >> 32) == 1) {
+                hasRegion = true;
+            }
+        }
+        if (c.types.isScoped(c.hir.locals[local as usize].typ) && !hasRegion) {
+            addName(mut set, elidedFlowName(i))?; // elided: a region of its own
+        }
+        names.push(set)?;
+    }
+    c.flowNames = names;
+    let returnType = c.hir.functions[function as usize].returnType;
+    if (decl.returnType != none() && mayHoldLoans(c, returnType)) {
+        var resultNames = Vector<u64>.create();
+        collectFlowNames(c, decl.returnType, function, true, mut resultNames)?;
+        var sources = Vector<u32>.create();
+        for (i in 0..parameterCount) {
+            if (overlaps(c.flowNames[i], resultNames)) {
+                sources.push(truncate<u32>(i))?;
+            }
+        }
+        let hasSourceList = match (c.front.ast.types[decl.returnType as usize]) {
+            TypeNode.Reference(_, hasSources, _, _) => hasSources,
+            _ => false,
+        };
+        var named = hasSourceList;
+        for (n in resultNames.view()) {
+            if (isRegionOrElided(n)) {
+                named = true;
+            }
+        }
+        if (hasSourceList || (c.types.isScoped(returnType) && !named)) {
+            var resolved = Vector<u32>.create();
+            resolveReturnSources(c, f, function, mut resolved)?; // v0: `borrow(a, b)`, or elision (§13.5)
+            for (i in resolved.view()) {
+                if (!containsU32(sources, i)) {
+                    sources.push(i)?;
+                }
+            }
+        }
+        sortU32(mut sources);
+        c.hir.functions[function as usize].returnSources = sources;
+    }
+    var flows = Vector<u64>.create();
+    for (i in 0..parameterCount) {
+        let local = c.hir.functions[function as usize].parameters[i];
+        let t = c.hir.locals[local as usize].typ;
+        if (!c.types.is(t, TypeKind.Reference) || !c.types.info(t).mutableReference || !mayHoldLoans(
+            c,
+            c.types.info(t).pointee,
+        )) {
+            continue;
+        }
+        var target = Vector<u64>.create();
+        if (i < receiverOffset) {
+            for (n in c.flowNames[i].view()) {
+                target.push(n)?;
+            }
+        } else {
+            let p = c.front.ast.parameters[c.front.ast.at(decl.parameters, truncate<u32>(i - receiverOffset)) as usize];
+            match (c.front.ast.types[p.typ as usize]) {
+                TypeNode.Reference(_, _, _, pointee) => { collectFlowNames(c, pointee, function, false, mut target)?; }
+                _ => {}
+            }
+        }
+        var kept = Vector<u64>.create();
+        for (n in target.view()) {
+            if (!isElided(n)) {
+                kept.push(n)?;
+            }
+        }
+        for (j in 0..parameterCount) {
+            if (j != i && overlaps(c.flowNames[j], kept)) {
+                flows.push((i as u64) << 32 | j as u64)?;
+            }
+        }
+    }
+    c.hir.functions[function as usize].mutableFlows = flows;
+    c.flowNames = Vector<Vector<u64>>.create();
     return Ok();
 }
 
-/// CollectFlowNames over a result type: each scoped parameter a source list names (`#i` in the reference).
-fn collectSourceParameters(
+/// The flow names a type written in a signature mentions (CollectFlowNames). In a result (`inResult`), `borrow(p)`
+/// adds parameter `p`'s names (c.flowNames), less its type parameters'.
+fn collectFlowNames(
     c: borrow Checker,
     syntax: u32,
     function: u32,
-    receiverOffset: usize,
-    out: borrow mut Vector<u32>,
+    inResult: bool,
+    names: borrow mut Vector<u64>,
 ) -> Result<void, AllocError> {
     match (c.front.ast.types[syntax as usize]) {
-        TypeNode.Optional(inner) => { return collectSourceParameters(c, inner, function, receiverOffset, out); }
-        TypeNode.Array(element, _) => { return collectSourceParameters(c, element, function, receiverOffset, out); }
+        TypeNode.Optional(inner) => { return collectFlowNames(c, inner, function, inResult, names); }
+        TypeNode.Array(element, _) => { return collectFlowNames(c, element, function, inResult, names); }
         TypeNode.Reference(_, _, sources, pointee) => {
             for (k in 0..sources.count) {
                 let symbol = c.front.ast.idents[c.front.ast.at(sources, k) as usize].symbol;
-                let i = parameterIndex(c, function, symbol);
-                if (i != none() && c.types.isScoped(
-                    c.hir.locals[c.hir.functions[function as usize].parameters[i as usize] as usize].typ,
-                )) {
-                    out.push(i)?;
+                let i = if (inResult) parameterIndex(c, function, symbol) else none();
+                if (i != none()) {
+                    // The result borrows the parameter's referent: its regions, not its type parameters' loans.
+                    for (n in c.flowNames[i as usize].view()) {
+                        if (!isTypeFlowName(n)) {
+                            addName(names, n)?;
+                        }
+                    }
+                } else if (isRegionSymbol(c, symbol) && !sameText(c.name(symbol), "static")) {
+                    addName(names, regionFlowName(symbol))?;
                 }
             }
-            return collectSourceParameters(c, pointee, function, receiverOffset, out);
+            return collectFlowNames(c, pointee, function, inResult, names);
         }
-        TypeNode.Generic(_, arguments) => {
+        TypeNode.Generic(name, arguments) => {
+            if (name.parts.count != 1) {
+                return Ok();
+            }
+            let symbol = c.front.ast.idents[c.front.ast.at(name.parts, 0) as usize].symbol;
+            let text = c.name(symbol);
+            var regions: u32 = 0;
+            match (c.item(symbol)) {
+                Entity.Struct(index) => { regions = itemRegionCount(c, c.structs[index as usize].item); }
+                Entity.Enum(index) => { regions = itemRegionCount(c, c.enums[index as usize].item); }
+                Entity.LibraryItem(item) => { regions = itemRegionCount(c, item); }
+                _ => {
+                    if (sameText(text, "StringView") || ((sameText(text, "Slice") || sameText(text, "SliceMut")) &&
+                        arguments.count == 2)) {
+                        regions = 1;
+                    }
+                }
+            }
+            let hasRegions = regions > 0 && arguments.count > 0 && isRegionName(c, c.front.ast.at(arguments, 0));
             for (k in 0..arguments.count) {
-                collectSourceParameters(c, c.front.ast.at(arguments, k), function, receiverOffset, out)?;
+                let argument = c.front.ast.at(arguments, k);
+                if (hasRegions && k < regions) {
+                    let r = singleName(c, argument);
+                    if (isRegionName(c, argument) && !sameText(c.name(r), "static")) {
+                        addName(names, regionFlowName(r))?;
+                    }
+                } else {
+                    collectFlowNames(c, argument, function, inResult, names)?;
+                }
             }
             return Ok();
         }
         _ => { return Ok(); }
+    }
+}
+
+/// The number of region parameters an item declares.
+fn itemRegionCount(c: borrow Checker, item: u32) -> u32 {
+    if (item == none()) {
+        return 0;
+    }
+    match (c.front.ast.items[item as usize].kind) {
+        ItemKind.Struct(k) => { return c.front.ast.structs[k as usize].regionParameters.count; }
+        ItemKind.Enum(_, _, regionParameters) => { return regionParameters.count; }
+        _ => { return 0; }
     }
 }
 
@@ -442,7 +594,7 @@ fn resolveReturnSources(
     }
     for (k in 0..sourceList.count) {
         let ident = c.front.ast.idents[c.front.ast.at(sourceList, k) as usize];
-        if (sameText(c.name(ident.symbol), "static")) {
+        if (isRegionSymbol(c, ident.symbol)) {
             continue; // a region: its parameters were found by name (§25.6)
         }
         let i = parameterIndex(c, function, ident.symbol);

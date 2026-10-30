@@ -1,0 +1,53 @@
+struct Token<region r> { text: StringView<r>; next: borrow(r) Token<r>?; }
+enum Piece<region r> { Word(StringView<r>), Gap }
+struct Holder<region r> { bytes: Slice<r, u8>; }
+struct Point { x: i32; y: i32; }
+
+fn first<region r>(t: borrow Token<r>) -> StringView<r> => t.text;
+fn pick<region a>(x: borrow(a) i32, y: borrow i32) -> borrow(a) i32 => x;
+fn fill<region r>(out: borrow mut Holder<r>, data: Slice<r, u8>) {
+    out.bytes = data;
+}
+
+fn arenas() -> Result<i32, AllocError> {
+    using arena = Arena.create(SystemHeap {}, 4096);
+    let p = arena.alloc(Point { x: 1, y: 2 })?;
+    let xs = arena.allocArray(4, 0u8)?;
+    xs[0] = 1;
+    let r = borrow arena;
+    let q = r.alloc(3)?;
+    var other = Arena.create(FailingAllocator {}, 64);
+    other.reset();
+    return Ok(p.x + q);
+}
+
+fn buffers() -> Result<void, AllocError> {
+    var storage = [0u8; 64];
+    using fixed = FixedBufferAllocator.over(mut storage);
+    let a = fixed.alloc(5)?;
+    using frame = Scratch.enter();
+    let b = frame.alloc(7u64)?;
+    using inner = frame.enter();
+    let c = inner.allocArray(2, 1i16)?;
+    return Ok();
+}
+
+fn pools() -> Result<void, AllocError> {
+    using pool: Pool<Point> = Pool.create(SystemHeap {}, 8);
+    let b = pool.take(Point { x: 1, y: 1 })?;
+    let x = b.x;
+    let boxed: PoolBox<Point> = pool.take(Point { x: 2, y: 2 })?;
+    return Ok();
+}
+
+fn main() {
+    let t = Token { text: "a", next: null };
+    let w = first(t);
+    let piece = Piece.Word("x");
+    let n = 1;
+    let m = 2;
+    let k = pick(n, m);
+    let total = arenas()!;
+    buffers()!;
+    pools()!;
+}

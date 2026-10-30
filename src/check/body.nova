@@ -5,6 +5,9 @@
 fn checkFunctionBody(c: borrow mut Checker, function: u32) -> Result<void, AllocError> {
     c.file = c.hir.functions[function as usize].file;
     c.function = function;
+    var scope = Vector<u32>.create();
+    regionScope(c, c.hir.functions[function as usize].syntax, c.hir.functions[function as usize].owner, mut scope)?;
+    c.regions = scope;
     c.loopDepth = 0;
     c.scopes.truncate(0);
     c.scopeStarts.truncate(0);
@@ -49,6 +52,7 @@ fn checkFunctionBody(c: borrow mut Checker, function: u32) -> Result<void, Alloc
     }
     analyzeFlow(c, function)?;
     c.function = none();
+    c.regions = Vector<u32>.create();
     return Ok();
 }
 
@@ -170,9 +174,6 @@ fn checkLocalDecl(
         LocalKind.Var => true,
         _ => false,
     };
-    if (isUsing) {
-        c.notPorted(span.start, span.end, "a 'using' local", "S3")?;
-    }
     let declared = if (typ == none()) none() else c.resolveType(typ, false)?;
     if (!isMutable && initializerSyntax == none()) {
         var message = Vector<u8>.create();

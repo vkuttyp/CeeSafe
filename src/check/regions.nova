@@ -1,0 +1,682 @@
+// Regions (the reference's RegionScope, CheckRegionParameters, CheckRegionArgument, IsRegionName, the region part of
+// ResolveGenericItemType, CheckArenaCreate, RegionReceiver, CheckPoolElement, CheckPoolCreate, CheckPoolTake,
+// CheckRegionContent, CheckRegionConstructor and CheckArenaMethod): P3 S3d (type-system.md §19, §25). Region
+// arguments are checked and erased; an item with region parameters but no type parameters is not generic.
+
+fn notRegionContent() -> u32 => 264;
+
+fn builtinArena() -> u32 => 8;
+fn builtinFixedBufferAllocator() -> u32 => 9;
+fn builtinScratch() -> u32 => 10;
+fn builtinPool() -> u32 => 11;
+
+/// The region names of a parameter list (TypeParameter indexes).
+fn pushRegionNames(c: borrow Checker, regions: Range, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    for (k in 0..regions.count) {
+        let p = c.front.ast.typeParameters[c.front.ast.at(regions, k) as usize];
+        out.push(c.front.ast.idents[p.name as usize].symbol)?;
+    }
+    return Ok();
+}
+
+/// The regions a function may name (RegionScope, §25.1): its own and, for a method, its struct's.
+fn regionScope(c: borrow Checker, f: u32, owner: u32, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    let decl = c.front.ast.functions[f as usize];
+    pushRegionNames(c, decl.regionParameters, out)?;
+    if (owner != none()) {
+        let definition = c.types.info(owner).structDef;
+        if (definition != none()) {
+            let item = c.types.structs[definition as usize].item;
+            if (item != none()) {
+                match (c.front.ast.items[item as usize].kind) {
+                    ItemKind.Struct(k) => {
+                        pushRegionNames(c, c.front.ast.structs[k as usize].regionParameters, out)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    return Ok();
+}
+
+/// Replaces the regions in scope, returning (a copy of) the old ones.
+fn swapRegions(c: borrow mut Checker, regions: Vector<u32>) -> Result<Vector<u32>, AllocError> {
+    var old = Vector<u32>.create();
+    for (r in c.regions.view()) {
+        old.push(r)?;
+    }
+    c.regions = regions;
+    return Ok(old);
+}
+
+fn isRegionSymbol(c: borrow Checker, symbol: u32) -> bool =>
+    sameText(c.name(symbol), "static") || containsU32(c.regions, symbol);
+
+/// Region parameters are declared once each, and not twice with the same name (CheckRegionParameters, §25.1).
+fn checkRegionParameters(c: borrow mut Checker, regions: Range, types: Range) -> Result<void, AllocError> {
+    var names = Vector<u32>.create();
+    for (k in 0..regions.count) {
+        let p = c.front.ast.typeParameters[c.front.ast.at(regions, k) as usize];
+        let ident = c.front.ast.idents[p.name as usize];
+        var sameAsType = false;
+        for (t in 0..types.count) {
+            let tp = c.front.ast.typeParameters[c.front.ast.at(types, t) as usize];
+            if (c.front.ast.idents[tp.name as usize].symbol == ident.symbol) {
+                sameAsType = true;
+            }
+        }
+        let repeated = containsU32(names, ident.symbol);
+        if (!repeated) {
+            names.push(ident.symbol)?;
+        }
+        if (repeated || sameAsType || sameText(c.name(ident.symbol), "static")) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "the region name ")?;
+            appendQuotedName(mut message, c, ident.symbol)?;
+            appendText(mut message, " is already used")?;
+            c.error(duplicateParameter(), ident.start, ident.end, message)?;
+        }
+    }
+    return Ok();
+}
+
+/// The single name a type syntax is, or none.
+fn singleName(c: borrow Checker, typ: u32) -> u32 => match (c.front.ast.types[typ as usize]) {
+    TypeNode.Named(q) => if (q.parts.count == 1) c.front.ast.idents[c.front.ast.at(
+        q.parts,
+        0,
+    ) as usize].symbol else none(),
+    _ => none(),
+};
+
+/// Is the type syntax a region name in scope, or `static` (IsRegionName)?
+fn isRegionName(c: borrow Checker, typ: u32) -> bool {
+    let symbol = singleName(c, typ);
+    return symbol != none() && isRegionSymbol(c, symbol);
+}
+
+/// Is `typ` a region name in scope (or `static`)? Reports N0273 if not (CheckRegionArgument).
+fn checkRegionArgument(c: borrow mut Checker, typ: u32) -> Result<bool, AllocError> {
+    if (isRegionName(c, typ)) {
+        return Ok(true);
+    }
+    let span = c.front.ast.typeSpans[typ as usize];
+    let symbol = singleName(c, typ);
+    var message = Vector<u8>.create();
+    if (symbol != none()) {
+        appendQuotedName(mut message, c, symbol)?;
+        appendText(mut message, " is not a region in scope; declare it with 'region ")?;
+        appendBytes(mut message, c.name(symbol))?;
+        appendText(mut message, "' or use 'static'")?;
+    } else {
+        appendText(mut message, "a region argument must be a region name")?;
+    }
+    c.error(unknownRegion(), span.start, span.end, message)?;
+    return Ok(false);
+}
+
+/// `S<a>` or `E<a>` for a struct or enum with region parameters and no type parameters (ResolveGenericItemType's
+/// region part); generic items are S4's.
+fn resolveRegionItemType(
+    c: borrow mut Checker,
+    typ: u32,
+    item: u32,
+    text: Slice<u8>,
+    arguments: Range,
+    span: Span,
+) -> Result<u32, AllocError> {
+    var regions = emptyRange();
+    var parameters = emptyRange();
+    match (c.front.ast.items[item as usize].kind) {
+        ItemKind.Struct(k) => {
+            regions = c.front.ast.structs[k as usize].regionParameters;
+            parameters = c.front.ast.structs[k as usize].typeParameters;
+        }
+        ItemKind.Enum(_, typeParameters, regionParameters) => {
+            regions = regionParameters;
+            parameters = typeParameters;
+        }
+        _ => {}
+    }
+    var typeArguments = arguments.count;
+    if (regions.count > 0 && arguments.count == regions.count + parameters.count) {
+        // Region arguments come first and are erased (§25.2, §25.5).
+        for (k in 0..regions.count) {
+            let regionArgument = c.front.ast.at(arguments, k);
+            checkRegionArgument(c, regionArgument)?;
+        }
+        typeArguments = arguments.count - regions.count;
+    } else if (regions.count == 0) {
+        for (k in 0..arguments.count) {
+            if (isRegionName(c, c.front.ast.at(arguments, k))) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "'")?;
+                appendBytes(mut message, text)?;
+                appendText(mut message, "' has no region parameters")?;
+                c.error(unknownRegion(), span.start, span.end, message)?;
+                return Ok(c.types.error);
+            }
+        }
+    }
+    if (typeArguments == 0 && parameters.count == 0) {
+        return Ok(typ);
+    }
+    if (parameters.count != typeArguments) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, text)?;
+        if (parameters.count == 0) {
+            appendText(mut message, "' is not generic; write '")?;
+            appendBytes(mut message, text)?;
+            appendText(mut message, "' without type arguments")?;
+        } else {
+            appendText(mut message, "' takes ")?;
+            appendDecimal(mut message, parameters.count as u64)?;
+            appendText(mut message, " type argument(s), but ")?;
+            appendDecimal(mut message, typeArguments as u64)?;
+            appendText(mut message, " were given")?;
+        }
+        c.error(unknownType(), span.start, span.end, message)?;
+        return Ok(c.types.error);
+    }
+    c.notPorted(span.start, span.end, "a generic struct or enum", "S4")?;
+    return Ok(c.types.error);
+}
+
+// ---- pools ----
+
+/// A pool holds values one by one, so they may need drop; but nothing scoped (CheckPoolElement, E3, N0264).
+fn checkPoolElement(c: borrow mut Checker, element: u32, span: Span) -> Result<bool, AllocError> {
+    let scoped = c.types.isScoped(element);
+    if (c.types.is(element, TypeKind.Void) || c.types.is(element, TypeKind.Never) || scoped) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "a pool cannot hold a ")?;
+        appendQuotedType(mut message, c, element)?;
+        appendText(
+            mut message,
+            if (scoped) ": it is scoped (a reference or slice), and pool memory cannot hold loans (E3)" else ": it has no value",
+        )?;
+        c.error(notRegionContent(), span.start, span.end, message)?;
+        return Ok(false);
+    }
+    return Ok(true);
+}
+
+/// `Pool<T>` and `PoolBox<T>`.
+fn resolvePoolType(c: borrow mut Checker, isBox: bool, arguments: Range) -> Result<u32, AllocError> {
+    let elementSyntax = c.front.ast.at(arguments, 0);
+    let pooled = c.resolveType(elementSyntax, false)?;
+    let elementSpan = c.front.ast.typeSpans[elementSyntax as usize];
+    if (c.types.isBottom(pooled) || !checkPoolElement(c, pooled, elementSpan)?) {
+        return Ok(c.types.error);
+    }
+    return if (isBox) c.types.poolBoxOf(pooled) else c.types.poolOf(pooled);
+}
+
+/// `Pool.create(allocator, capacity)` (CheckPoolCreate, §19.6): `T` comes from the expected `Pool<T>`.
+fn checkPoolCreate(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    expected: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let isCreate = sameText(c.name(c.front.ast.idents[member as usize].symbol), "create");
+    if (!isCreate || arguments.count != 2) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "a pool is made with 'Pool.create(allocator, capacity)'")?;
+        c.error(if (isCreate) argumentCount() else undefinedName(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let allocatorSyntax = c.front.ast.at(arguments, 0);
+    let synthesized = synth(c, allocatorSyntax, none())?;
+    let allocator = autoDeref(c, synthesized)?;
+    let u32Type = c.types.u32;
+    let capacitySyntax = c.front.ast.at(arguments, 1);
+    let capacity = checkExpr(c, capacitySyntax, u32Type)?;
+    let isPool = expected != none() && regionIndex(c.types.info(expected).region) == 4;
+    if (!isPool) {
+        if (expected == none() || !c.types.isBottom(expected)) {
+            var message = Vector<u8>.create();
+            if (expected == none()) {
+                appendText(
+                    mut message,
+                    "the element type of 'Pool.create(...)' is unknown here; give the variable a type: 'let pool: Pool<T> = …'",
+                )?;
+            } else {
+                appendText(mut message, "'Pool.create(...)' makes a pool, but ")?;
+                appendQuotedType(mut message, c, expected)?;
+                appendText(mut message, " is expected here")?;
+            }
+            c.error(resultTypeUnknown(), span.start, span.end, message)?;
+        }
+        return c.errorResult(span.start, span.end);
+    }
+    if (c.isBottom(allocator)) {
+        return c.errorResult(span.start, span.end);
+    }
+    if (!checkRegionAllocator(c, allocator, allocatorSyntax)?) {
+        return c.errorResult(span.start, span.end);
+    }
+    let values = [allocator, capacity];
+    let list = c.hir.list(values[..])?;
+    return c.expr(HirExpr.BuiltinCall(bfPoolCreate(), list), expected, span.start, span.end);
+}
+
+/// N0263 for an arena's or pool's allocator that is not a built-in one.
+fn checkRegionAllocator(c: borrow mut Checker, allocator: u32, syntax: u32) -> Result<bool, AllocError> {
+    let t = c.typeOf(allocator);
+    if (isAllocatorType(c, t)) {
+        return Ok(true);
+    }
+    let span = c.front.ast.exprSpans[syntax as usize];
+    var message = Vector<u8>.create();
+    appendQuotedType(mut message, c, t)?;
+    appendText(mut message, " is not an allocator type; use 'SystemHeap {}' or 'FailingAllocator {}'")?;
+    c.error(notAnAllocator(), span.start, span.end, message)?;
+    return Ok(false);
+}
+
+/// `pool.take(v)` (CheckPoolTake, §19.6): a `PoolBox<T>` carrying a shared loan of the pool.
+fn checkPoolTake(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    receiver: u32,
+    pool: u32,
+    targetSpan: Span,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let ident = c.front.ast.idents[member as usize];
+    let isTake = sameText(c.name(ident.symbol), "take");
+    if (!isTake || arguments.count != 1) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, pool)?;
+        appendText(mut message, " has one method: 'take(v)'")?;
+        c.error(if (isTake) argumentCount() else undefinedName(), ident.start, ident.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let reference = regionReceiver(c, receiver, pool, false, member, targetSpan)?;
+    if (reference == none()) {
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let element = c.types.info(pool).element;
+    let valueSyntax = c.front.ast.at(arguments, 0);
+    let value = checkExpr(c, valueSyntax, element)?;
+    let poolBox = c.types.poolBoxOf(element)?;
+    let allocError = c.allocErrorType;
+    let result = resultOf(c, poolBox, allocError)?;
+    let values = [reference, value];
+    let list = c.hir.list(values[..])?;
+    return c.expr(HirExpr.BuiltinCall(bfPoolTake(), list), result, span.start, span.end);
+}
+
+// ---- arenas, fixed buffers and scratch frames ----
+
+/// `Arena.create(allocator, chunkSize)` (CheckArenaCreate, §19.2): cannot fail.
+fn checkArenaCreate(c: borrow mut Checker, member: u32, arguments: Range, span: Span) -> Result<u32, AllocError> {
+    let isCreate = sameText(c.name(c.front.ast.idents[member as usize].symbol), "create");
+    if (!isCreate || arguments.count != 2) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "an arena is made with 'Arena.create(allocator, chunkSize)'")?;
+        c.error(if (isCreate) argumentCount() else undefinedName(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let allocatorSyntax = c.front.ast.at(arguments, 0);
+    let synthesized = synth(c, allocatorSyntax, none())?;
+    let allocator = autoDeref(c, synthesized)?;
+    let u64Type = c.types.u64;
+    let chunkSyntax = c.front.ast.at(arguments, 1);
+    let chunkSize = checkExpr(c, chunkSyntax, u64Type)?;
+    if (c.isBottom(allocator)) {
+        return c.errorResult(span.start, span.end);
+    }
+    if (!checkRegionAllocator(c, allocator, allocatorSyntax)?) {
+        return c.errorResult(span.start, span.end);
+    }
+    let values = [allocator, chunkSize];
+    let list = c.hir.list(values[..])?;
+    let arena = c.types.arena;
+    return c.expr(HirExpr.BuiltinCall(bfArenaCreate(), list), arena, span.start, span.end);
+}
+
+/// A reference to the receiver of a region method (RegionReceiver, §19.2): shared for allocation, mutable for
+/// `reset`. None after reporting an error.
+fn regionReceiver(
+    c: borrow mut Checker,
+    receiver: u32,
+    regionType: u32,
+    mutable: bool,
+    member: u32,
+    targetSpan: Span,
+) -> Result<u32, AllocError> {
+    let referenceType = c.types.referenceTo(regionType, mutable)?;
+    let t = c.typeOf(receiver);
+    if (c.types.is(t, TypeKind.Reference)) {
+        if (mutable && !c.types.info(t).mutableReference) {
+            var message = Vector<u8>.create();
+            appendQuotedName(mut message, c, c.front.ast.idents[member as usize].symbol)?;
+            appendText(mut message, " takes 'borrow mut this', but this value is behind a shared reference")?;
+            c.error(borrowMutOfImmutable(), targetSpan.start, targetSpan.end, message)?;
+            c.errorResult(targetSpan.start, targetSpan.end)?;
+            return Ok(none());
+        }
+        return coerce(c, receiver, referenceType, targetSpan);
+    }
+    if (mutable) {
+        let borrowed = borrowPlace(c, receiver, true, targetSpan)?;
+        return Ok(if (c.isBottom(borrowed)) none() else borrowed);
+    }
+    let place = toPlace(c, receiver)?;
+    if (place != none()) {
+        return c.expr(HirExpr.Borrow(false, place), referenceType, targetSpan.start, targetSpan.end);
+    }
+    return c.expr(HirExpr.BorrowTemp(false, receiver), referenceType, targetSpan.start, targetSpan.end);
+}
+
+/// R2 (ownership.md): region memory holds no type with drop and nothing scoped (CheckRegionContent, N0264).
+fn checkRegionContent(c: borrow mut Checker, typ: u32, needCopy: bool, span: Span) -> Result<bool, AllocError> {
+    if (c.types.isBottom(typ)) {
+        return Ok(false);
+    }
+    var problem: u32 = 0;
+    if (c.types.is(typ, TypeKind.Void) || c.types.is(typ, TypeKind.Never)) {
+        problem = 1;
+    } else if (c.types.isScoped(typ) && needCopy) {
+        problem = 2;
+    } else if (c.types.is(typ, TypeKind.Reference)) {
+        problem = 3;
+    } else if (c.types.holdsRegionValue(typ)) {
+        problem = 4;
+    } else if (c.types.needsDrop(typ)) {
+        problem = 5;
+    } else if (needCopy && !c.types.isCopy(typ)) {
+        problem = 6;
+    }
+    let found = problem != 0;
+    if (found) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "a region cannot hold a ")?;
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, ": ")?;
+        appendText(mut message, regionContentProblem(problem))?;
+        c.error(notRegionContent(), span.start, span.end, message)?;
+        return Ok(false);
+    }
+    return Ok(true);
+}
+
+fn regionContentProblem(k: u32) -> StringView => match (k) {
+    1 => "it has no value",
+    2 => "it is scoped, and arrays cannot hold scoped elements (type-system.md §25.4)",
+    3 => "it is a reference, and region memory holds values, not bare references (type-system.md §25.4)",
+    4 => "region values and pool boxes stay in locals (type-system.md §25.4)",
+    5 => "it needs drop, and a region releases its memory without destroying values (R2)",
+    _ => "an array allocation copies its fill value, so the type must be Copy",
+};
+
+/// `FixedBufferAllocator.over(mut storage)` (§19.4) and `Scratch.enter()` (§19.5) (CheckRegionConstructor).
+fn checkRegionConstructor(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    isScratch: bool,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let text = c.name(c.front.ast.idents[member as usize].symbol);
+    if (isScratch) {
+        let isEnter = sameText(text, "enter");
+        if (!isEnter || arguments.count != 0) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "a root scratch frame is made with 'Scratch.enter()'")?;
+            c.error(if (isEnter) argumentCount() else undefinedName(), span.start, span.end, message)?;
+            checkArgumentsLoosely(c, arguments)?;
+            return c.errorResult(span.start, span.end);
+        }
+        let frame = c.types.scratchFrame;
+        return c.expr(HirExpr.BuiltinCall(bfScratchEnter(), emptyRange()), frame, span.start, span.end);
+    }
+    let isOver = sameText(text, "over");
+    let storageOperand = if (arguments.count == 1) match (c.front.ast.exprs[c.front.ast.at(arguments, 0) as usize]) {
+        ExprNode.MutArg(operand) => operand,
+        _ => none(),
+    } else none();
+    if (!isOver || arguments.count != 1 || storageOperand == none()) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "a fixed-buffer allocator is made with 'FixedBufferAllocator.over(mut storage)'")?;
+        c.error(if (isOver) argumentCount() else undefinedName(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let argumentSpan = c.front.ast.exprSpans[c.front.ast.at(arguments, 0) as usize];
+    let storage = synth(c, storageOperand, none())?;
+    if (c.isBottom(storage)) {
+        return c.errorResult(span.start, span.end);
+    }
+    let u8Type = c.types.u8;
+    let bytes = c.types.sliceOf(u8Type, true)?;
+    var slice = none();
+    let deref = autoDeref(c, storage)?;
+    let derefType = c.typeOf(deref);
+    if (c.typeOf(storage) == bytes) {
+        slice = coerce(c, storage, bytes, argumentSpan)?; // a reborrow of the caller's slice
+    } else if (c.types.is(
+        derefType,
+        TypeKind.Array,
+    ) && !c.types.isUnsized(derefType) && c.types.info(derefType).element ==
+        u8Type) {
+        let place = toPlace(c, deref)?;
+        if (place == none()) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "the storage must be a variable or field; bind the value to a local first")?;
+            c.error(borrowOfNonPlace(), argumentSpan.start, argumentSpan.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+        var reason = Vector<u8>.create();
+        mutabilityError(c, place, mut reason)?;
+        if (reason.length > 0) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "cannot borrow ")?;
+            describePlace(c, place, mut message)?;
+            appendText(mut message, " as mutable: ")?;
+            appendBytes(mut message, reason.view())?;
+            errorWithLetToVar(c, borrowMutOfImmutable(), argumentSpan.start, argumentSpan.end, message, place, reason)?;
+            return c.errorResult(span.start, span.end);
+        }
+        slice = c.expr(HirExpr.Slice(true, place, none(), none()), bytes, argumentSpan.start, argumentSpan.end)?;
+    } else {
+        let operandSpan = c.front.ast.exprSpans[storageOperand as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "the storage of a fixed-buffer allocator is a '[u8; N]' or a 'SliceMut<u8>'; found ")?;
+        appendQuotedType(mut message, c, c.typeOf(storage))?;
+        c.error(typeMismatch(), operandSpan.start, operandSpan.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let values = [slice];
+    let list = c.hir.list(values[..])?;
+    let fixed = c.types.fixedBufferAllocator;
+    return c.expr(HirExpr.BuiltinCall(bfFixedBufferOver(), list), fixed, span.start, span.end);
+}
+
+/// Region methods (CheckArenaMethod, §19.2, §19.4, §19.5): `alloc(v)` and `allocArray(n, fill)` on every region,
+/// `reset()` on an arena, `enter()` on a scratch frame.
+fn checkArenaMethod(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    receiver: u32,
+    targetSpan: Span,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let receiverType = c.typeOf(receiver);
+    let pointee = c.types.info(receiverType).pointee;
+    let candidate = if (pointee != none()) pointee else receiverType;
+    let regionType = if (c.types.is(candidate, TypeKind.Region)) candidate else c.types.arena;
+    let region = regionIndex(c.types.info(regionType).region);
+    let ident = c.front.ast.idents[member as usize];
+    var textBytes = Vector<u8>.create();
+    appendBytes(mut textBytes, c.name(ident.symbol))?;
+    let text = textBytes.view();
+    let special = if (region == 1) "reset" else if (region == 3) "enter" else "";
+    let hasSpecial = region == 1 || region == 3;
+    let arity: i32 = if (sameText(
+        text,
+        "alloc",
+    )) 1 else if (sameText(text, "allocArray")) 2 else if (hasSpecial && sameText(
+        text,
+        special,
+    )) 0 else -1;
+    if (arity < 0 || truncate<i32>(arguments.count) != arity) {
+        var message = Vector<u8>.create();
+        if (arity < 0) {
+            appendQuotedType(mut message, c, regionType)?;
+            appendText(mut message, " has no method ")?;
+            appendQuotedName(mut message, c, ident.symbol)?;
+            appendText(mut message, "; it has 'alloc(v)', 'allocArray(n, fill)'")?;
+            if (hasSpecial) {
+                appendText(mut message, " and '")?;
+                appendText(mut message, special)?;
+                appendText(mut message, "()'")?;
+            }
+        } else {
+            appendText(mut message, "'")?;
+            appendBytes(mut message, c.typeName(regionType))?;
+            appendText(mut message, ".")?;
+            appendBytes(mut message, text)?;
+            appendText(mut message, "' takes ")?;
+            appendDecimal(mut message, truncate<u64>(arity))?;
+            appendText(mut message, " argument(s)")?;
+        }
+        c.error(if (arity < 0) undefinedName() else argumentCount(), ident.start, ident.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var arena = none();
+    var allocationRight = none();
+    if (region == 3) {
+        // Allocations borrow the frame's memory; allocating and nesting use its allocation right (§19.5).
+        let read = autoDeref(c, receiver)?;
+        let frame = toPlace(c, read)?;
+        if (frame == none()) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "a scratch frame must be bound to a local first: 'using frame = …'")?;
+            c.error(borrowOfNonPlace(), targetSpan.start, targetSpan.end, message)?;
+            checkArgumentsLoosely(c, arguments)?;
+            return c.errorResult(span.start, span.end);
+        }
+        let allocationField = c.frameAllocation;
+        let right = project(c, frame, fieldProjection(allocationField))?;
+        if (sameText(text, "enter")) {
+            var reason = Vector<u8>.create();
+            mutabilityError(c, right, mut reason)?;
+            if (reason.length > 0) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "cannot nest in ")?;
+                describePlace(c, frame, mut message)?;
+                appendText(mut message, ": ")?;
+                appendBytes(mut message, reason.view())?;
+                c.error(borrowMutOfImmutable(), targetSpan.start, targetSpan.end, message)?;
+                checkArgumentsLoosely(c, arguments)?;
+                return c.errorResult(span.start, span.end);
+            }
+            let mutableFrame = c.types.referenceTo(regionType, true)?;
+            arena = c.expr(HirExpr.Borrow(true, right), mutableFrame, targetSpan.start, targetSpan.end)?;
+        } else {
+            let sharedFrame = c.types.referenceTo(regionType, false)?;
+            let memoryField = c.frameMemory;
+            let memory = project(c, frame, fieldProjection(memoryField))?;
+            arena = c.expr(HirExpr.Borrow(false, memory), sharedFrame, targetSpan.start, targetSpan.end)?;
+            allocationRight = c.expr(HirExpr.Borrow(false, right), sharedFrame, targetSpan.start, targetSpan.end)?;
+        }
+    } else {
+        arena = regionReceiver(c, receiver, regionType, hasSpecial && sameText(text, special), member, targetSpan)?;
+    }
+    if (arena == none()) {
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (sameText(text, "reset")) {
+        let values = [arena];
+        let list = c.hir.list(values[..])?;
+        let voidType = c.types.voidType;
+        return c.expr(HirExpr.BuiltinCall(bfArenaReset(), list), voidType, span.start, span.end);
+    }
+    if (sameText(text, "enter")) {
+        let values = [arena];
+        let list = c.hir.list(values[..])?;
+        let frameType = c.types.scratchFrame;
+        return c.expr(HirExpr.BuiltinCall(bfScratchNest(), list), frameType, span.start, span.end);
+    }
+    let isArray = sameText(text, "allocArray");
+    var count = none();
+    if (isArray) {
+        let usize = c.types.usize;
+        let countSyntax = c.front.ast.at(arguments, 0);
+        count = checkExpr(c, countSyntax, usize)?;
+    }
+    let valueSyntax = c.front.ast.at(arguments, arguments.count - 1);
+    let valueSpan = c.front.ast.exprSpans[valueSyntax as usize];
+    var value = synth(c, valueSyntax, none())?;
+    let ownType = c.typeOf(value);
+    value = coerce(c, value, ownType, valueSpan)?;
+    let valueType = c.typeOf(value);
+    if (!checkRegionContent(c, valueType, isArray, valueSpan)?) {
+        return c.errorResult(span.start, span.end);
+    }
+    let allocError = c.allocErrorType;
+    var values = Vector<u32>.create();
+    values.push(arena)?;
+    if (isArray) {
+        values.push(count)?;
+    }
+    values.push(value)?;
+    // A frame's allocation right comes last: the result borrows only from the first argument.
+    if (allocationRight != none()) {
+        values.push(allocationRight)?;
+    }
+    let list = c.hir.list(values.view())?;
+    if (isArray) {
+        let slice = c.types.sliceOf(valueType, true)?;
+        let result = resultOf(c, slice, allocError)?;
+        return c.expr(HirExpr.BuiltinCall(bfArenaAllocArray(), list), result, span.start, span.end);
+    }
+    let reference = c.types.referenceTo(valueType, true)?;
+    let result = resultOf(c, reference, allocError)?;
+    return c.expr(HirExpr.BuiltinCall(bfArenaAlloc(), list), result, span.start, span.end);
+}
+
+fn fieldProjection(field: u32) -> HirProjection =>
+    HirProjection { kind: ProjectionKind.Field, field: field, variant: none(), index: none() };
+
+/// The scratch frame's two region parts (the reference's _frameMemory and _frameAllocation), as fields.
+fn declareFrameFields(c: borrow mut Checker) -> Result<void, AllocError> {
+    let frame = c.types.scratchFrame;
+    let memory = c.intern("memory")?;
+    let allocation = c.intern("allocation")?;
+    c.frameMemory = addRegionPart(c, memory, frame, 0)?;
+    c.frameAllocation = addRegionPart(c, allocation, frame, 1)?;
+    return Ok();
+}
+
+fn addRegionPart(c: borrow mut Checker, name: u32, typ: u32, index: u32) -> Result<u32, AllocError> {
+    c.types.fields.push(StructField {
+        name: name,
+        typ: typ,
+        index: index,
+        start: 0,
+        end: 0,
+        offset: 0,
+        hasNovaCName: false,
+        hasCName: false,
+        cName: emptyRange(),
+        isPrivate: false,
+        isPublic: false,
+        isRegionPart: true,
+    })?;
+    return Ok(truncate<u32>(c.types.fields.length - 1));
+}

@@ -46,13 +46,17 @@ fn resolveGenericType(
     let first = c.front.ast.idents[c.front.ast.at(name.parts, 0) as usize];
     if (name.parts.count == 1) {
         match (c.item(first.symbol)) {
-            Entity.Struct(_) => {
-                c.notPorted(span.start, span.end, "type arguments on a struct", "S4")?;
-                return Ok(c.types.error);
+            Entity.Struct(index) => {
+                let entry = c.structs[index as usize];
+                var itemName = Vector<u8>.create();
+                appendBytes(mut itemName, c.name(first.symbol))?;
+                return resolveRegionItemType(c, entry.typ, entry.item, itemName.view(), arguments, span);
             }
-            Entity.Enum(_) => {
-                c.notPorted(span.start, span.end, "type arguments on an enum", "S4")?;
-                return Ok(c.types.error);
+            Entity.Enum(index) => {
+                let entry = c.enums[index as usize];
+                var itemName = Vector<u8>.create();
+                appendBytes(mut itemName, c.name(first.symbol))?;
+                return resolveRegionItemType(c, entry.typ, entry.item, itemName.view(), arguments, span);
             }
             Entity.LibraryItem(_) => {
                 c.notPorted(span.start, span.end, "a generic struct or enum", "S4/S5")?;
@@ -75,17 +79,25 @@ fn resolveGenericType(
         }
         return resultOf(c, ok, err);
     }
-    if ((sameText(n, "Slice") || sameText(n, "SliceMut")) && arguments.count == 2 && namesStaticRegion(
+    if ((sameText(n, "Slice") || sameText(n, "SliceMut")) && arguments.count == 2 && isRegionName(
         c,
         c.front.ast.at(arguments, 0),
     )) {
-        // `Slice<static, T>`: the region is erased (§25.5); declared regions come with S3.
+        // `Slice<r, T>`: the region is checked and erased (§25.5).
+        let regionArgument = c.front.ast.at(arguments, 0);
+        checkRegionArgument(c, regionArgument)?;
         let element = c.front.ast.at(arguments, 1);
         let mutable = sameText(n, "SliceMut");
         return resolveSliceType(c, element, mutable);
     }
-    if (sameText(n, "StringView") && arguments.count == 1 && namesStaticRegion(c, c.front.ast.at(arguments, 0))) {
-        return Ok(c.types.stringView);
+    if (sameText(n, "StringView") && arguments.count == 1) {
+        let regionArgument = c.front.ast.at(arguments, 0);
+        checkRegionArgument(c, regionArgument)?;
+        return Ok(c.types.stringView); // regions are erased (§25.5)
+    }
+    if ((sameText(n, "Pool") || sameText(n, "PoolBox")) && arguments.count == 1) {
+        let isBox = sameText(n, "PoolBox");
+        return resolvePoolType(c, isBox, arguments);
     }
     if ((sameText(n, "Slice") || sameText(n, "SliceMut")) && arguments.count == 1) {
         let element = c.front.ast.at(arguments, 0);
@@ -108,19 +120,9 @@ fn resolveGenericType(
         return resolveBoxType(c, arguments);
     }
     let one = arguments.count == 1;
-    let oneOrTwo = arguments.count == 1 || arguments.count == 2;
-    let known = (sameText(
-        n,
-        "StringView",
-    ) && one) || ((sameText(n, "Slice") || sameText(n, "SliceMut")) && arguments.count == 2 &&
-        namesRegionCandidate(c, c.front.ast.at(arguments, 0))) || (sameText(
-        n,
-        "Box",
-    ) && oneOrTwo) || ((sameText(n, "Pool") || sameText(n, "PoolBox")) &&
-        one) || (sameText(n, "Vector") && oneOrTwo) || (sameText(n, "String") && one) || ((sameText(n, "SlotMap") ||
-        sameText(n, "StableVector")) && oneOrTwo) || (sameText(n, "Thread") && one) || (sameText(n, "Handle") && one);
+    let known = sameText(n, "Thread") && one; // `Thread<T>` comes with threads (S6)
     if (known) {
-        c.notPorted(span.start, span.end, "this built-in generic type", "S2e/S3")?;
+        c.notPorted(span.start, span.end, "this built-in generic type", "S6")?;
         return Ok(c.types.error);
     }
     var message = Vector<u8>.create();
@@ -508,25 +510,3 @@ fn findJump(c: borrow Checker, stmt: u32) -> u32 {
         _ => { return none(); }
     }
 }
-
-/// Is the type syntax the region name `static` (IsRegionName; declared regions come with S3)?
-fn namesStaticRegion(c: borrow Checker, typ: u32) -> bool {
-    match (c.front.ast.types[typ as usize]) {
-        TypeNode.Named(q) => {
-            if (q.parts.count != 1) {
-                return false;
-            }
-            return sameText(c.name(c.front.ast.idents[c.front.ast.at(q.parts, 0) as usize].symbol), "static");
-        }
-        _ => { return false; }
-    }
-}
-
-/// A single name that could be a declared region (S3 knows them); `static` is handled before.
-fn namesRegionCandidate(c: borrow Checker, typ: u32) -> bool => match (c.front.ast.types[typ as usize]) {
-    TypeNode.Named(q) => q.parts.count == 1 && c.types.lookup(c.name(c.front.ast.idents[c.front.ast.at(
-        q.parts,
-        0,
-    ) as usize].symbol)) == none(),
-    _ => false,
-};
