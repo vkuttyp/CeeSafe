@@ -661,6 +661,27 @@ fn synthCall(
         ExprNode.Member(target, member) => {
             match (c.front.ast.exprs[target as usize]) {
                 ExprNode.Name(targetName, typeArguments) => {
+                    match (c.lookup(c.front.ast.idents[targetName as usize].symbol)) {
+                        Entity.Builtin(b) => {
+                            if (b == builtinVector() || b == builtinString()) {
+                                let isString = b == builtinString();
+                                return checkVectorCreate(
+                                    c,
+                                    member,
+                                    target,
+                                    typeArguments,
+                                    isString,
+                                    arguments,
+                                    expected,
+                                    span,
+                                );
+                            }
+                            if (b == builtinStringView() && typeArguments.count == 0) {
+                                return checkStringViewFunction(c, member, arguments, span);
+                            }
+                        }
+                        _ => {}
+                    }
                     if (typeArguments.count == 0) {
                         let symbol = c.front.ast.idents[targetName as usize].symbol;
                         let entity = c.lookup(symbol);
@@ -894,15 +915,21 @@ fn checkBuiltinMemberCall(
     return c.expr(HirExpr.BuiltinCall(function, list), voidType, span.start, span.end);
 }
 
-/// ViewOf, and a String place as a view of its text (PrintableView): strings come with S3.
+/// ViewOf, and a String place as a view of its text (PrintableView, §23.2).
 fn printableView(c: borrow mut Checker, e: u32) -> Result<u32, AllocError> {
-    let value = viewOf(c, e);
-    if (value == e && c.types.info(c.typeOf(e)).isStr) {
-        let span = c.spanOf(e);
-        c.notPorted(span.start, span.end, "printing a String", "S3")?;
-        return c.errorResult(span.start, span.end);
+    let isStringText = c.types.info(c.typeOf(e)).isStr && match (c.hir.exprs[e as usize]) {
+        HirExpr.Deref(r) => c.types.isString(c.typeOf(r)),
+        _ => false,
+    };
+    if (isStringText) {
+        let place = toPlace(c, e)?;
+        if (place != none()) {
+            let span = c.spanOf(e);
+            let view = c.types.stringView;
+            return c.expr(HirExpr.Borrow(false, place), view, span.start, span.end);
+        }
     }
-    return Ok(value);
+    return Ok(viewOf(c, e));
 }
 
 /// Does a flexible expression hold a float literal (HasFloatLiteral)?
@@ -1095,9 +1122,16 @@ fn synthMember(c: borrow mut Checker, target: u32, member: u32, span: Span) -> R
         through = c.expr(HirExpr.Deref(through), pointee, s.start, s.end)?;
     }
     let throughType = c.typeOf(through);
-    if (c.types.is(throughType, TypeKind.SlotMap) || c.types.is(throughType, TypeKind.Vector)) {
-        c.notPorted(span.start, span.end, "a container's length or capacity", "S3")?;
+    if (c.types.is(throughType, TypeKind.SlotMap)) {
+        c.notPorted(span.start, span.end, "a slot map's length", "S3c")?;
         return c.errorResult(span.start, span.end);
+    }
+    if (c.types.is(throughType, TypeKind.Vector) && sameText(
+        c.name(c.front.ast.idents[member as usize].symbol),
+        "capacity",
+    )) {
+        let targetSpan = c.front.ast.exprSpans[target as usize];
+        return vectorCapacity(c, through, targetSpan, span);
     }
     let value = autoDeref(c, synthesized)?;
     let valueType = c.typeOf(value);

@@ -1,0 +1,521 @@
+// Vectors, strings and string views (the reference's ResolveVectorType, VectorType, the String case of a named type,
+// CheckVectorCreate, CheckVectorMethod, NumberToFormat, CheckViewMethod, CheckSliceMethod's copyFrom and fill,
+// CheckStringViewFunction, PrintableView, and the vector cases of SynthMember and CheckFor): P3 S3b. The methods that
+// call lib/core (`retain`, `swap`, `sortBy`, `forEach`, `any`, `all`, `splitAt`, `splitAtMut`) come with the library
+// (S5) and closures (S6).
+
+fn builtinVector() -> u32 => 12;
+fn builtinString() -> u32 => 13;
+fn builtinStringView() -> u32 => 22;
+
+/// The vector or string type, with the types its built-in operations return: `Result<void, AllocError>` and, for a
+/// vector, `T?` (VectorType, §23). `element` is none for a string.
+fn vectorType(c: borrow mut Checker, element: u32, allocator: u32) -> Result<u32, AllocError> {
+    let voidType = c.types.voidType;
+    let allocError = c.allocErrorType;
+    resultOf(c, voidType, allocError)?;
+    if (element != none()) {
+        optionOf(c, element)?;
+    }
+    let systemHeap = c.systemHeapType;
+    return c.types.vectorOf(element, allocator, allocator == systemHeap);
+}
+
+/// `Vector<T>`, `Vector<T, A>`, `String`, `String<A>` (ResolveVectorType).
+fn resolveVectorType(c: borrow mut Checker, isString: bool, arguments: Range) -> Result<u32, AllocError> {
+    var element = none();
+    if (!isString) {
+        let elementSyntax = c.front.ast.at(arguments, 0);
+        element = c.resolveType(elementSyntax, false)?;
+    }
+    let allocatorIndex: u32 = if (isString) 0 else 1;
+    var allocator = c.systemHeapType;
+    if (arguments.count > allocatorIndex) {
+        let allocatorSyntax = c.front.ast.at(arguments, allocatorIndex);
+        allocator = c.resolveType(allocatorSyntax, false)?;
+    }
+    if ((element != none() && c.types.isBottom(element)) || c.types.isBottom(allocator)) {
+        return Ok(c.types.error);
+    }
+    if (!isAllocatorType(c, allocator)) {
+        let span = c.front.ast.typeSpans[c.front.ast.at(arguments, allocatorIndex) as usize];
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, allocator)?;
+        appendText(mut message, " is not an allocator type; use 'SystemHeap' or 'FailingAllocator'")?;
+        c.error(notAnAllocator(), span.start, span.end, message)?;
+        return Ok(c.types.error);
+    }
+    if (element != none() && c.types.holdsRegionValue(element)) {
+        let span = c.front.ast.typeSpans[c.front.ast.at(arguments, 0) as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "a 'Vector' cannot hold ")?;
+        appendQuotedType(mut message, c, element)?;
+        appendText(mut message, ": region values and pool boxes stay in locals (type-system.md §25.4)")?;
+        c.error(referenceNotAllowed(), span.start, span.end, message)?;
+        return Ok(c.types.error);
+    }
+    return vectorType(c, element, allocator); // scoped elements make a scoped vector (§25.3, §25.4)
+}
+
+/// A built-in container name written without its type arguments: `String` is a string, the others need theirs.
+fn resolveBareContainer(c: borrow mut Checker, text: Slice<u8>, span: Span) -> Result<u32, AllocError> {
+    if (sameText(text, "String")) {
+        return resolveVectorType(c, true, emptyRange());
+    }
+    var message = Vector<u8>.create();
+    appendText(mut message, "'")?;
+    appendBytes(mut message, text)?;
+    appendText(mut message, "' needs its element type: '")?;
+    appendBytes(mut message, text)?;
+    appendText(mut message, "<T>'")?;
+    c.error(unknownType(), span.start, span.end, message)?;
+    return Ok(c.types.error);
+}
+
+fn isBareContainerName(text: Slice<u8>) -> bool =>
+    sameText(
+        text,
+        "String",
+    ) || sameText(text, "Vector") || sameText(text, "SlotMap") || sameText(text, "StableVector") ||
+        sameText(text, "Handle");
+
+/// `Vector.create()`, `Vector<T>.withCapacity(n)`, `String.create()` (CheckVectorCreate, §23).
+fn checkVectorCreate(
+    c: borrow mut Checker,
+    member: u32,
+    target: u32,
+    typeArguments: Range,
+    isString: bool,
+    arguments: Range,
+    expected: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let kind = if (isString) "String" else "Vector";
+    let ident = c.front.ast.idents[member as usize];
+    let text = c.name(ident.symbol);
+    let withCapacity = sameText(text, "withCapacity");
+    if (!withCapacity && !sameText(text, "create")) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendText(mut message, kind)?;
+        appendText(mut message, "' has no function ")?;
+        appendQuotedName(mut message, c, ident.symbol)?;
+        appendText(mut message, "; use '")?;
+        appendText(mut message, kind)?;
+        appendText(mut message, ".create()' or '")?;
+        appendText(mut message, kind)?;
+        appendText(mut message, ".withCapacity(n)'")?;
+        c.error(undefinedName(), ident.start, ident.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (arguments.count != (if (withCapacity) 1u32 else 0u32)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendText(mut message, kind)?;
+        if (withCapacity) {
+            appendText(mut message, ".withCapacity' takes the number of elements: '")?;
+            appendText(mut message, kind)?;
+            appendText(mut message, ".withCapacity(n)'")?;
+        } else {
+            appendText(mut message, ".create' takes no arguments: '")?;
+            appendText(mut message, kind)?;
+            appendText(mut message, ".create()'")?;
+        }
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var capacity = none();
+    if (withCapacity) {
+        let usize = c.types.usize;
+        let argument = c.front.ast.at(arguments, 0);
+        capacity = checkExpr(c, argument, usize)?;
+    }
+    var vector = none();
+    if (typeArguments.count > 0) {
+        if (typeArguments.count > (if (isString) 1u32 else 2u32)) {
+            let targetSpan = c.front.ast.exprSpans[target as usize];
+            var message = Vector<u8>.create();
+            appendText(
+                mut message,
+                if (isString) "'String' takes at most one type argument: 'String<A>'" else "'Vector' takes one or two type arguments: 'Vector<T>' or 'Vector<T, A>'",
+            )?;
+            c.error(unknownType(), targetSpan.start, targetSpan.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+        vector = resolveVectorType(c, isString, typeArguments)?;
+    } else {
+        var hint = expected;
+        if (withCapacity) {
+            hint = if (expected != none() && isResultType(c, expected)) resultOk(c, expected) else none();
+        }
+        if (hint != none() && c.types.is(hint, TypeKind.Vector) && c.types.isString(hint) == isString) {
+            vector = hint;
+        } else if (isString) {
+            vector = resolveVectorType(c, true, emptyRange())?;
+        }
+    }
+    if (vector == none()) {
+        if (expected == none() || !c.types.isBottom(expected)) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "the element type of 'Vector.")?;
+            appendBytes(mut message, c.name(ident.symbol))?;
+            appendText(mut message, "(...)' is unknown here; write 'Vector<T>.")?;
+            appendBytes(mut message, c.name(ident.symbol))?;
+            appendText(mut message, "(...)' or give the variable a type")?;
+            c.error(resultTypeUnknown(), span.start, span.end, message)?;
+        }
+        return c.errorResult(span.start, span.end);
+    }
+    if (c.types.isBottom(vector) || (capacity != none() && c.isBottom(capacity))) {
+        return c.errorResult(span.start, span.end);
+    }
+    if (withCapacity) {
+        let values = [capacity];
+        let list = c.hir.list(values[..])?;
+        let allocError = c.allocErrorType;
+        let result = resultOf(c, vector, allocError)?;
+        return c.expr(HirExpr.BuiltinCall(bfVectorWithCapacity(), list), result, span.start, span.end);
+    }
+    return c.expr(HirExpr.BuiltinCall(bfVectorCreate(), emptyRange()), vector, span.start, span.end);
+}
+
+/// A vector's or string's methods (CheckVectorMethod, §23).
+fn checkVectorMethod(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    vector: u32,
+    targetSpan: Span,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let typ = c.typeOf(vector);
+    let isString = c.types.isString(typ);
+    let ident = c.front.ast.idents[member as usize];
+    var textBytes = Vector<u8>.create();
+    appendBytes(mut textBytes, c.name(ident.symbol))?;
+    let text = textBytes.view();
+    let arity = vectorMethodArity(isString, text);
+    if (arity < 0) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, " has no method ")?;
+        appendQuotedName(mut message, c, ident.symbol)?;
+        appendText(
+            mut message,
+            if (isString) "; it has 'append', 'appendNumber', 'clear', 'view', 'bytes'" else "; it has 'push', 'pop', 'clear', 'view', 'viewMut', 'retain', 'truncate', 'swap', 'sortBy', 'forEach', 'any', 'all', 'splitAt', 'splitAtMut'",
+        )?;
+        c.error(undefinedName(), ident.start, ident.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (truncate<i32>(arguments.count) != arity) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, text)?;
+        appendText(mut message, if (arity == 0) "' takes no arguments" else "' takes one argument")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let pointee = c.types.info(typ).pointee;
+    if (!isString && (sameText(
+        text,
+        "swap",
+    ) || sameText(text, "sortBy") || sameText(text, "forEach") || sameText(text, "any") ||
+        sameText(
+            text,
+            "all",
+        ) || sameText(text, "splitAt") || sameText(text, "splitAtMut") || sameText(text, "retain"))) {
+        c.notPorted(span.start, span.end, "a vector method that calls lib/core", "S5/S6")?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (sameText(text, "view") || sameText(text, "bytes") || sameText(text, "viewMut")) {
+        let s = c.spanOf(vector);
+        let elements = c.expr(HirExpr.Deref(vector), pointee, s.start, s.end)?;
+        let view = borrowPlace(c, elements, sameText(text, "viewMut"), span)?;
+        if (sameText(text, "bytes") && !c.isBottom(view)) {
+            let u8Type = c.types.u8;
+            let bytes = c.types.sliceOf(u8Type, false)?;
+            return c.expr(HirExpr.Cast(view), bytes, span.start, span.end);
+        }
+        return Ok(view);
+    }
+    // Two-phase (B5): the argument is checked (and later evaluated) before the receiver's mutable loan.
+    var argument = none();
+    if (arguments.count > 0) {
+        let argumentSyntax = c.front.ast.at(arguments, 0);
+        if (sameText(text, "push")) {
+            let element = c.types.info(pointee).element;
+            argument = checkExpr(c, argumentSyntax, element)?;
+        } else if (sameText(text, "append")) {
+            let view = c.types.stringView;
+            argument = checkArgument(c, argumentSyntax, view)?;
+        } else if (sameText(text, "appendNumber")) {
+            argument = numberToFormat(c, argumentSyntax)?;
+        } else if (sameText(text, "truncate")) {
+            let usize = c.types.usize;
+            argument = checkExpr(c, argumentSyntax, usize)?;
+        }
+    }
+    let receiver = borrowPlace(c, vector, true, targetSpan)?;
+    if (c.isBottom(receiver) || (argument != none() && c.isBottom(argument))) {
+        return c.errorResult(span.start, span.end);
+    }
+    let voidType = c.types.voidType;
+    let allocError = c.allocErrorType;
+    let voidResult = resultOf(c, voidType, allocError)?;
+    var values = Vector<u32>.create();
+    values.push(receiver)?;
+    if (argument != none()) {
+        values.push(argument)?;
+    }
+    let list = c.hir.list(values.view())?;
+    if (sameText(text, "push")) {
+        return c.expr(HirExpr.BuiltinCall(bfVectorPush(), list), voidResult, span.start, span.end);
+    }
+    if (sameText(text, "append")) {
+        return c.expr(HirExpr.BuiltinCall(bfStringAppend(), list), voidResult, span.start, span.end);
+    }
+    if (sameText(text, "appendNumber")) {
+        return c.expr(HirExpr.BuiltinCall(bfStringAppendNumber(), list), voidResult, span.start, span.end);
+    }
+    if (sameText(text, "pop")) {
+        let element = c.types.info(pointee).element;
+        let option = optionOf(c, element)?;
+        return c.expr(HirExpr.BuiltinCall(bfVectorPop(), list), option, span.start, span.end);
+    }
+    if (sameText(text, "truncate")) {
+        return c.expr(HirExpr.BuiltinCall(bfVectorTruncate(), list), voidType, span.start, span.end);
+    }
+    return c.expr(HirExpr.BuiltinCall(bfVectorClear(), list), voidType, span.start, span.end);
+}
+
+/// The number of arguments a vector's (or a string's) method takes, or -1 if it has no such method.
+fn vectorMethodArity(isString: bool, text: Slice<u8>) -> i32 {
+    if (isString) {
+        if (sameText(text, "append") || sameText(text, "appendNumber")) {
+            return 1;
+        }
+        if (sameText(text, "clear") || sameText(text, "view") || sameText(text, "bytes")) {
+            return 0;
+        }
+        return -1;
+    }
+    if (sameText(text, "push") || sameText(text, "retain") || sameText(text, "truncate") || sameText(text, "sortBy") ||
+        sameText(text, "forEach") || sameText(text, "any") || sameText(text, "all") || sameText(text, "splitAt") ||
+        sameText(text, "splitAtMut")) {
+        return 1;
+    }
+    if (sameText(text, "pop") || sameText(text, "clear") || sameText(text, "view") || sameText(text, "viewMut")) {
+        return 0;
+    }
+    if (sameText(text, "swap")) {
+        return 2;
+    }
+    return -1;
+}
+
+/// The argument of `s.appendNumber(n)` (NumberToFormat, §23.2, §35.7): an integer or float, or a reference to one.
+fn numberToFormat(c: borrow mut Checker, argument: u32) -> Result<u32, AllocError> {
+    let synthesized = synth(c, argument, none())?;
+    let value = autoDeref(c, synthesized)?;
+    let t = c.typeOf(value);
+    if (!c.types.isBottom(t) && !c.types.is(t, TypeKind.Integer) && !c.types.is(t, TypeKind.Float)) {
+        let span = c.front.ast.exprSpans[argument as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "'appendNumber' appends an integer or a float, not ")?;
+        appendQuotedType(mut message, c, t)?;
+        c.error(invalidOperandTypes(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    return Ok(value);
+}
+
+/// `s.bytes()` (CheckViewMethod, §22.2): the view's bytes as a `Slice<u8>`, with the view's loans.
+fn checkViewMethod(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    view: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let ident = c.front.ast.idents[member as usize];
+    if (!sameText(c.name(ident.symbol), "bytes")) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'StringView' has no method ")?;
+        appendQuotedName(mut message, c, ident.symbol)?;
+        appendText(mut message, "; it has 'bytes()' and 'length'")?;
+        c.error(undefinedName(), ident.start, ident.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (arguments.count != 0) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'bytes' takes no arguments: 's.bytes()'")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let u8Type = c.types.u8;
+    let bytes = c.types.sliceOf(u8Type, false)?;
+    return c.expr(HirExpr.Cast(view), bytes, span.start, span.end);
+}
+
+/// `d.copyFrom(s)` and `d.fill(v)` (CheckSliceMethod, §16.5): `slice` is the receiver, already borrowed; it is
+/// evaluated before the argument (not two-phase).
+fn checkSliceMethod(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    slice: u32,
+    targetSpan: Span,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let ident = c.front.ast.idents[member as usize];
+    var textBytes = Vector<u8>.create();
+    appendBytes(mut textBytes, c.name(ident.symbol))?;
+    let text = textBytes.view();
+    if (sameText(text, "sortBy") || sameText(text, "forEach") || sameText(text, "any") || sameText(text, "all") ||
+        sameText(text, "swap") || sameText(text, "splitAt") || sameText(text, "splitAtMut")) {
+        c.notPorted(span.start, span.end, "a slice method that calls lib/core", "S5/S6")?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let sliceType = c.typeOf(slice);
+    if (!sameText(text, "copyFrom") && !sameText(text, "fill")) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, sliceType)?;
+        appendText(mut message, " has no method ")?;
+        appendQuotedName(mut message, c, ident.symbol)?;
+        appendText(
+            mut message,
+            "; slices have 'copyFrom', 'fill', 'swap', 'sortBy', 'forEach', 'any', 'all', 'splitAt' and 'splitAtMut'",
+        )?;
+        c.error(undefinedName(), ident.start, ident.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (arguments.count != 1) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, text)?;
+        appendText(mut message, "' takes one argument")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (c.types.isBottom(sliceType)) {
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let element = c.types.info(c.types.info(sliceType).pointee).element;
+    if (!c.types.info(sliceType).mutableReference) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, text)?;
+        appendText(mut message, "' writes through the slice, which is a ")?;
+        appendQuotedType(mut message, c, sliceType)?;
+        appendText(mut message, "; it needs a 'SliceMut<")?;
+        appendBytes(mut message, c.typeName(element))?;
+        appendText(mut message, ">'")?;
+        c.error(assignToImmutable(), targetSpan.start, targetSpan.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (!c.types.isCopy(element)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, text)?;
+        appendText(mut message, "' copies elements, so the element type must be Copy; ")?;
+        appendQuotedType(mut message, c, element)?;
+        appendText(mut message, " is not")?;
+        c.error(invalidArray(), ident.start, ident.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let argumentSyntax = c.front.ast.at(arguments, 0);
+    let copyFrom = sameText(text, "copyFrom");
+    var argument = none();
+    if (copyFrom) {
+        let source = c.types.sliceOf(element, false)?;
+        argument = checkArgument(c, argumentSyntax, source)?;
+    } else {
+        argument = checkExpr(c, argumentSyntax, element)?;
+    }
+    if (c.isBottom(argument)) {
+        return c.errorResult(span.start, span.end);
+    }
+    let values = [slice, argument];
+    let list = c.hir.list(values[..])?;
+    let voidType = c.types.voidType;
+    let function = if (copyFrom) bfSliceCopy() else bfSliceFill();
+    return c.expr(HirExpr.BuiltinCall(function, list), voidType, span.start, span.end);
+}
+
+/// `StringView.fromUtf8(bytes)` (CheckStringViewFunction, §22.2).
+fn checkStringViewFunction(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let ident = c.front.ast.idents[member as usize];
+    if (!sameText(c.name(ident.symbol), "fromUtf8")) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'StringView' has no function ")?;
+        appendQuotedName(mut message, c, ident.symbol)?;
+        appendText(mut message, "; it has 'fromUtf8' (type-system.md §22.2)")?;
+        c.error(undefinedName(), ident.start, ident.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (arguments.count != 1) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'StringView.fromUtf8' takes 1 argument but ")?;
+        appendDecimal(mut message, arguments.count as u64)?;
+        appendText(mut message, " were supplied")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let u8Type = c.types.u8;
+    let bytesType = c.types.sliceOf(u8Type, false)?;
+    let argument = c.front.ast.at(arguments, 0);
+    let bytes = checkArgument(c, argument, bytesType)?;
+    if (c.isBottom(bytes)) {
+        return c.errorResult(span.start, span.end);
+    }
+    let values = [bytes];
+    let list = c.hir.list(values[..])?;
+    let view = c.types.stringView;
+    let option = optionOf(c, view)?;
+    return c.expr(HirExpr.BuiltinCall(bfStringViewFromUtf8(), list), option, span.start, span.end);
+}
+
+/// `v.capacity`: the vector's capacity, read through a shared borrow.
+fn vectorCapacity(c: borrow mut Checker, vector: u32, targetSpan: Span, span: Span) -> Result<u32, AllocError> {
+    let borrowed = borrowPlace(c, vector, false, targetSpan)?;
+    if (c.isBottom(borrowed)) {
+        return Ok(borrowed);
+    }
+    let values = [borrowed];
+    let list = c.hir.list(values[..])?;
+    let usize = c.types.usize;
+    return c.expr(HirExpr.BuiltinCall(bfVectorCapacity(), list), usize, span.start, span.end);
+}
+
+/// `for (x in v)` over a vector (CheckFor): over a view, which keeps the vector borrowed for the whole loop (§23.1).
+fn forOverVector(c: borrow mut Checker, vector: u32, span: Span) -> Result<u32, AllocError> {
+    let s = c.spanOf(vector);
+    let pointee = c.types.info(c.typeOf(vector)).pointee;
+    let elements = c.expr(HirExpr.Deref(vector), pointee, s.start, s.end)?;
+    let view = borrowPlace(c, elements, false, span)?;
+    if (c.isBottom(view)) {
+        return Ok(view);
+    }
+    let v = c.spanOf(view);
+    return c.expr(HirExpr.Deref(view), pointee, v.start, v.end);
+}

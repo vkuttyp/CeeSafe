@@ -1,0 +1,33 @@
+fn main() {
+    let a = Vector.create();
+    let b = Vector.make();
+    let c = Vector<i32>.withCapacity();
+    let d = Vector<i32, SystemHeap, u8>.create();
+    let e = String<u8, u8>.create();
+    let f: Vector<i32, u8> = Vector.create();
+    let g: Vector = Vector.create();
+    let h: SlotMap = 1;
+    var v = Vector<i32>.create();
+    v.push(true)!;
+    v.push()!;
+    v.fly();
+    var s = String.create();
+    s.append(5)!;
+    s.appendNumber("x")!;
+    s.push(1)!;
+    let sv = "abc";
+    let x = sv.upper();
+    let y = sv.bytes(1);
+    let z = StringView.fromBytes(1);
+    let w = StringView.fromUtf8();
+    let q = [1u8, 2u8];
+    q[0..1].fill(3);
+    let r = q[..];
+    r.fill(1);
+    r.copyFrom(r);
+    var t = [1u8, 2u8];
+    t[0..1].fill(true);
+    t[0..1].fill();
+    t[0..1].paint(1);
+    let k = v.capacities;
+}

@@ -243,6 +243,20 @@ fn checkMethodCall(
 ) -> Result<u32, AllocError> {
     let targetSpan = c.front.ast.exprSpans[target as usize];
     let memberIdent = c.front.ast.idents[member as usize];
+    match (c.front.ast.exprs[target as usize]) {
+        ExprNode.Slice(sliced, low, high) => {
+            let name = c.name(memberIdent.symbol);
+            if (isSliceMethodName(name)) {
+                // `a[lo..hi].copyFrom(s)`: the receiver is `borrow mut a[lo..hi]` (§16.5), or `borrow a[lo..hi]` for a
+                // method that only reads (§36.4).
+                let mutable = !(sameText(name, "forEach") || sameText(name, "any") || sameText(name, "all") ||
+                    sameText(name, "splitAt"));
+                let slice = synthSlice(c, sliced, low, high, mutable, targetSpan)?;
+                return checkSliceMethod(c, member, arguments, slice, targetSpan, span);
+            }
+        }
+        _ => {}
+    }
     var receiver = synth(c, target, none())?;
     if (c.isBottom(receiver)) {
         checkArgumentsLoosely(c, arguments)?;
@@ -250,12 +264,45 @@ fn checkMethodCall(
     }
     let read = autoDeref(c, receiver)?;
     let readType = c.typeOf(read);
-    if (!c.types.is(readType, TypeKind.Struct) || c.types.info(readType).structDef == none()) {
-        return checkNonStructMethod(c, receiver, readType, member, arguments, span);
+    if (c.types.isUnsized(readType)) {
+        match (c.hir.exprs[read as usize]) {
+            HirExpr.Deref(reference) => {
+                let sliceType = c.typeOf(reference);
+                if (c.types.isSlice(sliceType) && !c.types.isStringView(sliceType)) {
+                    let slice = coerce(c, reference, sliceType, targetSpan)?; // a SliceMut is reborrowed
+                    return checkSliceMethod(c, member, arguments, slice, targetSpan, span);
+                }
+            }
+            _ => {}
+        }
+    }
+    var vector = receiver;
+    loop {
+        let t = c.typeOf(vector);
+        if (!c.types.is(t, TypeKind.Reference)) {
+            break;
+        }
+        let s = c.spanOf(vector);
+        vector = c.expr(HirExpr.Deref(vector), c.types.info(t).pointee, s.start, s.end)?;
+    }
+    if (c.types.is(c.typeOf(vector), TypeKind.Vector)) {
+        return checkVectorMethod(c, member, arguments, vector, targetSpan, span);
     }
     let receiverType = c.typeOf(receiver);
-    if (c.types.is(receiverType, TypeKind.Box)) {
+    let receiverPointee = c.types.info(receiverType).pointee;
+    if (c.types.is(
+        receiverType,
+        TypeKind.Box,
+    ) || (receiverPointee != none() && c.types.is(receiverPointee, TypeKind.Box))) {
         receiver = read; // the method receives the box's contents (§18.2)
+    }
+    let readAgain = autoDeref(c, receiver)?;
+    let view = viewOf(c, readAgain);
+    if (c.types.isStringView(c.typeOf(view))) {
+        return checkViewMethod(c, member, arguments, view, span);
+    }
+    if (!c.types.is(readType, TypeKind.Struct) || c.types.info(readType).structDef == none()) {
+        return checkNonStructMethod(c, receiver, readType, member, arguments, span);
     }
     let currentType = c.typeOf(receiver);
     let structType = if (c.types.is(
@@ -390,3 +437,8 @@ fn checkNonStructMethod(
     checkArgumentsLoosely(c, arguments)?;
     return c.errorResult(span.start, span.end);
 }
+
+fn isSliceMethodName(name: Slice<u8>) -> bool =>
+    sameText(name, "copyFrom") || sameText(name, "fill") || sameText(name, "swap") || sameText(name, "sortBy") ||
+        sameText(name, "forEach") || sameText(name, "any") || sameText(name, "all") || sameText(name, "splitAt") ||
+        sameText(name, "splitAtMut");

@@ -285,6 +285,13 @@ struct Checker {
                 let ident = this.front.ast.idents[this.front.ast.at(q.parts, 0) as usize];
                 var text = Vector<u8>.create();
                 appendBytes(mut text, this.name(ident.symbol))?;
+                let undeclared = match (this.item(ident.symbol)) {
+                    Entity.None => true,
+                    _ => false,
+                };
+                if (isBareContainerName(text.view()) && undeclared) {
+                    return resolveBareContainer(this, text.view(), span);
+                }
                 var found = this.types.lookup(text.view());
                 if (found == none()) {
                     match (this.item(ident.symbol)) {

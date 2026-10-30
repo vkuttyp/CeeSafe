@@ -407,8 +407,7 @@ fn forSequence(c: borrow mut Checker, startSyntax: u32, variableType: borrow mut
         c.error(typeMismatch(), span.start, span.end, message)?;
         start = c.errorResult(span.start, span.end)?;
     } else if (c.types.is(vt, TypeKind.Vector) && !c.types.isString(vt)) {
-        c.notPorted(span.start, span.end, "'for' over a vector", "S3")?;
-        start = c.errorResult(span.start, span.end)?;
+        start = forOverVector(c, vector, span)?;
     } else {
         start = autoDeref(c, sequence)?;
     }

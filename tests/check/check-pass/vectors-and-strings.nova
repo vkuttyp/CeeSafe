@@ -1,0 +1,60 @@
+struct Log { lines: Vector<i32>; name: String; }
+
+fn total(xs: Slice<i32>) -> i32 {
+    var sum = 0;
+    for (x in xs) {
+        sum += x;
+    }
+    return sum;
+}
+
+fn build() -> Result<Vector<i32>, AllocError> {
+    var v = Vector<i32>.withCapacity(4)?;
+    v.push(1)?;
+    v.push(2)?;
+    let w: Vector<u8, FailingAllocator> = Vector.create();
+    return Ok(v);
+}
+
+fn text() -> Result<String, AllocError> {
+    var s = String.create();
+    s.append("n = ")?;
+    s.appendNumber(42)?;
+    s.appendNumber(1.5)?;
+    let n: u16 = 7;
+    s.appendNumber(n)?;
+    return Ok(s);
+}
+
+fn main() {
+    var v = build()!;
+    let t = total(v.view()) + total(v);
+    let last = v.pop();
+    v.truncate(1);
+    let n = v.length + v.capacity;
+    let first = v[0];
+    v[0] = 5;
+    for (x in v) {
+        let y = x;
+    }
+    let m = v.viewMut();
+    m[0] = 3;
+    v.clear();
+    var s = text()!;
+    Console.writeLine(s);
+    Console.write(s.view());
+    let bytes = s.bytes();
+    let sv = "hello";
+    let raw = sv.bytes();
+    let back = StringView.fromUtf8(raw);
+    let len = sv.length + s.length;
+    var buffer = [0u8; 8];
+    buffer[0..2].copyFrom(raw[0..2]);
+    buffer[2..4].fill(9);
+    let window = borrow mut buffer[4..];
+    window.fill(1);
+    var log = Log { lines: Vector.create(), name: String.create() };
+    log.lines.push(1)!;
+    log.name.append("x")!;
+    let g: String<SystemHeap> = String.create();
+}
