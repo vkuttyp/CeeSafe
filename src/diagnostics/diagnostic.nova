@@ -100,6 +100,35 @@ struct Diagnostics {
         return Ok();
     }
 
+    /// An error with a fix that replaces [fixStart, fixEnd) of the same file with `fixText`.
+    fn errorWithEdit(
+        borrow mut this,
+        code: u32,
+        file: u32,
+        start: u32,
+        end: u32,
+        message: Vector<u8>,
+        fixTitle: Vector<u8>,
+        fixStart: u32,
+        fixEnd: u32,
+        fixText: Vector<u8>,
+    ) -> Result<void, AllocError> {
+        this.items.push(Diagnostic {
+            code: code,
+            isError: true,
+            file: file,
+            start: start,
+            end: end,
+            message: message,
+            hasFix: true,
+            fixTitle: fixTitle,
+            fixStart: fixStart,
+            fixEnd: fixEnd,
+            fixText: fixText,
+        })?;
+        return Ok();
+    }
+
     /// Whether any diagnostic so far is in `file`.
     fn anyIn(borrow this, file: u32) -> bool {
         for (i in 0..this.items.length) {

@@ -1,0 +1,686 @@
+// Function bodies and statements (the reference's CheckFunctionBody, CheckBlock, CheckStmt, CheckLocalDecl,
+// CheckAssign, ResolveAssignmentTarget, MutabilityError, CheckIf, CheckFor, CheckReturn and
+// CheckExpressionStatement) and the missing-return analysis (Semantics/FlowAnalysis.cs), for what S1a supports.
+
+fn checkFunctionBody(c: borrow mut Checker, function: u32) -> Result<void, AllocError> {
+    c.file = c.hir.functions[function as usize].file;
+    c.function = function;
+    c.loopDepth = 0;
+    c.scopes.truncate(0);
+    c.scopeStarts.truncate(0);
+    c.pushScope()?;
+    for (k in 0..c.hir.functions[function as usize].parameters.length) {
+        let p = c.hir.functions[function as usize].parameters[k];
+        let symbol = c.hir.locals[p as usize].name;
+        // TryAdd: a repeated parameter name keeps its first local.
+        var present = false;
+        for (e in c.scopes.view()) {
+            if (e.symbol == symbol) {
+                present = true;
+            }
+        }
+        if (!present) {
+            c.bind(symbol, p)?;
+        }
+    }
+    let syntax = c.front.ast.functions[c.hir.functions[function as usize].syntax as usize];
+    var body = none();
+    if (syntax.body != none()) {
+        body = checkBlock(c, syntax.body)?;
+    } else {
+        let e = syntax.expressionBody;
+        let span = c.front.ast.exprSpans[e as usize];
+        let returnType = c.hir.functions[function as usize].returnType;
+        var statement: u32 = 0;
+        if (c.types.is(returnType, TypeKind.Void)) {
+            let value = checkExpressionStatement(c, e)?;
+            statement = c.hir.addStmt(HirStmt.Expression(value), span.start, span.end)?;
+        } else {
+            let value = checkExpr(c, e, returnType)?;
+            statement = c.hir.addStmt(HirStmt.Return(value), span.start, span.end)?;
+        }
+        let list = [statement];
+        let statements = c.hir.list(list[..])?;
+        body = c.hir.addStmt(HirStmt.Block(statements), span.start, span.end)?;
+    }
+    c.hir.functions[function as usize].body = body;
+    if (syntax.isUnsafe) {
+        c.notPorted(syntax.start, syntax.end, "an unsafe function", "S7")?;
+    }
+    analyzeFlow(c, function)?;
+    c.function = none();
+    return Ok();
+}
+
+fn checkBlock(c: borrow mut Checker, block: u32) -> Result<u32, AllocError> {
+    let span = c.front.ast.stmtSpans[block as usize];
+    let statements = match (c.front.ast.stmts[block as usize]) {
+        StmtNode.Block(s) => s,
+        _ => emptyRange(),
+    };
+    c.pushScope()?;
+    var checked = Vector<u32>.create();
+    for (k in 0..statements.count) {
+        let statement = c.front.ast.at(statements, k);
+        checked.push(checkStmt(c, statement)?)?;
+    }
+    c.popScope();
+    let list = c.hir.list(checked.view())?;
+    return c.hir.addStmt(HirStmt.Block(list), span.start, span.end);
+}
+
+fn checkStmt(c: borrow mut Checker, stmt: u32) -> Result<u32, AllocError> {
+    let span = c.front.ast.stmtSpans[stmt as usize];
+    match (c.front.ast.stmts[stmt as usize]) {
+        StmtNode.Block(_) => { return checkBlock(c, stmt); }
+        StmtNode.Local(kind, name, typ, initializer) => {
+            return checkLocalDecl(c, kind, name, typ, initializer, span);
+        }
+        StmtNode.Assign(target, op, value) => { return checkAssign(c, target, op, value, span); }
+        StmtNode.If(_, _, _) => { return checkIf(c, stmt); }
+        StmtNode.While(condition, body) => {
+            let boolType = c.types.boolType;
+            let checkedCondition = checkExpr(c, condition, boolType)?;
+            c.loopDepth += 1;
+            let checkedBody = checkBlock(c, body)?;
+            c.loopDepth -= 1;
+            return c.hir.addStmt(HirStmt.While(checkedCondition, checkedBody), span.start, span.end);
+        }
+        StmtNode.Loop(body) => {
+            c.loopDepth += 1;
+            let checkedBody = checkBlock(c, body)?;
+            c.loopDepth -= 1;
+            return c.hir.addStmt(HirStmt.Loop(checkedBody), span.start, span.end);
+        }
+        StmtNode.For(variable, start, end, body) => { return checkFor(c, variable, start, end, body, span); }
+        StmtNode.Break => {
+            checkInLoop(c, span, "break")?;
+            return c.hir.addStmt(HirStmt.Break, span.start, span.end);
+        }
+        StmtNode.Continue => {
+            checkInLoop(c, span, "continue")?;
+            return c.hir.addStmt(HirStmt.Continue, span.start, span.end);
+        }
+        StmtNode.Return(value) => { return checkReturn(c, value, span); }
+        StmtNode.Expression(e) => {
+            let value = checkExpressionStatement(c, e)?;
+            return c.hir.addStmt(HirStmt.Expression(value), span.start, span.end);
+        }
+        StmtNode.Match(_, _) => { c.notPorted(span.start, span.end, "a 'match' statement", "S2")?; }
+        StmtNode.Unsafe(_) => { c.notPorted(span.start, span.end, "an 'unsafe' block", "S7")?; }
+        StmtNode.Defer(_) => { c.notPorted(span.start, span.end, "a 'defer' statement", "S2")?; }
+    }
+    let error = c.errorResult(span.start, span.end)?;
+    return c.hir.addStmt(HirStmt.Expression(error), span.start, span.end);
+}
+
+fn checkInLoop(c: borrow mut Checker, span: Span, keyword: StringView) -> Result<void, AllocError> {
+    if (c.loopDepth == 0) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendText(mut message, keyword)?;
+        appendText(mut message, "' can only be used inside 'while' or 'loop'")?;
+        c.error(loopControlOutsideLoop(), span.start, span.end, message)?;
+    }
+    return Ok();
+}
+
+/// Only calls (or `?` and `!` on calls) can be statements (N0225).
+fn checkExpressionStatement(c: borrow mut Checker, e: u32) -> Result<u32, AllocError> {
+    let span = c.front.ast.exprSpans[e as usize];
+    var ok = false;
+    match (c.front.ast.exprs[e as usize]) {
+        ExprNode.Call(_, _) => { ok = true; }
+        ExprNode.Try(operand) => { ok = isCallSyntax(c, operand); }
+        ExprNode.Unwrap(operand) => { ok = isCallSyntax(c, operand); }
+        _ => {}
+    }
+    if (!ok) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "only calls can be used as statements")?;
+        c.error(statementNotCall(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    return synth(c, e, none());
+}
+
+fn isCallSyntax(c: borrow Checker, e: u32) -> bool => match (c.front.ast.exprs[e as usize]) {
+    ExprNode.Call(_, _) => true,
+    _ => false,
+};
+
+fn checkLocalDecl(
+    c: borrow mut Checker,
+    kind: LocalKind,
+    name: u32,
+    typ: u32,
+    initializerSyntax: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let id = c.front.ast.idents[name as usize];
+    let isLet = match (kind) {
+        LocalKind.Let => true,
+        _ => false,
+    };
+    let isUsing = match (kind) {
+        LocalKind.Using => true,
+        _ => false,
+    };
+    let isMutable = match (kind) {
+        LocalKind.Var => true,
+        _ => false,
+    };
+    if (isUsing) {
+        c.notPorted(span.start, span.end, "a 'using' local", "S3")?;
+    }
+    let declared = if (typ == none()) none() else c.resolveType(typ, false)?;
+    if (!isMutable && initializerSyntax == none()) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'let ")?;
+        appendBytes(mut message, c.name(id.symbol))?;
+        appendText(mut message, "' needs an initializer; use 'var' to assign later")?;
+        c.error(letWithoutInitializer(), id.start, id.end, message)?;
+    } else if (initializerSyntax == none() && declared == none()) {
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, id.symbol)?;
+        appendText(mut message, " needs a type annotation or an initializer")?;
+        c.error(localNeedsType(), id.start, id.end, message)?;
+    }
+    var initializer = none();
+    var localType = if (declared == none()) c.types.error else declared;
+    if (initializerSyntax != none()) {
+        initializer = checkExpr(c, initializerSyntax, declared)?;
+        if (declared == none()) {
+            let initializerSpan = c.front.ast.exprSpans[initializerSyntax as usize];
+            // A copy of a `borrow mut` variable is a reborrow (§13.3).
+            let ownType = c.typeOf(initializer);
+            initializer = coerce(c, initializer, ownType, initializerSpan)?;
+            localType = c.typeOf(initializer);
+            if (c.types.is(localType, TypeKind.Void)) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "this expression has no value (its type is 'void')")?;
+                c.error(voidValue(), initializerSpan.start, initializerSpan.end, message)?;
+                localType = c.types.error;
+            } else if (c.types.is(localType, TypeKind.Never)) {
+                localType = c.types.error;
+            }
+        }
+    }
+    if (c.types.is(localType, TypeKind.Reference) && isMutable) {
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            "a reference variable must be declared with 'let': references cannot be re-pointed (assigning to one writes through it)",
+        )?;
+        c.error(referenceNotAllowed(), id.start, id.end, message)?;
+        localType = c.types.error;
+    }
+    if (c.lookupLocal(id.symbol) != none()) {
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, id.symbol)?;
+        appendText(mut message, " is already declared in this function; locals cannot be shadowed")?;
+        c.error(localRedeclared(), id.start, id.end, message)?;
+    }
+    // Declared after the initializer is checked: `let x = x;` does not see the new `x`.
+    let local = c.hir.addLocal(c.function, id.symbol, localType, isMutable || isUsing, false, id.start, id.end)?;
+    c.hir.locals[local as usize].isUsing = isUsing;
+    if (isLet) {
+        c.letKeywords.push(LetKeyword { local: local, start: span.start })?;
+    }
+    c.bind(id.symbol, local)?;
+    return c.hir.addStmt(HirStmt.LocalDecl(local, initializer), span.start, span.end);
+}
+
+fn assignOperator(op: AssignOp) -> u32 => match (op) {
+    AssignOp.Assign => 0,
+    AssignOp.Add => 14,
+    AssignOp.Subtract => 15,
+    AssignOp.Multiply => 16,
+    AssignOp.Divide => 17,
+    AssignOp.Remainder => 18,
+    AssignOp.BitAnd => 11,
+    AssignOp.BitOr => 9,
+    AssignOp.BitXor => 10,
+    AssignOp.ShiftLeft => 12,
+    AssignOp.ShiftRight => 13,
+};
+
+/// The BinaryOp of a compound assignment's operator (binaryIndex + 1).
+fn binaryOpOf(operator: u32) -> BinaryOp => match (operator - 1) {
+    8 => BinaryOp.BitOr,
+    9 => BinaryOp.BitXor,
+    10 => BinaryOp.BitAnd,
+    11 => BinaryOp.ShiftLeft,
+    12 => BinaryOp.ShiftRight,
+    13 => BinaryOp.Add,
+    14 => BinaryOp.Subtract,
+    15 => BinaryOp.Multiply,
+    16 => BinaryOp.Divide,
+    _ => BinaryOp.Remainder,
+};
+
+fn checkAssign(
+    c: borrow mut Checker,
+    targetSyntax: u32,
+    op: AssignOp,
+    valueSyntax: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let operator = assignOperator(op);
+    let place = resolveAssignmentTarget(c, targetSyntax)?;
+    if (place == none()) {
+        // Still report errors inside the value; a bare `null` has none, only the missing expected type (N0260).
+        let isNull = match (c.front.ast.exprs[unparenthesized(c, valueSyntax) as usize]) {
+            ExprNode.NullLiteral => true,
+            _ => false,
+        };
+        if (!isNull) {
+            synth(c, valueSyntax, none())?;
+        }
+        let error = c.errorResult(span.start, span.end)?;
+        return c.hir.addStmt(HirStmt.Expression(error), span.start, span.end);
+    }
+    let targetType = c.hir.places[place as usize].typ;
+    var value: u32 = 0;
+    if (operator == 12 || operator == 13) {
+        value = checkShiftAmount(c, valueSyntax)?;
+    } else {
+        value = checkExpr(c, valueSyntax, targetType)?;
+    }
+    if (operator != 0 && !c.types.isBottom(targetType)) {
+        checkOperatorApplies(c, binaryOpOf(operator), targetType, span)?;
+    }
+    return c.hir.addStmt(HirStmt.Assign(place, operator, value), span.start, span.end);
+}
+
+fn unparenthesized(c: borrow Checker, e: u32) -> u32 => match (c.front.ast.exprs[e as usize]) {
+    ExprNode.Paren(inner) => unparenthesized(c, inner),
+    _ => e,
+};
+
+/// ResolveAssignmentTarget: the place an assignment writes, or none after reporting why it cannot.
+fn resolveAssignmentTarget(c: borrow mut Checker, target: u32) -> Result<u32, AllocError> {
+    let span = c.front.ast.exprSpans[target as usize];
+    match (c.front.ast.exprs[target as usize]) {
+        ExprNode.Name(name, _) => {
+            let symbol = c.front.ast.idents[name as usize].symbol;
+            match (c.lookup(symbol)) {
+                Entity.Local(_) => {}
+                Entity.None => {
+                    var message = Vector<u8>.create();
+                    appendText(mut message, "cannot find ")?;
+                    appendQuotedName(mut message, c, symbol)?;
+                    appendText(mut message, " in this scope")?;
+                    c.error(undefinedName(), span.start, span.end, message)?;
+                    return Ok(none());
+                }
+                _ => {
+                    var message = Vector<u8>.create();
+                    appendText(mut message, "cannot assign to ")?;
+                    appendQuotedName(mut message, c, symbol)?;
+                    appendText(mut message, ": it is not a variable")?;
+                    c.error(assignToImmutable(), span.start, span.end, message)?;
+                    return Ok(none());
+                }
+            }
+        }
+        ExprNode.Paren(_) => {}
+        ExprNode.Member(_, _) => {
+            c.notPorted(span.start, span.end, "assigning to a field", "S2")?;
+            return Ok(none());
+        }
+        ExprNode.Index(_, _) => {
+            c.notPorted(span.start, span.end, "assigning to an element", "S2")?;
+            return Ok(none());
+        }
+        ExprNode.This => {
+            c.notPorted(span.start, span.end, "assigning to 'this'", "S2")?;
+            return Ok(none());
+        }
+        _ => {
+            var message = Vector<u8>.create();
+            appendText(
+                mut message,
+                "only variables, their fields, and places reached through references can be assigned",
+            )?;
+            c.error(unsupported(), span.start, span.end, message)?;
+            return Ok(none());
+        }
+    }
+    let value = synth(c, target, none())?;
+    if (c.isBottom(value)) {
+        return Ok(none());
+    }
+    let root = match (c.hir.exprs[value as usize]) {
+        HirExpr.LocalRef(local) => local,
+        _ => none(),
+    };
+    if (root == none()) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "only variables, their fields, and places reached through references can be assigned")?;
+        c.error(unsupported(), span.start, span.end, message)?;
+        return Ok(none());
+    }
+    let local = c.hir.locals[root as usize];
+    if (local.isUsing && !c.types.is(local.typ, TypeKind.Reference)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "cannot assign to ")?;
+        appendQuotedName(mut message, c, local.name)?;
+        appendText(mut message, ": a 'using' binding stays the same value until the end of its block")?;
+        c.error(assignToImmutable(), span.start, span.end, message)?;
+        return Ok(none());
+    }
+    if (c.types.is(local.typ, TypeKind.Reference)) {
+        c.notPorted(span.start, span.end, "assigning through a reference", "S2")?;
+        return Ok(none());
+    }
+    if (!local.mutable) {
+        var reason = Vector<u8>.create();
+        let scoped = c.types.isScoped(local.typ);
+        if (!local.parameter && scoped) {
+            appendQuotedName(mut reason, c, local.name)?;
+            appendText(mut reason, " is not mutable; bind it with 'using' (a scoped value cannot be a 'var')")?;
+        } else if (local.name == c.thisSymbol) {
+            appendText(mut reason, "'this' is immutable in a by-value method; use 'borrow mut this'")?;
+        } else if (local.parameter) {
+            appendText(mut reason, "parameters are immutable")?;
+        } else {
+            appendQuotedName(mut reason, c, local.name)?;
+            appendText(mut reason, " was declared with 'let'; use 'var' for a mutable variable")?;
+        }
+        var message = Vector<u8>.create();
+        appendText(mut message, "cannot assign to ")?;
+        appendQuotedName(mut message, c, local.name)?;
+        appendText(mut message, ": ")?;
+        appendBytes(mut message, reason.view())?;
+        // LetToVar: `let` → `var`, unless the local is a reference or another scoped value.
+        let letStart = c.letKeywordOf(root);
+        if (!local.parameter && !scoped && local.name != c.thisSymbol && letStart != none()) {
+            var title = Vector<u8>.create();
+            appendText(mut title, "declare ")?;
+            appendQuotedName(mut title, c, local.name)?;
+            appendText(mut title, " with 'var'")?;
+            var text = Vector<u8>.create();
+            appendText(mut text, "var")?;
+            c.errorWithFix(assignToImmutable(), span.start, span.end, message, title, letStart, letStart + 3, text)?;
+        } else {
+            c.error(assignToImmutable(), span.start, span.end, message)?;
+        }
+        return Ok(none());
+    }
+    let t = local.typ;
+    let projections = Vector<HirProjection>.create();
+    return c.hir.addPlace(root, projections.view(), t);
+}
+
+fn checkIf(c: borrow mut Checker, stmt: u32) -> Result<u32, AllocError> {
+    // The `else if` chain is checked in a loop, as the parser builds it (docs/p2-frontend.md §6), with the nodes in
+    // the reference's order: each condition and then-block, then the final else, then the ifs from the inside out.
+    var starts = Vector<Span>.create();
+    var conditions = Vector<u32>.create();
+    var thens = Vector<u32>.create();
+    var current = stmt;
+    var otherwise = none();
+    let boolType = c.types.boolType;
+    loop {
+        match (c.front.ast.stmts[current as usize]) {
+            StmtNode.If(condition, then, elseBranch) => {
+                starts.push(c.front.ast.stmtSpans[current as usize])?;
+                conditions.push(checkExpr(c, condition, boolType)?)?;
+                thens.push(checkBlock(c, then)?)?;
+                if (elseBranch == none()) {
+                    break;
+                }
+                let isIf = match (c.front.ast.stmts[elseBranch as usize]) {
+                    StmtNode.If(_, _, _) => true,
+                    _ => false,
+                };
+                if (!isIf) {
+                    otherwise = checkBlock(c, elseBranch)?;
+                    break;
+                }
+                current = elseBranch;
+            }
+            _ => { break; }
+        }
+    }
+    var k = starts.length;
+    while (k > 0) {
+        k -= 1;
+        let span = starts[k];
+        otherwise = c.hir.addStmt(HirStmt.If(conditions[k], thens[k], otherwise), span.start, span.end)?;
+    }
+    return Ok(otherwise);
+}
+
+fn checkFor(
+    c: borrow mut Checker,
+    variable: u32,
+    startSyntax: u32,
+    endSyntax: u32,
+    body: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    if (endSyntax == none()) {
+        c.notPorted(span.start, span.end, "'for' over an array, slice or vector", "S2")?;
+        let error = c.errorResult(span.start, span.end)?;
+        return c.hir.addStmt(HirStmt.Expression(error), span.start, span.end);
+    }
+    var start: u32 = 0;
+    var end: u32 = 0;
+    // The bounds have one integer type; a flexible literal takes the other bound's type.
+    if (isFlexible(c, startSyntax) && !isFlexible(c, endSyntax)) {
+        let e = synth(c, endSyntax, none())?;
+        end = autoDeref(c, e)?;
+        let endType = c.typeOf(end);
+        let startHint = if (c.types.is(endType, TypeKind.Integer)) endType else none();
+        start = checkExpr(c, startSyntax, startHint)?;
+    } else {
+        let s = synth(c, startSyntax, none())?;
+        start = autoDeref(c, s)?;
+        let startType = c.typeOf(start);
+        let endHint = if (c.types.is(startType, TypeKind.Integer)) startType else none();
+        end = checkExpr(c, endSyntax, endHint)?;
+    }
+    let startType = c.typeOf(start);
+    let variableType = if (c.types.is(startType, TypeKind.Integer)) startType else c.types.error;
+    if (!c.types.isBottom(startType) && !c.types.is(startType, TypeKind.Integer)) {
+        let s = c.front.ast.exprSpans[startSyntax as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "a range in 'for' needs integer bounds; found ")?;
+        appendQuotedType(mut message, c, startType)?;
+        c.error(typeMismatch(), s.start, s.end, message)?;
+    }
+    let id = c.front.ast.idents[variable as usize];
+    if (c.lookupLocal(id.symbol) != none()) {
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, id.symbol)?;
+        appendText(mut message, " is already declared in this function; locals cannot be shadowed")?;
+        c.error(localRedeclared(), id.start, id.end, message)?;
+    }
+    c.pushScope()?;
+    let local = c.hir.addLocal(c.function, id.symbol, variableType, false, false, id.start, id.end)?;
+    c.bind(id.symbol, local)?;
+    c.loopDepth += 1;
+    let checkedBody = checkBlock(c, body)?;
+    c.loopDepth -= 1;
+    c.popScope();
+    return c.hir.addStmt(HirStmt.For(local, start, end, checkedBody), span.start, span.end);
+}
+
+fn checkReturn(c: borrow mut Checker, valueSyntax: u32, span: Span) -> Result<u32, AllocError> {
+    let returnType = c.hir.functions[c.function as usize].returnType;
+    let name = c.hir.functions[c.function as usize].name;
+    if (valueSyntax == none()) {
+        if (!c.types.is(returnType, TypeKind.Void) && !c.types.isBottom(returnType)) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "missing return value: ")?;
+            appendQuotedName(mut message, c, name)?;
+            appendText(mut message, " returns ")?;
+            appendQuotedType(mut message, c, returnType)?;
+            c.error(returnValueMismatch(), span.start, span.end, message)?;
+        }
+        return c.hir.addStmt(HirStmt.Return(none()), span.start, span.end);
+    }
+    if (c.types.is(returnType, TypeKind.Void)) {
+        let valueSpan = c.front.ast.exprSpans[valueSyntax as usize];
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, name)?;
+        appendText(mut message, " returns 'void', so 'return' cannot have a value")?;
+        c.error(returnValueMismatch(), valueSpan.start, valueSpan.end, message)?;
+        synth(c, valueSyntax, none())?;
+        return c.hir.addStmt(HirStmt.Return(none()), span.start, span.end);
+    }
+    let value = checkExpr(c, valueSyntax, returnType)?;
+    return c.hir.addStmt(HirStmt.Return(value), span.start, span.end);
+}
+
+// ---- FlowAnalysis ----
+
+/// N0213 if the end of a non-void body is reachable (FlowAnalysis.Analyze).
+fn analyzeFlow(c: borrow mut Checker, function: u32) -> Result<void, AllocError> {
+    var loopExits = Vector<bool>.create();
+    let body = c.hir.functions[function as usize].body;
+    let endReachable = completes(c, body, mut loopExits)?;
+    let returnType = c.hir.functions[function as usize].returnType;
+    if (endReachable && !c.types.is(returnType, TypeKind.Void) && returnType != c.types.error) {
+        let syntax = c.front.ast.functions[c.hir.functions[function as usize].syntax as usize];
+        let id = c.front.ast.idents[syntax.name as usize];
+        let name = c.hir.functions[function as usize].name;
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, name)?;
+        appendText(mut message, " must return a ")?;
+        appendQuotedType(mut message, c, returnType)?;
+        appendText(mut message, " on every path; the end of its body is reachable")?;
+        c.error(missingReturn(), id.start, id.end, message)?;
+    }
+    return Ok();
+}
+
+/// May control leave the statement normally? A `break` or `continue` leaves it (FlowAnalysis.Completes).
+fn completes(c: borrow Checker, stmt: u32, loopExits: borrow mut Vector<bool>) -> Result<bool, AllocError> {
+    match (c.hir.stmts[stmt as usize]) {
+        HirStmt.Block(statements) => {
+            for (k in 0..statements.count) {
+                if (!completes(c, c.hir.at(statements, k), loopExits)?) {
+                    return Ok(false); // the rest of the block is unreachable
+                }
+            }
+            return Ok(true);
+        }
+        HirStmt.If(condition, then, otherwise) => {
+            let thenCompletes = completes(c, then, loopExits)?;
+            let elseCompletes = otherwise == none() || completes(c, otherwise, loopExits)?;
+            return Ok(!diverges(c, condition, loopExits)? && (thenCompletes || elseCompletes));
+        }
+        HirStmt.While(condition, body) => {
+            if (diverges(c, condition, loopExits)?) {
+                return Ok(false);
+            }
+            runLoop(c, body, loopExits)?;
+            return Ok(true); // the condition can be false
+        }
+        HirStmt.Loop(body) => { return runLoop(c, body, loopExits); } // only a break leaves a `loop`
+        HirStmt.For(_, start, end, body) => {
+            if (diverges(c, start, loopExits)? || (end != none() && diverges(c, end, loopExits)?)) {
+                return Ok(false);
+            }
+            runLoop(c, body, loopExits)?;
+            return Ok(true);
+        }
+        HirStmt.Break => {
+            if (loopExits.length > 0) {
+                loopExits[loopExits.length - 1] = true;
+            }
+            return Ok(false);
+        }
+        HirStmt.Continue => { return Ok(false); }
+        HirStmt.Return(_) => { return Ok(false); }
+        HirStmt.LocalDecl(_, initializer) => {
+            return Ok(initializer == none() || !diverges(c, initializer, loopExits)?);
+        }
+        HirStmt.Assign(_, _, value) => { return Ok(!diverges(c, value, loopExits)?); }
+        HirStmt.Expression(e) => { return Ok(!diverges(c, e, loopExits)?); }
+        HirStmt.Yield(value) => { return Ok(!diverges(c, value, loopExits)?); }
+        HirStmt.Defer(_) => { return Ok(true); }
+        HirStmt.Match(scrutinee, arms, _, _) => {
+            if (diverges(c, scrutinee, loopExits)?) {
+                return Ok(false);
+            }
+            var any = false;
+            for (k in 0..arms.count) {
+                if (completes(c, c.hir.arms[c.hir.at(arms, k) as usize].body, loopExits)?) {
+                    any = true;
+                }
+            }
+            return Ok(any);
+        }
+    }
+}
+
+/// Checks a loop body; returns whether a `break` targets the loop.
+fn runLoop(c: borrow Checker, body: u32, loopExits: borrow mut Vector<bool>) -> Result<bool, AllocError> {
+    loopExits.push(false)?;
+    completes(c, body, loopExits)?;
+    let broke = loopExits[loopExits.length - 1];
+    loopExits.truncate(loopExits.length - 1);
+    return Ok(broke);
+}
+
+/// Does evaluating the expression certainly not complete (FlowAnalysis.Diverges)?
+fn diverges(c: borrow Checker, e: u32, loopExits: borrow mut Vector<bool>) -> Result<bool, AllocError> {
+    let never = c.types.is(c.typeOf(e), TypeKind.Never);
+    match (c.hir.exprs[e as usize]) {
+        HirExpr.StmtValue(statement) => { return Ok(!completes(c, statement, loopExits)?); }
+        HirExpr.Call(_, arguments) => { return if (never) Ok(true) else anyDiverges(c, arguments, loopExits); }
+        HirExpr.BuiltinCall(_, arguments) => { return if (never) Ok(true) else anyDiverges(c, arguments, loopExits); }
+        HirExpr.Binary(op, left, right) => {
+            let index = binaryIndex(op);
+            if (index == 0 || index == 1) {
+                return diverges(c, left, loopExits);
+            }
+            return Ok(diverges(c, left, loopExits)? || diverges(c, right, loopExits)?);
+        }
+        HirExpr.Unary(_, operand) => { return diverges(c, operand, loopExits); }
+        HirExpr.Cast(operand) => { return diverges(c, operand, loopExits); }
+        HirExpr.Truncate(operand) => { return diverges(c, operand, loopExits); }
+        HirExpr.FieldAccess(target, _) => { return diverges(c, target, loopExits); }
+        HirExpr.StructLiteral(fields) => {
+            for (k in 0..fields.count) {
+                if (diverges(c, c.hir.fieldValues[(fields.start + k) as usize].value, loopExits)?) {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        HirExpr.EnumValue(_, payload) => { return anyDiverges(c, payload, loopExits); }
+        HirExpr.Deref(reference) => { return diverges(c, reference, loopExits); }
+        HirExpr.Reborrow(_, reference) => { return diverges(c, reference, loopExits); }
+        HirExpr.BorrowTemp(_, value) => { return diverges(c, value, loopExits); }
+        HirExpr.BorrowPath(_, path) => { return diverges(c, path, loopExits); }
+        HirExpr.ArrayLiteral(elements) => { return anyDiverges(c, elements, loopExits); }
+        HirExpr.ArrayRepeat(value) => { return diverges(c, value, loopExits); }
+        HirExpr.Index(target, index) => {
+            return Ok(diverges(c, target, loopExits)? || diverges(c, index, loopExits)?);
+        }
+        HirExpr.Slice(_, _, low, high) => {
+            return Ok(
+                (low != none() && diverges(c, low, loopExits)?) || (high != none() && diverges(c, high, loopExits)?),
+            );
+        }
+        HirExpr.SliceLength(slice) => { return diverges(c, slice, loopExits); }
+        HirExpr.Try(operand) => { return diverges(c, operand, loopExits); }
+        HirExpr.Unwrap(operand) => { return diverges(c, operand, loopExits); }
+        HirExpr.IsNull(reference, _) => { return diverges(c, reference, loopExits); }
+        _ => { return Ok(false); }
+    }
+}
+
+fn anyDiverges(c: borrow Checker, list: Range, loopExits: borrow mut Vector<bool>) -> Result<bool, AllocError> {
+    for (k in 0..list.count) {
+        if (diverges(c, c.hir.at(list, k), loopExits)?) {
+            return Ok(true);
+        }
+    }
+    return Ok(false);
+}

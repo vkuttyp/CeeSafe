@@ -1,0 +1,366 @@
+// Constants (the reference's EvaluateConstant, Fold, FoldBinary and IntegerSemantics). A constant is checked against
+// its type, then folded to a literal. Integer folding is exact: + - * / % through BigInt (src/support/bigint.nova),
+// bitwise operators and shifts on u64, since their operands are unsigned and fit their type (type-system.md §6).
+// Float folding comes with floats (S1b).
+
+fn notConstant() -> u32 => 217;
+fn cyclicConstant() -> u32 => 218;
+
+fn bigOf(v: IntValue) -> Result<BigInt, AllocError> => Ok(BigInt.of(v.negative, BigNat.fromU64(v.magnitude)?));
+
+/// A BigInt that fits 64 bits (as every folded value does) as an IntValue.
+fn intValueOf(b: borrow BigInt) -> IntValue {
+    let magnitude = match (b.magnitude.toU64()) {
+        Some(m) => m,
+        null => 0, // not reached: callers check the type's range first
+    };
+    return IntValue { negative: b.negative, magnitude: magnitude };
+}
+
+fn appendBig(out: borrow mut Vector<u8>, b: borrow BigInt) -> Result<void, AllocError> => b.appendDecimal(out);
+
+fn evaluateConstant(c: borrow mut Checker, k: u32) -> Result<u32, AllocError> {
+    let entry = c.constants[k as usize];
+    let hirConstant = c.hir.constants[entry.hir as usize];
+    let item = c.front.ast.items[entry.item as usize];
+    let id = c.front.ast.idents[item.name as usize];
+    if (entry.state == 2) {
+        return Ok(hirConstant.value);
+    }
+    if (entry.state == 1) {
+        let saved = c.file;
+        c.file = entry.file;
+        var message = Vector<u8>.create();
+        appendText(mut message, "constant '")?;
+        appendBytes(mut message, c.name(hirConstant.name))?;
+        appendText(mut message, "' depends on itself")?;
+        c.error(cyclicConstant(), id.start, id.end, message)?;
+        c.file = saved;
+        return c.errorResult(id.start, id.end);
+    }
+    c.constants[k as usize].state = 1;
+    let savedFile = c.file;
+    let savedFunction = c.function;
+    let savedLoop = c.loopDepth;
+    let savedScopeCount = c.scopes.length;
+    let savedStarts = c.scopeStarts.length;
+    c.file = entry.file;
+    c.function = none();
+    c.loopDepth = 0;
+    let valueSyntax = match (item.kind) {
+        ItemKind.Const(_, value) => value,
+        _ => none(),
+    };
+    let checked = checkExpr(c, valueSyntax, hirConstant.typ)?;
+    let valueSpan = c.front.ast.exprSpans[valueSyntax as usize];
+    let value = if (hirConstant.typ == c.types.error) c.errorResult(
+        valueSpan.start,
+        valueSpan.end,
+    )? else fold(c, checked)?;
+    c.file = savedFile;
+    c.function = savedFunction;
+    c.loopDepth = savedLoop;
+    c.scopes.truncate(savedScopeCount);
+    c.scopeStarts.truncate(savedStarts);
+    // A cycle may already have stored an error value for this constant; keep the first result.
+    if (c.hir.constants[entry.hir as usize].value == none()) {
+        c.hir.constants[entry.hir as usize].value = value;
+    }
+    c.constants[k as usize].state = 2;
+    return Ok(c.hir.constants[entry.hir as usize].value);
+}
+
+fn fold(c: borrow mut Checker, e: u32) -> Result<u32, AllocError> {
+    let typ = c.typeOf(e);
+    let span = c.spanOf(e);
+    match (c.hir.exprs[e as usize]) {
+        HirExpr.IntConst(_) => { return Ok(e); }
+        HirExpr.BoolConst(_) => { return Ok(e); }
+        HirExpr.FloatConst(_) => { return Ok(e); }
+        HirExpr.Error => { return Ok(e); }
+        HirExpr.Unary(op, operand) => {
+            let folded = fold(c, operand)?;
+            match (c.hir.exprs[folded as usize]) {
+                HirExpr.FloatConst(f) => { return c.expr(HirExpr.FloatConst(0.0 - f), typ, span.start, span.end); }
+                HirExpr.BoolConst(b) => { return c.expr(HirExpr.BoolConst(!b), typ, span.start, span.end); }
+                HirExpr.IntConst(i) => {
+                    let negated = BigInt.negate(bigOf(i)?)?;
+                    if (!c.types.fits(typ, negated)) {
+                        var message = Vector<u8>.create();
+                        appendText(mut message, "arithmetic overflow: -(")?;
+                        appendIntValue(mut message, i)?;
+                        appendText(mut message, ") does not fit in '")?;
+                        appendBytes(mut message, c.typeName(typ))?;
+                        appendText(mut message, "'")?;
+                        c.error(notConstant(), span.start, span.end, message)?;
+                        return c.errorResult(span.start, span.end);
+                    }
+                    return c.expr(HirExpr.IntConst(intValueOf(negated)), typ, span.start, span.end);
+                }
+                _ => { return Ok(folded); }
+            }
+        }
+        HirExpr.Binary(op, left, right) => { return foldBinary(c, e, op, left, right); }
+        HirExpr.Cast(operand) => {
+            let folded = fold(c, operand)?;
+            match (c.hir.exprs[folded as usize]) {
+                HirExpr.IntConst(i) => {
+                    if (c.types.is(typ, TypeKind.Float)) {
+                        c.notPorted(span.start, span.end, "a constant integer-to-float cast", "S1b")?;
+                        return c.errorResult(span.start, span.end);
+                    }
+                    return c.expr(HirExpr.IntConst(i), typ, span.start, span.end);
+                }
+                HirExpr.FloatConst(f) => {
+                    if (c.types.is(typ, TypeKind.Float)) {
+                        c.notPorted(span.start, span.end, "a constant float cast", "S1b")?;
+                        return c.errorResult(span.start, span.end);
+                    }
+                    return Ok(folded);
+                }
+                HirExpr.BoolConst(b) => {
+                    return c.expr(
+                        HirExpr.IntConst(IntValue { negative: false, magnitude: if (b) 1 else 0 }),
+                        typ,
+                        span.start,
+                        span.end,
+                    );
+                }
+                _ => { return Ok(folded); }
+            }
+        }
+        HirExpr.Truncate(operand) => {
+            let folded = fold(c, operand)?;
+            match (c.hir.exprs[folded as usize]) {
+                HirExpr.IntConst(i) => {
+                    let t = c.types.info(typ);
+                    let wrapped = BigInt.wrap(bigOf(i)?, t.bits as usize, t.signed)?;
+                    return c.expr(HirExpr.IntConst(intValueOf(wrapped)), typ, span.start, span.end);
+                }
+                _ => { return Ok(folded); }
+            }
+        }
+        HirExpr.ArrayLiteral(_) => {
+            c.notPorted(span.start, span.end, "a constant array", "S2")?;
+            return c.errorResult(span.start, span.end);
+        }
+        HirExpr.ArrayRepeat(_) => {
+            c.notPorted(span.start, span.end, "a constant array", "S2")?;
+            return c.errorResult(span.start, span.end);
+        }
+        HirExpr.Call(_, _) => {
+            var message = Vector<u8>.create();
+            appendText(mut message, "constant expressions cannot contain calls")?;
+            c.error(notConstant(), span.start, span.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+        HirExpr.BuiltinCall(_, _) => {
+            var message = Vector<u8>.create();
+            appendText(mut message, "constant expressions cannot contain calls")?;
+            c.error(notConstant(), span.start, span.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+        _ => {
+            var message = Vector<u8>.create();
+            appendText(
+                mut message,
+                "constant expressions can only contain literals, operators, casts and other constants",
+            )?;
+            c.error(notConstant(), span.start, span.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+    }
+}
+
+fn foldBinary(c: borrow mut Checker, e: u32, op: BinaryOp, leftExpr: u32, rightExpr: u32) -> Result<u32, AllocError> {
+    let typ = c.typeOf(e);
+    let span = c.spanOf(e);
+    let left = fold(c, leftExpr)?;
+    match (c.hir.exprs[left as usize]) {
+        HirExpr.Error => { return Ok(left); }
+        _ => {}
+    }
+    // Short-circuit operators evaluate the right side only when needed, as at run time.
+    let logicalOr = binaryIndex(op) == 0;
+    let logicalAnd = binaryIndex(op) == 1;
+    if (logicalOr || logicalAnd) {
+        match (c.hir.exprs[left as usize]) {
+            HirExpr.BoolConst(lb) => {
+                if (lb == logicalOr) {
+                    return c.expr(HirExpr.BoolConst(lb), typ, span.start, span.end);
+                }
+                let rightValue = fold(c, rightExpr)?;
+                match (c.hir.exprs[rightValue as usize]) {
+                    HirExpr.BoolConst(rb) => { return c.expr(HirExpr.BoolConst(rb), typ, span.start, span.end); }
+                    _ => { return Ok(rightValue); }
+                }
+            }
+            _ => {}
+        }
+    }
+    let right = fold(c, rightExpr)?;
+    let l = c.hir.exprs[left as usize];
+    let r = c.hir.exprs[right as usize];
+    match (l) {
+        HirExpr.BoolConst(a) => {
+            match (r) {
+                HirExpr.BoolConst(b) => {
+                    let equal = a == b;
+                    return c.expr(
+                        HirExpr.BoolConst(if (binaryIndex(op) == 2) equal else !equal),
+                        typ,
+                        span.start,
+                        span.end,
+                    );
+                }
+                _ => {}
+            }
+        }
+        HirExpr.IntConst(a) => {
+            match (r) {
+                HirExpr.IntConst(b) => {
+                    if (c.types.is(typ, TypeKind.Bool)) {
+                        return c.expr(HirExpr.BoolConst(compareInts(op, a, b)), typ, span.start, span.end);
+                    }
+                    return evaluateInts(c, op, a, b, typ, span);
+                }
+                _ => {}
+            }
+        }
+        HirExpr.FloatConst(_) => {
+            match (r) {
+                HirExpr.FloatConst(_) => {
+                    c.notPorted(span.start, span.end, "folding a float constant", "S1b")?;
+                    return c.errorResult(span.start, span.end);
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    match (r) {
+        HirExpr.Error => { return Ok(right); }
+        _ => { return c.errorResult(span.start, span.end); }
+    }
+}
+
+fn binaryIndex(op: BinaryOp) -> u32 => match (op) {
+    BinaryOp.LogicalOr => 0,
+    BinaryOp.LogicalAnd => 1,
+    BinaryOp.Equal => 2,
+    BinaryOp.NotEqual => 3,
+    BinaryOp.Less => 4,
+    BinaryOp.LessEqual => 5,
+    BinaryOp.Greater => 6,
+    BinaryOp.GreaterEqual => 7,
+    BinaryOp.BitOr => 8,
+    BinaryOp.BitXor => 9,
+    BinaryOp.BitAnd => 10,
+    BinaryOp.ShiftLeft => 11,
+    BinaryOp.ShiftRight => 12,
+    BinaryOp.Add => 13,
+    BinaryOp.Subtract => 14,
+    BinaryOp.Multiply => 15,
+    BinaryOp.Divide => 16,
+    BinaryOp.Remainder => 17,
+};
+
+/// The sign-aware order of two IntValues: -1, 0 or 1.
+fn compareIntValues(a: IntValue, b: IntValue) -> i32 {
+    let an = a.negative && a.magnitude != 0;
+    let bn = b.negative && b.magnitude != 0;
+    if (an != bn) {
+        return if (an) -1 else 1;
+    }
+    if (a.magnitude == b.magnitude) {
+        return 0;
+    }
+    let less = a.magnitude < b.magnitude;
+    return if (less != an) -1 else 1;
+}
+
+fn compareInts(op: BinaryOp, a: IntValue, b: IntValue) -> bool {
+    let order = compareIntValues(a, b);
+    return match (binaryIndex(op)) {
+        2 => order == 0,
+        3 => order != 0,
+        4 => order < 0,
+        5 => order <= 0,
+        6 => order > 0,
+        _ => order >= 0,
+    };
+}
+
+/// IntegerSemantics.TryEvaluate, reporting N0217 where the run time would panic.
+fn evaluateInts(
+    c: borrow mut Checker,
+    op: BinaryOp,
+    a: IntValue,
+    b: IntValue,
+    typ: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let t = c.types.info(typ);
+    let index = binaryIndex(op);
+    var message = Vector<u8>.create();
+    appendText(mut message, "constant evaluation failed: ")?;
+    if (index >= 8 && index <= 12) {
+        // Bitwise operators and shifts: unsigned operands of at most 64 bits (§6).
+        let x = a.magnitude;
+        let y = b.magnitude;
+        let mask: u64 = if (t.bits >= 64) 0xFFFFFFFFFFFFFFFF else (1u64 << truncate<u32>(t.bits)) - 1;
+        if (index == 11 || index == 12) {
+            if (b.negative || y >= t.bits as u64) {
+                appendText(mut message, "shift amount ")?;
+                appendIntValue(mut message, b)?;
+                appendText(mut message, " is out of range for '")?;
+                appendBytes(mut message, c.typeName(typ))?;
+                appendText(mut message, "' (0..")?;
+                appendDecimal(mut message, (t.bits - 1) as u64)?;
+                appendText(mut message, ")")?;
+                c.error(notConstant(), span.start, span.end, message)?;
+                return c.errorResult(span.start, span.end);
+            }
+            let shifted = if (index == 11) (x << truncate<u32>(y)) & mask else x >> truncate<u32>(y);
+            return c.expr(
+                HirExpr.IntConst(IntValue { negative: false, magnitude: shifted }),
+                typ,
+                span.start,
+                span.end,
+            );
+        }
+        let value = if (index == 8) x | y else if (index == 9) x ^ y else x & y;
+        return c.expr(HirExpr.IntConst(IntValue { negative: false, magnitude: value }), typ, span.start, span.end);
+    }
+    let x = bigOf(a)?;
+    let y = bigOf(b)?;
+    var result = BigInt.of(false, BigNat.zero());
+    if (index == 13) {
+        result = BigInt.add(x, y)?;
+    } else if (index == 14) {
+        result = BigInt.sub(x, y)?;
+    } else if (index == 15) {
+        result = BigInt.mul(x, y)?;
+    } else {
+        if (y.isZero()) {
+            appendText(mut message, "division by zero")?;
+            c.error(notConstant(), span.start, span.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+        let d = BigInt.divRem(x, y)?;
+        if (index == 17) {
+            return c.expr(HirExpr.IntConst(intValueOf(d.remainder)), typ, span.start, span.end); // always in range
+        }
+        result = d.quotient;
+    }
+    if (!c.types.fits(typ, result)) {
+        appendText(mut message, "arithmetic overflow: the result ")?;
+        appendBig(mut message, result)?;
+        appendText(mut message, " does not fit in '")?;
+        appendBytes(mut message, c.typeName(typ))?;
+        appendText(mut message, "'")?;
+        c.error(notConstant(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    return c.expr(HirExpr.IntConst(intValueOf(result)), typ, span.start, span.end);
+}

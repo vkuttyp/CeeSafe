@@ -1,0 +1,962 @@
+// Expressions and calls (the reference's CheckExpr, Synth, Coerce, CheckIntLiteral, SynthName, SynthUnary,
+// SynthBinary, CheckOperatorApplies, CheckShiftAmount, SynthCall, CheckUserCall, CheckArgument and
+// CheckBuiltinMemberCall), for what S1a supports; every other form is N0216 "not ported yet" (src/check/checker.nova).
+
+fn appendQuotedType(message: borrow mut Vector<u8>, c: borrow Checker, typ: u32) -> Result<void, AllocError> {
+    appendText(message, "'")?;
+    appendBytes(message, c.typeName(typ))?;
+    return appendText(message, "'");
+}
+
+fn appendQuotedName(message: borrow mut Vector<u8>, c: borrow Checker, symbol: u32) -> Result<void, AllocError> {
+    appendText(message, "'")?;
+    appendBytes(message, c.name(symbol))?;
+    return appendText(message, "'");
+}
+
+fn isArithmetic(op: BinaryOp) -> bool => binaryIndex(op) >= 13;
+
+fn isBitwise(op: BinaryOp) -> bool => binaryIndex(op) >= 8 && binaryIndex(op) <= 10;
+
+fn isShift(op: BinaryOp) -> bool => binaryIndex(op) == 11 || binaryIndex(op) == 12;
+
+fn isComparison(op: BinaryOp) -> bool => binaryIndex(op) >= 2 && binaryIndex(op) <= 7;
+
+/// Only unsuffixed literals combined by -, (), and arithmetic, bitwise or shift operators (IsFlexible, §5).
+fn isFlexible(c: borrow Checker, e: u32) -> bool => match (c.front.ast.exprs[e as usize]) {
+    ExprNode.IntLiteral(_, suffix) => match (suffix) {
+        IntSuffix.None => true,
+        _ => false,
+    },
+    ExprNode.CharLiteral(_) => true,
+    ExprNode.FloatLiteral(_, suffix) => match (suffix) {
+        FloatSuffix.None => true,
+        _ => false,
+    },
+    ExprNode.Paren(inner) => isFlexible(c, inner),
+    ExprNode.Unary(op, operand) => match (op) {
+        UnaryOp.Negate => isFlexible(c, operand),
+        UnaryOp.Not => false,
+    },
+    ExprNode.Binary(left, op, right) => (isArithmetic(op) || isBitwise(op) || isShift(op)) && isFlexible(c, left) &&
+        isFlexible(c, right),
+    _ => false, // `if` and `match` expressions are flexible by their branches: S1b
+};
+
+/// The integer type a literal takes from `expected`, looking through an optional (IntegerHint).
+fn integerHint(c: borrow Checker, expected: u32) -> u32 {
+    if (expected == none()) {
+        return none();
+    }
+    let option = c.types.optionType(expected);
+    let t = if (option != none()) option else expected;
+    return if (c.types.is(t, TypeKind.Integer)) t else none();
+}
+
+/// The integer or float type an operand takes from `expected` (NumericHint).
+fn numericHint(c: borrow Checker, expected: u32) -> u32 {
+    if (expected == none()) {
+        return none();
+    }
+    let option = c.types.optionType(expected);
+    let t = if (option != none()) option else expected;
+    return if (c.types.is(t, TypeKind.Integer) || c.types.is(t, TypeKind.Float)) t else none();
+}
+
+/// CheckExpr: checks against an optional expected type (§5).
+fn checkExpr(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError> {
+    let span = c.front.ast.exprSpans[e as usize];
+    match (c.front.ast.exprs[e as usize]) {
+        ExprNode.If(_, _, _) => {
+            c.notPorted(span.start, span.end, "an 'if' expression", "S1b")?;
+            return c.errorResult(span.start, span.end);
+        }
+        ExprNode.Match(_, _) => {
+            c.notPorted(span.start, span.end, "a 'match' expression", "S2")?;
+            return c.errorResult(span.start, span.end);
+        }
+        ExprNode.Closure(_) => {
+            c.notPorted(span.start, span.end, "a closure", "S6")?;
+            return c.errorResult(span.start, span.end);
+        }
+        _ => {}
+    }
+    var synthExpected = expected;
+    if (expected != none()) {
+        let t = c.types.info(expected);
+        let keep = c.types.is(
+            expected,
+            TypeKind.Vector,
+        ) || c.types.is(expected, TypeKind.StableVector) || c.types.isDynBox(expected);
+        if (!keep && t.pointee != none()) {
+            synthExpected = t.pointee;
+        }
+    }
+    let value = synth(c, e, synthExpected)?;
+    return coerce(c, value, expected, span);
+}
+
+fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError> {
+    let span = c.front.ast.exprSpans[e as usize];
+    match (c.front.ast.exprs[e as usize]) {
+        ExprNode.IntLiteral(value, suffix) => { return checkIntLiteral(c, value, suffix, false, expected, span); }
+        ExprNode.BoolLiteral(value) => {
+            let b = c.types.boolType;
+            return c.expr(HirExpr.BoolConst(value), b, span.start, span.end);
+        }
+        ExprNode.StringLiteral(text) => {
+            let value = c.hir.addText(c.front.ast.textOf(text))?;
+            let view = c.types.stringView;
+            return c.expr(HirExpr.StringConst(value), view, span.start, span.end); // static bytes: no loans (§22.2)
+        }
+        ExprNode.Paren(inner) => {
+            let value = synth(c, inner, expected)?;
+            c.hir.exprSpans[value as usize] = span;
+            return Ok(value);
+        }
+        ExprNode.Name(name, typeArguments) => {
+            if (typeArguments.count > 0) {
+                c.notPorted(span.start, span.end, "a name with type arguments", "S4")?;
+                return c.errorResult(span.start, span.end);
+            }
+            return synthName(c, name, span);
+        }
+        ExprNode.Unary(op, operand) => { return synthUnary(c, op, operand, expected, span); }
+        ExprNode.Binary(left, op, right) => { return synthBinary(c, left, op, right, expected, span); }
+        ExprNode.Call(callee, arguments) => { return synthCall(c, callee, arguments, expected, span); }
+        ExprNode.This => {
+            var message = Vector<u8>.create();
+            appendText(mut message, "'this' can only be used inside a method")?;
+            c.error(thisOutsideMethod(), span.start, span.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+        ExprNode.Error => { return c.errorResult(span.start, span.end); }
+        ExprNode.FloatLiteral(_, _) => { c.notPorted(span.start, span.end, "a float literal", "S1b")?; }
+        ExprNode.CharLiteral(_) => { c.notPorted(span.start, span.end, "a char literal", "S1b")?; }
+        ExprNode.Cast(operand, typ) => { return synthCast(c, operand, typ, span); }
+        _ => { c.notPorted(span.start, span.end, "this expression", "S2-S7")?; }
+    }
+    return c.errorResult(span.start, span.end);
+}
+
+/// CheckIntLiteral: the literal's type is its suffix's, else the expected integer type, else i32.
+fn checkIntLiteral(
+    c: borrow mut Checker,
+    literal: u64,
+    suffix: IntSuffix,
+    negative: bool,
+    expected: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    var typ = c.types.forSuffix(suffix);
+    if (typ == none()) {
+        typ = integerHint(c, expected);
+    }
+    if (typ == none()) {
+        typ = c.types.i32;
+    }
+    let t = c.types.info(typ);
+    if (negative && !t.signed) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "cannot negate a value of unsigned type ")?;
+        appendQuotedType(mut message, c, typ)?;
+        c.error(invalidOperandTypes(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let value = IntValue { negative: negative && literal != 0, magnitude: literal };
+    if (!c.types.fits(typ, bigOf(value)?)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "integer literal ")?;
+        appendIntValue(mut message, value)?;
+        appendText(mut message, " does not fit in ")?;
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, " (range ")?;
+        appendTypeBound(mut message, t, false)?;
+        appendText(mut message, "..")?;
+        appendTypeBound(mut message, t, true)?;
+        appendText(mut message, ")")?;
+        c.error(literalOutOfRange(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    return c.expr(HirExpr.IntConst(value), typ, span.start, span.end);
+}
+
+/// An integer type's Min (max: false) or Max.
+fn appendTypeBound(out: borrow mut Vector<u8>, t: TypeInfo, max: bool) -> Result<void, AllocError> {
+    if (!t.signed) {
+        if (!max) {
+            return appendText(out, "0");
+        }
+        let m: u64 = if (t.bits >= 64) 0xFFFFFFFFFFFFFFFF else (1u64 << t.bits) - 1;
+        return appendDecimal(out, m);
+    }
+    let half: u64 = 1u64 << (t.bits - 1);
+    if (max) {
+        return appendDecimal(out, half - 1);
+    }
+    out.push('-')?;
+    return appendDecimal(out, half);
+}
+
+fn synthName(c: borrow mut Checker, name: u32, span: Span) -> Result<u32, AllocError> {
+    let symbol = c.front.ast.idents[name as usize].symbol;
+    match (c.lookup(symbol)) {
+        Entity.Local(local) => {
+            let t = c.hir.locals[local as usize].typ;
+            return c.expr(HirExpr.LocalRef(local), t, span.start, span.end);
+        }
+        Entity.Constant(k) => {
+            let value = evaluateConstant(c, k)?;
+            let t = c.hir.constants[c.constants[k as usize].hir as usize].typ;
+            match (c.hir.exprs[value as usize]) {
+                HirExpr.IntConst(i) => { return c.expr(HirExpr.IntConst(i), t, span.start, span.end); }
+                HirExpr.BoolConst(b) => { return c.expr(HirExpr.BoolConst(b), t, span.start, span.end); }
+                HirExpr.FloatConst(f) => { return c.expr(HirExpr.FloatConst(f), t, span.start, span.end); }
+                _ => { return c.errorResult(span.start, span.end); }
+            }
+        }
+        Entity.Function(_) => { c.notPorted(span.start, span.end, "a function used as a value", "S6")?; }
+        Entity.LibraryItem(_) => { c.notPorted(span.start, span.end, "a library or not-yet-ported item", "S2-S7")?; }
+        Entity.BuiltinItem(_) => {
+            var message = Vector<u8>.create();
+            appendQuotedName(mut message, c, symbol)?;
+            appendText(mut message, " is a type, not a value")?;
+            c.error(notCallable(), span.start, span.end, message)?;
+        }
+        Entity.Builtin(_) => {
+            var message = Vector<u8>.create();
+            appendQuotedName(mut message, c, symbol)?;
+            appendText(mut message, " is not a value")?;
+            c.error(notCallable(), span.start, span.end, message)?;
+        }
+        Entity.None => {
+            var message = Vector<u8>.create();
+            appendText(mut message, "cannot find ")?;
+            appendQuotedName(mut message, c, symbol)?;
+            appendText(mut message, " in this scope")?;
+            c.error(undefinedName(), span.start, span.end, message)?;
+        }
+    }
+    return c.errorResult(span.start, span.end);
+}
+
+/// Reads through references, boxes and vectors (AutoDeref); a closure's callable object is never read.
+fn autoDeref(c: borrow mut Checker, e: u32) -> Result<u32, AllocError> {
+    var value = e;
+    loop {
+        let t = c.typeOf(value);
+        let readThrough = (c.types.is(t, TypeKind.Reference) && !c.types.isClosure(t)) || c.types.is(t, TypeKind.Box) ||
+            c.types.is(t, TypeKind.Vector) || c.types.is(t, TypeKind.StableVector);
+        if (!readThrough) {
+            return Ok(value);
+        }
+        let span = c.spanOf(value);
+        let pointee = c.types.info(t).pointee;
+        value = c.expr(HirExpr.Deref(value), pointee, span.start, span.end)?;
+    }
+}
+
+/// The StringView an auto-dereferenced value reads, if it is the text of one (ViewOf).
+fn viewOf(c: borrow Checker, e: u32) -> u32 {
+    if (c.types.info(c.typeOf(e)).isStr) {
+        match (c.hir.exprs[e as usize]) {
+            HirExpr.Deref(reference) => { return reference; }
+            _ => {}
+        }
+    }
+    return e;
+}
+
+fn synthUnary(c: borrow mut Checker, op: UnaryOp, operand: u32, expected: u32, span: Span) -> Result<u32, AllocError> {
+    match (op) {
+        UnaryOp.Not => {
+            let b = c.types.boolType;
+            let value = checkExpr(c, operand, b)?;
+            return c.expr(HirExpr.Unary(UnaryOp.Not, value), b, span.start, span.end);
+        }
+        UnaryOp.Negate => {}
+    }
+    // A literal directly under '-' is checked as one negative literal (§4).
+    match (c.front.ast.exprs[operand as usize]) {
+        ExprNode.IntLiteral(literal, suffix) => { return checkIntLiteral(c, literal, suffix, true, expected, span); }
+        _ => {}
+    }
+    let operandHint = numericHint(c, expected);
+    let synthesized = synth(c, operand, operandHint)?;
+    let value = autoDeref(c, synthesized)?;
+    let t = c.typeOf(value);
+    if (c.types.isBottom(t)) {
+        return Ok(value);
+    }
+    let info = c.types.info(t);
+    if (c.types.is(t, TypeKind.Float)) {
+        return c.expr(HirExpr.Unary(UnaryOp.Negate, value), t, span.start, span.end); // flips the sign (§35.3)
+    }
+    if (!c.types.is(t, TypeKind.Integer) || !info.signed) {
+        var message = Vector<u8>.create();
+        if (c.types.is(t, TypeKind.Integer)) {
+            appendText(mut message, "cannot negate a value of unsigned type ")?;
+        } else {
+            appendText(mut message, "operator '-' cannot be applied to type ")?;
+        }
+        appendQuotedType(mut message, c, t)?;
+        c.error(invalidOperandTypes(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    return c.expr(HirExpr.Unary(UnaryOp.Negate, value), t, span.start, span.end);
+}
+
+fn synthBinary(
+    c: borrow mut Checker,
+    leftSyntax: u32,
+    op: BinaryOp,
+    rightSyntax: u32,
+    expected: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let index = binaryIndex(op);
+    let isNullLeft = match (c.front.ast.exprs[leftSyntax as usize]) {
+        ExprNode.NullLiteral => true,
+        _ => false,
+    };
+    let isNullRight = match (c.front.ast.exprs[rightSyntax as usize]) {
+        ExprNode.NullLiteral => true,
+        _ => false,
+    };
+    if ((index == 2 || index == 3) && (isNullLeft || isNullRight)) {
+        c.notPorted(span.start, span.end, "a null test", "S2")?;
+        return c.errorResult(span.start, span.end);
+    }
+    let boolType = c.types.boolType;
+    if (index == 0 || index == 1) {
+        let l = checkExpr(c, leftSyntax, boolType)?;
+        let r = checkExpr(c, rightSyntax, boolType)?;
+        return c.expr(HirExpr.Binary(op, l, r), boolType, span.start, span.end);
+    }
+    if (isShift(op)) {
+        let leftHint = integerHint(c, expected);
+        let leftSynth = synth(c, leftSyntax, leftHint)?;
+        let left = autoDeref(c, leftSynth)?;
+        let amount = checkShiftAmount(c, rightSyntax)?;
+        if (c.isBottom(left) || c.isBottom(amount)) {
+            return c.errorResult(span.start, span.end);
+        }
+        let lt = c.typeOf(left);
+        if (!checkOperatorApplies(c, op, lt, span)?) {
+            return c.errorResult(span.start, span.end);
+        }
+        return c.expr(HirExpr.Binary(op, left, amount), lt, span.start, span.end);
+    }
+    let hint = if (isArithmetic(op) || isBitwise(op)) numericHint(c, expected) else none();
+    var leftHir: u32 = 0;
+    var rightHir: u32 = 0;
+    if (hint != none()) {
+        leftHir = checkExpr(c, leftSyntax, hint)?;
+        rightHir = checkExpr(c, rightSyntax, hint)?;
+    } else if (!isFlexible(c, leftSyntax) && isFlexible(c, rightSyntax)) {
+        let l = synth(c, leftSyntax, none())?;
+        leftHir = autoDeref(c, l)?;
+        let leftHint = numericHint(c, c.typeOf(leftHir));
+        rightHir = checkExpr(c, rightSyntax, leftHint)?;
+    } else if (isFlexible(c, leftSyntax) && !isFlexible(c, rightSyntax)) {
+        let r = synth(c, rightSyntax, none())?;
+        rightHir = autoDeref(c, r)?;
+        let rightHint = numericHint(c, c.typeOf(rightHir));
+        leftHir = checkExpr(c, leftSyntax, rightHint)?;
+    } else {
+        let l = synth(c, leftSyntax, none())?;
+        leftHir = autoDeref(c, l)?;
+        let r = synth(c, rightSyntax, none())?;
+        rightHir = autoDeref(c, r)?;
+    }
+    if (c.isBottom(leftHir) || c.isBottom(rightHir)) {
+        return c.errorResult(span.start, span.end);
+    }
+    leftHir = viewOf(c, leftHir);
+    rightHir = viewOf(c, rightHir);
+    let lt = c.typeOf(leftHir);
+    let rt = c.typeOf(rightHir);
+    if (c.types.isStringView(lt) && c.types.isStringView(rt)) {
+        if (index != 2 && index != 3) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "operator '")?;
+            appendText(mut message, binaryOpText(op))?;
+            appendText(mut message, "' cannot be applied to type 'StringView'; views compare with '==' and '!='")?;
+            c.error(invalidOperandTypes(), span.start, span.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+        return c.expr(HirExpr.Binary(op, leftHir, rightHir), boolType, span.start, span.end); // compares the bytes
+    }
+    if (c.types.is(lt, TypeKind.RawPointer) && c.types.is(rt, TypeKind.RawPointer)) {
+        c.notPorted(span.start, span.end, "comparing raw pointers", "S7")?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (lt != rt) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "operator '")?;
+        appendText(mut message, binaryOpText(op))?;
+        appendText(mut message, "' requires operands of the same type, found ")?;
+        appendQuotedType(mut message, c, lt)?;
+        appendText(mut message, " and ")?;
+        appendQuotedType(mut message, c, rt)?;
+        c.error(invalidOperandTypes(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (!checkOperatorApplies(c, op, lt, span)?) {
+        return c.errorResult(span.start, span.end);
+    }
+    let resultType = if (isComparison(op)) boolType else lt;
+    return c.expr(HirExpr.Binary(op, leftHir, rightHir), resultType, span.start, span.end);
+}
+
+/// A shift amount: any integer type; a flexible literal is typed as u32 (§6).
+fn checkShiftAmount(c: borrow mut Checker, amount: u32) -> Result<u32, AllocError> {
+    if (isFlexible(c, amount)) {
+        let u32Type = c.types.u32;
+        return checkExpr(c, amount, u32Type);
+    }
+    let synthesized = synth(c, amount, none())?;
+    let value = autoDeref(c, synthesized)?;
+    let t = c.typeOf(value);
+    if (!c.types.isBottom(t) && !c.types.is(t, TypeKind.Integer)) {
+        let span = c.front.ast.exprSpans[amount as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "a shift amount must be an integer, found ")?;
+        appendQuotedType(mut message, c, t)?;
+        c.error(invalidOperandTypes(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    return Ok(value);
+}
+
+/// Reports N0207 unless `op` accepts operands of `typ` (CheckOperatorApplies, §6).
+fn checkOperatorApplies(c: borrow mut Checker, op: BinaryOp, typ: u32, span: Span) -> Result<bool, AllocError> {
+    let t = c.types.info(typ);
+    let integer = c.types.is(typ, TypeKind.Integer);
+    let float = c.types.is(typ, TypeKind.Float);
+    let index = binaryIndex(op);
+    let ok = if (index == 17) integer else if (isArithmetic(
+        op,
+    )) integer || float else if (isBitwise(
+        op,
+    ) || isShift(op)) integer && !t.signed else if (index == 2 || index == 3) integer || float || c.types.is(
+        typ,
+        TypeKind.Bool,
+    ) ||
+        c.types.is(typ, TypeKind.Handle) || c.types.is(typ, TypeKind.RawPointer) ||
+        c.types.is(
+            typ,
+            TypeKind.FunctionPointer,
+        ) else if (isComparison(op)) integer || float else c.types.is(typ, TypeKind.Bool);
+    if (!ok) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "operator '")?;
+        appendText(mut message, binaryOpText(op))?;
+        appendText(mut message, "' cannot be applied to type ")?;
+        appendQuotedType(mut message, c, typ)?;
+        if ((isBitwise(op) || isShift(op)) && integer) {
+            appendText(
+                mut message,
+                "; bitwise operators and shifts require unsigned operands (reinterpret with truncate<uN>(x))",
+            )?;
+        }
+        c.error(invalidOperandTypes(), span.start, span.end, message)?;
+    }
+    return Ok(ok);
+}
+
+/// Coerce: the conversions S1a's programs need (identity, reborrows, reading through references); every other
+/// mismatch is N0205.
+fn coerce(c: borrow mut Checker, e: u32, expected: u32, span: Span) -> Result<u32, AllocError> {
+    let t = c.typeOf(e);
+    if (expected == none() || expected == c.types.error || c.types.isBottom(t)) {
+        return Ok(e);
+    }
+    let x = c.types.info(expected);
+    if (t == expected) {
+        let isLocalRef = match (c.hir.exprs[e as usize]) {
+            HirExpr.LocalRef(_) => true,
+            _ => false,
+        };
+        if (x.mutableReference && isLocalRef) {
+            return c.expr(HirExpr.Reborrow(true, e), expected, span.start, span.end);
+        }
+        return Ok(e);
+    }
+    let h = c.types.info(t);
+    if (c.types.is(
+        expected,
+        TypeKind.Reference,
+    ) && h.mutableReference && !x.mutableReference && h.pointee == x.pointee) {
+        return c.expr(HirExpr.Reborrow(false, e), expected, span.start, span.end);
+    }
+    if (!c.types.is(
+        expected,
+        TypeKind.Reference,
+    ) && (c.types.is(t, TypeKind.Reference) || c.types.is(t, TypeKind.Box))) {
+        var read = e;
+        loop {
+            let rt = c.typeOf(read);
+            if (rt == expected || !(c.types.is(rt, TypeKind.Reference) || c.types.is(rt, TypeKind.Box))) {
+                break;
+            }
+            let pointee = c.types.info(rt).pointee;
+            read = c.expr(HirExpr.Deref(read), pointee, span.start, span.end)?;
+        }
+        if (c.typeOf(read) == expected) {
+            return Ok(read);
+        }
+    }
+    if (c.types.optionType(expected) != none()) {
+        c.notPorted(span.start, span.end, "a value where an optional is expected", "S2")?;
+        return c.errorResult(span.start, span.end);
+    }
+    var message = Vector<u8>.create();
+    appendText(mut message, "expected ")?;
+    appendQuotedType(mut message, c, expected)?;
+    appendText(mut message, ", found ")?;
+    appendQuotedType(mut message, c, t)?;
+    c.error(typeMismatch(), span.start, span.end, message)?;
+    return c.errorResult(span.start, span.end);
+}
+
+/// CheckArgumentsLoosely: the call is already rejected; its arguments are still checked.
+fn checkArgumentsLoosely(c: borrow mut Checker, arguments: Range) -> Result<void, AllocError> {
+    for (k in 0..arguments.count) {
+        var argument = c.front.ast.at(arguments, k);
+        match (c.front.ast.exprs[argument as usize]) {
+            ExprNode.MutArg(operand) => { argument = operand; }
+            _ => {}
+        }
+        synth(c, argument, none())?;
+    }
+    return Ok();
+}
+
+fn synthCall(
+    c: borrow mut Checker,
+    callee: u32,
+    arguments: Range,
+    expected: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let calleeSpan = c.front.ast.exprSpans[callee as usize];
+    match (c.front.ast.exprs[callee as usize]) {
+        ExprNode.Name(name, typeArguments) => {
+            let id = c.front.ast.idents[name as usize];
+            match (c.lookup(id.symbol)) {
+                Entity.Function(function) => {
+                    if (typeArguments.count == 0) {
+                        return checkUserCall(c, function, arguments, span);
+                    }
+                    var message = Vector<u8>.create();
+                    appendText(mut message, "generic arguments are only supported in calls to truncate<T>(...)")?;
+                    c.error(unsupported(), calleeSpan.start, calleeSpan.end, message)?;
+                    return c.errorResult(span.start, span.end);
+                }
+                Entity.None => {
+                    var message = Vector<u8>.create();
+                    appendText(mut message, "cannot find function ")?;
+                    appendQuotedName(mut message, c, id.symbol)?;
+                    appendText(mut message, " in this scope")?;
+                    c.error(undefinedName(), calleeSpan.start, calleeSpan.end, message)?;
+                    checkArgumentsLoosely(c, arguments)?;
+                    return c.errorResult(span.start, span.end);
+                }
+                Entity.Local(local) => {
+                    let t = c.hir.locals[local as usize].typ;
+                    if (c.types.is(
+                        t,
+                        TypeKind.FunctionPointer,
+                    ) || c.types.is(t, TypeKind.Function) || c.types.isClosure(t) ||
+                        c.types.is(t, TypeKind.Box)) {
+                        c.notPorted(span.start, span.end, "calling a function value", "S6")?;
+                        return c.errorResult(span.start, span.end);
+                    }
+                }
+                Entity.Builtin(b) => {
+                    if (b == 2) {
+                        return checkTruncate(c, name, typeArguments, arguments, calleeSpan, span);
+                    }
+                    c.notPorted(span.start, span.end, "this built-in function", "S1b")?;
+                    return c.errorResult(span.start, span.end);
+                }
+                Entity.LibraryItem(_) => {
+                    c.notPorted(span.start, span.end, "calling this item", "S2-S5")?;
+                    return c.errorResult(span.start, span.end);
+                }
+                _ => {}
+            }
+        }
+        ExprNode.Member(target, member) => {
+            match (c.front.ast.exprs[target as usize]) {
+                ExprNode.Name(targetName, typeArguments) => {
+                    if (typeArguments.count == 0) {
+                        let symbol = c.front.ast.idents[targetName as usize].symbol;
+                        match (c.lookup(symbol)) {
+                            Entity.Builtin(b) => {
+                                if (b == builtinConsole() || b == builtinProcess() || b == 23 || b == 24) {
+                                    return checkBuiltinMemberCall(c, b, targetName, member, arguments, span);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            c.notPorted(span.start, span.end, "this call", "S2-S7")?;
+            return c.errorResult(span.start, span.end);
+        }
+        _ => {}
+    }
+    var message = Vector<u8>.create();
+    appendText(mut message, "this expression cannot be called")?;
+    c.error(notCallable(), calleeSpan.start, calleeSpan.end, message)?;
+    checkArgumentsLoosely(c, arguments)?;
+    return c.errorResult(span.start, span.end);
+}
+
+/// CheckUserCall for a top-level function.
+fn checkUserCall(c: borrow mut Checker, function: u32, arguments: Range, span: Span) -> Result<u32, AllocError> {
+    let f = borrow c.hir.functions[function as usize];
+    let parameterCount = f.parameters.length;
+    let returnType = f.returnType;
+    let name = f.name;
+    let syntax = c.front.ast.functions[f.syntax as usize];
+    if (syntax.isUnsafe || syntax.isExtern) {
+        c.notPorted(span.start, span.end, "calling an unsafe or C function", "S7")?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (arguments.count as usize != parameterCount) {
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, name)?;
+        appendText(mut message, " takes ")?;
+        appendDecimal(mut message, parameterCount as u64)?;
+        appendText(mut message, " argument(s) but ")?;
+        appendDecimal(mut message, arguments.count as u64)?;
+        appendText(mut message, " were supplied")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+    }
+    var values = Vector<u32>.create();
+    for (k in 0..arguments.count) {
+        let parameterType =
+            if ((k as usize) <
+                parameterCount) c.hir.locals[c.hir.functions[function as usize]
+                .parameters[k as usize] as usize].typ else none();
+        let argument = c.front.ast.at(arguments, k);
+        values.push(checkArgument(c, argument, parameterType)?)?;
+    }
+    if (arguments.count as usize != parameterCount) {
+        return c.errorResult(span.start, span.end);
+    }
+    let list = c.hir.list(values.view())?;
+    return c.expr(HirExpr.Call(function, list), returnType, span.start, span.end);
+}
+
+/// CheckArgument for a parameter of `parameterType` (§13.2): by value here; references come with S2.
+fn checkArgument(c: borrow mut Checker, argument: u32, parameterType: u32) -> Result<u32, AllocError> {
+    let span = c.front.ast.exprSpans[argument as usize];
+    let isMutArg = match (c.front.ast.exprs[argument as usize]) {
+        ExprNode.MutArg(_) => true,
+        _ => false,
+    };
+    if (parameterType == none()) {
+        var inner = argument;
+        match (c.front.ast.exprs[argument as usize]) {
+            ExprNode.MutArg(operand) => { inner = operand; }
+            _ => {}
+        }
+        synth(c, inner, none())?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (isMutArg || c.types.is(parameterType, TypeKind.Reference)) {
+        if (c.types.isStringView(parameterType) && !isMutArg) {
+            // A view is a reference to text; a view argument coerces as a value does.
+            let value = synth(c, argument, none())?;
+            return coerce(c, value, parameterType, span);
+        }
+        c.notPorted(span.start, span.end, "a reference argument", "S2")?;
+        return c.errorResult(span.start, span.end);
+    }
+    return checkExpr(c, argument, parameterType);
+}
+
+/// CheckBuiltinMemberCall: Console, Process, Cpu and Target.
+fn checkBuiltinMemberCall(
+    c: borrow mut Checker,
+    owner: u32,
+    targetName: u32,
+    member: u32,
+    arguments: Range,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let targetSymbol = c.front.ast.idents[targetName as usize].symbol;
+    let memberIdent = c.front.ast.idents[member as usize];
+    var memberText = Vector<u8>.create();
+    appendBytes(mut memberText, c.name(memberIdent.symbol))?;
+    let m = memberText.view();
+    if (owner == builtinProcess() && sameText(m, "capture")) {
+        c.notPorted(span.start, span.end, "Process.capture", "S7")?;
+        return c.errorResult(span.start, span.end);
+    }
+    var function = none();
+    var minArgs: u32 = 0;
+    var maxArgs: u32 = 0;
+    if (owner == builtinConsole() && sameText(m, "write")) {
+        function = bfConsoleWrite();
+        minArgs = 1;
+        maxArgs = 1;
+    } else if (owner == builtinConsole() && sameText(m, "writeLine")) {
+        function = bfConsoleWriteLine();
+        maxArgs = 1;
+    } else if (owner == builtinProcess() && sameText(m, "exit")) {
+        function = bfProcessExit();
+        minArgs = 1;
+        maxArgs = 1;
+    } else if (owner == builtinProcess() && sameText(m, "argumentCount")) {
+        function = bfArgumentCount();
+    } else if (owner == builtinProcess() && sameText(m, "argument")) {
+        function = bfArgument();
+        minArgs = 1;
+        maxArgs = 1;
+    } else if ((owner == builtinProcess() && sameText(m, "run")) || (owner == builtinConsole() &&
+        (sameText(
+            m,
+            "read",
+        ) || sameText(m, "writeBytes") || sameText(m, "writeError") || sameText(m, "writeErrorLine"))) ||
+        (owner == 23 && sameText(m, "spinHint")) || (owner == 24 &&
+        (sameText(m, "isX86_64") || sameText(m, "isAArch64") || sameText(m, "pointerBits")))) {
+        c.notPorted(span.start, span.end, "this built-in function", "S1b")?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (function == none()) {
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, targetSymbol)?;
+        appendText(mut message, " has no member '")?;
+        appendBytes(mut message, m)?;
+        appendText(mut message, "'")?;
+        c.error(undefinedName(), memberIdent.start, memberIdent.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let count = arguments.count;
+    if (count < minArgs || count > maxArgs) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, c.name(targetSymbol))?;
+        appendText(mut message, ".")?;
+        appendBytes(mut message, m)?;
+        appendText(mut message, "' takes ")?;
+        appendDecimal(mut message, minArgs as u64)?;
+        if (minArgs != maxArgs) {
+            appendText(mut message, " or ")?;
+            appendDecimal(mut message, maxArgs as u64)?;
+        }
+        appendText(mut message, " argument(s) but ")?;
+        appendDecimal(mut message, count as u64)?;
+        appendText(mut message, " were supplied")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (function == bfProcessExit()) {
+        let i32Type = c.types.i32;
+        let codeSyntax = c.front.ast.at(arguments, 0);
+        let code = checkExpr(c, codeSyntax, i32Type)?;
+        let codes = [code];
+        let list = c.hir.list(codes[..])?;
+        let never = c.types.never;
+        return c.expr(HirExpr.BuiltinCall(function, list), never, span.start, span.end);
+    }
+    if (function == bfArgumentCount()) {
+        let usize = c.types.usize;
+        return c.expr(HirExpr.BuiltinCall(function, emptyRange()), usize, span.start, span.end);
+    }
+    if (function == bfArgument()) {
+        c.notPorted(span.start, span.end, "Process.argument (an optional result)", "S2")?;
+        return c.errorResult(span.start, span.end);
+    }
+    var values = Vector<u32>.create();
+    for (k in 0..count) {
+        let argument = c.front.ast.at(arguments, k);
+        let synthesized = synth(c, argument, none())?;
+        let read = autoDeref(c, synthesized)?;
+        var value = printableView(c, read)?;
+        let t = c.typeOf(value);
+        if (!c.types.isBottom(t) && !c.types.is(t, TypeKind.Integer) && !c.types.is(t, TypeKind.Float) &&
+            !c.types.is(t, TypeKind.Bool) && !c.types.isStringView(t)) {
+            let argumentSpan = c.front.ast.exprSpans[argument as usize];
+            var message = Vector<u8>.create();
+            appendText(mut message, "'Console.")?;
+            appendBytes(mut message, m)?;
+            appendText(mut message, "' can print integers, floats, bools and string views, not ")?;
+            appendQuotedType(mut message, c, t)?;
+            c.error(invalidOperandTypes(), argumentSpan.start, argumentSpan.end, message)?;
+            value = c.errorResult(argumentSpan.start, argumentSpan.end)?;
+        }
+        values.push(value)?;
+    }
+    let list = c.hir.list(values.view())?;
+    let voidType = c.types.voidType;
+    return c.expr(HirExpr.BuiltinCall(function, list), voidType, span.start, span.end);
+}
+
+/// ViewOf, and a String place as a view of its text (PrintableView): strings come with S3.
+fn printableView(c: borrow mut Checker, e: u32) -> Result<u32, AllocError> {
+    let value = viewOf(c, e);
+    if (value == e && c.types.info(c.typeOf(e)).isStr) {
+        let span = c.spanOf(e);
+        c.notPorted(span.start, span.end, "printing a String", "S3")?;
+        return c.errorResult(span.start, span.end);
+    }
+    return Ok(value);
+}
+
+/// Does a flexible expression hold a float literal (HasFloatLiteral)?
+fn hasFloatLiteral(c: borrow Checker, e: u32) -> bool => match (c.front.ast.exprs[e as usize]) {
+    ExprNode.FloatLiteral(_, _) => true,
+    ExprNode.Paren(inner) => hasFloatLiteral(c, inner),
+    ExprNode.Unary(_, operand) => hasFloatLiteral(c, operand),
+    ExprNode.Binary(left, _, right) => hasFloatLiteral(c, left) || hasFloatLiteral(c, right),
+    _ => false,
+};
+
+/// `e as T` (SynthCast): only conversions that never lose information (§7).
+fn synthCast(c: borrow mut Checker, operandSyntax: u32, typeSyntax: u32, span: Span) -> Result<u32, AllocError> {
+    let target = c.resolveType(typeSyntax, false)?;
+    if (c.types.isBottom(target)) {
+        synth(c, operandSyntax, none())?;
+        return c.errorResult(span.start, span.end);
+    }
+    let pointerTarget = c.types.is(target, TypeKind.RawPointer) || c.types.is(target, TypeKind.FunctionPointer);
+    if (pointerTarget && isFlexible(c, operandSyntax)) {
+        c.notPorted(span.start, span.end, "a literal address", "S7")?;
+        return c.errorResult(span.start, span.end);
+    }
+    // `5 as u64`, `1.5 as f32`: a flexible literal simply takes the target type, if it is of the same kind.
+    if (isFlexible(c, operandSyntax) && hasFloatLiteral(c, operandSyntax) == c.types.is(target, TypeKind.Float)) {
+        let value = checkExpr(c, operandSyntax, target)?;
+        c.hir.exprSpans[value as usize] = span;
+        return Ok(value);
+    }
+    let synthesized = synth(c, operandSyntax, none())?;
+    let synthesizedType = c.typeOf(synthesized);
+    if (pointerTarget || c.types.is(
+        synthesizedType,
+        TypeKind.RawPointer,
+    ) || c.types.is(synthesizedType, TypeKind.FunctionPointer)) {
+        c.notPorted(span.start, span.end, "a pointer cast", "S7")?;
+        return c.errorResult(span.start, span.end);
+    }
+    let operand = autoDeref(c, synthesized)?;
+    let operandType = c.typeOf(operand);
+    if (c.types.isBottom(operandType)) {
+        return Ok(operand);
+    }
+    if (!c.types.isLosslessCast(operandType, target)) {
+        let integers = c.types.is(operandType, TypeKind.Integer) && c.types.is(target, TypeKind.Integer);
+        var message = Vector<u8>.create();
+        appendText(mut message, "cannot convert ")?;
+        appendQuotedType(mut message, c, operandType)?;
+        appendText(mut message, " to ")?;
+        appendQuotedType(mut message, c, target)?;
+        appendText(mut message, " with 'as': 'as' only allows conversions that never lose information")?;
+        if (integers) {
+            appendText(mut message, "; use truncate<")?;
+            appendBytes(mut message, c.typeName(target))?;
+            appendText(mut message, ">(...) to convert with wrap-around")?;
+            // `(a + b) as u8` → `truncate<u8>(a + b)`: the operand's text, without its parentheses.
+            let inner = match (c.front.ast.exprs[operandSyntax as usize]) {
+                ExprNode.Paren(i) => i,
+                _ => operandSyntax,
+            };
+            let innerSpan = c.front.ast.exprSpans[inner as usize];
+            var title = Vector<u8>.create();
+            appendText(mut title, "use truncate<")?;
+            appendBytes(mut title, c.typeName(target))?;
+            appendText(mut title, ">(…)")?;
+            var text = Vector<u8>.create();
+            appendText(mut text, "truncate<")?;
+            appendBytes(mut text, c.typeName(target))?;
+            appendText(mut text, ">(")?;
+            appendBytes(mut text, c.fileTexts[c.file as usize][(innerSpan.start as usize)..(innerSpan.end as usize)])?;
+            appendText(mut text, ")")?;
+            c.errorWithFix(invalidCast(), span.start, span.end, message, title, span.start, span.end, text)?;
+        } else {
+            c.error(invalidCast(), span.start, span.end, message)?;
+        }
+        return c.errorResult(span.start, span.end);
+    }
+    if (operandType == target) {
+        c.hir.exprSpans[operand as usize] = span;
+        return Ok(operand);
+    }
+    return c.expr(HirExpr.Cast(operand), target, span.start, span.end);
+}
+
+/// `truncate<T>(e)` (CheckTruncate): an integer reduced modulo 2^bits(T); a float rounds toward zero (§35.4).
+fn checkTruncate(
+    c: borrow mut Checker,
+    name: u32,
+    typeArguments: Range,
+    arguments: Range,
+    nameSpan: Span,
+    span: Span,
+) -> Result<u32, AllocError> {
+    if (typeArguments.count != 1) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "truncate needs exactly one type argument: truncate<T>(value)")?;
+        c.error(unsupported(), nameSpan.start, nameSpan.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let typeSyntax = c.front.ast.at(typeArguments, 0);
+    var target = c.resolveType(typeSyntax, false)?;
+    if (!c.types.isBottom(target) && !c.types.is(target, TypeKind.Integer)) {
+        let typeSpan = c.front.ast.typeSpans[typeSyntax as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "truncate<T> requires an integer type, found ")?;
+        appendQuotedType(mut message, c, target)?;
+        if (c.types.is(target, TypeKind.Float)) {
+            appendText(mut message, "; use round<")?;
+            appendBytes(mut message, c.typeName(target))?;
+            appendText(mut message, ">(...) to convert to a float")?;
+        }
+        c.error(invalidOperandTypes(), typeSpan.start, typeSpan.end, message)?;
+        target = c.types.error;
+    }
+    if (arguments.count != 1) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "truncate takes 1 argument but ")?;
+        appendDecimal(mut message, arguments.count as u64)?;
+        appendText(mut message, " were supplied")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let argument = c.front.ast.at(arguments, 0);
+    let synthesized = synth(c, argument, none())?;
+    let operand = autoDeref(c, synthesized)?;
+    let operandType = c.typeOf(operand);
+    if (!c.types.isBottom(operandType) && !c.types.is(
+        operandType,
+        TypeKind.Integer,
+    ) && !c.types.is(operandType, TypeKind.Float)) {
+        let argumentSpan = c.front.ast.exprSpans[argument as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "truncate requires an integer or float value, found ")?;
+        appendQuotedType(mut message, c, operandType)?;
+        c.error(invalidOperandTypes(), argumentSpan.start, argumentSpan.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (c.types.isBottom(target) || c.types.isBottom(operandType)) {
+        return c.errorResult(span.start, span.end);
+    }
+    if (c.types.is(operandType, TypeKind.Float)) {
+        return c.expr(HirExpr.FloatToInt(operand, FloatToIntMode.Panic), target, span.start, span.end);
+    }
+    return c.expr(HirExpr.Truncate(operand), target, span.start, span.end);
+}
+
+fn invalidCast() -> u32 => 208;

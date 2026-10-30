@@ -41,6 +41,7 @@ struct Options {
     json: bool;
     dumpTokens: bool;
     dumpAst: bool;
+    dumpHir: bool;
     files: Vector<String>;
 }
 
@@ -81,6 +82,8 @@ fn readOptions(options: borrow mut Options) -> i32 {
             }
         } else if (arg == "--dump-ast") {
             options.dumpAst = true;
+        } else if (arg == "--dump-hir") {
+            options.dumpHir = true;
         } else if (arg == "--dump-tokens") {
             options.dumpTokens = true;
         } else if (arg.length > 0 && arg[0] == '-') {
@@ -206,7 +209,13 @@ fn render(out: borrow mut Vector<u8>, d: borrow Diagnostic, source: borrow Sourc
 }
 
 fn parseCommand() -> i32 {
-    var options = Options { json: false, dumpTokens: false, dumpAst: false, files: Vector<String>.create() };
+    var options = Options {
+        json: false,
+        dumpTokens: false,
+        dumpAst: false,
+        dumpHir: false,
+        files: Vector<String>.create(),
+    };
     let status = readOptions(mut options);
     if (status != 0) {
         return status;
@@ -256,6 +265,80 @@ fn parseCommand() -> i32 {
     return if (diagnostics.hasErrors()) 1 else 0;
 }
 
+/// Prints the diagnostics as text on stderr or as the JSON document on stdout, and returns the exit status (Report).
+fn report(json: bool, diagnostics: borrow Diagnostics, sources: borrow Vector<SourceText>) -> i32 {
+    if (json) {
+        let document = diagnosticsJson(diagnostics, sources)!;
+        Console.writeBytes(document.view());
+        Console.writeLine("");
+    } else {
+        var text = Vector<u8>.create();
+        for (i in 0..diagnostics.items.length) {
+            let d = borrow diagnostics.items[i];
+            render(mut text, d, sources[d.file as usize])!;
+        }
+        // Valid UTF-8: paths come from arguments, and source lines are decoded with U+FFFD.
+        Console.writeError(StringView.fromUtf8(text.view())!);
+    }
+    return if (diagnostics.hasErrors()) 1 else 0;
+}
+
+/// `check`: the hosted libraries and the files, parsed; then checked if they parse (Compilation.Create, P3).
+fn checkCommand() -> i32 {
+    var options = Options {
+        json: false,
+        dumpTokens: false,
+        dumpAst: false,
+        dumpHir: false,
+        files: Vector<String>.create(),
+    };
+    let status = readOptions(mut options);
+    if (status != 0) {
+        return status;
+    }
+    if (options.files.length == 0) {
+        return fail("package mode is not implemented yet (ROADMAP P8); name the files");
+    }
+    var sources = Vector<SourceText>.create();
+    var fileIsLibrary = Vector<bool>.create();
+    // lib/core, then lib/std (hosted): library files come first (CoreLibrary.SourcesFor).
+    for (k in 0..libraryFileCount()) {
+        if (libraryGroup(k) <= 1) {
+            let text = libraryText(k)!;
+            sources.push(SourceText.create(libraryPath(k).bytes(), text.view())!)!;
+            fileIsLibrary.push(true)!;
+        }
+    }
+    let loaded = loadFiles(options.files, mut sources);
+    if (loaded != 0) {
+        return loaded;
+    }
+    while (fileIsLibrary.length < sources.length) {
+        fileIsLibrary.push(false)!;
+    }
+    var front = Frontend.create();
+    for (i in 0..sources.length) {
+        let source = borrow sources[i];
+        let file = truncate<u32>(i);
+        let lexed = lex(source.text.view(), file, mut front.symbols, mut front.diagnostics)!;
+        front = parseFile(file, lexed, front)!;
+    }
+    if (front.diagnostics.hasErrors()) {
+        return report(options.json, front.diagnostics, sources);
+    }
+    var texts = Vector<Vector<u8>>.create();
+    for (i in 0..sources.length) {
+        texts.push(copyBytes(sources[i].text.view())!)!;
+    }
+    let checker = checkProgram(front, fileIsLibrary, texts)!;
+    if (options.dumpHir) {
+        var printer = HirPrinter.create();
+        printer.printProgram(checker.hir, checker.types, checker.front.symbols)!;
+        Console.writeBytes(printer.out.view());
+    }
+    return report(options.json, checker.front.diagnostics, sources);
+}
+
 fn main() -> i32 {
     let argument = Process.argument(1);
     if (argument == null) {
@@ -273,6 +356,9 @@ fn main() -> i32 {
     }
     if (command == "parse") {
         return parseCommand();
+    }
+    if (command == "check") {
+        return checkCommand();
     }
     match (phaseOf(command)) {
         Some(phase) => {

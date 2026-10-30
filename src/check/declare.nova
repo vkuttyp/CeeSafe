@@ -1,0 +1,464 @@
+// The checker's driver and declarations (the reference's TypeChecker constructor, Check(), DeclareAllocError,
+// Declare, DeclareFunction and CheckMain). See src/check/checker.nova for what S1a covers.
+
+/// The reference's s_reservedNames: names no item may take (N0201).
+fn reservedNameCount() -> usize => 20;
+
+fn reservedName(k: usize) -> StringView => match (k) {
+    0 => "Result",
+    1 => "Ok",
+    2 => "Err",
+    3 => "Box",
+    4 => "Scratch",
+    5 => "Pool",
+    6 => "PoolBox",
+    7 => "Vector",
+    8 => "String",
+    9 => "SlotMap",
+    10 => "StableVector",
+    11 => "Handle",
+    12 => "File",
+    13 => "TcpListener",
+    14 => "TcpStream",
+    15 => "Ptr",
+    16 => "Slice",
+    17 => "SliceMut",
+    18 => "Cpu",
+    _ => "Target",
+};
+
+/// The reference's Builtin names, in its declaration order (the constructor's _builtins).
+fn builtinName(k: u32) -> StringView => match (k) {
+    0 => "Console",
+    1 => "Process",
+    2 => "truncate",
+    3 => "layoutOf",
+    4 => "checkedTruncate",
+    5 => "saturatingTruncate",
+    6 => "round",
+    7 => "Box",
+    8 => "Arena",
+    9 => "FixedBufferAllocator",
+    10 => "Scratch",
+    11 => "Pool",
+    12 => "Vector",
+    13 => "String",
+    14 => "SlotMap",
+    15 => "StableVector",
+    16 => "File",
+    17 => "TcpListener",
+    18 => "TcpStream",
+    19 => "Ptr",
+    20 => "Slice",
+    21 => "SliceMut",
+    22 => "StringView",
+    23 => "Cpu",
+    24 => "Target",
+    _ => "Thread",
+};
+
+/// The names the reference interns while declaring the built-in items (DeclareAllocError, DeclareIoError,
+/// DeclareAllocatorType), in its order, so symbol ids match.
+fn builtinItemSymbol(k: usize) -> StringView => match (k) {
+    0 => "AllocError",
+    1 => "OutOfMemory",
+    2 => "IoError",
+    3 => "NotFound",
+    4 => "PermissionDenied",
+    5 => "AlreadyExists",
+    6 => "IsDirectory",
+    7 => "NotDirectory",
+    8 => "InvalidInput",
+    9 => "BrokenPipe",
+    10 => "ConnectionRefused",
+    11 => "AddressInUse",
+    12 => "Other",
+    13 => "i32",
+    14 => "SystemHeap",
+    _ => "FailingAllocator",
+};
+
+/// Checks the program: `units` are the parsed files, library files first (TypeChecker.Check). The returned
+/// checker holds the HIR, the types and the front end (symbols, diagnostics, tree).
+fn checkProgram(
+    front: Frontend,
+    fileIsLibrary: Vector<bool>,
+    fileTexts: Vector<Vector<u8>>,
+) -> Result<Checker, AllocError> {
+    var c = Checker {
+        front: front,
+        types: TypeTable.create(lp64())?,
+        hir: HirProgram.create(),
+        fileIsLibrary: fileIsLibrary,
+        fileTexts: fileTexts,
+        rootItems: Map<Word, Entity>.create(),
+        coreItems: Map<Word, Entity>.create(),
+        builtins: Map<Word, u32>.create(),
+        builtinNames: Vector<u32>.create(),
+        constants: Vector<ConstEntry>.create(),
+        reserved: Vector<u32>.create(),
+        thisSymbol: 0,
+        file: 0,
+        function: none(),
+        scopes: Vector<ScopeEntry>.create(),
+        scopeStarts: Vector<usize>.create(),
+        loopDepth: 0,
+        letKeywords: Vector<LetKeyword>.create(),
+    };
+    // The constructor: the builtins' names, `this`, and a scratch frame's two parts.
+    for (k in 0..26u32) {
+        let symbol = c.intern(builtinName(k))?;
+        c.builtins.put(Word { value: symbol as u64 }, k)?;
+    }
+    c.thisSymbol = c.intern("this")?;
+    c.intern("memory")?;
+    c.intern("allocation")?;
+    for (k in 0..reservedNameCount()) {
+        let symbol = c.intern(reservedName(k))?;
+        c.reserved.push(symbol)?;
+    }
+    declareBuiltinItems(mut c)?;
+
+    // Interfaces, then structs and enums, then every other item, unit by unit (Check()).
+    for (u in 0..c.front.ast.units.length) {
+        c.file = c.front.ast.units[u].file;
+        let items = c.front.ast.units[u].items;
+        for (k in 0..items.count) {
+            let item = c.front.ast.at(items, k);
+            match (c.front.ast.items[item as usize].kind) {
+                ItemKind.Interface(_, _) => { declareTypeItem(mut c, item, "an interface", "S4")?; }
+                _ => {}
+            }
+        }
+    }
+    for (u in 0..c.front.ast.units.length) {
+        c.file = c.front.ast.units[u].file;
+        let items = c.front.ast.units[u].items;
+        for (k in 0..items.count) {
+            let item = c.front.ast.at(items, k);
+            match (c.front.ast.items[item as usize].kind) {
+                ItemKind.Struct(_) => { declareTypeItem(mut c, item, "a struct", "S2")?; }
+                ItemKind.Enum(_, _, _) => { declareTypeItem(mut c, item, "an enum", "S2")?; }
+                ItemKind.Extern(_, _, structs) => {
+                    for (s in 0..structs.count) {
+                        let imported = c.front.ast.at(structs, s);
+                        declareTypeItem(mut c, imported, "an imported C struct", "S7")?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for (u in 0..c.front.ast.units.length) {
+        c.file = c.front.ast.units[u].file;
+        let items = c.front.ast.units[u].items;
+        for (k in 0..items.count) {
+            let item = c.front.ast.at(items, k);
+            match (c.front.ast.items[item as usize].kind) {
+                ItemKind.Interface(_, _) => {}
+                ItemKind.Struct(_) => {}
+                ItemKind.Enum(_, _, _) => {}
+                _ => { declare(mut c, item)?; }
+            }
+        }
+    }
+
+    for (k in 0..c.constants.length) {
+        evaluateConstant(mut c, truncate<u32>(k))?;
+    }
+
+    // The body pass: every function in creation order; library bodies wait for S5.
+    var f: usize = 0;
+    while (f < c.hir.functions.length) {
+        if (!c.hir.functions[f].library) {
+            checkFunctionBody(mut c, truncate<u32>(f))?;
+        }
+        f += 1;
+    }
+    checkMain(mut c)?;
+    return Ok(c);
+}
+
+fn declareBuiltinItems(c: borrow mut Checker) -> Result<void, AllocError> {
+    for (k in 0..16usize) {
+        let symbol = c.intern(builtinItemSymbol(k))?;
+        let index: u32 = match (k) {
+            0 => 0,
+            2 => 1,
+            14 => 2,
+            15 => 3,
+            _ => none(),
+        };
+        if (index != none()) {
+            c.builtinNames.push(symbol)?;
+            c.coreItems.put(Word { value: symbol as u64 }, Entity.BuiltinItem(index))?;
+        }
+    }
+    return Ok();
+}
+
+fn isLibraryFile(c: borrow Checker) -> bool => c.fileIsLibrary[c.file as usize];
+
+/// N0201 if the name is reserved or a built-in item's (IsReservedName).
+fn isReservedName(c: borrow mut Checker, ident: u32) -> Result<bool, AllocError> {
+    let id = c.front.ast.idents[ident as usize];
+    var reserved = false;
+    for (r in c.reserved.view()) {
+        if (r == id.symbol) {
+            reserved = true;
+        }
+    }
+    match (c.coreItems.get(Word { value: id.symbol as u64 })) {
+        Some(e) => {
+            match (e) {
+                Entity.BuiltinItem(_) => { reserved = true; }
+                _ => {}
+            }
+        }
+        null => {}
+    }
+    if (!reserved) {
+        return Ok(false);
+    }
+    var message = Vector<u8>.create();
+    appendText(mut message, "'")?;
+    appendBytes(mut message, c.name(id.symbol))?;
+    appendText(mut message, "' is a built-in name")?;
+    c.error(duplicateItem(), id.start, id.end, message)?;
+    return Ok(true);
+}
+
+/// Own.ContainsKey(name) || (not lib/core && _core.Items.ContainsKey(name)) (IsDeclared).
+fn isDeclared(c: borrow Checker, symbol: u32) -> bool {
+    let key = Word { value: symbol as u64 };
+    if (isLibraryFile(c)) {
+        return c.coreItems.find(key) != null;
+    }
+    return c.rootItems.find(key) != null || c.coreItems.find(key) != null;
+}
+
+fn ownItem(c: borrow mut Checker, symbol: u32, entity: Entity) -> Result<void, AllocError> {
+    let key = Word { value: symbol as u64 };
+    if (isLibraryFile(c)) {
+        c.coreItems.put(key, entity)?;
+    } else {
+        c.rootItems.put(key, entity)?;
+    }
+    return Ok();
+}
+
+/// A struct, enum, interface or imported C struct. A library one is recorded by name only (S5); a user one is a gap
+/// until its slice, but its name is declared so later uses are not "cannot find".
+fn declareTypeItem(c: borrow mut Checker, item: u32, what: StringView, slice: StringView) -> Result<void, AllocError> {
+    let name = c.front.ast.items[item as usize].name;
+    let symbol = c.front.ast.idents[name as usize].symbol;
+    if (isLibraryFile(c)) {
+        if (c.coreItems.find(Word { value: symbol as u64 }) == null) {
+            ownItem(c, symbol, Entity.LibraryItem(item))?;
+        }
+        return Ok();
+    }
+    let id = c.front.ast.idents[name as usize];
+    c.notPorted(id.start, id.end, what, slice)?;
+    if (!isDeclared(c, symbol)) {
+        ownItem(c, symbol, Entity.LibraryItem(item))?;
+    }
+    return Ok();
+}
+
+/// Declare(item) for the items S1a supports; the others are gaps (in the library: names only).
+fn declare(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
+    let entry = c.front.ast.items[item as usize];
+    if (isLibraryFile(c)) {
+        match (entry.kind) {
+            ItemKind.Impl(_, _, _) => {}
+            ItemKind.Extern(_, functions, _) => {
+                for (k in 0..functions.count) {
+                    let f = c.front.ast.at(functions, k);
+                    let symbol = c.front.ast.idents[c.front.ast.functions[f as usize].name as usize].symbol;
+                    if (c.coreItems.find(Word { value: symbol as u64 }) == null) {
+                        ownItem(c, symbol, Entity.LibraryItem(item))?;
+                    }
+                }
+            }
+            _ => {
+                let symbol = c.front.ast.idents[entry.name as usize].symbol;
+                if (c.coreItems.find(Word { value: symbol as u64 }) == null) {
+                    ownItem(c, symbol, Entity.LibraryItem(item))?;
+                }
+            }
+        }
+        return Ok();
+    }
+    match (entry.kind) {
+        ItemKind.Impl(_, _, _) => {
+            c.notPorted(entry.start, entry.end, "an impl block", "S4")?;
+            return Ok();
+        }
+        ItemKind.Extern(_, _, _) => {
+            c.notPorted(entry.start, entry.end, "an extern block", "S7")?;
+            return Ok();
+        }
+        _ => {}
+    }
+    let id = c.front.ast.idents[entry.name as usize];
+    if (isReservedName(c, entry.name)?) {
+        return Ok();
+    }
+    if (isDeclared(c, id.symbol)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, c.name(id.symbol))?;
+        appendText(mut message, "' is already defined")?;
+        c.error(duplicateItem(), id.start, id.end, message)?;
+        return Ok();
+    }
+    match (entry.kind) {
+        ItemKind.Function(f) => {
+            let decl = c.front.ast.functions[f as usize];
+            if (receiverIndex(decl.receiver) != 0) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "'this' parameters are only allowed in functions declared inside a struct")?;
+                c.error(thisOutsideMethod(), decl.receiverStart, decl.receiverEnd, message)?;
+            }
+            if (decl.typeParameters.count > 0) {
+                c.notPorted(id.start, id.end, "a generic function", "S4")?;
+                ownItem(c, id.symbol, Entity.LibraryItem(item))?;
+                return Ok();
+            }
+            let function = declareFunction(c, f, none())?;
+            ownItem(c, id.symbol, Entity.Function(function))?;
+        }
+        ItemKind.Const(typ, _) => {
+            var t = c.resolveType(typ, false)?;
+            let span = c.front.ast.typeSpans[typ as usize];
+            if (c.types.is(t, TypeKind.Struct) || (c.types.is(t, TypeKind.Array) && !constElementOk(c, t))) {
+                var message = Vector<u8>.create();
+                appendText(
+                    mut message,
+                    if (c.types.is(
+                        t,
+                        TypeKind.Array,
+                    )) "constant arrays hold integers or bools (type-system.md §10)" else "constants of struct type are not supported yet",
+                )?;
+                c.error(unsupported(), span.start, span.end, message)?;
+                t = c.types.error;
+            } else if (c.types.isScoped(t)) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "constants cannot be references")?;
+                c.error(referenceNotAllowed(), span.start, span.end, message)?;
+                t = c.types.error;
+            }
+            c.hir.constants.push(HirConstant {
+                name: id.symbol,
+                typ: t,
+                file: c.file,
+                start: entry.start,
+                end: entry.end,
+                value: none(),
+            })?;
+            c.constants.push(ConstEntry {
+                item: item,
+                file: c.file,
+                hir: truncate<u32>(c.hir.constants.length - 1),
+                state: 0,
+            })?;
+            let constant = truncate<u32>(c.constants.length - 1);
+            ownItem(c, id.symbol, Entity.Constant(constant))?;
+        }
+        ItemKind.Static(_, _, _) => {
+            c.notPorted(id.start, id.end, "a static item", "S7")?;
+            ownItem(c, id.symbol, Entity.LibraryItem(item))?;
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn constElementOk(c: borrow Checker, t: u32) -> bool {
+    let element = c.types.info(t).element;
+    return c.types.is(
+        element,
+        TypeKind.Integer,
+    ) || c.types.is(element, TypeKind.Bool) || c.types.is(element, TypeKind.Error);
+}
+
+fn receiverIndex(kind: ReceiverKind) -> u32 => match (kind) {
+    ReceiverKind.None => 0,
+    ReceiverKind.Value => 1,
+    ReceiverKind.Borrow => 2,
+    ReceiverKind.BorrowMut => 3,
+};
+
+/// DeclareFunction for a top-level function without type parameters: its signature, and its parameters as locals.
+fn declareFunction(c: borrow mut Checker, f: u32, owner: u32) -> Result<u32, AllocError> {
+    let decl = c.front.ast.functions[f as usize];
+    let returnType = if (decl.returnType == none()) c.types.voidType else c.resolveType(decl.returnType, true)?;
+    let name = c.front.ast.idents[decl.name as usize].symbol;
+    let library = isLibraryFile(c);
+    let function = c.hir.addFunction(name, owner, returnType, c.file, f, library)?;
+    var seen = Vector<u32>.create();
+    for (k in 0..decl.parameters.count) {
+        let p = c.front.ast.parameters[c.front.ast.at(decl.parameters, k) as usize];
+        let t = c.resolveType(p.typ, false)?;
+        let id = c.front.ast.idents[p.name as usize];
+        var duplicate = false;
+        for (s in seen.view()) {
+            if (s == id.symbol) {
+                duplicate = true;
+            }
+        }
+        if (duplicate) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "parameter '")?;
+            appendBytes(mut message, c.name(id.symbol))?;
+            appendText(mut message, "' is declared more than once")?;
+            c.error(duplicateParameter(), id.start, id.end, message)?;
+        } else {
+            seen.push(id.symbol)?;
+        }
+        let local = c.hir.addLocal(function, id.symbol, t, false, true, id.start, id.end)?;
+        c.hir.functions[function as usize].parameters.push(local)?;
+    }
+    return Ok(function);
+}
+
+/// CheckMain: `main` takes no parameters and returns i32 or void (hosted).
+fn checkMain(c: borrow mut Checker) -> Result<void, AllocError> {
+    let symbol = c.front.symbols.find("main".bytes());
+    let mainSymbol = match (symbol) {
+        Some(s) => s.id,
+        null => { return Ok(); }
+    };
+    let entity = foundEntity(c.rootItems, Word { value: mainSymbol as u64 });
+    let function = match (entity) {
+        Entity.Function(f) => f,
+        _ => { return Ok(); }
+    };
+    let f = borrow c.hir.functions[function as usize];
+    let returnType = f.returnType;
+    let parameterCount = f.parameters.length;
+    let syntax = c.front.ast.functions[f.syntax as usize];
+    let file = f.file;
+    let id = c.front.ast.idents[syntax.name as usize];
+    let okReturn = returnType == c.types.i32 || returnType == c.types.voidType;
+    c.file = file;
+    if (parameterCount != 0 || !okReturn) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'main' must take no parameters and return 'i32' or 'void'")?;
+        c.error(invalidMain(), id.start, id.end, message)?;
+    } else if (syntax.isUnsafe) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'main' cannot be unsafe; put the unsafe code in an 'unsafe { ... }' block")?;
+        c.error(invalidMain(), id.start, id.end, message)?;
+    }
+    return Ok();
+}
+
+/// The entity `map` holds for `key`, or Entity.None (a copy, so no borrow of the map outlives the call).
+fn foundEntity(map: borrow Map<Word, Entity>, key: Word) -> Entity {
+    match (map.get(key)) {
+        Some(e) => { return e; }
+        null => { return Entity.None; }
+    }
+}

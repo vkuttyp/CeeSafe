@@ -1,0 +1,285 @@
+// The type checker (the reference's Semantics/TypeChecker.cs), ported slice by slice (docs/p3-plan.md). It turns the
+// AST into the HIR and reports the checker's diagnostics in the reference's order.
+//
+// S1a (this file): the built-in items, the library's item names, functions without type parameters, function bodies
+// (blocks, locals, assignment, if, while, loop, break, continue, return, expression statements), literals, names,
+// unary and binary operators, calls of functions, Console and Process, CheckMain and FlowAnalysis. Everything else
+// is reported as N0216 "not ported yet (P3 …)" so that a gap is never a silent difference from the reference.
+// Library bodies are not checked until S5: library HIR is never printed, and function IDs print only for closures.
+
+/// What a name denotes (the reference's `object` items and builtins).
+enum Entity {
+    None,
+    Local(u32),       // HirProgram.locals
+    Function(u32),    // HirProgram.functions
+    Constant(u32),    // Checker.constants
+    LibraryItem(u32), // a library item not yet ported (S5): its AST item
+    BuiltinItem(u32), // AllocError, IoError, SystemHeap, FailingAllocator: their index in builtinNames
+    Builtin(u32),     // Console, Process, ... (the reference's Builtin enum, by declaration index)
+}
+
+/// The reference's Builtin enum members S1 uses, by declaration index.
+fn builtinConsole() -> u32 => 0;
+fn builtinProcess() -> u32 => 1;
+
+/// BuiltinFunction members: only ConsoleWrite (0) and ConsoleWriteLine (1) print by name (HirPrinter.BuiltinName).
+fn bfConsoleWrite() -> u32 => 0;
+fn bfConsoleWriteLine() -> u32 => 1;
+fn bfProcessExit() -> u32 => 2;
+fn bfArgumentCount() -> u32 => 3;
+fn bfArgument() -> u32 => 4;
+fn bfOther() -> u32 => 99;
+
+struct ScopeEntry {
+    symbol: u32;
+    local: u32;
+}
+
+/// The `let` keyword of a `let` local, for the fix that makes it a `var` (the reference's _letKeywords).
+struct LetKeyword {
+    local: u32;
+    start: u32;
+}
+
+struct ConstEntry {
+    item: u32; // Ast.items
+    file: u32;
+    hir: u32;   // HirProgram.constants
+    state: u32; // 0 not evaluated, 1 evaluating, 2 done
+}
+
+struct Checker {
+    front: Frontend;
+    types: TypeTable;
+    hir: HirProgram;
+    fileIsLibrary: Vector<bool>;
+    fileTexts: Vector<Vector<u8>>; // each file's bytes, for fixes that quote source text
+    rootItems: Map<Word, Entity>;
+    coreItems: Map<Word, Entity>;
+    builtins: Map<Word, u32>;
+    builtinNames: Vector<u32>; // the symbols of AllocError, IoError, SystemHeap, FailingAllocator
+    constants: Vector<ConstEntry>;
+    reserved: Vector<u32>; // symbols of the reserved names (s_reservedNames)
+    thisSymbol: u32;
+    // The body being checked.
+    file: u32;
+    function: u32;
+    scopes: Vector<ScopeEntry>;
+    scopeStarts: Vector<usize>;
+    loopDepth: u32;
+    letKeywords: Vector<LetKeyword>;
+
+    fn letKeywordOf(borrow this, local: u32) -> u32 {
+        for (k in this.letKeywords.view()) {
+            if (k.local == local) {
+                return k.start;
+            }
+        }
+        return none();
+    }
+
+    // ---- Diagnostics ----
+
+    fn error(borrow mut this, code: u32, start: u32, end: u32, message: Vector<u8>) -> Result<void, AllocError> =>
+        this.front.diagnostics.error(code, this.file, start, end, message);
+
+    fn errorWithFix(
+        borrow mut this,
+        code: u32,
+        start: u32,
+        end: u32,
+        message: Vector<u8>,
+        title: Vector<u8>,
+        fixStart: u32,
+        fixEnd: u32,
+        text: Vector<u8>,
+    ) -> Result<void, AllocError> {
+        this.front.diagnostics.errorWithEdit(code, this.file, start, end, message, title, fixStart, fixEnd, text)?;
+        return Ok();
+    }
+
+    /// An S1a gap: N0216 with a message naming the slice that ports it.
+    fn notPorted(
+        borrow mut this,
+        start: u32,
+        end: u32,
+        what: StringView,
+        slice: StringView,
+    ) -> Result<void, AllocError> {
+        var message = Vector<u8>.create();
+        appendText(mut message, "ceesafec: ")?;
+        appendText(mut message, what)?;
+        appendText(mut message, " is not ported yet (docs/p3-plan.md ")?;
+        appendText(mut message, slice)?;
+        appendText(mut message, ")")?;
+        return this.error(unsupported(), start, end, message);
+    }
+
+    fn name(borrow this, symbol: u32) -> Slice<u8> => this.front.symbols.name(Symbol { id: symbol });
+
+    fn typeName(borrow this, typ: u32) -> Slice<u8> => this.types.name(typ);
+
+    fn intern(borrow mut this, text: StringView) -> Result<u32, AllocError> {
+        let s = this.front.symbols.intern(text.bytes())?;
+        return Ok(s.id);
+    }
+
+    // ---- Expressions in the HIR ----
+
+    fn expr(borrow mut this, node: HirExpr, typ: u32, start: u32, end: u32) -> Result<u32, AllocError> =>
+        this.hir.addExpr(node, typ, start, end);
+
+    fn errorResult(borrow mut this, start: u32, end: u32) -> Result<u32, AllocError> {
+        let error = this.types.error;
+        return this.hir.addExpr(HirExpr.Error, error, start, end);
+    }
+
+    fn typeOf(borrow this, e: u32) -> u32 => this.hir.exprTypes[e as usize];
+
+    fn spanOf(borrow this, e: u32) -> Span => this.hir.exprSpans[e as usize];
+
+    fn isBottom(borrow this, e: u32) -> bool => this.types.isBottom(this.typeOf(e));
+
+    // ---- Names ----
+
+    fn lookupLocal(borrow this, symbol: u32) -> u32 {
+        var i = this.scopes.length;
+        while (i > 0) {
+            i -= 1;
+            if (this.scopes[i].symbol == symbol) {
+                return this.scopes[i].local;
+            }
+        }
+        return none();
+    }
+
+    fn item(borrow this, symbol: u32) -> Entity {
+        let key = Word { value: symbol as u64 };
+        let library = this.fileIsLibrary[this.file as usize];
+        if (!library) {
+            match (this.rootItems.get(key)) {
+                Some(e) => { return e; }
+                null => {}
+            }
+        }
+        match (this.coreItems.get(key)) {
+            Some(e) => { return e; }
+            null => { return Entity.None; }
+        }
+    }
+
+    /// Locals (innermost first), then package items, then built-ins (Lookup).
+    fn lookup(borrow this, symbol: u32) -> Entity {
+        let local = this.lookupLocal(symbol);
+        if (local != none()) {
+            return Entity.Local(local);
+        }
+        let found = this.item(symbol);
+        match (found) {
+            Entity.None => {}
+            _ => { return found; }
+        }
+        match (this.builtins.get(Word { value: symbol as u64 })) {
+            Some(b) => { return Entity.Builtin(b); }
+            null => { return Entity.None; }
+        }
+    }
+
+    fn pushScope(borrow mut this) -> Result<void, AllocError> {
+        this.scopeStarts.push(this.scopes.length)?;
+        return Ok();
+    }
+
+    fn popScope(borrow mut this) {
+        let start = this.scopeStarts[this.scopeStarts.length - 1];
+        this.scopeStarts.truncate(this.scopeStarts.length - 1);
+        this.scopes.truncate(start);
+    }
+
+    fn bind(borrow mut this, symbol: u32, local: u32) -> Result<void, AllocError> {
+        this.scopes.push(ScopeEntry { symbol: symbol, local: local })?;
+        return Ok();
+    }
+
+    // ---- Types ----
+
+    /// ResolveType for what S1a supports: built-in named types. Other forms are N0216 "not ported yet".
+    fn resolveType(borrow mut this, typ: u32, allowVoid: bool) -> Result<u32, AllocError> {
+        let span = this.front.ast.typeSpans[typ as usize];
+        match (this.front.ast.types[typ as usize]) {
+            TypeNode.Named(q) => {
+                if (q.parts.count > 1) {
+                    var message = Vector<u8>.create();
+                    appendText(mut message, "qualified type names are not supported yet")?;
+                    this.error(unsupported(), span.start, span.end, message)?;
+                    return Ok(this.types.error);
+                }
+                let ident = this.front.ast.idents[this.front.ast.at(q.parts, 0) as usize];
+                var text = Vector<u8>.create();
+                appendBytes(mut text, this.name(ident.symbol))?;
+                let found = this.types.lookup(text.view());
+                if (found == none()) {
+                    match (this.item(ident.symbol)) {
+                        Entity.None => {
+                            var message = Vector<u8>.create();
+                            appendText(mut message, "unknown type '")?;
+                            appendBytes(mut message, text.view())?;
+                            appendText(mut message, "'")?;
+                            this.error(unknownType(), span.start, span.end, message)?;
+                            return Ok(this.types.error);
+                        }
+                        _ => {
+                            this.notPorted(span.start, span.end, "a struct, enum or library type", "S2/S5")?;
+                            return Ok(this.types.error);
+                        }
+                    }
+                }
+                if (this.types.is(found, TypeKind.Void) && !allowVoid) {
+                    var message = Vector<u8>.create();
+                    appendText(mut message, "'void' can only be used as a function return type")?;
+                    this.error(voidNotAllowed(), span.start, span.end, message)?;
+                    return Ok(this.types.error);
+                }
+                if (this.types.is(found, TypeKind.CChar)) {
+                    var message = Vector<u8>.create();
+                    appendText(
+                        mut message,
+                        "'CChar' is C's 'char' and can only be pointed to: use '*CChar' (type-system.md §28.3)",
+                    )?;
+                    this.error(invalidPointee(), span.start, span.end, message)?;
+                    return Ok(this.types.error);
+                }
+                return Ok(found);
+            }
+            TypeNode.Missing => { return Ok(this.types.error); }
+            _ => {
+                this.notPorted(span.start, span.end, "this kind of type", "S2-S7")?;
+                return Ok(this.types.error);
+            }
+        }
+    }
+}
+
+fn unknownType() -> u32 => 204;
+fn typeMismatch() -> u32 => 205;
+fn literalOutOfRange() -> u32 => 206;
+fn invalidOperandTypes() -> u32 => 207;
+fn argumentCount() -> u32 => 209;
+fn notCallable() -> u32 => 210;
+fn assignToImmutable() -> u32 => 211;
+fn missingReturn() -> u32 => 213;
+fn loopControlOutsideLoop() -> u32 => 214;
+fn returnValueMismatch() -> u32 => 215;
+fn invalidMain() -> u32 => 219;
+fn letWithoutInitializer() -> u32 => 220;
+fn localNeedsType() -> u32 => 221;
+fn voidValue() -> u32 => 224;
+fn statementNotCall() -> u32 => 225;
+fn voidNotAllowed() -> u32 => 226;
+fn thisOutsideMethod() -> u32 => 232;
+fn undefinedName() -> u32 => 200;
+fn duplicateItem() -> u32 => 201;
+fn duplicateParameter() -> u32 => 202;
+fn localRedeclared() -> u32 => 203;
+fn referenceNotAllowed() -> u32 => 246;
+fn invalidPointee() -> u32 => 281;
