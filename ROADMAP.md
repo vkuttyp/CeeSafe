@@ -579,7 +579,7 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
    fixtures (`docs/parity.md` §3).
 3. P2 and P3 are done (`docs/p2-frontend.md`, `docs/p3-plan.md`), pinned to novac 0.6.0. Next: P4, NIR and the
    safety passes, whose diagnostics are all that the remaining check-fail differences need.
-4. Upstream: novac 0.6.0's `offsetOf<T>(field)` is 0 unless `T`'s layout was computed before (CheckOffsetOf reads
+4. Upstream (Nova #6, filed 2026-10-30): novac 0.6.0's `offsetOf<T>(field)` is 0 unless `T`'s layout was computed before (CheckOffsetOf reads
    `member.Offset` without `TypeTable.LayoutOf(measured)`); ceesafec gives the true offset.
 5. Owner's call: propose upstream that N0110 count `else if` links and `?` suffixes. novac's `--dump-ast` aborts on a
    20,000-link `else if` chain (`docs/p2-frontend.md` §6).
