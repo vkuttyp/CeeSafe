@@ -146,6 +146,7 @@ fn checkProgram(
         constantFunctions: Vector<u32>.create(),
         callbacks: Vector<u32>.create(),
         placedMethods: Vector<u32>.create(),
+        moveBodies: Vector<MoveBody>.create(),
     };
     // The constructor: the builtins' names, `this`, and a scratch frame's two parts.
     for (k in 0..26u32) {

@@ -128,13 +128,37 @@ fn checkBoxCreate(
             hint = c.types.info(ok).pointee;
         }
     }
-    let isMoveLiteral = match (c.front.ast.exprs[valueSyntax as usize]) {
-        ExprNode.Closure(closure) => c.front.ast.closures[closure as usize].isMove,
-        _ => false,
+    let moveLiteral = match (c.front.ast.exprs[valueSyntax as usize]) {
+        ExprNode.Closure(closure) => if (c.front.ast.closures[closure as usize].isMove) closure else none(),
+        _ => none(),
     };
-    if (isMoveLiteral) {
-        c.notPorted(span.start, span.end, "a boxed 'move' closure", "S6")?;
-        return c.errorResult(span.start, span.end);
+    if (moveLiteral != none()) {
+        // `Box.create(move (…) => …)` for an expected `Box<dyn fn…>` (§36.5): the box holds the environment.
+        let literalSpan = c.front.ast.exprSpans[valueSyntax as usize];
+        var dynFunction = none();
+        if (expected != none() && isResultType(c, expected)) {
+            let ok = resultOk(c, expected);
+            if (c.types.is(ok, TypeKind.Box)) {
+                let contents = c.types.info(ok).pointee;
+                if (c.types.isDyn(contents) && c.types.info(contents).dynInterface == none()) {
+                    dynFunction = contents;
+                }
+            }
+        }
+        if (dynFunction == none()) {
+            return misplacedMoveLiteral(c, literalSpan);
+        }
+        let environment = checkClosureWith(c, moveLiteral, none(), dynFunction, true, literalSpan)?;
+        if (c.isBottom(environment)) {
+            return c.errorResult(span.start, span.end);
+        }
+        values.push(environment)?;
+        let environmentType = c.typeOf(environment);
+        let box = boxOf(c, environmentType, allocator)?;
+        let allocError = c.allocErrorType;
+        let result = resultOf(c, box, allocError)?;
+        let list = c.hir.list(values.view())?;
+        return c.expr(HirExpr.BuiltinCall(bfBoxCreate(), list), result, span.start, span.end);
     }
     var value = none();
     if (hint != none()) {

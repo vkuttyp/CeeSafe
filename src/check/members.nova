@@ -316,13 +316,17 @@ fn checkMethodCall(
         let field = findField(c, holder, memberIdent.symbol);
         if (field != none()) {
             let fieldType = c.types.fields[field as usize].typ;
-            let callable = c.types.is(fieldType, TypeKind.Function) || c.types.isClosure(fieldType);
+            let callable = c.types.is(fieldType, TypeKind.Function) || c.types.isClosure(fieldType) ||
+                dynFunctionBehind(c, fieldType) != none();
             let hidden = c.types.fields[field as usize].isPrivate && c.types.structs[holder as usize].file != c.file;
             let memberSpan = Span { start: memberIdent.start, end: memberIdent.end };
             if (callable && !hidden && findMethod(c, readType, memberIdent.symbol, memberSpan)? == none()) {
                 let callee = c.expr(HirExpr.FieldAccess(read, field), fieldType, targetSpan.start, memberIdent.end)?;
                 if (c.types.is(fieldType, TypeKind.Function)) {
                     return checkFunctionValueCall(c, callee, arguments, span);
+                }
+                if (!c.types.isClosure(fieldType)) {
+                    return checkDynFunctionCall(c, callee, arguments, span); // §36.5
                 }
                 return checkClosureCall(c, callee, arguments, span);
             }

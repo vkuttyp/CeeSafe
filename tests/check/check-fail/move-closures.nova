@@ -1,0 +1,36 @@
+struct Holder { run: dyn fn(u64) -> u64; }
+
+fn unboxed(f: dyn fn() -> u64) {}
+fn scoped(text: StringView) -> Box<dyn fn() -> usize> => Box.create(move () => text.length)!;
+fn changes() -> Box<dyn fn() -> u64> {
+    var count: u64 = 0;
+    return Box.create(move () => {
+        count += 1;
+        return count;
+    })!;
+}
+fn arity() -> Box<dyn fn() -> u64> => Box.create(move (x) => x)!;
+fn wrongResult() -> Box<dyn fn() -> u64> => Box.create(move () => true)!;
+fn mutToShared() -> Box<dyn fn() -> u64> {
+    var count: u64 = 0;
+    let boxed: Box<dyn mut fn() -> u64> = Box.create(move () => {
+        count += 1;
+        return count;
+    })!;
+    return boxed;
+}
+fn sharedCall(f: borrow Box<dyn mut fn() -> u64>) -> u64 => f();
+fn wrongCount(f: borrow dyn fn(u64) -> u64) -> u64 => f(1, 2);
+fn wrongArgument(f: borrow dyn fn(u64) -> u64) -> u64 => f(true);
+
+fn main() {
+    let loose = move () => 1;
+    let held = Box.create(move () => 2)!;
+    var count: u64 = 0;
+    let fixed: Box<dyn mut fn() -> u64> = Box.create(move () => {
+        count += 1;
+        return count;
+    })!;
+    fixed();
+    let other: Box<dyn fn() -> u64> = Box.create(5)!;
+}

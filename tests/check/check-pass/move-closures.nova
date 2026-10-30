@@ -1,0 +1,35 @@
+struct Item { id: u64; }
+struct Holder {
+    run: Box<dyn fn(u64) -> u64>;
+    count: Box<dyn mut fn() -> u64>;
+}
+
+fn adder(n: u64) -> Result<Box<dyn fn(u64) -> u64>, AllocError> => Ok(Box.create(move (x) => x + n)?);
+fn counter() -> Box<dyn mut fn() -> u64> {
+    var count: u64 = 0;
+    return Box.create(move () => {
+        count += 1;
+        return count;
+    })!;
+}
+fn quiet() -> Box<dyn @effects() fn(u64) -> u64> => Box.create(move (x) => x * 3)!;
+fn sendable(item: Item) -> Box<dyn fn() -> u64 + Send> => Box.create(move () => item.id)!;
+fn call(f: borrow dyn fn(u64) -> u64, x: u64) -> u64 => f(x);
+fn callTwice(f: borrow mut Box<dyn mut fn() -> u64>) -> u64 {
+    f();
+    return f();
+}
+
+fn main() {
+    let add = adder(2)!;
+    var next = counter();
+    let q = quiet();
+    let s = sendable(Item { id: 4 });
+    let plain: Box<dyn fn() -> u64> = s;
+    var holder = Holder { run: adder(5)!, count: counter() };
+    let names = Vector<u64>.create();
+    let size: Box<dyn fn() -> usize> = Box.create(move () => names.length)!;
+    Console.writeLine(add(1) + next() + q(2) + plain() + call(add, 3) + callTwice(mut next));
+    Console.writeLine(holder.run(1) + holder.count());
+    Console.writeLine(size());
+}

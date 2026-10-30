@@ -298,8 +298,15 @@ fn appendQuotedCall(out: borrow mut Vector<u8>, c: borrow Checker, name: u32) ->
 }
 
 /// The operand of `e?` or `e!`: a `Result` or optional value (CheckResultOperand, N0262), or none.
-fn checkResultOperand(c: borrow mut Checker, operand: u32, text: StringView) -> Result<u32, AllocError> {
-    let value = synth(c, operand, none())?;
+fn checkResultOperand(c: borrow mut Checker, operand: u32, text: StringView, expected: u32) -> Result<u32, AllocError> {
+    // `Box.create(move …)!` for an expected `Box<dyn fn…>`: the move literal's type comes from it (§36.5).
+    var hint = none();
+    if (expected != none() && c.types.isDynBox(expected) &&
+        c.types.info(c.types.info(expected).pointee).dynInterface == none()) {
+        let allocError = c.allocErrorType;
+        hint = resultOf(c, expected, allocError)?;
+    }
+    let value = synth(c, operand, hint)?;
     if (c.isBottom(value)) {
         return Ok(none());
     }
@@ -326,8 +333,8 @@ fn checkResultOperand(c: borrow mut Checker, operand: u32, text: StringView) -> 
 }
 
 /// `e?` (CheckTry, §17.4, §22.1).
-fn checkTry(c: borrow mut Checker, operandSyntax: u32, span: Span) -> Result<u32, AllocError> {
-    let operand = checkResultOperand(c, operandSyntax, "?")?;
+fn checkTry(c: borrow mut Checker, operandSyntax: u32, expected: u32, span: Span) -> Result<u32, AllocError> {
+    let operand = checkResultOperand(c, operandSyntax, "?", expected)?;
     if (operand == none()) {
         return c.errorResult(span.start, span.end);
     }
@@ -393,8 +400,8 @@ fn appendFunctionName(out: borrow mut Vector<u8>, c: borrow Checker) -> Result<v
 }
 
 /// `e!` (§17.5, §22.1).
-fn checkUnwrap(c: borrow mut Checker, operandSyntax: u32, span: Span) -> Result<u32, AllocError> {
-    let operand = checkResultOperand(c, operandSyntax, "!")?;
+fn checkUnwrap(c: borrow mut Checker, operandSyntax: u32, expected: u32, span: Span) -> Result<u32, AllocError> {
+    let operand = checkResultOperand(c, operandSyntax, "!", expected)?;
     if (operand == none()) {
         return c.errorResult(span.start, span.end);
     }

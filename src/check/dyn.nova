@@ -21,13 +21,31 @@ fn resolveDynType(
     span: Span,
     allowed: bool,
 ) -> Result<u32, AllocError> {
-    let isFunction = match (c.front.ast.types[interfaceSyntax as usize]) {
-        TypeNode.Function(_, _, _) => true,
-        _ => false,
-    };
-    if (isFunction) {
-        c.notPorted(span.start, span.end, "a 'dyn fn' type", "S6")?;
-        return Ok(c.types.error);
+    match (c.front.ast.types[interfaceSyntax as usize]) {
+        TypeNode.Function(attributes, parameters, result) => {
+            // `dyn fn(…) -> R` / `dyn mut fn(…) -> R` (§36.5).
+            let functionSpan = c.front.ast.typeSpans[interfaceSyntax as usize];
+            let callable = c.resolveFunctionType(attributes, parameters, result, functionSpan)?;
+            if (c.types.isBottom(callable)) {
+                return Ok(c.types.error);
+            }
+            var types = Vector<u32>.create();
+            listTypes(c, c.types.info(callable).parameters, mut types)?;
+            let callableResult = c.types.info(callable).result;
+            let callableEffects = c.types.info(callable).effects;
+            let dynFunction = c.types.dynFunctionOf(types.view(), callableResult, callableEffects, mutable, send)?;
+            if (!allowed) {
+                var message = Vector<u8>.create();
+                appendQuotedType(mut message, c, dynFunction)?;
+                appendText(mut message, " has no size the compiler knows: use it in a box, 'Box<")?;
+                appendBytes(mut message, c.typeName(dynFunction))?;
+                appendText(mut message, ">' (type-system.md §36.5)")?;
+                c.error(dynNotBehindPointer(), span.start, span.end, message)?;
+                return Ok(c.types.error);
+            }
+            return Ok(dynFunction);
+        }
+        _ => {}
     }
     if (mutable) {
         var message = Vector<u8>.create();
@@ -159,11 +177,7 @@ fn coerceToDyn(c: borrow mut Checker, e: u32, expected: u32, span: Span) -> Resu
     ) && a.allocator == x.allocator;
     let pointee = a.pointee;
     if (fits && c.types.isDyn(pointee) && c.types.info(pointee).sendDyn && !c.types.info(dynType).sendDyn &&
-        c.types.info(pointee).dynInterface != none() && c.types.info(dynType).dynInterface != none() && sameBound(
-        c,
-        c.types.info(pointee).dynInterface,
-        c.types.info(dynType).dynInterface,
-    )) {
+        sameDyn(c, pointee, dynType)) {
         return c.expr(HirExpr.Cast(value), expected, span.start, span.end); // forgetting `+ Send` (§38.4)
     }
     if (!fits || c.types.isDyn(pointee) || c.types.isUnsized(pointee) || c.types.info(pointee).isStr ||
@@ -182,8 +196,7 @@ fn coerceToDyn(c: borrow mut Checker, e: u32, expected: u32, span: Span) -> Resu
     }
     let bound = c.types.info(dynType).dynInterface;
     if (bound == none()) {
-        c.notPorted(span.start, span.end, "a 'dyn fn' coercion", "S6")?;
-        return c.errorResult(span.start, span.end);
+        return coerceToDynFunction(c, value, implementation, dynType, expected, span);
     }
     if (!implements(c, implementation, bound)) {
         var message = Vector<u8>.create();
@@ -213,6 +226,212 @@ fn coerceToDyn(c: borrow mut Checker, e: u32, expected: u32, span: Span) -> Resu
         c.dynTables.push(DynTable { implementation: implementation, dynType: dynType, methods: list })?;
     }
     return c.expr(HirExpr.Cast(value), expected, span.start, span.end);
+}
+
+/// A boxed move literal's environment as a `dyn fn` (CoerceToDynFunction, §36.5): the same signature, and a changing
+/// body only for `dyn mut fn`. Its table's one entry is the body. None if `environment` is no move literal's.
+fn coerceToDynFunction(
+    c: borrow mut Checker,
+    e: u32,
+    environment: u32,
+    dynType: u32,
+    expected: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    var body = none();
+    for (m in c.moveBodies.view()) {
+        if (m.environment == environment) {
+            body = m.function;
+        }
+    }
+    if (body == none()) {
+        return Ok(none());
+    }
+    let parameters = c.hir.functions[body as usize].parameters.length;
+    let d = c.types.info(dynType);
+    var same = (parameters - 1) == (d.parameters.count as usize) &&
+        c.hir.functions[body as usize].returnType == d.result;
+    if (same) {
+        for (k in 1..parameters) {
+            let local = c.hir.functions[body as usize].parameters[k];
+            if (c.hir.locals[local as usize].typ != c.types.listAt(d.parameters, truncate<u32>(k - 1))) {
+                same = false;
+            }
+        }
+    }
+    if (!same) {
+        return Ok(none());
+    }
+    if (!d.mutableDynFunction) {
+        let captures = c.hir.functions[body as usize].closureCaptures;
+        for (k in 0..captures.count) {
+            if (isMutableCapture(c.hir.captures[(captures.start + k) as usize].mode)) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "expected ")?;
+                appendQuotedType(mut message, c, expected)?;
+                appendText(
+                    mut message,
+                    ", but this closure changes what it captured, so it is a 'dyn mut fn' (type-system.md §36.5)",
+                )?;
+                c.error(closureKind(), span.start, span.end, message)?;
+                return c.errorResult(span.start, span.end);
+            }
+        }
+    }
+    var recorded = false;
+    for (t in c.dynTables.view()) {
+        if (t.implementation == environment && t.dynType == dynType) {
+            recorded = true;
+        }
+    }
+    if (!recorded) {
+        let functions = [body];
+        let list = c.hir.list(functions[..])?;
+        c.dynTables.push(DynTable { implementation: environment, dynType: dynType, methods: list })?;
+    }
+    return c.expr(HirExpr.Cast(e), expected, span.start, span.end);
+}
+
+/// Two dyn types that differ at most in `+ Send` (SameDyn, §38.4).
+fn sameDyn(c: borrow Checker, a: u32, b: u32) -> bool {
+    let x = c.types.info(a);
+    let y = c.types.info(b);
+    if (x.dynInterface == none()) {
+        return y.dynInterface == none() && x.mutableDynFunction == y.mutableDynFunction && x.effects == y.effects &&
+            sameLists(c, x.parameters, y.parameters) && x.result == y.result;
+    }
+    return y.dynInterface != none() && sameBound(c, x.dynInterface, y.dynInterface);
+}
+
+/// The method `call` of a `dyn fn` type (DynFunctionMethod, §36.5): a bodiless dyn method taking the closure (shared,
+/// or mutable for `dyn mut fn`) and the parameters, with the type's effect list.
+fn dynFunctionMethod(c: borrow mut Checker, dynType: u32) -> Result<u32, AllocError> {
+    let callSymbol = c.intern("call")?;
+    for (m in c.boundMethods.view()) {
+        if (m.typ == dynType && m.bound == none() && m.name == callSymbol) {
+            return Ok(m.function);
+        }
+    }
+    let d = c.types.info(dynType);
+    let nameIdent = c.front.ast.addIdent(Ident { symbol: callSymbol, start: 0, end: 0, missing: false })?;
+    c.front.ast.functions.push(Function {
+        visibility: Visibility.Default,
+        name: nameIdent,
+        receiver: if (d.mutableDynFunction) ReceiverKind.BorrowMut else ReceiverKind.Borrow,
+        receiverStart: 0,
+        receiverEnd: 0,
+        parameters: emptyRange(),
+        returnType: none(),
+        body: none(),
+        expressionBody: none(),
+        typeParameters: emptyRange(),
+        regionParameters: emptyRange(),
+        isUnsafe: false,
+        hasDoc: false,
+        doc: emptyRange(),
+        isExtern: false,
+        attributes: emptyRange(),
+        start: 0,
+        end: 0,
+    })?;
+    let syntax = truncate<u32>(c.front.ast.functions.length - 1);
+    let library = isLibraryFile(c);
+    let function = c.hir.addFunction(callSymbol, dynType, d.result, c.file, syntax, library, false)?;
+    c.hir.functions[function as usize].isDynMethod = true;
+    c.hir.functions[function as usize].dynSlot = 0;
+    c.hir.functions[function as usize].declaredEffects = boundOf(c, dynType);
+    let thisType = c.types.referenceTo(dynType, d.mutableDynFunction)?;
+    let thisSymbol = c.thisSymbol;
+    let receiver = c.hir.addLocal(function, thisSymbol, thisType, false, true, 0, 0)?;
+    c.hir.functions[function as usize].parameters.push(receiver)?;
+    for (k in 0..d.parameters.count) {
+        var text = Vector<u8>.create();
+        text.push('a')?;
+        appendDecimal(mut text, k as u64)?;
+        let name = c.front.symbols.intern(text.view())?.id;
+        let t = c.types.listAt(d.parameters, k);
+        let local = c.hir.addLocal(function, name, t, false, true, 0, 0)?;
+        c.hir.functions[function as usize].parameters.push(local)?;
+    }
+    c.boundMethods.push(BoundMethod { typ: dynType, bound: none(), name: callSymbol, function: function })?;
+    return Ok(function);
+}
+
+/// `f(args)` where `f` reaches a `dyn fn` through references and boxes (CheckDynFunctionCall, §36.5): a call of its
+/// `call` method on a borrow of the closure, mutable for `dyn mut fn`.
+fn checkDynFunctionCall(c: borrow mut Checker, callee: u32, arguments: Range, span: Span) -> Result<u32, AllocError> {
+    let calleeSpan = c.hir.exprSpans[callee as usize];
+    var target = callee;
+    while (!c.types.isDyn(c.typeOf(target))) {
+        let pointee = c.types.info(c.typeOf(target)).pointee;
+        target = c.expr(HirExpr.Deref(target), pointee, calleeSpan.start, calleeSpan.end)?;
+    }
+    let dynType = c.typeOf(target);
+    let d = c.types.info(dynType);
+    if (arguments.count != d.parameters.count) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, dynType)?;
+        appendText(mut message, " takes ")?;
+        appendDecimal(mut message, d.parameters.count as u64)?;
+        appendText(mut message, " argument(s) but ")?;
+        appendDecimal(mut message, arguments.count as u64)?;
+        appendText(mut message, " were supplied")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (d.mutableDynFunction && !canMutateThrough(c, target)) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, dynType)?;
+        appendText(
+            mut message,
+            " changes what it captured, so calling it needs mutable access, but this closure is behind a shared reference or in a 'let' (type-system.md §36.5)",
+        )?;
+        c.error(borrowMutOfImmutable(), calleeSpan.start, calleeSpan.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let method = dynFunctionMethod(c, dynType)?;
+    var values = Vector<u32>.create();
+    values.push(borrowPlace(c, target, d.mutableDynFunction, calleeSpan)?)?;
+    var bottom = false;
+    for (k in 0..arguments.count) {
+        let syntax = c.front.ast.at(arguments, k);
+        let parameter = c.types.listAt(d.parameters, k);
+        let argument = checkArgument(c, syntax, parameter)?;
+        if (c.isBottom(argument)) {
+            bottom = true;
+        }
+        values.push(argument)?;
+    }
+    if (bottom || c.isBottom(values[0])) {
+        return c.errorResult(span.start, span.end);
+    }
+    let list = c.hir.list(values.view())?;
+    return c.expr(HirExpr.Call(method, list), d.result, span.start, span.end);
+}
+
+/// Does a place allow a mutable borrow: no shared reference on its path, and a `var` (or mutable reference) at its
+/// root (CanMutateThrough)?
+fn canMutateThrough(c: borrow Checker, place: u32) -> bool {
+    match (c.hir.exprs[place as usize]) {
+        HirExpr.Deref(reference) => {
+            let t = c.typeOf(reference);
+            return if (c.types.is(t, TypeKind.Reference)) c.types.info(t).mutableReference else canMutateThrough(
+                c,
+                reference,
+            );
+        }
+        HirExpr.FieldAccess(target, _) => {
+            let t = c.typeOf(target);
+            return if (c.types.is(t, TypeKind.Reference)) c.types.info(t).mutableReference else canMutateThrough(
+                c,
+                target,
+            );
+        }
+        HirExpr.LocalRef(local) => { return c.hir.locals[local as usize].mutable; }
+        _ => { return true; }
+    }
 }
 
 /// Two bounds of the same interface with the same arguments (SameDyn for interface dyns).

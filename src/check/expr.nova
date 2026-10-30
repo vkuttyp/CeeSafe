@@ -188,8 +188,8 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
         ExprNode.Index(target, index) => { return synthIndex(c, target, index, span); }
         ExprNode.Slice(target, low, high) => { return synthSlice(c, target, low, high, false, span); }
         ExprNode.MutArg(_) => { return misplacedMutArgument(c, span); }
-        ExprNode.Try(operand) => { return checkTry(c, operand, span); }
-        ExprNode.Unwrap(operand) => { return checkUnwrap(c, operand, span); }
+        ExprNode.Try(operand) => { return checkTry(c, operand, expected, span); }
+        ExprNode.Unwrap(operand) => { return checkUnwrap(c, operand, expected, span); }
         ExprNode.If(_, _, _) => { return checkBranching(c, e, none()); }
         ExprNode.Match(_, _) => { return checkBranching(c, e, none()); }
         ExprNode.This => {
@@ -758,8 +758,8 @@ fn synthCall(
                         return c.errorResult(span.start, span.end);
                     }
                     if (dynFunctionBehind(c, t) != none()) {
-                        c.notPorted(span.start, span.end, "a call through a 'dyn fn'", "S6c")?;
-                        return c.errorResult(span.start, span.end);
+                        let value = c.expr(HirExpr.LocalRef(local), t, calleeSpan.start, calleeSpan.end)?;
+                        return checkDynFunctionCall(c, value, arguments, span); // §36.5
                     }
                 }
                 Entity.Builtin(b) => {

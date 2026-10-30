@@ -222,18 +222,37 @@ fn namesInStmt(c: borrow Checker, s: u32, parameters: borrow Vector<u32>) -> boo
 /// enclosing scopes visible, as a function of its own; every outer local it names is captured, mutably if it is written
 /// or borrowed mutably. With captures (or a closure type expected) it gets an environment and is a closure; without,
 /// it is a plain function value.
-fn checkClosure(c: borrow mut Checker, closure: u32, expected: u32, span: Span) -> Result<u32, AllocError> {
+fn checkClosure(c: borrow mut Checker, closure: u32, expected: u32, span: Span) -> Result<u32, AllocError> =>
+    checkClosureWith(c, closure, expected, none(), false, span);
+
+/// CheckClosure with its move arguments: a move literal (§36.5) for the `dyn fn` type `moveInto`, or, when that is none
+/// (a spawned body, §38.2), with its result type inferred from the body.
+fn checkClosureWith(
+    c: borrow mut Checker,
+    closure: u32,
+    expected: u32,
+    moveInto: u32,
+    isMoveLiteral: bool,
+    span: Span,
+) -> Result<u32, AllocError> {
     let literal = c.front.ast.closures[closure as usize];
+    let moveLiteral = isMoveLiteral || moveInto != none();
     let expectsClosure = expected != none() && c.types.isClosure(expected);
     let expectsFunction = expected != none() && c.types.is(expected, TypeKind.Function);
-    let callable = if (expectsClosure) c.types.info(expected).pointee else if (expectsFunction) expected else none();
+    let callable = if (moveInto != none()) moveInto else if (expectsClosure) c.types.info(
+        expected,
+    ).pointee else if (expectsFunction) expected else none();
     let parameterCount = literal.parameters.count;
     if (callable != none() && c.types.info(callable).parameters.count != parameterCount) {
         var message = Vector<u8>.create();
         appendText(mut message, "this closure takes ")?;
         appendDecimal(mut message, parameterCount as u64)?;
         appendText(mut message, " parameter(s), but ")?;
-        appendQuotedType(mut message, c, expected)?;
+        if (expected == none()) {
+            appendText(mut message, "''")?; // as the reference prints a move literal's absent expected type
+        } else {
+            appendQuotedType(mut message, c, expected)?;
+        }
         appendText(mut message, " takes ")?;
         appendDecimal(mut message, c.types.info(callable).parameters.count as u64)?;
         c.error(argumentCount(), span.start, span.end, message)?;
@@ -270,11 +289,7 @@ fn checkClosure(c: borrow mut Checker, closure: u32, expected: u32, span: Span) 
     if (bottom) {
         return c.errorResult(span.start, span.end);
     }
-    if (literal.isMove) {
-        c.notPorted(span.start, span.end, "a 'move' closure", "S6c")?;
-        return c.errorResult(span.start, span.end);
-    }
-    let asClosure = expectsClosure || namesOuterLocal(c, closure);
+    let asClosure = moveLiteral || expectsClosure || namesOuterLocal(c, closure);
     // A block's result is unknown without an expected type: the error type until the body is checked, so a
     // `return value` there is not also reported as returning from a void function.
     let initialReturn = if (callable != none()) c.types.info(
@@ -364,7 +379,11 @@ fn checkClosure(c: borrow mut Checker, closure: u32, expected: u32, span: Span) 
     c.closureContexts.truncate(last);
     c.function = savedFunction;
     c.loopDepth = savedLoop;
-    if (callable == none() && literal.block != none()) {
+    if (callable == none() && literal.block != none() && moveLiteral && returnsValue(c, body)) {
+        // A spawned body's result is its first `return`'s type (§38.2): threads, S6d.
+        c.notPorted(span.start, span.end, "a spawned body's result", "S6d")?;
+        return c.errorResult(span.start, span.end);
+    } else if (callable == none() && literal.block != none()) {
         if (returnsValue(c, body)) {
             var message = Vector<u8>.create();
             appendText(
@@ -384,6 +403,14 @@ fn checkClosure(c: borrow mut Checker, closure: u32, expected: u32, span: Span) 
     let callableType = c.types.functionTo(parameterTypes.view(), returnType, effects)?;
     if (c.types.isBottom(returnType)) {
         return c.errorResult(span.start, span.end);
+    }
+    if (moveLiteral) {
+        var into = moveInto;
+        if (into == none()) {
+            let none0 = Vector<u32>.create();
+            into = c.types.dynFunctionOf(none0.view(), returnType, allEffects(), true, false)?;
+        }
+        return finishMoveLiteral(c, function, environment, captures.view(), into, effects, span);
     }
     if (!asClosure) {
         return c.expr(HirExpr.Closure(function, emptyRange()), callableType, span.start, span.end);
@@ -591,6 +618,88 @@ fn finishEnvironment(
     c.environments.push(EnvironmentRecord { typ: environment, closure: function })?;
     return Ok(range);
 }
+
+/// A move literal after its body is checked (FinishMoveLiteral, §36.5): no scoped capture (N0332), no change to a
+/// capture unless a `dyn mut fn` is expected (N0299). Its value is its environment, a struct of the captured values,
+/// which `Box.create` then boxes.
+fn finishMoveLiteral(
+    c: borrow mut Checker,
+    function: u32,
+    environment: u32,
+    captures: Slice<HirCapture>,
+    moveInto: u32,
+    effects: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    for (capture in captures) {
+        let local = c.hir.locals[capture.local as usize];
+        if (c.types.isScoped(local.typ)) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "this 'move' closure captures ")?;
+            appendQuotedName(mut message, c, local.name)?;
+            appendText(mut message, ", a ")?;
+            appendQuotedType(mut message, c, local.typ)?;
+            appendText(mut message, ", which holds a loan: the box could outlive it (type-system.md §36.5)")?;
+            c.error(moveCaptureScoped(), span.start, span.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+    }
+    if (!c.types.info(moveInto).mutableDynFunction) {
+        for (capture in captures) {
+            if (isMutableCapture(capture.mode)) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "expected ")?;
+                appendQuotedType(mut message, c, moveInto)?;
+                appendText(mut message, ", but this closure changes its ")?;
+                appendQuotedName(mut message, c, c.hir.locals[capture.local as usize].name)?;
+                appendText(mut message, ", so it is a 'dyn mut fn' (type-system.md §36.5)")?;
+                c.error(closureKind(), span.start, span.end, message)?;
+                return c.errorResult(span.start, span.end);
+            }
+        }
+    }
+    var moved = Vector<HirCapture>.create();
+    for (capture in captures) {
+        let t = c.hir.locals[capture.local as usize].typ;
+        let value = c.expr(HirExpr.LocalRef(capture.local), t, span.start, span.end)?;
+        moved.push(
+            HirCapture {
+                local: capture.local,
+                mode: CaptureMode.Move,
+                value: value,
+                field: none(),
+                throughReference: false,
+            },
+        )?;
+    }
+    let definition = c.types.info(environment).structDef;
+    c.types.structs[definition as usize].isMoveEnvironment = true;
+    let range = finishEnvironment(c, function, environment, moved.view(), effects, span)?;
+    // It owns its captures (§36.5): it needs drop if one does, made after ComputeCopyAndDrop has run.
+    var needsDrop = false;
+    var isCopy = true;
+    for (field in c.types.structs[definition as usize].fields.view()) {
+        let t = c.types.fields[field as usize].typ;
+        if (c.types.needsDrop(t)) {
+            needsDrop = true;
+        }
+        if (!c.types.isCopy(t)) {
+            isCopy = false;
+        }
+    }
+    c.types.structs[definition as usize].needsDrop = needsDrop;
+    c.types.structs[definition as usize].isCopy = isCopy;
+    c.moveBodies.push(MoveBody { environment: environment, function: function })?;
+    return c.expr(HirExpr.Closure(function, range), environment, span.start, span.end);
+}
+
+/// A move literal's environment type and its body (the reference's _moveBodies).
+struct MoveBody {
+    environment: u32;
+    function: u32;
+}
+
+fn moveCaptureScoped() -> u32 => 332;
 
 /// A closure environment and its function (the reference's _environments), for the C backend.
 struct EnvironmentRecord {
