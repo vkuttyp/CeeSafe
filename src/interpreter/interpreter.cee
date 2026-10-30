@@ -1,0 +1,1798 @@
+// The NIR reference interpreter (the reference's Interpreter/NirInterpreter.cs; intermediate-representation.md §5):
+// it runs the checked NIR on a memory that checks every access, with the native program's observable behaviour
+// (output, exit status, panics). Memory-model violations are faults (exit status 70). A fault, panic or exit is a
+// `Stop` returned through every call, where the reference throws.
+
+fn panicExitStatus() -> i32 => 134; // 128 + SIGABRT, as abort() gives natively
+
+fn faultExitStatus() -> i32 => 70;
+
+struct InterpreterOptions {
+    arguments: Vector<Vector<u8>>;
+    failAllocationAt: u64;
+    allocationReport: bool;
+    placement: bool;
+    bce: bool;
+    oce: bool;
+    stepLimit: u64;
+    memoryLimit: i64;
+    sandboxed: bool;
+    workingDirectory: Vector<u8>;
+}
+
+/// One call's frame: its locals' allocations, and each placed site's latest slot.
+struct Frame {
+    function: u32; // the NIR function
+    locals: Vector<u64>;
+    slotNumbers: Vector<u32>;
+    slots: Vector<u64>;
+}
+
+struct Interp {
+    options: InterpreterOptions;
+    memory: Memory;
+    sources: Vector<SourceText>;
+    functionOf: Vector<u32>;  // by HIR function: its NIR function (variant 0), or none
+    variantKeys: Vector<u64>; // (HIR function << 32) | variant
+    variantFunctions: Vector<u32>;
+    blockIndex: Vector<Vector<u32>>; // by NIR function, by block id: the block's index
+    literalTexts: Vector<Vector<u8>>;
+    literalAddresses: Vector<u64>;
+    statics: Vector<u64>;   // by HIR static: its memory
+    addressed: Vector<u32>; // HIR functions whose address was taken
+    hasPosition: bool;
+    positionFile: u32;
+    positionStart: u32;
+    steps: u64;
+    hasPlacement: bool;
+    placement: PlacementAnalysis;
+    hasChecks: bool;
+    checks: CheckResults;
+    stdout: Vector<u8>; // buffered, flushed before stderr is written and at the end
+    // nova_rt_core.c: allocation accounting, fault injection, the scratch stack.
+    emptyVector: u64;
+    attempts: u64;
+    liveAllocations: u64;
+    failingArmed: bool;
+    failingLeft: u64;
+    scratchChunk: u64;
+    scratchCur: u64;
+    scratchEnd: u64;
+    scratchDepth: u64;
+    allocatorTypes: Vector<u32>;
+    allocatorAddresses: Vector<u64>;
+    runtime: InterpRuntime;
+}
+
+// ---- Output ----
+
+fn flushOutput(it: borrow mut Interp) {
+    if (it.stdout.length > 0) {
+        Console.writeBytes(it.stdout.view());
+        it.stdout.clear();
+    }
+}
+
+fn writeOutput(it: borrow mut Interp, bytes: Slice<u8>) {
+    appendBytes(mut it.stdout, bytes)!;
+    if (it.stdout.length > 65536) {
+        flushOutput(it);
+    }
+}
+
+/// nova_platform_write_stderr: standard output is flushed first.
+fn writeError(it: borrow mut Interp, bytes: Slice<u8>) {
+    flushOutput(it);
+    match (StringView.fromUtf8(bytes)) {
+        Some(text) => { Console.writeError(text); }
+        null => {
+            // Console.writeError takes text: an invalid sequence goes out as U+FFFD.
+            var fixed = Vector<u8>.create();
+            var i: usize = 0;
+            while (i < bytes.length) {
+                let d = decodeUtf8(bytes, i);
+                if (d.valid) {
+                    appendBytes(mut fixed, bytes[i..i + (d.length as usize)])!;
+                } else {
+                    appendUtf8(mut fixed, 0xFFFD)!;
+                }
+                i += d.length as usize;
+            }
+            Console.writeError(StringView.fromUtf8(fixed.view())!);
+        }
+    }
+}
+
+// ---- Positions ----
+
+fn appendInterpLocation(it: borrow Interp, out: borrow mut Vector<u8>, file: u32, start: u32) {
+    let source = borrow it.sources[file as usize];
+    let p = source.position(start as usize);
+    appendBytes(out, source.path.view())!;
+    out.push(':')!;
+    appendDecimal(out, p.line as u64)!;
+    out.push(':')!;
+    appendDecimal(out, p.column as u64)!;
+}
+
+fn locationOf(it: borrow Interp, file: u32, start: u32) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    appendInterpLocation(it, mut out, file, start);
+    return out;
+}
+
+/// Where the program is now (Here): the statement or terminator being run, or `<runtime>`.
+fn here(it: borrow Interp) -> Vector<u8> {
+    if (!it.hasPosition) {
+        return copyBytes("<runtime>".bytes())!;
+    }
+    return locationOf(it, it.positionFile, it.positionStart);
+}
+
+fn nirFunctionFile(c: borrow Checker, n: borrow NirProgram, f: u32) -> u32 =>
+    c.hir.functions[n.functions[f as usize].source as usize].file;
+
+// ---- Layout ----
+
+fn appendTypeName(c: borrow Checker, out: borrow mut Vector<u8>, t: u32) {
+    c.types.appendName(out, t)!;
+}
+
+/// C state has the C compiler's layout, which the interpreter does not have (type-system.md §33.4).
+fn cLayoutFault(c: borrow Checker, t: u32) -> Result<void, Stop> {
+    if (c.types.isCLaidOut(t, 0)) {
+        var m = copyBytes("a value of '".bytes())!;
+        appendTypeName(c, mut m, t);
+        appendText(mut m, "', which holds C state laid out by the C compiler")!;
+        return Err(faultBytes(m.view()));
+    }
+    return Ok();
+}
+
+fn typeSize(c: borrow Checker, t: u32) -> Result<usize, Stop> {
+    cLayoutFault(c, t)?;
+    return Ok(truncate<usize>(cLayout(c, t).size));
+}
+
+fn typeAlign(c: borrow Checker, t: u32) -> Result<u64, Stop> {
+    cLayoutFault(c, t)?;
+    return Ok(cLayout(c, t).align as u64);
+}
+
+fn enumUnionOffset(c: borrow Checker, t: u32) -> u64 {
+    let offset = c.types.enums[c.types.info(t).enumDef as usize].unionOffset;
+    return if (offset < 0) 0 else truncate<u64>(offset);
+}
+
+fn enumTagSize(c: borrow Checker, t: u32) -> usize => c.types.enums[c.types.info(t).enumDef as usize].tagSize as usize;
+
+fn isIntType(c: borrow Checker, t: u32) -> bool => c.types.is(t, TypeKind.Integer);
+
+fn isFloatValueType(c: borrow Checker, t: u32) -> bool => c.types.is(t, TypeKind.Float);
+
+fn isBoolType(c: borrow Checker, t: u32) -> bool => c.types.is(t, TypeKind.Bool);
+
+fn pointeeOf(c: borrow Checker, t: u32) -> u32 => c.types.info(t).pointee;
+
+fn elementOf(c: borrow Checker, t: u32) -> u32 => c.types.info(t).element;
+
+// ---- Integers (IntValue holds every value of a type of at most 64 bits) ----
+
+fn integerOf(c: borrow Checker, value: borrow Value, t: u32) -> Result<IntValue, Stop> {
+    let size = typeSize(c, t)?;
+    var bits = value.bits(0, size)?;
+    if (isIntType(c, t) && c.types.info(t).signed) {
+        if (size < 8 && ((bits >> ((8 * size - 1) as u64)) & 1) != 0) {
+            bits = bits | (0xFFFFFFFFFFFFFFFF << ((8 * size) as u64));
+        }
+        return Ok(intValue(truncate<i64>(bits)));
+    }
+    return Ok(IntValue { negative: false, magnitude: bits });
+}
+
+/// The value's two's-complement bits.
+fn intBits(v: IntValue) -> u64 => if (v.negative) (0u64).wrappingSub(v.magnitude) else v.magnitude;
+
+/// The value modulo 2^bits, as the type's bytes (FromInteger).
+fn fromInteger(c: borrow Checker, v: IntValue, t: u32) -> Result<Value, Stop> =>
+    Ok(valueOf(intBits(v), typeSize(c, t)?));
+
+fn intCompare(a: IntValue, b: IntValue) -> i32 {
+    if (a.negative != b.negative) {
+        return if (a.negative) -1 else 1;
+    }
+    if (a.magnitude == b.magnitude) {
+        return 0;
+    }
+    let less = a.magnitude < b.magnitude;
+    return if (less != a.negative) -1 else 1;
+}
+
+fn intOfU64(v: u64) -> IntValue => IntValue { negative: false, magnitude: v };
+
+/// The type's least and greatest values.
+fn intMin(c: borrow Checker, t: u32) -> IntValue {
+    let info = c.types.info(t);
+    if (!info.signed) {
+        return intOfU64(0);
+    }
+    return IntValue { negative: true, magnitude: (1u64) << ((info.bits - 1) as u64) };
+}
+
+fn intMax(c: borrow Checker, t: u32) -> IntValue {
+    let info = c.types.info(t);
+    if (info.signed) {
+        return intOfU64(((1u64) << ((info.bits - 1) as u64)) - 1);
+    }
+    return intOfU64(if (info.bits >= 64) 0xFFFFFFFFFFFFFFFF else ((1u64) << (info.bits as u64)) - 1);
+}
+
+fn inRange(c: borrow Checker, v: IntValue, t: u32) -> bool =>
+    intCompare(v, intMin(c, t)) >= 0 && intCompare(v, intMax(c, t)) <= 0;
+
+/// i64 of a value known to fit in one.
+fn intToI64(v: IntValue) -> i64 => truncate<i64>(intBits(v));
+
+/// An operator's result, or a panic reason (0 none, 1 integer overflow, 2 division by zero, 3 shift out of range).
+struct Arith {
+    value: IntValue;
+    panic: u32;
+}
+
+fn arithOk(v: IntValue) -> Arith => Arith { value: v, panic: 0 };
+
+fn arithPanic(reason: u32) -> Arith => Arith { value: intOfU64(0), panic: reason };
+
+fn arithPanicText(reason: u32) -> StringView => match (reason) {
+    1 => "integer overflow",
+    2 => "division by zero",
+    _ => "shift amount out of range",
+};
+
+/// An arithmetic, bitwise or shift operator with IntegerSemantics' rules (type-system.md §6).
+fn arithmetic(c: borrow Checker, op: BinaryOp, a: IntValue, b: IntValue, t: u32) -> Arith {
+    let k = binaryIndex(op);
+    let info = c.types.info(t);
+    if (k == 11 || k == 12) {
+        // Shifts: the amount in range; bits shifted out are discarded (left operands are unsigned).
+        if (b.negative || b.magnitude >= (info.bits as u64)) {
+            return arithPanic(3);
+        }
+        let x = intBits(a);
+        if (k == 11) {
+            return arithOk(intOfU64((x << b.magnitude) & intMax(c, t).magnitude));
+        }
+        return arithOk(intOfU64(x >> b.magnitude));
+    }
+    if (k == 8 || k == 9 || k == 10) {
+        let x = intBits(a);
+        let y = intBits(b);
+        let r = if (k == 8) x | y else if (k == 9) x ^ y else x & y;
+        return arithOk(if (info.signed) intValue(truncate<i64>(r)) else intOfU64(r));
+    }
+    if (info.signed) {
+        let x = intToI64(a);
+        let y = intToI64(b);
+        var result: i64? = null;
+        if (k == 13) {
+            result = x.checkedAdd(y);
+        } else if (k == 14) {
+            result = x.checkedSub(y);
+        } else if (k == 15) {
+            result = x.checkedMul(y);
+        } else if (k == 16 || k == 17) {
+            if (y == 0) {
+                return arithPanic(2);
+            }
+            if (y == -1) {
+                if (k == 17) {
+                    return arithOk(intOfU64(0)); // the dividend's sign; MIN % -1 == 0
+                }
+                result = (0i64).checkedSub(x);
+            } else {
+                result = if (k == 16) x / y else x % y;
+            }
+        }
+        match (result) {
+            Some(r) => {
+                let v = intValue(r);
+                return if (inRange(c, v, t)) arithOk(v) else arithPanic(1);
+            }
+            null => { return arithPanic(1); }
+        }
+    }
+    let x = a.magnitude;
+    let y = b.magnitude;
+    var result: u64? = null;
+    if (k == 13) {
+        result = x.checkedAdd(y);
+    } else if (k == 14) {
+        if (y > x) {
+            return arithPanic(1);
+        }
+        result = x - y;
+    } else if (k == 15) {
+        result = x.checkedMul(y);
+    } else if (k == 16 || k == 17) {
+        if (y == 0) {
+            return arithPanic(2);
+        }
+        result = if (k == 16) x / y else x % y;
+    }
+    match (result) {
+        Some(r) => { return if (r <= intMax(c, t).magnitude) arithOk(intOfU64(r)) else arithPanic(1); }
+        null => { return arithPanic(1); }
+    }
+}
+
+// ---- Floats ----
+
+fn toDouble(c: borrow Checker, value: borrow Value, t: u32) -> Result<f64, Stop> {
+    let size = typeSize(c, t)?;
+    let bits = value.bits(0, size)?;
+    return Ok(if (size == 4) f32.fromBits(truncate<u32>(bits)) as f64 else f64.fromBits(bits));
+}
+
+/// A float of `t` as its bytes; `number` is already exact in the type.
+fn floatValue(c: borrow Checker, number: f64, t: u32) -> Result<Value, Stop> {
+    let size = typeSize(c, t)?;
+    return Ok(valueOf(if (size == 4) round<f32>(number).bits() as u64 else number.bits(), size));
+}
+
+// ---- Results and options ----
+
+fn makeEnumValue(c: borrow Checker, t: u32, variant: u32, payload: borrow Vector<Value>) -> Result<Value, Stop> {
+    let size = typeSize(c, t)?;
+    if (c.types.isNicheOptional(t)) {
+        // The pointer itself, or null.
+        return Ok(if (payload.length == 0) valueOf(0, size) else copyValue(payload[0]));
+    }
+    var value = uninitialisedValue(size);
+    let v = borrow c.types.variants[variant as usize];
+    value.put(0, valueOf(v.index as u64, enumTagSize(c, t)));
+    let unionOffset = enumUnionOffset(c, t) as usize;
+    for (i in 0..payload.length) {
+        let field = v.payload[i];
+        value.put(unionOffset + (c.types.fields[field as usize].offset as usize), payload[i]);
+    }
+    return Ok(value);
+}
+
+fn enumVariantAt(c: borrow Checker, t: u32, k: usize) -> u32 =>
+    c.types.enums[c.types.info(t).enumDef as usize].variants[k];
+
+fn okValue(c: borrow Checker, result: u32, payload: Value?) -> Result<Value, Stop> {
+    var values = Vector<Value>.create();
+    match (payload) {
+        Some(p) => { values.push(p)!; }
+        null => {}
+    }
+    return makeEnumValue(c, result, enumVariantAt(c, result, 0), values);
+}
+
+/// `Err(AllocError.OutOfMemory)` (tag 0).
+fn outOfMemory(c: borrow Checker, result: u32) -> Result<Value, Stop> {
+    let error = resultErrOf(c, result);
+    let none = Vector<Value>.create();
+    var values = Vector<Value>.create();
+    values.push(makeEnumValue(c, error, enumVariantAt(c, error, 0), none)?)!;
+    return makeEnumValue(c, result, enumVariantAt(c, result, 1), values);
+}
+
+fn noneValue(c: borrow Checker, option: u32) -> Result<Value, Stop> {
+    let none = Vector<Value>.create();
+    return makeEnumValue(c, option, enumVariantAt(c, option, 0), none);
+}
+
+fn someValue(c: borrow Checker, option: u32, value: Value) -> Result<Value, Stop> {
+    var values = Vector<Value>.create();
+    values.push(value)!;
+    return makeEnumValue(c, option, enumVariantAt(c, option, 1), values);
+}
+
+/// A slice or string view: the pointer and the length.
+fn viewValue(pointer: u64, length: u64) -> Value {
+    var result = uninitialisedValue(16);
+    result.put(0, valueOf(pointer, 8));
+    result.put(8, valueOf(length, 8));
+    return result;
+}
+
+/// The variant of the enum value at `address`: its tag, or for a niche optional 1 (Some) if its pointer is non-null.
+fn variantIndex(it: borrow Interp, c: borrow Checker, t: u32, address: u64) -> Result<u64, Stop> {
+    if (c.types.isNicheOptional(t)) {
+        return Ok(if (it.memory.loadBits(address, typeSize(c, t)?)? != 0) 1 else 0);
+    }
+    return it.memory.loadBits(address, enumTagSize(c, t));
+}
+
+/// The static bytes of a string literal (one allocation per distinct text).
+fn literal(it: borrow mut Interp, text: Slice<u8>) -> Result<u64, Stop> {
+    for (k in 0..it.literalTexts.length) {
+        if (sameBytes(it.literalTexts[k].view(), text)) {
+            return Ok(it.literalAddresses[k]);
+        }
+    }
+    let address = it.memory.staticBytes(text, "a string literal".bytes())?;
+    it.literalTexts.push(copyBytes(text)!)!;
+    it.literalAddresses.push(address)!;
+    return Ok(address);
+}
+
+/// The bytes a slice or string view points to (a use).
+fn bytesOf(it: borrow Interp, slice: borrow Value) -> Result<Vector<u8>, Stop> {
+    let pointer = slice.bits(0, 8)?;
+    let length = slice.bits(8, 8)?;
+    if (length == 0) {
+        return Ok(Vector<u8>.create());
+    }
+    if (length > 0x7FFFFFFF) {
+        return Err(fault("a slice longer than the interpreter's memory"));
+    }
+    let value = it.memory.load(pointer, length as usize)?;
+    for (b in value.init.view()) {
+        if (!b) {
+            return Err(fault("use of uninitialised memory"));
+        }
+    }
+    return Ok(value.data);
+}
+
+fn pointerAt(it: borrow Interp, address: u64) -> Result<u64, Stop> => it.memory.loadBits(address, 8);
+
+// ---- Calls and frames (§5.3) ----
+
+fn newFrameLocal(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    f: u32,
+    local: u32,
+) -> Result<u64, Stop> {
+    let l = n.functions[f as usize].locals[local as usize];
+    let size = typeSize(c, l.typ)?;
+    var what = copyBytes(if (l.name == none()) "temporary _".bytes() else "local _".bytes())!;
+    appendDecimal(mut what, local as u64)!;
+    return it.memory.allocate(allocationLocal(), size, true, what.view());
+}
+
+fn endFrame(it: borrow mut Interp, frame: borrow Frame) {
+    for (address in frame.locals.view()) {
+        if (it.memory.isLive(address)) {
+            it.memory.end(address);
+        }
+    }
+    for (address in frame.slots.view()) {
+        if (it.memory.isLive(address)) {
+            it.memory.end(address);
+        }
+    }
+}
+
+/// Counts one statement or terminator against the sandbox's step limit.
+fn step(it: borrow mut Interp) -> Result<void, Stop> {
+    if (it.options.stepLimit != 0) {
+        it.steps += 1;
+        if (it.steps > it.options.stepLimit) {
+            var m = copyBytes("the sandbox's step limit of ".bytes())!;
+            appendDecimal(mut m, it.options.stepLimit)!;
+            appendText(mut m, " is reached")!;
+            return Err(faultBytes(m.view()));
+        }
+    }
+    return Ok();
+}
+
+/// One call in progress: its frame, where it is, the caller's place awaiting the result (none for a call whose result
+/// is not stored), and the position to restore when it returns.
+struct Activation {
+    frame: Frame;
+    block: u32;
+    next: u32;
+    target: u32;
+    savedHas: bool;
+    savedFile: u32;
+    savedStart: u32;
+}
+
+/// A new frame for `f` with `arguments` in its first locals; a fault while making it is the caller's.
+fn newFrame(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    f: u32,
+    arguments: borrow Vector<Value>,
+) -> Result<Frame, Stop> {
+    var frame = Frame {
+        function: f,
+        locals: Vector<u64>.create(),
+        slotNumbers: Vector<u32>.create(),
+        slots: Vector<u64>.create(),
+    };
+    for (k in 0..n.functions[f as usize].locals.length) {
+        match (newFrameLocal(it, c, n, f, truncate<u32>(k))) {
+            Ok(address) => { frame.locals.push(address)!; }
+            Err(stop) => {
+                endFrame(it, frame);
+                return Err(stop);
+            }
+        }
+    }
+    for (i in 0..arguments.length) {
+        match (it.memory.store(frame.locals[i], arguments[i])) {
+            Ok() => {}
+            Err(stop) => {
+                endFrame(it, frame);
+                return Err(stop);
+            }
+        }
+    }
+    return Ok(frame);
+}
+
+/// Calls `f` and runs until it returns (NirInterpreter.Call). Calls from its statements (`x = g(…)` and `g(…);`) run on
+/// an explicit stack of activations, not on the host's, so deep Nova recursion needs no deep native stack (§5.3).
+fn callFunction(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    f: u32,
+    arguments: borrow Vector<Value>,
+) -> Result<Value?, Stop> {
+    let frame = newFrame(it, c, n, f, arguments)?;
+    var stack = Vector<Activation>.create();
+    stack.push(
+        Activation {
+            frame: frame,
+            block: 0,
+            next: 0,
+            target: none(),
+            savedHas: it.hasPosition,
+            savedFile: it.positionFile,
+            savedStart: it.positionStart,
+        },
+    )!;
+    let result = runActivations(it, c, n, mut stack);
+    match (result) {
+        Ok(value) => { return Ok(value); }
+        Err(stop) => {
+            var located = stop;
+            if (located.kind == 0 && !located.hasLocation) {
+                located.location = here(it);
+                located.hasLocation = true;
+            }
+            // Unwind: every frame ends, and the outermost caller's position comes back.
+            var k = stack.length;
+            while (k > 0) {
+                k -= 1;
+                endFrame(it, stack[k].frame);
+                it.hasPosition = stack[k].savedHas;
+                it.positionFile = stack[k].savedFile;
+                it.positionStart = stack[k].savedStart;
+            }
+            return Err(located);
+        }
+    }
+}
+
+/// A direct call a statement makes: its NIR function and evaluated arguments; or, for a C function, its result.
+struct PreparedCall {
+    direct: bool;
+    function: u32;
+    arguments: Vector<Value>;
+    result: Value?;
+}
+
+fn prepareCall(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow mut Frame,
+    r: u32,
+    callee: u32,
+    arguments: Range,
+) -> Result<PreparedCall, Stop> {
+    if (c.hir.functions[callee as usize].isDynMethod) {
+        // Through the receiver's table (§37.3): T's method, with the data address as its receiver.
+        var values = operandsOf(it, c, n, frame, arguments, 0)?;
+        let table = dynTableAt(c, values[0].bits(8, 8)?)?;
+        values[0] = valueOf(values[0].bits(0, 8)?, 8);
+        let slot = c.hir.functions[callee as usize].dynSlot;
+        let method = c.hir.at(c.dynTables[table].methods, slot);
+        let f = nirFunctionOf(it, method, 0)?;
+        return Ok(PreparedCall { direct: true, function: f, arguments: values, result: null });
+    }
+    let values = operandsOf(it, c, n, frame, arguments, 0)?;
+    if (isExternHir(c, callee)) {
+        let result = callC(it, c, n, callee, values)?;
+        return Ok(PreparedCall { direct: false, function: none(), arguments: Vector<Value>.create(), result: result });
+    }
+    let f = nirFunctionOf(it, callee, n.rvalueVariants[r as usize])?;
+    return Ok(PreparedCall { direct: true, function: f, arguments: values, result: null });
+}
+
+/// The call a statement makes directly, if any: its rvalue (for `x = g(…)` or `g(…);`).
+fn statementCall(n: borrow NirProgram, s: u32) -> u32 {
+    let r = match (n.statements[s as usize]) {
+        NirStatement.Assign(_, value) => value,
+        NirStatement.Eval(value) => value,
+        _ => none(),
+    };
+    if (r == none()) {
+        return none();
+    }
+    return match (n.rvalues[r as usize]) {
+        NirRvalue.Call(_, _) => r,
+        _ => none(),
+    };
+}
+
+fn runActivations(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    stack: borrow mut Vector<Activation>,
+) -> Result<Value?, Stop> {
+    loop {
+        let top = stack.length - 1;
+        let f = stack[top].frame.function;
+        let file = nirFunctionFile(c, n, f);
+        let block = stack[top].block;
+        let count = truncate<u32>(n.functions[f as usize].blocks[block as usize].statements.length);
+        if (stack[top].next < count) {
+            let s = n.functions[f as usize].blocks[block as usize].statements[stack[top].next as usize];
+            stack[top].next += 1;
+            it.hasPosition = true;
+            it.positionFile = file;
+            it.positionStart = n.statementSpans[s as usize].start;
+            step(it)?;
+            let r = statementCall(n, s);
+            if (r == none()) {
+                execute(it, c, n, mut stack[top].frame, s)?;
+                continue;
+            }
+            var callee: u32 = 0;
+            var arguments = emptyRange();
+            match (n.rvalues[r as usize]) {
+                NirRvalue.Call(function, args) => {
+                    callee = function;
+                    arguments = args;
+                }
+                _ => {}
+            }
+            let target = match (n.statements[s as usize]) {
+                NirStatement.Assign(place, _) => place,
+                _ => none(),
+            };
+            let prepared = prepareCall(it, c, n, mut stack[top].frame, r, callee, arguments)?;
+            if (!prepared.direct) {
+                // A C function's result, stored as an assignment stores any value.
+                match (prepared.result) {
+                    Some(value) => {
+                        if (target != none()) {
+                            let addr = address(it, c, n, mut stack[top].frame, target, true)?;
+                            it.memory.store(addr, value)?;
+                        }
+                    }
+                    null => {}
+                }
+                continue;
+            }
+            let frame = newFrame(it, c, n, prepared.function, prepared.arguments)?;
+            stack.push(
+                Activation {
+                    frame: frame,
+                    block: 0,
+                    next: 0,
+                    target: target,
+                    savedHas: it.hasPosition,
+                    savedFile: it.positionFile,
+                    savedStart: it.positionStart,
+                },
+            )!;
+            continue;
+        }
+        let t = n.functions[f as usize].blocks[block as usize].terminator;
+        it.hasPosition = true;
+        it.positionFile = file;
+        it.positionStart = n.terminatorSpans[t as usize].start;
+        step(it)?;
+        var returned = false;
+        var result: Value? = null;
+        match (n.terminators[t as usize]) {
+            NirTerminator.Goto(target) => { stack[top].block = it.blockIndex[f as usize][target as usize]; }
+            NirTerminator.Branch(condition, thenBlock, elseBlock) => {
+                let value = operand(it, c, n, mut stack[top].frame, condition)?;
+                let taken = if (value.bits(0, 1)? != 0) thenBlock else elseBlock;
+                stack[top].block = it.blockIndex[f as usize][taken as usize];
+            }
+            NirTerminator.Switch(value, cases, otherwise) => {
+                let v = operand(it, c, n, mut stack[top].frame, value)?;
+                let x = integerOf(c, v, n.operandTypes[value as usize])?;
+                var target = otherwise;
+                for (k in 0..cases.count) {
+                    let case = n.cases[(cases.start + k) as usize];
+                    if (intCompare(x, case.value) == 0) {
+                        target = case.target;
+                        break;
+                    }
+                }
+                stack[top].block = it.blockIndex[f as usize][target as usize];
+            }
+            NirTerminator.Return(value) => {
+                returned = true;
+                if (value != none()) {
+                    result = operand(it, c, n, mut stack[top].frame, value)?;
+                }
+            }
+            NirTerminator.Exit(code) => {
+                let v = operand(it, c, n, mut stack[top].frame, code)?;
+                let x = integerOf(c, v, n.operandTypes[code as usize])?;
+                flushOutput(it);
+                return Err(exitWith(intToI64(x)));
+            }
+            NirTerminator.Panic(kind) => {
+                let reason: StringView = match (kind) {
+                    NirPanicKind.UnwrapNull => "unwrapped null",
+                    NirPanicKind.Unwrap => "unwrapped an Err value",
+                };
+                let location = locationOf(it, file, n.terminatorSpans[t as usize].start);
+                return Err(panicAt(reason, location));
+            }
+            NirTerminator.Unreachable => {
+                let syntax = c.hir.functions[n.functions[f as usize].source as usize].syntax;
+                let name = c.front.ast.functions[syntax as usize].name;
+                let location = locationOf(it, file, c.front.ast.idents[name as usize].start);
+                return Err(panicAt("entered unreachable code", location));
+            }
+        }
+        if (!returned) {
+            stack[top].block = stack[top].block;
+            stack[top].next = 0;
+            continue;
+        }
+        // The call returns: its frame ends, the caller's position comes back, and the result goes to its place.
+        let finished = stack.pop()!;
+        endFrame(it, finished.frame);
+        it.hasPosition = finished.savedHas;
+        it.positionFile = finished.savedFile;
+        it.positionStart = finished.savedStart;
+        if (stack.length == 0) {
+            return Ok(result);
+        }
+        if (finished.target != none()) {
+            let caller = stack.length - 1;
+            let addr = address(it, c, n, mut stack[caller].frame, finished.target, true)?;
+            match (result) {
+                Some(value) => { it.memory.store(addr, value)?; }
+                null => {}
+            }
+        }
+    }
+}
+
+/// The NIR function a HIR function runs as (variant 0, or the variant specialisation chose).
+fn nirFunctionOf(it: borrow Interp, hir: u32, variant: u32) -> Result<u32, Stop> {
+    if (variant == 0) {
+        let f = if ((hir as usize) < it.functionOf.length) it.functionOf[hir as usize] else none();
+        if (f == none()) {
+            return Err(fault("call of a function the program has no body for"));
+        }
+        return Ok(f);
+    }
+    let key = ((hir as u64) << 32) | (variant as u64);
+    for (k in 0..it.variantKeys.length) {
+        if (it.variantKeys[k] == key) {
+            return Ok(it.variantFunctions[k]);
+        }
+    }
+    return Err(fault("call of a variant the program has no body for"));
+}
+
+fn isExternHir(c: borrow Checker, hir: u32) -> bool {
+    let syntax = c.hir.functions[hir as usize].syntax;
+    return syntax != none() && c.front.ast.functions[syntax as usize].isExtern;
+}
+
+// ---- Places ----
+
+fn placeProjection(n: borrow NirProgram, place: u32, k: u32) -> NirProjection {
+    let p = n.places[place as usize];
+    return n.projections[(p.projections.start + k) as usize];
+}
+
+/// The address of a place. A deref of a slice, vector or stable vector stays at the value itself (its elements'
+/// pointer and length are the value's), as in the generated C (c-backend.md §2).
+fn address(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow mut Frame,
+    place: u32,
+    write: bool,
+) -> Result<u64, Stop> {
+    let p = n.places[place as usize];
+    var base = frame.locals[p.local as usize];
+    if (!it.memory.isLive(base)) {
+        if (!write) {
+            var m = copyBytes("use of a dead local (_".bytes())!;
+            appendDecimal(mut m, p.local as u64)!;
+            m.push(')')!;
+            return Err(faultBytes(m.view()));
+        }
+        // A new incarnation: references to the old one stay dead (§5.2).
+        base = newFrameLocal(it, c, n, frame.function, p.local)?;
+        frame.locals[p.local as usize] = base;
+    }
+    var addr = base;
+    var t = n.functions[frame.function as usize].locals[p.local as usize].typ;
+    var stable = false;
+    for (k in 0..p.projections.count) {
+        let projection = placeProjection(n, place, k);
+        var isDeref = false;
+        match (projection.kind) {
+            ProjectionKind.Field => {
+                let field = borrow c.types.fields[projection.field as usize];
+                if (!field.isRegionPart) {
+                    let s = c.types.info(t).structDef;
+                    if (s != none() && c.types.structs[s as usize].isImported) {
+                        // Its layout is the C compiler's, from headers the interpreter does not have (§31.4).
+                        var m = copyBytes("access to a field of the imported C type '".bytes())!;
+                        appendTypeName(c, mut m, t);
+                        appendText(mut m, "', whose layout only the C compiler knows")!;
+                        return Err(faultBytes(m.view()));
+                    }
+                    addr += field.offset as u64;
+                }
+            }
+            ProjectionKind.Downcast => { addr += enumUnionOffset(c, t); }
+            ProjectionKind.Deref => {
+                isDeref = true;
+                if (c.types.is(t, TypeKind.StableVector) || c.types.isSlice(t) || c.types.is(t, TypeKind.Vector) ||
+                    c.types.isDynReference(t) || c.types.isDynBox(t)) {
+                    // The value itself (a dyn value's place is its (data, table) pair, §37.4).
+                } else if (c.types.is(t, TypeKind.RawPointer)) {
+                    addr = checkAligned(c, pointerAt(it, addr)?, pointeeOf(c, t))?;
+                } else {
+                    addr = pointerAt(it, addr)?; // a reference, a box, or a pool box's first field
+                }
+            }
+            ProjectionKind.Index => {
+                let indexValue = operand(it, c, n, frame, projection.index)?;
+                let index = integerOf(c, indexValue, n.operandTypes[projection.index as usize])?.magnitude;
+                let size = typeSize(c, elementOf(c, t))? as u64;
+                if (stable) {
+                    addr = stableVectorAt(it, addr, index, size)?;
+                } else if (c.types.isUnsized(t)) {
+                    addr = pointerAt(it, addr)?.wrappingAdd(index.wrappingMul(size));
+                } else {
+                    addr = addr.wrappingAdd(index.wrappingMul(size));
+                }
+            }
+        }
+        stable = isDeref && c.types.is(t, TypeKind.StableVector);
+        t = applyNirProjection(c, t, projection);
+    }
+    return Ok(addr);
+}
+
+/// Unsafe code's accesses are checked like any other, and for alignment too (unsafe.md §5).
+fn checkAligned(c: borrow Checker, addr: u64, pointee: u32) -> Result<u64, Stop> {
+    let align = typeAlign(c, pointee)?;
+    if (addr != 0 && addr % align != 0) {
+        var m = copyBytes("misaligned access: a '".bytes())!;
+        appendTypeName(c, mut m, pointee);
+        appendText(mut m, "' at 0x")!;
+        appendLowerHex(mut m, addr)!;
+        appendText(mut m, " needs alignment ")!;
+        appendDecimal(mut m, align)!;
+        return Err(faultBytes(m.view()));
+    }
+    return Ok(addr);
+}
+
+fn rawAddress(c: borrow Checker, pointer: borrow Value, pointee: u32) -> Result<u64, Stop> =>
+    checkAligned(c, pointer.bits(0, 8)?, pointee);
+
+fn placeTypeOf(c: borrow Checker, n: borrow NirProgram, frame: borrow Frame, place: u32) -> u32 =>
+    nirPlaceType(c, n, n.functions[frame.function as usize].locals, place);
+
+// ---- Dyn tables and function addresses ----
+
+/// The address of a dyn table (§37.4): below the function addresses, far above every allocation's.
+fn dynTableBase() -> u64 => 0xFFFE000000000000;
+
+fn dynTableAddress(c: borrow Checker, implementation: u32, dyn: u32) -> Result<u64, Stop> {
+    for (k in 0..c.dynTables.length) {
+        if (c.dynTables[k].implementation == implementation && c.dynTables[k].dynType == dyn) {
+            return Ok(dynTableBase() + (k as u64) * 16);
+        }
+    }
+    return Err(fault("a dyn coercion with no table"));
+}
+
+fn dynTableAt(c: borrow Checker, addr: u64) -> Result<usize, Stop> {
+    let index = (addr.wrappingSub(dynTableBase())) / 16;
+    if (addr < dynTableBase() || (addr - dynTableBase()) % 16 != 0 || index >= (c.dynTables.length as u64)) {
+        return Err(addressMessage("call through an invalid dyn table ", addr, ""));
+    }
+    return Ok(index as usize);
+}
+
+/// C function addresses (type-system.md §29.5): far above every allocation's address.
+fn functionAddressBase() -> u64 => 0xFFFF000000000000;
+
+fn functionAddressOf(it: borrow mut Interp, hir: u32) -> u64 {
+    var index = it.addressed.length;
+    for (k in 0..it.addressed.length) {
+        if (it.addressed[k] == hir) {
+            index = k;
+        }
+    }
+    if (index == it.addressed.length) {
+        it.addressed.push(hir)!;
+    }
+    return functionAddressBase() + (index as u64) * 16;
+}
+
+/// A call through a C function pointer: to the function, or to the C library model for an extern.
+fn callThrough(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    addr: u64,
+    arguments: borrow Vector<Value>,
+) -> Result<Value?, Stop> {
+    if (addr == 0) {
+        return Err(fault("call through a null function pointer"));
+    }
+    let index = addr.wrappingSub(functionAddressBase()) / 16;
+    if (addr < functionAddressBase() || (addr - functionAddressBase()) % 16 != 0 ||
+        index >= (it.addressed.length as u64)) {
+        return Err(addressMessage("call through an invalid function pointer ", addr, ""));
+    }
+    let hir = it.addressed[index as usize];
+    if (isExternHir(c, hir)) {
+        return callC(it, c, n, hir, arguments);
+    }
+    let f = nirFunctionOf(it, hir, 0)?;
+    return callFunction(it, c, n, f, arguments);
+}
+
+// ---- Operands and rvalues ----
+
+fn operand(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow mut Frame,
+    op: u32,
+) -> Result<Value, Stop> {
+    let t = n.operandTypes[op as usize];
+    match (n.operands[op as usize]) {
+        NirOperand.Place(place, isMove) => {
+            let addr = address(it, c, n, frame, place, false)?;
+            let size = typeSize(c, placeTypeOf(c, n, frame, place))?;
+            let value = it.memory.load(addr, size)?;
+            if (isMove) {
+                it.memory.uninitialise(addr, size)?; // a move leaves the place uninitialised (§14.3)
+            }
+            return Ok(value);
+        }
+        NirOperand.Const(v) => {
+            if (isBoolType(c, t)) {
+                return Ok(valueOf(if (v.magnitude != 0) 1 else 0, 1));
+            }
+            return fromInteger(c, v, t);
+        }
+        NirOperand.String(text) => {
+            let bytes = copyBytes(n.textOf(text))!;
+            let pointer = literal(it, bytes.view())?;
+            return Ok(viewValue(pointer, bytes.length as u64));
+        }
+        NirOperand.Zero => {
+            var m = copyBytes("making C state of type '".bytes())!;
+            appendTypeName(c, mut m, t);
+            appendText(mut m, "', whose layout only the C compiler knows")!;
+            return Err(faultBytes(m.view()));
+        }
+    }
+}
+
+fn operandsOf(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow mut Frame,
+    operands: Range,
+    from: u32,
+) -> Result<Vector<Value>, Stop> {
+    var values = Vector<Value>.create();
+    for (k in from..operands.count) {
+        values.push(operand(it, c, n, frame, n.at(operands, k))?)!;
+    }
+    return Ok(values);
+}
+
+/// Whether the compiled program omits this operation's overflow check (optimisations.md §3.5).
+fn eliminated(it: borrow Interp, c: borrow Checker, n: borrow NirProgram, r: u32) -> bool =>
+    it.options.oce && it.hasChecks && isOverflowChecked(c, n, r) && inSet(it.checks.noOverflow, r);
+
+fn rvalueLocation(
+    it: borrow Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow Frame,
+    r: u32,
+) -> Vector<u8> =>
+    locationOf(it, nirFunctionFile(c, n, frame.function), n.rvalueSpans[r as usize].start);
+
+fn overflowStop(
+    it: borrow Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow Frame,
+    r: u32,
+    reason: StringView,
+) -> Stop {
+    let location = rvalueLocation(it, c, n, frame, r);
+    if (reason.bytes().length == 16 && sameText(reason.bytes(), "integer overflow") && eliminated(it, c, n, r)) {
+        var m = copyBytes("an eliminated overflow check fails at ".bytes())!;
+        appendBytes(mut m, location.view())!;
+        return faultBytes(m.view());
+    }
+    return panicAt(reason, location);
+}
+
+fn rvalue(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow mut Frame,
+    r: u32,
+) -> Result<Value?, Stop> {
+    let t = n.rvalueTypes[r as usize];
+    match (n.rvalues[r as usize]) {
+        NirRvalue.Use(op) => { return Ok(operand(it, c, n, frame, op)?); }
+        NirRvalue.Binary(op, left, right) => { return Ok(binary(it, c, n, frame, r, op, left, right)?); }
+        NirRvalue.Unary(op, value) => {
+            let v = operand(it, c, n, frame, value)?;
+            match (op) {
+                UnaryOp.Not => { return Ok(valueOf(if (v.bits(0, 1)? == 0) 1 else 0, 1)); }
+                UnaryOp.Negate => {
+                    if (isFloatValueType(c, t)) {
+                        return Ok(floatValue(c, -toDouble(c, v, t)?, t)?);
+                    }
+                    let x = integerOf(c, v, t)?;
+                    let negated = IntValue { negative: !x.negative && x.magnitude != 0, magnitude: x.magnitude };
+                    if (!inRange(c, negated, t)) {
+                        return Err(overflowStop(it, c, n, frame, r, "integer overflow"));
+                    }
+                    return Ok(fromInteger(c, negated, t)?);
+                }
+            }
+        }
+        NirRvalue.Cast(value) => {
+            let from = n.operandTypes[value as usize];
+            let v = operand(it, c, n, frame, value)?;
+            if (c.types.isStringView(from)) {
+                return Ok(v); // `s.bytes()`: the same pointer and length (§22.2)
+            }
+            if (isFloatValueType(c, t)) {
+                // `as` and round<T> to a float (§35.4): one rounding, to nearest even.
+                let bits = c.types.info(t).bits;
+                let x = if (isFloatValueType(c, from)) roundFloat(toDouble(c, v, from)?, bits) else floatFromInteger(
+                    integerOf(c, v, from)?,
+                    bits,
+                );
+                return Ok(floatValue(c, x, t)?);
+            }
+            let intLike = isIntType(c, t) || isBoolType(c, t);
+            let fromIntLike = isIntType(c, from) || isBoolType(c, from);
+            if (intLike && fromIntLike) {
+                let x = integerOf(c, v, from)?;
+                if (isBoolType(c, t)) {
+                    return Ok(valueOf(if (x.magnitude == 0) 0 else 1, 1));
+                }
+                return Ok(fromInteger(c, x, t)?);
+            }
+            if ((c.types.isDynReference(t) || c.types.isDynBox(t)) && !c.types.isDyn(pointeeOf(c, from))) {
+                // A coercion to a dyn type (§37.2): the address, then the table of the pair (T, dyn I).
+                var pair = uninitialisedValue(16);
+                pair.put(0, v);
+                pair.put(8, valueOf(dynTableAddress(c, pointeeOf(c, from), pointeeOf(c, t))?, 8));
+                return Ok(pair);
+            }
+            return Ok(v); // reference and other same-representation conversions
+        }
+        NirRvalue.Truncate(value) => {
+            let v = operand(it, c, n, frame, value)?;
+            return Ok(fromInteger(c, integerOf(c, v, n.operandTypes[value as usize])?, t)?);
+        }
+        NirRvalue.FloatToInt(value, kind) => { return Ok(floatToInt(it, c, n, frame, r, value, kind)?); }
+        NirRvalue.Call(callee, arguments) => {
+            if (c.hir.functions[callee as usize].isDynMethod) {
+                // Through the receiver's table (§37.3): T's method, with the data address as its receiver.
+                var values = operandsOf(it, c, n, frame, arguments, 0)?;
+                let table = dynTableAt(c, values[0].bits(8, 8)?)?;
+                values[0] = valueOf(values[0].bits(0, 8)?, 8);
+                let slot = c.hir.functions[callee as usize].dynSlot;
+                let method = c.hir.at(c.dynTables[table].methods, slot);
+                let f = nirFunctionOf(it, method, 0)?;
+                return callFunction(it, c, n, f, values);
+            }
+            let values = operandsOf(it, c, n, frame, arguments, 0)?;
+            if (isExternHir(c, callee)) {
+                return callC(it, c, n, callee, values);
+            }
+            let f = nirFunctionOf(it, callee, n.rvalueVariants[r as usize])?;
+            return callFunction(it, c, n, f, values);
+        }
+        NirRvalue.Aggregate(fields) => {
+            let s = c.types.info(t).structDef;
+            let count = c.types.structs[s as usize].fields.length;
+            if (count == 0) {
+                return Ok(valueOf(0, 1)); // `nv_empty`
+            }
+            var value = uninitialisedValue(typeSize(c, t)?);
+            for (k in 0..count) {
+                let field = c.types.structs[s as usize].fields[k];
+                let v = operand(it, c, n, frame, n.at(fields, truncate<u32>(k)))?;
+                value.put(c.types.fields[field as usize].offset as usize, v);
+            }
+            return Ok(value);
+        }
+        NirRvalue.EnumAggregate(variant, payload) => {
+            let values = operandsOf(it, c, n, frame, payload, 0)?;
+            return Ok(makeEnumValue(c, t, variant, values)?);
+        }
+        NirRvalue.Array(elements) => {
+            let size = typeSize(c, elementOf(c, t))?;
+            var value = uninitialisedValue(typeSize(c, t)?);
+            for (k in 0..elements.count) {
+                let v = operand(it, c, n, frame, n.at(elements, k))?;
+                value.put((k as usize) * size, v);
+            }
+            return Ok(value);
+        }
+        NirRvalue.Ref(_, place) => {
+            let placeType = placeTypeOf(c, n, frame, place);
+            let addr = address(it, c, n, frame, place, false)?;
+            if (c.types.isDyn(placeType) || c.types.isUnsized(placeType)) {
+                // A borrow of a dyn value is its pair (§37.4); a slice reborrow, the slice itself.
+                return Ok(it.memory.load(addr, 16)?);
+            }
+            return Ok(valueOf(addr, 8));
+        }
+        NirRvalue.Slice(_, base, low, high) => {
+            let baseType = placeTypeOf(c, n, frame, base);
+            let baseAddress = address(it, c, n, frame, base, false)?;
+            let start = if (c.types.isUnsized(baseType)) pointerAt(it, baseAddress)? else baseAddress;
+            let lowValue = operand(it, c, n, frame, low)?;
+            let lowIndex = integerOf(c, lowValue, n.operandTypes[low as usize])?.magnitude;
+            let highValue = operand(it, c, n, frame, high)?;
+            let highIndex = integerOf(c, highValue, n.operandTypes[high as usize])?.magnitude;
+            let size = typeSize(c, elementOf(c, baseType))? as u64;
+            return Ok(viewValue(start.wrappingAdd(lowIndex.wrappingMul(size)), highIndex.wrappingSub(lowIndex)));
+        }
+        NirRvalue.Length(place) => {
+            // `.len`: after the pointer of a slice or vector, after the 32 chunk pointers of a stable vector.
+            let p = n.places[place as usize];
+            var container = placeTypeOf(c, n, frame, place);
+            if (p.projections.count > 0 && projectionIsDeref(placeProjection(n, place, p.projections.count - 1))) {
+                var outer = n.functions[frame.function as usize].locals[p.local as usize].typ;
+                for (k in 0..p.projections.count - 1) {
+                    outer = applyNirProjection(c, outer, placeProjection(n, place, k));
+                }
+                container = outer;
+            }
+            let addr = address(it, c, n, frame, place, false)?;
+            let offset: u64 = if (c.types.is(container, TypeKind.StableVector)) 256 else 8;
+            return Ok(it.memory.load(addr + offset, 8)?);
+        }
+        NirRvalue.Discriminant(place) => {
+            let placeType = placeTypeOf(c, n, frame, place);
+            let addr = address(it, c, n, frame, place, false)?;
+            return Ok(valueOf(variantIndex(it, c, placeType, addr)?, 4));
+        }
+        NirRvalue.Builtin(_, _) => { return builtin(it, c, n, frame, r); }
+        NirRvalue.FunctionAddress(f) => { return Ok(valueOf(functionAddressOf(it, f), 8)); }
+        NirRvalue.StaticAddress(s) => { return Ok(valueOf(it.statics[s as usize], 8)); }
+        NirRvalue.ArrayRepeat(_) => { return Err(fault("an array repeat outside an assignment")); }
+    }
+}
+
+fn projectionIsDeref(p: NirProjection) -> bool => match (p.kind) {
+    ProjectionKind.Deref => true,
+    _ => false,
+};
+
+/// `truncate`, `checkedTruncate` and `saturatingTruncate` from a float (§35.4): toward zero, and for NaN or a value
+/// outside the integer type a panic, null, or the nearest bound (0 for NaN).
+fn floatToInt(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow mut Frame,
+    r: u32,
+    value: u32,
+    kind: FloatToIntKind,
+) -> Result<Value, Stop> {
+    let t = n.rvalueTypes[r as usize];
+    let checked = match (kind) {
+        FloatToIntKind.Checked => true,
+        _ => false,
+    };
+    let integer = if (checked) c.types.optionType(t) else t;
+    let v = operand(it, c, n, frame, value)?;
+    let x = toDouble(c, v, n.operandTypes[value as usize])?;
+    let min = intMin(c, integer);
+    let max = intMax(c, integer);
+    let finite = x == x && x - x == 0.0;
+    if (finite) {
+        let truncated = if (x < 0.0) -(-x).floor() else x.floor();
+        // The bounds as doubles; values at or past 2^64 never fit.
+        let minDouble = if (min.negative) -round<f64>(min.magnitude) else round<f64>(min.magnitude);
+        let maxDouble = round<f64>(max.magnitude);
+        if (truncated >= minDouble && truncated <= maxDouble && truncated < 18446744073709551616.0) {
+            let exact = if (truncated < 0.0) IntValue {
+                negative: true,
+                magnitude: truncate<u64>(-truncated),
+            } else intOfU64(truncate<u64>(truncated));
+            if (intCompare(exact, min) >= 0 && intCompare(exact, max) <= 0) {
+                let result = fromInteger(c, exact, integer)?;
+                return if (checked) someValue(c, t, result) else Ok(result);
+            }
+        }
+    }
+    match (kind) {
+        FloatToIntKind.Panic => {
+            let location = rvalueLocation(it, c, n, frame, r);
+            return Err(panicAt("float out of range", location));
+        }
+        FloatToIntKind.Checked => { return noneValue(c, t); }
+        FloatToIntKind.Saturating => {
+            let bound = if (x != x) intOfU64(0) else if (x < 0.0) min else max;
+            return fromInteger(c, bound, integer);
+        }
+    }
+}
+
+fn binary(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow mut Frame,
+    r: u32,
+    op: BinaryOp,
+    leftOperand: u32,
+    rightOperand: u32,
+) -> Result<Value, Stop> {
+    let left = operand(it, c, n, frame, leftOperand)?;
+    let right = operand(it, c, n, frame, rightOperand)?;
+    let t = n.operandTypes[leftOperand as usize];
+    let k = binaryIndex(op);
+    let equality = k == 2 || k == 3;
+    if (c.types.is(t, TypeKind.Handle)) {
+        let equal = left.bits(0, 8)? == right.bits(0, 8)?;
+        return Ok(valueOf(if (equal == (k == 2)) 1 else 0, 1));
+    }
+    if (c.types.isStringView(t)) {
+        let a = bytesOf(it, left)?;
+        let b = bytesOf(it, right)?;
+        let equal = sameBytes(a.view(), b.view());
+        return Ok(valueOf(if (equal == (k == 2)) 1 else 0, 1));
+    }
+    let resultType = n.rvalueTypes[r as usize];
+    if (isFloatValueType(c, t)) {
+        // IEEE, in the operands' own precision (§35.3); never panics.
+        let x = toDouble(c, left, t)?;
+        let y = toDouble(c, right, t)?;
+        if (isBoolType(c, resultType)) {
+            return Ok(valueOf(if (compareFloats(op, x, y)) 1 else 0, 1));
+        }
+        return Ok(floatValue(c, evaluateFloats(op, x, y, c.types.info(t).bits), t)?);
+    }
+    let a = integerOf(c, left, t)?;
+    let b = integerOf(c, right, n.operandTypes[rightOperand as usize])?;
+    if (equality || (k >= 4 && k <= 7)) {
+        let compared = intCompare(a, b);
+        let truth = match (k) {
+            2 => compared == 0,
+            3 => compared != 0,
+            4 => compared < 0,
+            5 => compared <= 0,
+            6 => compared > 0,
+            _ => compared >= 0,
+        };
+        return Ok(valueOf(if (truth) 1 else 0, 1));
+    }
+    let result = arithmetic(c, op, a, b, t);
+    if (result.panic != 0) {
+        return Err(overflowStop(it, c, n, frame, r, arithPanicText(result.panic)));
+    }
+    return fromInteger(c, result.value, resultType);
+}
+
+// ---- Statements ----
+
+fn statementLocation(
+    it: borrow Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow Frame,
+    s: u32,
+) -> Vector<u8> =>
+    locationOf(it, nirFunctionFile(c, n, frame.function), n.statementSpans[s as usize].start);
+
+fn functionPlacement(it: borrow Interp, f: u32) -> u32 =>
+    if (it.hasPlacement && (f as usize) < it.placement.functions.length) f else none();
+
+fn isPlacedBoxPlace(it: borrow Interp, n: borrow NirProgram, frame: borrow Frame, place: u32) -> bool {
+    let p = n.places[place as usize];
+    if (p.projections.count != 0 || functionPlacement(it, frame.function) == none()) {
+        return false;
+    }
+    let locals = borrow it.placement.functions[frame.function as usize].boxLocals;
+    return (p.local as usize) < locals.length && locals[p.local as usize];
+}
+
+fn flagSet(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow mut Frame,
+    flag: u32,
+) -> Result<bool, Stop> {
+    if (flag == none()) {
+        return Ok(true);
+    }
+    let base = frame.locals[flag as usize];
+    if (!it.memory.isLive(base)) {
+        var m = copyBytes("use of a dead local (_".bytes())!;
+        appendDecimal(mut m, flag as u64)!;
+        m.push(')')!;
+        return Err(faultBytes(m.view()));
+    }
+    return Ok(it.memory.loadBits(base, 1)? != 0);
+}
+
+/// Ends a stack-placed box's slot, as freeing ends a heap box: ending it twice is a fault, like a double free.
+fn endSlot(it: borrow mut Interp, contents: u64) -> Result<void, Stop> {
+    let index = it.memory.allocationAt(contents)?;
+    if (!it.memory.allocations[index].live) {
+        return Err(fault("a stack-placed box is destroyed twice"));
+    }
+    it.memory.end(allocationBase(index));
+    return Ok();
+}
+
+fn execute(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow mut Frame,
+    s: u32,
+) -> Result<void, Stop> {
+    match (n.statements[s as usize]) {
+        NirStatement.Assign(target, r) => {
+            match (n.rvalues[r as usize]) {
+                NirRvalue.Builtin(b, arguments) => {
+                    if (b == bfScratchEnter()) {
+                        let addr = address(it, c, n, frame, target, true)?;
+                        let location = statementLocation(it, c, n, frame, s);
+                        let value = scratchEnterRoot(it, location)?;
+                        it.memory.store(addr, value)?;
+                        return Ok();
+                    }
+                    let p = functionPlacement(it, frame.function);
+                    if (b == bfBoxCreate() && p != none()) {
+                        let number = placementSlotOf(it.placement.functions[p as usize], s);
+                        if (number != none()) {
+                            // A stack-placed box (§5.5a): the value goes into a slot of the frame, uncounted, and cannot
+                            // fail. Natively the site has one slot, so its previous box must be gone (a site in a loop).
+                            for (k in 0..frame.slotNumbers.length) {
+                                if (frame.slotNumbers[k] == number && it.memory.isLive(frame.slots[k])) {
+                                    return Err(
+                                        fault("a stack-placed box's slot is reused while its previous box is alive"),
+                                    );
+                                }
+                            }
+                            let value = operand(it, c, n, frame, n.at(arguments, arguments.count - 1))?;
+                            let slot = it.memory.allocate(
+                                allocationLocal(),
+                                value.size(),
+                                false,
+                                "a stack-placed box".bytes(),
+                            )?;
+                            frame.slotNumbers.push(number)!;
+                            frame.slots.push(slot)!;
+                            it.memory.store(slot, value)?;
+                            let addr = address(it, c, n, frame, target, true)?;
+                            let ok = okValue(c, n.rvalueTypes[r as usize], valueOf(slot, 8))?;
+                            it.memory.store(addr, ok)?;
+                            return Ok();
+                        }
+                    }
+                }
+                NirRvalue.ArrayRepeat(value) => {
+                    let element = operand(it, c, n, frame, value)?;
+                    let addr = address(it, c, n, frame, target, true)?;
+                    let length = c.types.info(n.rvalueTypes[r as usize]).arrayLength;
+                    for (i in 0..length) {
+                        it.memory.store(addr + truncate<u64>(i) * (element.size() as u64), element)?;
+                    }
+                    return Ok();
+                }
+                _ => {}
+            }
+            let value = rvalue(it, c, n, frame, r)?;
+            let addr = address(it, c, n, frame, target, true)?;
+            match (value) {
+                Some(v) => { it.memory.store(addr, v)?; }
+                null => {}
+            }
+        }
+        NirStatement.Unpack(source, variant, targets) => {
+            let sourceType = placeTypeOf(c, n, frame, source);
+            let base = address(it, c, n, frame, source, false)? + enumUnionOffset(c, sourceType);
+            let payload = borrow c.types.variants[variant as usize].payload;
+            for (i in 0..targets.count) {
+                let target = n.at(targets, i);
+                if (target == none()) {
+                    continue;
+                }
+                let field = borrow c.types.fields[payload[i as usize] as usize];
+                let value = it.memory.load(base + (field.offset as u64), typeSize(c, field.typ)?)?;
+                var targetAddress = frame.locals[target as usize];
+                if (!it.memory.isLive(targetAddress)) {
+                    targetAddress = newFrameLocal(it, c, n, frame.function, target)?;
+                    frame.locals[target as usize] = targetAddress;
+                }
+                it.memory.store(targetAddress, value)?;
+            }
+        }
+        NirStatement.BoxFree(box, flag) => {
+            if (isPlacedBoxPlace(it, n, frame, box)) {
+                if (flagSet(it, c, n, frame, flag)?) {
+                    let addr = address(it, c, n, frame, box, false)?;
+                    let loaded1 = pointerAt(it, addr)?;
+                    endSlot(it, loaded1)?;
+                }
+            } else if (flagSet(it, c, n, frame, flag)?) {
+                let boxType = placeTypeOf(c, n, frame, box);
+                let addr = address(it, c, n, frame, box, false)?;
+                if (c.types.isPoolBox(boxType)) {
+                    let loaded2 = pointerAt(it, addr + 8)?;
+                    let loaded3 = pointerAt(it, addr)?;
+                    poolRelease(it, loaded2, loaded3)?;
+                } else {
+                    let loaded4 = pointerAt(it, addr)?;
+                    freeBox(it, c, n, loaded4, boxType, none())?;
+                }
+            }
+        }
+        NirStatement.BoundsCheck(index, length) => {
+            let i = operand(it, c, n, frame, index)?;
+            let l = operand(it, c, n, frame, length)?;
+            let x = integerOf(c, i, n.operandTypes[index as usize])?;
+            let y = integerOf(c, l, n.operandTypes[length as usize])?;
+            if (intCompare(x, y) >= 0) {
+                let location = statementLocation(it, c, n, frame, s);
+                if (it.options.bce && it.hasChecks && inSet(it.checks.removed, s)) {
+                    var m = copyBytes("an eliminated bounds check fails at ".bytes())!;
+                    appendBytes(mut m, location.view())!;
+                    return Err(faultBytes(m.view()));
+                }
+                return Err(panicAt("index out of bounds", location));
+            }
+        }
+        NirStatement.LengthCheck(left, right) => {
+            let a = operand(it, c, n, frame, left)?;
+            let b = operand(it, c, n, frame, right)?;
+            let x = integerOf(c, a, n.operandTypes[left as usize])?;
+            let y = integerOf(c, b, n.operandTypes[right as usize])?;
+            if (intCompare(x, y) != 0) {
+                let location = statementLocation(it, c, n, frame, s);
+                return Err(panicAt("slice lengths differ", location));
+            }
+        }
+        NirStatement.RangeCheck(low, high, length, text) => {
+            let lowValue = operand(it, c, n, frame, low)?;
+            let x = integerOf(c, lowValue, n.operandTypes[low as usize])?;
+            let highValue = operand(it, c, n, frame, high)?;
+            let y = integerOf(c, highValue, n.operandTypes[high as usize])?;
+            let location = statementLocation(it, c, n, frame, s);
+            if (text != none()) {
+                let addr = address(it, c, n, frame, text, false)?;
+                let view = it.memory.load(addr, 16)?;
+                let bytes = bytesOf(it, view)?;
+                if (intCompare(x, y) > 0 || intCompare(y, intOfU64(bytes.length as u64)) > 0) {
+                    return Err(panicAt("slice range out of bounds", location));
+                }
+                let lowOk = x.magnitude >= (bytes.length as u64) || (bytes[x.magnitude as usize] & 0xC0) != 0x80;
+                let highOk = y.magnitude >= (bytes.length as u64) || (bytes[y.magnitude as usize] & 0xC0) != 0x80;
+                if (!lowOk || !highOk) {
+                    if (it.options.bce && it.hasChecks && inSet(it.checks.ascii, s)) {
+                        var m = copyBytes("an eliminated boundary check fails at ".bytes())!;
+                        appendBytes(mut m, location.view())!;
+                        return Err(faultBytes(m.view()));
+                    }
+                    return Err(panicAt("string slice not on a character boundary", location));
+                }
+            } else {
+                if (intCompare(x, y) > 0) {
+                    return Err(panicAt("slice range out of bounds", location));
+                }
+                let lengthValue = operand(it, c, n, frame, length)?;
+                let l = integerOf(c, lengthValue, n.operandTypes[length as usize])?;
+                if (intCompare(y, l) > 0) {
+                    return Err(panicAt("slice range out of bounds", location));
+                }
+            }
+        }
+        NirStatement.StorageDead(local) => {
+            let base = frame.locals[local as usize];
+            if (it.memory.isLive(base)) {
+                it.memory.end(base);
+            }
+        }
+        NirStatement.Drop(place, flag) => {
+            if (flagSet(it, c, n, frame, flag)?) {
+                let placeType = placeTypeOf(c, n, frame, place);
+                let addr = address(it, c, n, frame, place, false)?;
+                if (isPlacedBoxPlace(it, n, frame, place)) {
+                    // A stack-placed box: destroy the contents, then end the slot instead of freeing (§5.5a).
+                    let contents = pointerAt(it, addr)?;
+                    let index = it.memory.allocationAt(contents)?;
+                    if (!it.memory.allocations[index].live) {
+                        return Err(fault("a stack-placed box is destroyed twice"));
+                    }
+                    let pointee = pointeeOf(c, placeType);
+                    if (c.types.needsDrop(pointee)) {
+                        destroy(it, c, n, pointee, contents)?;
+                    }
+                    endSlot(it, contents)?;
+                } else {
+                    destroy(it, c, n, placeType, addr)?;
+                }
+            }
+        }
+        NirStatement.Eval(r) => { rvalue(it, c, n, frame, r)?; }
+    }
+    return Ok();
+}
+
+// ---- Statics ----
+
+/// Evaluates every static's initialiser into its memory before `main` (§39.5).
+fn initialiseStatics(it: borrow mut Interp, c: borrow Checker) -> Result<void, Stop> {
+    for (k in 0..c.hir.statics.length) {
+        let item = borrow c.hir.statics[k];
+        var what = copyBytes("static ".bytes())!;
+        appendBytes(mut what, c.name(item.name))!;
+        let size = typeSize(c, item.typ)?;
+        let addr = it.memory.allocate(allocationHeap(), if (size == 0) 1 else size, false, what.view())?;
+        let value = staticValue(it, c, item.value, item.typ)?;
+        it.memory.store(addr, value)?;
+        it.statics.push(addr)!;
+    }
+    return Ok();
+}
+
+fn staticValue(it: borrow mut Interp, c: borrow Checker, e: u32, t: u32) -> Result<Value, Stop> {
+    match (c.hir.exprs[e as usize]) {
+        HirExpr.IntConst(v) => { return fromInteger(c, v, t); }
+        HirExpr.BoolConst(b) => { return Ok(valueOf(if (b) 1 else 0, 1)); }
+        HirExpr.FloatConst(f) => {
+            let x = if (c.types.info(t).bits == 32) round<f32>(f) as f64 else f;
+            return floatValue(c, x, t);
+        }
+        HirExpr.StringConst(text) => {
+            let bytes = copyBytes(c.hir.text[text.start as usize..(text.start + text.count) as usize])!;
+            let pointer = literal(it, bytes.view())?;
+            return Ok(viewValue(pointer, bytes.length as u64));
+        }
+        HirExpr.StaticCString(text) => {
+            let bytes = copyBytes(c.hir.text[text.start as usize..(text.start + text.count) as usize])!;
+            return Ok(valueOf(literal(it, bytes.view())?, 8));
+        }
+        HirExpr.StructLiteral(fields) => {
+            if (fields.count == 0) {
+                return Ok(valueOf(0, 1)); // `nv_empty`
+            }
+            var result = uninitialisedValue(typeSize(c, t)?);
+            for (k in 0..fields.count) {
+                let fv = c.hir.fieldValues[(fields.start + k) as usize];
+                let field = borrow c.types.fields[fv.field as usize];
+                let value = staticValue(it, c, fv.value, field.typ)?;
+                result.put(field.offset as usize, value);
+            }
+            return Ok(result);
+        }
+        HirExpr.ArrayLiteral(elements) => {
+            let element = elementOf(c, t);
+            let size = typeSize(c, element)?;
+            var result = uninitialisedValue(typeSize(c, t)?);
+            for (k in 0..elements.count) {
+                let value = staticValue(it, c, c.hir.at(elements, k), element)?;
+                result.put((k as usize) * size, value);
+            }
+            return Ok(result);
+        }
+        HirExpr.ArrayRepeat(value) => {
+            let element = elementOf(c, t);
+            let size = typeSize(c, element)?;
+            var result = uninitialisedValue(typeSize(c, t)?);
+            for (k in 0..c.types.info(t).arrayLength) {
+                let v = staticValue(it, c, value, element)?;
+                result.put(truncate<usize>(k) * size, v);
+            }
+            return Ok(result);
+        }
+        HirExpr.Call(callee, _) => {
+            var m = copyBytes("static initialiser calls the C constant macro '".bytes())!;
+            appendBytes(mut m, c.name(c.hir.functions[callee as usize].name))!;
+            appendText(mut m, "', which only C can evaluate (type-system.md §39.5)")!;
+            return Err(faultBytes(m.view()));
+        }
+        _ => { return Err(fault("a static's initialiser was not evaluated")); }
+    }
+}
+
+// ---- Running main ----
+
+fn newInterp(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    options: InterpreterOptions,
+) -> Interp {
+    var functionOf = Vector<u32>.create();
+    for (k in 0..c.hir.functions.length) {
+        functionOf.push(none())!;
+    }
+    var variantKeys = Vector<u64>.create();
+    var variantFunctions = Vector<u32>.create();
+    var blockIndex = Vector<Vector<u32>>.create();
+    for (k in 0..n.functions.length) {
+        let f = borrow n.functions[k];
+        if (f.variant == 0) {
+            functionOf[f.source as usize] = truncate<u32>(k);
+        } else {
+            variantKeys.push(((f.source as u64) << 32) | (f.variant as u64))!;
+            variantFunctions.push(truncate<u32>(k))!;
+        }
+        var index = Vector<u32>.create();
+        for (b in 0..f.blocks.length) {
+            let id = f.blocks[b].id as usize;
+            while (index.length <= id) {
+                index.push(none())!;
+            }
+            index[id] = truncate<u32>(b);
+        }
+        blockIndex.push(index)!;
+    }
+    var copies = Vector<SourceText>.create();
+    for (s in sources.view()) {
+        copies.push(SourceText.create(s.path.view(), s.text.view())!)!;
+    }
+    let limit = options.memoryLimit;
+    return Interp {
+        options: options,
+        memory: Memory.create(limit),
+        sources: copies,
+        functionOf: functionOf,
+        variantKeys: variantKeys,
+        variantFunctions: variantFunctions,
+        blockIndex: blockIndex,
+        literalTexts: Vector<Vector<u8>>.create(),
+        literalAddresses: Vector<u64>.create(),
+        statics: Vector<u64>.create(),
+        addressed: Vector<u32>.create(),
+        hasPosition: false,
+        positionFile: 0,
+        positionStart: 0,
+        steps: 0,
+        hasPlacement: false,
+        placement: PlacementAnalysis {
+            functions: Vector<FunctionPlacement>.create(),
+            decisions: Vector<PlacementDecision>.create(),
+        },
+        hasChecks: false,
+        checks: CheckResults {
+            removed: Vector<bool>.create(),
+            noOverflow: Vector<bool>.create(),
+            ascii: Vector<bool>.create(),
+        },
+        stdout: Vector<u8>.create(),
+        emptyVector: 0,
+        attempts: 0,
+        liveAllocations: 0,
+        failingArmed: false,
+        failingLeft: 0,
+        scratchChunk: 0,
+        scratchCur: 0,
+        scratchEnd: 0,
+        scratchDepth: 0,
+        allocatorTypes: Vector<u32>.create(),
+        allocatorAddresses: Vector<u64>.create(),
+        runtime: newInterpRuntime(),
+    };
+}
+
+/// Runs `main` and returns the exit status, as the native program would (NirInterpreter.Run).
+fn interpretProgram(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    options: InterpreterOptions,
+) -> Result<i32, AllocError> {
+    var it = newInterp(c, n, sources, options);
+    if (it.options.placement) {
+        it.placement = analyzePlacement(c, n, sources)?;
+        it.hasPlacement = true;
+    }
+    if (it.options.bce || it.options.oce) {
+        it.checks = analyzeChecks(c, n)?;
+        it.hasChecks = true;
+    }
+    var main = none();
+    for (k in 0..n.functions.length) {
+        let hir = borrow c.hir.functions[n.functions[k].source as usize];
+        if (main == none() && hir.owner == none() && sameText(c.name(hir.name), "main")) {
+            main = n.functions[k].source;
+        }
+    }
+    let status = runMain(mut it, c, n, main);
+    flushOutput(mut it);
+    return Ok(status);
+}
+
+fn runMain(it: borrow mut Interp, c: borrow Checker, n: borrow NirProgram, main: u32) -> i32 {
+    let outcome = runMainSteps(it, c, n, main);
+    match (outcome) {
+        Ok(code) => { return truncate<i32>(truncate<u32>(code) & 0xFF); }
+        Err(stop) => {
+            if (stop.kind == 0) {
+                var m = copyBytes("nova interp: fault: ".bytes())!;
+                appendBytes(mut m, stop.message.view())!;
+                appendText(mut m, " at ")!;
+                if (stop.hasLocation) {
+                    appendBytes(mut m, stop.location.view())!;
+                } else {
+                    let location = here(it);
+                    appendBytes(mut m, location.view())!;
+                }
+                m.push('\n')!;
+                writeError(it, m.view());
+                return faultExitStatus();
+            }
+            if (stop.kind == 1) {
+                var m = copyBytes("nova panic: ".bytes())!;
+                appendBytes(mut m, stop.message.view())!;
+                appendText(mut m, " at ")!;
+                appendBytes(mut m, stop.location.view())!;
+                m.push('\n')!;
+                writeError(it, m.view());
+                return panicExitStatus();
+            }
+            return truncate<i32>(truncate<u64>(stop.code) & 0xFF);
+        }
+    }
+}
+
+fn runMainSteps(it: borrow mut Interp, c: borrow Checker, n: borrow NirProgram, main: u32) -> Result<i32, Stop> {
+    it.emptyVector = it.memory.allocate(allocationStatic(), 0, true, "the empty-vector sentinel".bytes())?;
+    startRuntime(it)?;
+    initialiseStatics(it, c)?;
+    let f = nirFunctionOf(it, main, 0)?;
+    let noArguments = Vector<Value>.create();
+    let result = callFunction(it, c, n, f, noArguments)?;
+    let code = match (result) {
+        Some(v) => truncate<i32>(truncate<u32>(v.bits(0, 4)?)),
+        null => 0,
+    };
+    finishRuntime(it);
+    return Ok(code);
+}

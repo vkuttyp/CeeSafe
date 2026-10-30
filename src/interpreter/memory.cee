@@ -1,0 +1,336 @@
+// The interpreter's memory (the reference's Interpreter/Memory.cs; intermediate-representation.md §5.2):
+// byte-addressed allocations with the target layout, each byte carrying an initialised bit. Allocation i has base
+// address (i + 1) << 32, which is 16-aligned like malloc's memory, so address arithmetic behaves as in the generated C.
+
+fn allocationLocal() -> u32 => 0;
+fn allocationHeap() -> u32 => 1;
+fn allocationStatic() -> u32 => 2;
+
+struct Allocation {
+    kind: u32;
+    data: Vector<u8>;
+    init: Vector<bool>;
+    what: Vector<u8>;
+    live: bool;
+}
+
+fn allocationBase(id: usize) -> u64 => ((id as u64) + 1) << 32;
+
+/// A value in transit: its bytes and which of them are initialised.
+struct Value {
+    data: Vector<u8>;
+    init: Vector<bool>;
+
+    fn size(borrow this) -> usize => this.data.length;
+
+    /// The bytes [offset, offset + size) as an unsigned number; a use, so they must be initialised.
+    fn bits(borrow this, offset: usize, size: usize) -> Result<u64, Stop> {
+        var bits: u64 = 0;
+        for (i in 0..size) {
+            if (!this.init[offset + i]) {
+                return Err(fault("use of uninitialised memory"));
+            }
+            bits = bits | ((this.data[offset + i] as u64) << ((8 * i) as u64));
+        }
+        return Ok(bits);
+    }
+
+    fn put(borrow mut this, offset: usize, part: borrow Value) {
+        for (i in 0..part.data.length) {
+            this.data[offset + i] = part.data[i];
+            this.init[offset + i] = part.init[i];
+        }
+    }
+
+    fn slice(borrow this, offset: usize, size: usize) -> Value {
+        var value = uninitialisedValue(size);
+        for (i in 0..size) {
+            value.data[i] = this.data[offset + i];
+            value.init[i] = this.init[offset + i];
+        }
+        return value;
+    }
+}
+
+fn uninitialisedValue(size: usize) -> Value {
+    var data = Vector<u8>.create();
+    var init = Vector<bool>.create();
+    for (i in 0..size) {
+        data.push(0)!;
+        init.push(false)!;
+    }
+    return Value { data: data, init: init };
+}
+
+fn initialisedValue(bytes: Slice<u8>) -> Value {
+    var data = Vector<u8>.create();
+    var init = Vector<bool>.create();
+    for (b in bytes) {
+        data.push(b)!;
+        init.push(true)!;
+    }
+    return Value { data: data, init: init };
+}
+
+/// `bits` as `size` little-endian bytes (x86-64 and AArch64), initialised.
+fn valueOf(bits: u64, size: usize) -> Value {
+    var data = Vector<u8>.create();
+    var init = Vector<bool>.create();
+    for (i in 0..size) {
+        data.push(if (i < 8) truncate<u8>(bits >> ((8 * i) as u64)) else 0)!;
+        init.push(true)!;
+    }
+    return Value { data: data, init: init };
+}
+
+fn copyValue(v: borrow Value) -> Value => v.slice(0, v.data.length);
+
+/// Why the interpreter stopped: a fault (§5.2: something no checked program can do), a panic, or `Process.exit`.
+struct Stop {
+    kind: u32; // 0 fault, 1 panic, 2 exit
+    message: Vector<u8>;
+    location: Vector<u8>;
+    hasLocation: bool;
+    code: i64;
+}
+
+fn fault(message: StringView) -> Stop => faultBytes(message.bytes());
+
+fn faultBytes(message: Slice<u8>) -> Stop =>
+    Stop { kind: 0, message: copyBytes(message)!, location: Vector<u8>.create(), hasLocation: false, code: 0 };
+
+fn panicAt(reason: StringView, location: borrow Vector<u8>) -> Stop =>
+    Stop {
+        kind: 1,
+        message: copyBytes(reason.bytes())!,
+        location: copyBytes(location.view())!,
+        hasLocation: true,
+        code: 0,
+    };
+
+fn exitWith(code: i64) -> Stop =>
+    Stop { kind: 2, message: Vector<u8>.create(), location: Vector<u8>.create(), hasLocation: false, code: code };
+
+/// A message and a lower-case hexadecimal address: `prefix0x…suffix`.
+fn addressMessage(prefix: StringView, address: u64, suffix: StringView) -> Stop {
+    var m = copyBytes(prefix.bytes())!;
+    appendText(mut m, "0x")!;
+    appendLowerHex(mut m, address)!;
+    appendText(mut m, suffix)!;
+    return faultBytes(m.view());
+}
+
+fn appendLowerHex(out: borrow mut Vector<u8>, value: u64) -> Result<void, AllocError> {
+    var digits = [0u8; 16];
+    var n: usize = 0;
+    var v = value;
+    loop {
+        let d = truncate<u8>(v & 15);
+        digits[n] = if (d < 10) '0' + d else 'a' + (d - 10);
+        n += 1;
+        v = v >> 4;
+        if (v == 0) {
+            break;
+        }
+    }
+    while (n > 0) {
+        n -= 1;
+        out.push(digits[n])?;
+    }
+    return Ok();
+}
+
+struct Memory {
+    allocations: Vector<Allocation>;
+    live: i64;  // the bytes of live allocations
+    limit: i64; // the most there may be (0: no limit; tooling.md §6.3)
+
+    fn create(limit: i64) -> Memory => Memory { allocations: Vector<Allocation>.create(), live: 0, limit: limit };
+
+    /// Would `size` more bytes pass the limit? Then the heap reports out of memory instead.
+    fn wouldExceed(borrow this, size: u64) -> bool =>
+        this.limit > 0 && truncate<u64>(this.live) + size > truncate<u64>(this.limit);
+
+    fn allocate(borrow mut this, kind: u32, size: usize, initialised: bool, what: Slice<u8>) -> Result<u64, Stop> {
+        if (this.wouldExceed(size as u64)) {
+            var m = copyBytes("the sandbox's memory limit of ".bytes())!;
+            appendDecimal(mut m, truncate<u64>(this.limit))!;
+            appendText(mut m, " bytes is reached")!;
+            return Err(faultBytes(m.view()));
+        }
+        this.live += truncate<i64>(size);
+        var data = Vector<u8>.create();
+        var init = Vector<bool>.create();
+        for (i in 0..size) {
+            data.push(0)!;
+            init.push(initialised)!;
+        }
+        this.allocations.push(Allocation { kind: kind, data: data, init: init, what: copyBytes(what)!, live: true })!;
+        return Ok(allocationBase(this.allocations.length - 1));
+    }
+
+    fn staticBytes(borrow mut this, bytes: Slice<u8>, what: Slice<u8>) -> Result<u64, Stop> {
+        let base = this.allocate(allocationStatic(), bytes.length, true, what)?;
+        let id = (base >> 32) - 1;
+        for (i in 0..bytes.length) {
+            this.allocations[id as usize].data[i] = bytes[i];
+        }
+        return Ok(base);
+    }
+
+    /// Ends an allocation (its memory may no longer be used).
+    fn end(borrow mut this, address: u64) {
+        let id = ((address >> 32) - 1) as usize;
+        if (this.allocations[id].live) {
+            this.live -= truncate<i64>(this.allocations[id].data.length);
+        }
+        this.allocations[id].live = false;
+        this.allocations[id].data.clear();
+        this.allocations[id].init.clear();
+    }
+
+    fn isLive(borrow this, address: u64) -> bool {
+        let id = (address >> 32);
+        return id >= 1 && ((id - 1) as usize) < this.allocations.length && this.allocations[(id - 1) as usize].live;
+    }
+
+    /// The live allocation containing [address, address + size), and the offset in it.
+    fn resolve(borrow this, address: u64, size: usize, write: bool) -> Result<usize, Stop> {
+        if (address == 0) {
+            return Err(fault("dereference of null"));
+        }
+        let id = address >> 32;
+        if (id == 0 || (id - 1) >= (this.allocations.length as u64)) {
+            return Err(addressMessage("access to an invalid address ", address, ""));
+        }
+        let allocation = borrow this.allocations[(id - 1) as usize];
+        if (!allocation.live) {
+            var m = copyBytes("access to ended memory (".bytes())!;
+            appendBytes(mut m, allocation.what.view())!;
+            m.push(')')!;
+            return Err(faultBytes(m.view()));
+        }
+        let offset = address & 0xFFFFFFFF;
+        if (offset + (size as u64) > (allocation.data.length as u64)) {
+            var m = copyBytes("access out of bounds of ".bytes())!;
+            appendBytes(mut m, allocation.what.view())!;
+            appendText(mut m, " (")!;
+            appendDecimal(mut m, size as u64)!;
+            appendText(mut m, " bytes at offset ")!;
+            appendDecimal(mut m, offset)!;
+            appendText(mut m, " of ")!;
+            appendDecimal(mut m, allocation.data.length as u64)!;
+            m.push(')')!;
+            return Err(faultBytes(m.view()));
+        }
+        if (write && allocation.kind == allocationStatic()) {
+            var m = copyBytes("write to static memory (".bytes())!;
+            appendBytes(mut m, allocation.what.view())!;
+            m.push(')')!;
+            return Err(faultBytes(m.view()));
+        }
+        return Ok(offset as usize);
+    }
+
+    fn load(borrow this, address: u64, size: usize) -> Result<Value, Stop> {
+        if (size == 0) {
+            return Ok(uninitialisedValue(0));
+        }
+        let offset = this.resolve(address, size, false)?;
+        let allocation = borrow this.allocations[((address >> 32) - 1) as usize];
+        var value = uninitialisedValue(size);
+        for (i in 0..size) {
+            value.data[i] = allocation.data[offset + i];
+            value.init[i] = allocation.init[offset + i];
+        }
+        return Ok(value);
+    }
+
+    fn store(borrow mut this, address: u64, value: borrow Value) -> Result<void, Stop> {
+        if (value.data.length == 0) {
+            return Ok();
+        }
+        let offset = this.resolve(address, value.data.length, true)?;
+        let id = ((address >> 32) - 1) as usize;
+        for (i in 0..value.data.length) {
+            this.allocations[id].data[offset + i] = value.data[i];
+            this.allocations[id].init[offset + i] = value.init[i];
+        }
+        return Ok();
+    }
+
+    /// Marks bytes uninitialised: the value was moved out (type-system.md §14.3).
+    fn uninitialise(borrow mut this, address: u64, size: usize) -> Result<void, Stop> {
+        if (size == 0) {
+            return Ok();
+        }
+        let offset = this.resolve(address, size, false)?;
+        let id = ((address >> 32) - 1) as usize;
+        for (i in 0..size) {
+            this.allocations[id].init[offset + i] = false;
+        }
+        return Ok();
+    }
+
+    /// A scalar of `size` bytes (a use: they must be initialised).
+    fn loadBits(borrow this, address: u64, size: usize) -> Result<u64, Stop> {
+        let offset = this.resolve(address, size, false)?;
+        let allocation = borrow this.allocations[((address >> 32) - 1) as usize];
+        var bits: u64 = 0;
+        for (i in 0..size) {
+            if (!allocation.init[offset + i]) {
+                return Err(fault("use of uninitialised memory"));
+            }
+            bits = bits | ((allocation.data[offset + i] as u64) << ((8 * i) as u64));
+        }
+        return Ok(bits);
+    }
+
+    fn storeBits(borrow mut this, address: u64, bits: u64, size: usize) -> Result<void, Stop> {
+        let offset = this.resolve(address, size, true)?;
+        let id = ((address >> 32) - 1) as usize;
+        for (i in 0..size) {
+            this.allocations[id].data[offset + i] = if (i < 8) truncate<u8>(bits >> ((8 * i) as u64)) else 0;
+            this.allocations[id].init[offset + i] = true;
+        }
+        return Ok();
+    }
+
+    /// Copies bytes with their initialised bits (memmove semantics).
+    fn copy(borrow mut this, destination: u64, source: u64, size: usize) -> Result<void, Stop> {
+        if (size == 0) {
+            return Ok();
+        }
+        let value = this.load(source, size)?;
+        this.resolve(destination, size, true)?;
+        return this.store(destination, value);
+    }
+
+    /// The allocation an address is in, or a fault.
+    fn allocationAt(borrow this, address: u64) -> Result<usize, Stop> {
+        let id = address >> 32;
+        if (id == 0 || (id - 1) >= (this.allocations.length as u64)) {
+            return Err(addressMessage("invalid address ", address, ""));
+        }
+        return Ok((id - 1) as usize);
+    }
+
+    /// Ends a heap allocation; only its base address may be freed.
+    fn free(borrow mut this, address: u64) -> Result<void, Stop> {
+        let id = address >> 32;
+        if (id == 0 || (id - 1) >= (this.allocations.length as u64) || (address & 0xFFFFFFFF) != 0) {
+            return Err(addressMessage("free of an address that is not an allocation (", address, ")"));
+        }
+        let index = (id - 1) as usize;
+        if (this.allocations[index].kind != allocationHeap()) {
+            var m = copyBytes("free of ".bytes())!;
+            appendBytes(mut m, this.allocations[index].what.view())!;
+            return Err(faultBytes(m.view()));
+        }
+        if (!this.allocations[index].live) {
+            return Err(fault("double free"));
+        }
+        this.end(address);
+        return Ok();
+    }
+}

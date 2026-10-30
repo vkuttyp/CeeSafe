@@ -1,0 +1,173 @@
+// Printing a float as the runtime's nova_format_f64/f32 does (the reference's FloatSemantics.Format;
+// type-system.md §35.7): the shortest decimal that rounds back to the value, laid out by ECMA-262 §6.1.6.1.20.
+
+/// The shortest digits and the exponent n of 0.d1…dk × 10^n for a positive finite value of `bits` bits.
+struct ShortestDigits {
+    digits: Vector<u8>;
+    n: i64;
+}
+
+/// The sign of v / scale - 10^e, exactly.
+fn compare10(v: borrow BigNat, scale: borrow BigNat, e: i64) -> Result<i32, AllocError> {
+    if (e >= 0) {
+        let power = BigNat.power10(truncate<u32>(e))?;
+        let right = BigNat.mul(scale, power)?;
+        return Ok(v.compare(right));
+    }
+    let power = BigNat.power10(truncate<u32>(0 - e))?;
+    let left = BigNat.mul(v, power)?;
+    return Ok(left.compare(scale));
+}
+
+fn shortestDigits(value: f64, bits: u32) -> Result<ShortestDigits, AllocError> {
+    var mantissaBits: usize = 52;
+    var exponentBias: i64 = 1075;
+    var fraction: u64 = 0;
+    var biased: i64 = 0;
+    if (bits == 32) {
+        let b = round<f32>(value).bits();
+        mantissaBits = 23;
+        exponentBias = 150;
+        fraction = (b & 0x7FFFFF) as u64;
+        biased = (b >> 23) as i64;
+    } else {
+        let b = value.bits();
+        fraction = b & 0xFFFFFFFFFFFFF;
+        biased = truncate<i64>(b >> 52);
+    }
+    // value = c * 2^q = v / scale, and the interval's ends are low / scale and high / scale, all exact.
+    let c = if (biased == 0) fraction else ((1u64) << (mantissaBits as u64)) | fraction;
+    let q = (if (biased == 0) 1 else biased) - exponentBias;
+    let lowerCloser = biased > 1 && fraction == 0; // a power of two: the value below is half as far away
+    let scale = if (q < 2) BigNat.power2(truncate<usize>(2 - q))? else BigNat.fromU64(1)?;
+    let shift: usize = if (q < 2) 0 else truncate<usize>(q - 2);
+    let c1 = BigNat.fromU64(c)?;
+    let c4 = BigNat.mulSmall(c1, 4)?;
+    let v = BigNat.shiftLeft(c4, shift)?;
+    let lowBase = BigNat.sub(c4, BigNat.fromU64(if (lowerCloser) 1 else 2)?)?;
+    let low = BigNat.shiftLeft(lowBase, shift)?;
+    let highBase = BigNat.addSmall(c4, 2)?;
+    let high = BigNat.shiftLeft(highBase, shift)?;
+    let inclusive = c % 2 == 0; // a tie at an end rounds to the even significand, this one
+    // An estimate from the binary exponent (log10(2) ~ 0.30103), then made exact: 10^e10 <= value < 10^(e10 + 1).
+    var bitLength: i64 = 0;
+    var rest = c;
+    while (rest != 0) {
+        bitLength += 1;
+        rest = rest >> 1;
+    }
+    let e2 = q + bitLength - 1;
+    let scaled = e2 * 30103;
+    var e10 = scaled / 100000;
+    if (scaled < 0 && scaled % 100000 != 0) {
+        e10 -= 1;
+    }
+    while (compare10(v, scale, e10)? < 0) {
+        e10 -= 1;
+    }
+    while (compare10(v, scale, e10 + 1)? >= 0) {
+        e10 += 1;
+    }
+    var p: i64 = 1;
+    loop {
+        // Candidates d * 10^s and (d + 1) * 10^s, with d = floor(value / 10^s) and p digits.
+        let s10 = e10 - p + 1;
+        let power = BigNat.power10(truncate<u32>(if (s10 < 0) 0 - s10 else s10))?;
+        let numerator = if (s10 >= 0) v.copyOf()? else BigNat.mul(v, power)?;
+        let denominator = if (s10 >= 0) BigNat.mul(scale, power)? else scale.copyOf()?;
+        let division = BigNat.divRem(numerator, denominator)?;
+        let step = if (s10 >= 0) BigNat.mul(scale, power)? else scale.copyOf()?;
+        let k = if (s10 >= 0) BigNat.fromU64(1)? else power.copyOf()?;
+        let lo = BigNat.mul(low, k)?;
+        let hi = BigNat.mul(high, k)?;
+        let d = division.quotient.copyOf()?;
+        let dUp = BigNat.addSmall(d, 1)?;
+        let downIn = !d.isZero() && inside(d, step, lo, hi, inclusive)?;
+        let upIn = inside(dUp, step, lo, hi, inclusive)?;
+        if (!downIn && !upIn) {
+            p += 1;
+            continue;
+        }
+        // Both inside: the nearer (twice the remainder against the step), and on a tie the even one.
+        let twice = BigNat.mulSmall(division.remainder, 2)?;
+        let order = twice.compare(denominator);
+        var chooseUp = !downIn;
+        if (downIn && upIn) {
+            chooseUp = order > 0 || (order == 0 && !d.isEven());
+        }
+        var text = Vector<u8>.create();
+        if (chooseUp) {
+            dUp.appendDecimal(mut text)?;
+        } else {
+            d.appendDecimal(mut text)?;
+        }
+        let length = truncate<i64>(text.length);
+        var end = text.length;
+        while (end > 0 && text[end - 1] == '0') {
+            end -= 1;
+        }
+        text.truncate(end);
+        return Ok(ShortestDigits { digits: text, n: length + s10 });
+    }
+}
+
+fn inside(
+    digits: borrow BigNat,
+    step: borrow BigNat,
+    lo: borrow BigNat,
+    hi: borrow BigNat,
+    inclusive: bool,
+) -> Result<bool, AllocError> {
+    let x = BigNat.mul(digits, step)?;
+    if (inclusive) {
+        return Ok(lo.compare(x) <= 0 && x.compare(hi) <= 0);
+    }
+    return Ok(lo.compare(x) < 0 && x.compare(hi) < 0);
+}
+
+/// FloatSemantics.Format: NaN, Infinity, -Infinity, 0, or the shortest digits laid out as ECMA-262 does.
+fn appendFloatText(out: borrow mut Vector<u8>, value: f64, bits: u32) -> Result<void, AllocError> {
+    if (value != value) {
+        return appendText(out, "NaN");
+    }
+    if (value - value != 0.0) {
+        return appendText(out, if (value > 0.0) "Infinity" else "-Infinity");
+    }
+    if (value == 0.0) {
+        return appendText(out, "0");
+    }
+    let shortest = shortestDigits(value.abs(), bits)?;
+    if (value < 0.0) {
+        out.push('-')?;
+    }
+    let digits = shortest.digits.view();
+    let k = truncate<i64>(digits.length);
+    let n = shortest.n;
+    if (k <= n && n <= 21) {
+        appendBytes(out, digits)?;
+        for (i in 0..(n - k)) {
+            out.push('0')?;
+        }
+    } else if (0 < n && n <= 21) {
+        appendBytes(out, digits[0..truncate<usize>(n)])?;
+        out.push('.')?;
+        appendBytes(out, digits[truncate<usize>(n)..])?;
+    } else if (-6 < n && n <= 0) {
+        appendText(out, "0.")?;
+        for (i in 0..(0 - n)) {
+            out.push('0')?;
+        }
+        appendBytes(out, digits)?;
+    } else {
+        out.push(digits[0])?;
+        if (k > 1) {
+            out.push('.')?;
+            appendBytes(out, digits[1..])?;
+        }
+        out.push('e')?;
+        let e = n - 1;
+        out.push(if (e < 0) '-' else '+')?;
+        appendDecimal(out, truncate<u64>(if (e < 0) 0 - e else e))?;
+    }
+    return Ok();
+}

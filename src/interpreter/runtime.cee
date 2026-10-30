@@ -1,0 +1,1345 @@
+// The interpreter's runtime (the reference's Interpreter/Runtime.cs; intermediate-representation.md §5.1):
+// nova_rt_core.c and the emitter's helpers (c-backend.md §2), step for step, on the interpreter's memory.
+
+fn allocSystem() -> u64 => 0;
+fn allocFailing() -> u64 => 1;
+fn arenaHeader() -> u64 => 16;
+fn scratchChunkSize() -> u64 => 65536;
+fn stableVectorChunks() -> u64 => 32;
+
+/// nova_rt_finish: the NOVA_ALLOC_REPORT line.
+fn finishRuntime(it: borrow mut Interp) {
+    if (it.options.allocationReport) {
+        var m = copyBytes("nova alloc: attempts=".bytes())!;
+        appendDecimal(mut m, it.attempts)!;
+        appendText(mut m, " live=")!;
+        appendDecimal(mut m, it.liveAllocations)!;
+        m.push('\n')!;
+        writeError(it, m.view());
+    }
+}
+
+// ---- Heap ----
+
+fn allocatorId(c: borrow Checker, allocator: u32) -> u64 =>
+    if (sameText(c.types.name(allocator), "FailingAllocator")) allocFailing() else allocSystem();
+
+/// nova_alloc: 0 on failure.
+fn alloc(it: borrow mut Interp, size: u64, allocator: u64) -> Result<u64, Stop> {
+    it.attempts += 1;
+    if (allocator == allocFailing() && it.failingArmed) {
+        if (it.failingLeft == 0) {
+            return Ok(0);
+        }
+        it.failingLeft -= 1;
+    }
+    if (it.options.failAllocationAt != 0 && it.attempts == it.options.failAllocationAt) {
+        return Ok(0);
+    }
+    if (size > 0x7FFFFFFF || it.memory.wouldExceed(size)) {
+        return Ok(0); // malloc would fail, or the sandbox has no more memory (tooling.md §6.3)
+    }
+    it.liveAllocations += 1;
+    return it.memory.allocate(
+        allocationHeap(),
+        if (size == 0) 1 else size as usize,
+        false,
+        "a heap allocation".bytes(),
+    );
+}
+
+fn freeMemory(it: borrow mut Interp, pointer: u64) -> Result<void, Stop> {
+    it.liveAllocations -= 1;
+    return it.memory.free(pointer);
+}
+
+fn structDefOf(c: borrow Checker, t: u32) -> u32 => c.types.info(t).structDef;
+
+fn userAllocateMethod(c: borrow Checker, allocator: u32) -> u32 {
+    let s = structDefOf(c, allocator);
+    return if (s == none()) none() else c.types.structs[s as usize].allocateMethod;
+}
+
+fn userDeallocateMethod(c: borrow Checker, allocator: u32) -> u32 {
+    let s = structDefOf(c, allocator);
+    return if (s == none()) none() else c.types.structs[s as usize].deallocateMethod;
+}
+
+fn parameterTypeOf(c: borrow Checker, f: u32, k: usize) -> u32 =>
+    c.hir.locals[c.hir.functions[f as usize].parameters[k] as usize].typ;
+
+/// A box's memory: from its user allocator's `allocate` (type-system.md §30.3), or the runtime heap; 0 on failure.
+fn allocBox(it: borrow mut Interp, c: borrow Checker, n: borrow NirProgram, box: u32) -> Result<u64, Stop> {
+    let allocator = c.types.info(box).allocator;
+    let allocate = userAllocateMethod(c, allocator);
+    if (allocate == none()) {
+        return alloc(it, typeSize(c, pointeeOf(c, box))? as u64, allocatorId(c, allocator));
+    }
+    var arguments = Vector<Value>.create();
+    arguments.push(allocatorThis(it, c, allocator)?)!;
+    arguments.push(layoutValue(c, parameterTypeOf(c, allocate, 1), pointeeOf(c, box))?)!;
+    let f = nirFunctionOf(it, allocate, 0)?;
+    let result = callFunction(it, c, n, f, arguments)?!;
+    let returnType = c.hir.functions[allocate as usize].returnType;
+    let tag = result.bits(0, enumTagSize(c, returnType))?;
+    return Ok(if (tag == 0) result.bits(enumUnionOffset(c, returnType) as usize, 8)? else 0);
+}
+
+/// Frees a box's memory; `contents` is a dyn box's implementation (§37.4), else none for its pointee.
+fn freeBox(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    pointer: u64,
+    box: u32,
+    contents: u32,
+) -> Result<void, Stop> {
+    let allocator = c.types.info(box).allocator;
+    let deallocate = userDeallocateMethod(c, allocator);
+    if (deallocate == none()) {
+        return freeMemory(it, pointer);
+    }
+    var arguments = Vector<Value>.create();
+    arguments.push(allocatorThis(it, c, allocator)?)!;
+    arguments.push(valueOf(pointer, 8))!;
+    let measured = if (contents == none()) pointeeOf(c, box) else contents;
+    arguments.push(layoutValue(c, parameterTypeOf(c, deallocate, 2), measured)?)!;
+    let f = nirFunctionOf(it, deallocate, 0)?;
+    callFunction(it, c, n, f, arguments)?;
+    return Ok();
+}
+
+/// `borrow this` for a field-less allocator: the address of a value of it (read-only static memory).
+fn allocatorThis(it: borrow mut Interp, c: borrow Checker, allocator: u32) -> Result<Value, Stop> {
+    for (k in 0..it.allocatorTypes.length) {
+        if (it.allocatorTypes[k] == allocator) {
+            return Ok(valueOf(it.allocatorAddresses[k], 8));
+        }
+    }
+    let size = typeSize(c, allocator)?;
+    var bytes = Vector<u8>.create();
+    for (k in 0..(if (size == 0) 1 else size)) {
+        bytes.push(0)!;
+    }
+    var what = copyBytes("the allocator ".bytes())!;
+    appendTypeName(c, mut what, allocator);
+    let addr = it.memory.staticBytes(bytes.view(), what.view())?;
+    it.allocatorTypes.push(allocator)!;
+    it.allocatorAddresses.push(addr)!;
+    return Ok(valueOf(addr, 8));
+}
+
+/// A `Layout` (lib/core) value for a box's contents.
+fn layoutValue(c: borrow Checker, layout: u32, contents: u32) -> Result<Value, Stop> {
+    var value = uninitialisedValue(typeSize(c, layout)?);
+    let fields = borrow c.types.structs[structDefOf(c, layout) as usize].fields;
+    value.put(c.types.fields[fields[0] as usize].offset as usize, valueOf(typeSize(c, contents)? as u64, 8));
+    value.put(c.types.fields[fields[1] as usize].offset as usize, valueOf(typeAlign(c, contents)?, 8));
+    return Ok(value);
+}
+
+/// The string at `target` with `text` appended (nvVA_): Ok, or OutOfMemory with nothing changed.
+fn appendTextAt(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    target: u64,
+    stringType: u32,
+    text: Slice<u8>,
+    resultType: u32,
+) -> Result<Value, Stop> {
+    let length = it.memory.loadBits(target + 8, 8)?;
+    let old = pointerAt(it, target)?;
+    let pointer = vectorGrow(
+        it,
+        old,
+        length,
+        target + 16,
+        text.length as u64,
+        1,
+        allocatorId(c, c.types.info(stringType).allocator),
+    )?;
+    if (pointer == 0) {
+        return outOfMemory(c, resultType);
+    }
+    it.memory.storeBits(target, pointer, 8)?;
+    if (text.length > 0) {
+        it.memory.store(pointer + length, initialisedValue(text))?;
+    }
+    it.memory.storeBits(target + 8, length + (text.length as u64), 8)?;
+    return okValue(c, resultType, null);
+}
+
+/// nova_vec_grow: the buffer with room for `extra` more elements, or 0 with nothing changed.
+fn vectorGrow(
+    it: borrow mut Interp,
+    pointer: u64,
+    length: u64,
+    capacityAddress: u64,
+    extra: u64,
+    size: u64,
+    allocator: u64,
+) -> Result<u64, Stop> {
+    if (extra > 0xFFFFFFFFFFFFFFFF - length) {
+        return Ok(0);
+    }
+    let need = length + extra;
+    let capacity = it.memory.loadBits(capacityAddress, 8)?;
+    if (need <= capacity) {
+        return Ok(pointer);
+    }
+    var next = if (capacity > 0x7FFFFFFFFFFFFFFF) 0xFFFFFFFFFFFFFFFF else capacity * 2;
+    if (next < 4) {
+        next = 4;
+    }
+    if (next < need) {
+        next = need;
+    }
+    if (size == 0 || next > 0xFFFFFFFFFFFFFFFF / size) {
+        return Ok(0);
+    }
+    let fresh = alloc(it, next * size, allocator)?;
+    if (fresh == 0) {
+        return Ok(0);
+    }
+    if (length * size > 0) {
+        if (length * size > 0x7FFFFFFF) {
+            return Err(fault("a vector larger than the interpreter's memory"));
+        }
+        it.memory.copy(fresh, pointer, (length * size) as usize)?;
+    }
+    if (capacity != 0) {
+        freeMemory(it, pointer)?;
+    }
+    it.memory.storeBits(capacityAddress, next, 8)?;
+    return Ok(fresh);
+}
+
+/// The chunk of a stable vector's element j + 8: floor(log2(j)) - 3.
+fn chunkOf(j: u64) -> u64 {
+    var k: u64 = 0;
+    var v = j >> 3;
+    while (v > 1) {
+        v = v >> 1;
+        k += 1;
+    }
+    return k;
+}
+
+/// nova_svec_at.
+fn stableVectorAt(it: borrow Interp, vector: u64, index: u64, size: u64) -> Result<u64, Stop> {
+    let j = index + 8;
+    let k = chunkOf(j);
+    let chunk = pointerAt(it, vector + 8 * k)?;
+    return Ok(chunk.wrappingAdd((j - ((8u64) << k)).wrappingMul(size)));
+}
+
+/// nova_svec_slot: the slot for element `length`; 0 if full or out of memory.
+fn stableVectorSlot(it: borrow mut Interp, chunks: u64, length: u64, size: u64, allocator: u64) -> Result<u64, Stop> {
+    if (length > 0xFFFFFFFFFFFFFFFF - 8) {
+        return Ok(0);
+    }
+    let j = length + 8;
+    let k = chunkOf(j);
+    if (k >= stableVectorChunks()) {
+        return Ok(0);
+    }
+    let chunkAddress = chunks + 8 * k;
+    if (pointerAt(it, chunkAddress)? == 0) {
+        let count = (8u64) << k;
+        if (size == 0 || count > 0xFFFFFFFFFFFFFFFF / size) {
+            return Ok(0);
+        }
+        let chunk = alloc(it, count * size, allocator)?;
+        if (chunk == 0) {
+            return Ok(0);
+        }
+        it.memory.storeBits(chunkAddress, chunk, 8)?;
+    }
+    return Ok(pointerAt(it, chunkAddress)? + (j - ((8u64) << k)) * size);
+}
+
+// ---- Regions (nova_rt_core.c) ----
+
+fn alignUp(address: u64, align: u64) -> u64 => (address + (align - 1)) & ((align - 1) ^ 0xFFFFFFFFFFFFFFFF);
+
+/// nova_arena_alloc on the nv_arena at `arena` (chunks, cur, end, chunk_size, allocator).
+fn arenaAlloc(it: borrow mut Interp, arena: u64, size: u64, align: u64) -> Result<u64, Stop> {
+    let cur = pointerAt(it, arena + 8)?;
+    let end = pointerAt(it, arena + 16)?;
+    let aligned = alignUp(cur, align);
+    if (cur != 0 && aligned >= cur && end >= aligned && size <= end - aligned) {
+        it.memory.storeBits(arena + 8, aligned + size, 8)?;
+        return Ok(aligned);
+    }
+    let need = size.wrappingAdd(arenaHeader());
+    if (need < size) {
+        return Ok(0);
+    }
+    let chunkSize = it.memory.loadBits(arena + 24, 8)?;
+    let total = if (need > chunkSize) need else chunkSize;
+    let allocator = it.memory.loadBits(arena + 32, 8)?;
+    let chunk = alloc(it, total, allocator)?;
+    if (chunk == 0) {
+        return Ok(0);
+    }
+    let previous = pointerAt(it, arena)?;
+    it.memory.storeBits(chunk, previous, 8)?; // the previous chunk's address
+    it.memory.storeBits(arena, chunk, 8)?;
+    it.memory.storeBits(arena + 16, chunk + total, 8)?;
+    let data = chunk + arenaHeader();
+    it.memory.storeBits(arena + 8, data + size, 8)?;
+    return Ok(data);
+}
+
+/// nova_arena_reset (also its drop).
+fn arenaReset(it: borrow mut Interp, arena: u64) -> Result<void, Stop> {
+    var chunk = pointerAt(it, arena)?;
+    while (chunk != 0) {
+        let previous = pointerAt(it, chunk)?;
+        freeMemory(it, chunk)?;
+        chunk = previous;
+    }
+    it.memory.storeBits(arena, 0, 8)?;
+    it.memory.storeBits(arena + 8, 0, 8)?;
+    it.memory.storeBits(arena + 16, 0, 8)?;
+    return Ok();
+}
+
+/// fba_alloc on the nv_fba at `fba` (base, capacity, used).
+fn fixedBufferAlloc(it: borrow mut Interp, fba: u64, size: u64, align: u64) -> Result<u64, Stop> {
+    let base = pointerAt(it, fba)?;
+    let start = base + it.memory.loadBits(fba + 16, 8)?;
+    let aligned = alignUp(start, align);
+    let offset = aligned.wrappingSub(base);
+    let capacity = it.memory.loadBits(fba + 8, 8)?;
+    if (aligned < start || offset > capacity || size > capacity - offset) {
+        return Ok(0);
+    }
+    it.memory.storeBits(fba + 16, offset + size, 8)?;
+    return Ok(aligned);
+}
+
+/// nova_scratch_enter_root: an nv_scratch (chunk, cur, end, depth).
+fn scratchEnterRoot(it: borrow mut Interp, location: Vector<u8>) -> Result<Value, Stop> {
+    if (it.scratchDepth != 0) {
+        return Err(panicAt("a scratch frame is already active; nest with frame.enter()", location));
+    }
+    it.scratchDepth = 1;
+    return Ok(scratchFrame(it, 1));
+}
+
+fn scratchFrame(it: borrow Interp, depth: u64) -> Value {
+    var frame = uninitialisedValue(32);
+    frame.put(0, valueOf(it.scratchChunk, 8));
+    frame.put(8, valueOf(it.scratchCur, 8));
+    frame.put(16, valueOf(it.scratchEnd, 8));
+    frame.put(24, valueOf(depth, 8));
+    return frame;
+}
+
+/// nova_scratch_drop.
+fn scratchDrop(it: borrow mut Interp, frame: u64) -> Result<void, Stop> {
+    let entry = pointerAt(it, frame)?;
+    while (it.scratchChunk != entry) {
+        let previous = pointerAt(it, it.scratchChunk)?;
+        let chunk = it.scratchChunk;
+        freeMemory(it, chunk)?;
+        it.scratchChunk = previous;
+    }
+    it.scratchCur = pointerAt(it, frame + 8)?;
+    it.scratchEnd = pointerAt(it, frame + 16)?;
+    it.scratchDepth = it.memory.loadBits(frame + 24, 8)? - 1;
+    return Ok();
+}
+
+fn scratchAlloc(it: borrow mut Interp, size: u64, align: u64) -> Result<u64, Stop> {
+    let aligned = alignUp(it.scratchCur, align);
+    if (it.scratchCur != 0 && aligned >= it.scratchCur && it.scratchEnd >= aligned && size <= it.scratchEnd - aligned) {
+        it.scratchCur = aligned + size;
+        return Ok(aligned);
+    }
+    let need = size.wrappingAdd(arenaHeader());
+    if (need < size) {
+        return Ok(0);
+    }
+    let total = if (need > scratchChunkSize()) need else scratchChunkSize();
+    let chunk = alloc(it, total, allocSystem())?;
+    if (chunk == 0) {
+        return Ok(0);
+    }
+    let previous = it.scratchChunk;
+    it.memory.storeBits(chunk, previous, 8)?;
+    it.scratchChunk = chunk;
+    it.scratchEnd = chunk + total;
+    it.scratchCur = chunk + arenaHeader() + size;
+    return Ok(chunk + arenaHeader());
+}
+
+/// nova_region_alloc, dispatching on the region a reference names.
+fn regionAlloc(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    region: u64,
+    regionReference: u32,
+    size: u64,
+    align: u64,
+) -> Result<u64, Stop> {
+    let pointee = pointeeOf(c, regionReference);
+    let regionType = if (pointee == none()) regionReference else pointee;
+    return match (c.types.info(regionType).region) {
+        RegionKind.Arena => arenaAlloc(it, region, size, align),
+        RegionKind.FixedBuffer => fixedBufferAlloc(it, region, size, align),
+        _ => scratchAlloc(it, size, align),
+    };
+}
+
+/// nova_pool_take on the nv_pool at `pool` (slots, free, capacity, used, slot_size, allocator).
+fn poolTake(it: borrow mut Interp, pool: u64, size: u64) -> Result<u64, Stop> {
+    if (pointerAt(it, pool)? == 0) {
+        var slot = if (size > 8) size else 8;
+        slot = (slot + 15) & (15 ^ 0xFFFFFFFFFFFFFFFF);
+        let capacity = it.memory.loadBits(pool + 16, 8)?;
+        if (capacity == 0 || slot > 0xFFFFFFFFFFFFFFFF / capacity) {
+            return Ok(0);
+        }
+        let allocator = it.memory.loadBits(pool + 40, 8)?;
+        let slots = alloc(it, slot * capacity, allocator)?;
+        if (slots == 0) {
+            return Ok(0);
+        }
+        it.memory.storeBits(pool, slots, 8)?;
+        it.memory.storeBits(pool + 32, slot, 8)?;
+    }
+    let free = pointerAt(it, pool + 8)?;
+    if (free != 0) {
+        let next = pointerAt(it, free)?;
+        it.memory.storeBits(pool + 8, next, 8)?;
+        return Ok(free);
+    }
+    let used = it.memory.loadBits(pool + 24, 8)?;
+    if (used == it.memory.loadBits(pool + 16, 8)?) {
+        return Ok(0);
+    }
+    it.memory.storeBits(pool + 24, used + 1, 8)?;
+    let loaded1 = pointerAt(it, pool)?;
+    let loaded2 = it.memory.loadBits(pool + 32, 8)?;
+    return Ok(loaded1 + loaded2 * used);
+}
+
+fn poolRelease(it: borrow mut Interp, pool: u64, slot: u64) -> Result<void, Stop> {
+    let free = pointerAt(it, pool + 8)?;
+    it.memory.storeBits(slot, free, 8)?;
+    it.memory.storeBits(pool + 8, slot, 8)?;
+    return Ok();
+}
+
+// ---- Drop glue (c-backend.md §2: the order of the emitted nvD_ functions) ----
+
+/// Destroys a value that is not in memory (a parameter of a C helper that drops it).
+fn destroyValue(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    t: u32,
+    value: borrow Value,
+) -> Result<void, Stop> {
+    if (!c.types.needsDrop(t)) {
+        return Ok();
+    }
+    let temporary = it.memory.allocate(allocationLocal(), value.size(), true, "a helper's parameter".bytes())?;
+    it.memory.store(temporary, value)?;
+    destroy(it, c, n, t, temporary)?;
+    it.memory.end(temporary);
+    return Ok();
+}
+
+fn droppableFields(c: borrow Checker, fields: borrow Vector<u32>) -> Vector<u32> {
+    var out = Vector<u32>.create();
+    for (f in fields.view()) {
+        if (c.types.needsDrop(c.types.fields[f as usize].typ)) {
+            out.push(f)!;
+        }
+    }
+    return out;
+}
+
+fn destroy(it: borrow mut Interp, c: borrow Checker, n: borrow NirProgram, t: u32, addr: u64) -> Result<void, Stop> {
+    let info = c.types.info(t);
+    if (c.types.is(t, TypeKind.Resource)) {
+        let loaded3 = it.memory.loadBits(addr, 4)?;
+        return closeDescriptor(it, truncate<i32>(truncate<u32>(loaded3)));
+    }
+    if (c.types.is(t, TypeKind.Region)) {
+        match (info.region) {
+            RegionKind.Arena => { arenaReset(it, addr)?; }
+            RegionKind.Pool => {
+                let slots = pointerAt(it, addr)?;
+                if (slots != 0) {
+                    freeMemory(it, slots)?;
+                }
+            }
+            RegionKind.ScratchFrame => { scratchDrop(it, addr)?; }
+            _ => {}
+        }
+        return Ok();
+    }
+    if (c.types.isPoolBox(t)) {
+        if (c.types.needsDrop(info.pointee)) {
+            let loaded4 = pointerAt(it, addr)?;
+            destroy(it, c, n, info.pointee, loaded4)?;
+        }
+        let loaded5 = pointerAt(it, addr + 8)?;
+        let loaded6 = pointerAt(it, addr)?;
+        return poolRelease(it, loaded5, loaded6);
+    }
+    if (c.types.is(t, TypeKind.Box) && !c.types.isDynBox(t) && leadsTo(c, info.pointee, t)) {
+        // Tail iteration (type-system.md §18.5).
+        var node = pointerAt(it, addr)?;
+        while (node != 0) {
+            let next = destroyExceptTail(it, c, n, info.pointee, node, t)?;
+            freeBox(it, c, n, node, t, none())?;
+            node = next;
+        }
+        return Ok();
+    }
+    if (c.types.is(t, TypeKind.StableVector)) {
+        let element = elementOf(c, info.pointee);
+        if (c.types.needsDrop(element)) {
+            let length = it.memory.loadBits(addr + 256, 8)?;
+            let size = typeSize(c, element)? as u64;
+            for (i in 0..length) {
+                let at = stableVectorAt(it, addr, i, size)?;
+                destroy(it, c, n, element, at)?;
+            }
+        }
+        for (k in 0..stableVectorChunks()) {
+            let chunk = pointerAt(it, addr + 8 * k)?;
+            if (chunk != 0) {
+                freeMemory(it, chunk)?;
+            }
+        }
+        return Ok();
+    }
+    if (c.types.is(t, TypeKind.SlotMap)) {
+        let layout = slotLayout(c, info.element)?;
+        if (c.types.needsDrop(info.element)) {
+            let length = it.memory.loadBits(addr + 8, 8)?;
+            for (i in 0..length) {
+                let slot = pointerAt(it, addr)? + i * layout.size;
+                if ((it.memory.loadBits(slot, 4)? & 1) != 0) {
+                    destroy(it, c, n, info.element, slot + layout.valueOffset)?;
+                }
+            }
+        }
+        if (it.memory.loadBits(addr + 16, 8)? != 0) {
+            let loaded7 = pointerAt(it, addr)?;
+            freeMemory(it, loaded7)?;
+        }
+        return Ok();
+    }
+    if (c.types.is(t, TypeKind.Vector)) {
+        let element = elementOf(c, info.pointee);
+        if (c.types.needsDrop(element)) {
+            let length = it.memory.loadBits(addr + 8, 8)?;
+            let size = typeSize(c, element)? as u64;
+            for (i in 0..length) {
+                let at = pointerAt(it, addr)? + i * size;
+                destroy(it, c, n, element, at)?;
+            }
+        }
+        if (it.memory.loadBits(addr + 16, 8)? != 0) {
+            let loaded8 = pointerAt(it, addr)?;
+            freeMemory(it, loaded8)?;
+        }
+        return Ok();
+    }
+    if (c.types.is(t, TypeKind.Thread)) {
+        // Joins it, then destroys its result (§38.2).
+        let loaded9 = pointerAt(it, addr)?;
+        match (threadJoin(it, c, n, t, loaded9)?) {
+            Some(result) => { destroyValue(it, c, n, info.element, result)?; }
+            null => {}
+        }
+        return Ok();
+    }
+    if (c.types.isDynBox(t)) {
+        // Through the table (§37.3): the implementation's drop, then the box's memory.
+        let table = dynTableAt(c, it.memory.loadBits(addr + 8, 8)?)?;
+        let implementation = c.dynTables[table].implementation;
+        if (c.types.needsDrop(implementation)) {
+            let loaded10 = pointerAt(it, addr)?;
+            destroy(it, c, n, implementation, loaded10)?;
+        }
+        let loaded11 = pointerAt(it, addr)?;
+        return freeBox(it, c, n, loaded11, t, implementation);
+    }
+    if (c.types.is(t, TypeKind.Box)) {
+        if (c.types.needsDrop(info.pointee)) {
+            let loaded12 = pointerAt(it, addr)?;
+            destroy(it, c, n, info.pointee, loaded12)?;
+        }
+        let loaded13 = pointerAt(it, addr)?;
+        return freeBox(it, c, n, loaded13, t, none());
+    }
+    if (c.types.is(t, TypeKind.Enum)) {
+        let unionOffset = enumUnionOffset(c, t);
+        let index = variantIndex(it, c, t, addr)?;
+        let variant = enumVariantAt(c, t, index as usize);
+        let fields = droppableFields(c, c.types.variants[variant as usize].payload);
+        for (f in fields.view()) {
+            let field = borrow c.types.fields[f as usize];
+            destroy(it, c, n, field.typ, addr + unionOffset + (field.offset as u64))?;
+        }
+        return Ok();
+    }
+    if (c.types.is(t, TypeKind.Struct)) {
+        let s = borrow c.types.structs[info.structDef as usize];
+        if (s.dropFunction != none()) {
+            var arguments = Vector<Value>.create();
+            arguments.push(valueOf(addr, 8))!;
+            let f = nirFunctionOf(it, s.dropFunction, 0)?;
+            callFunction(it, c, n, f, arguments)?;
+        }
+        let fields = droppableFields(c, s.fields);
+        for (f in fields.view()) {
+            let field = borrow c.types.fields[f as usize];
+            destroy(it, c, n, field.typ, addr + (field.offset as u64))?;
+        }
+        return Ok();
+    }
+    var m = copyBytes("no drop glue for '".bytes())!;
+    appendTypeName(c, mut m, t);
+    m.push('\'')!;
+    return Err(faultBytes(m.view()));
+}
+
+/// The emitter's DestroyExceptTail: destroys the value but its tail box, whose pointer it returns (0 if none).
+fn destroyExceptTail(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    t: u32,
+    addr: u64,
+    box: u32,
+) -> Result<u64, Stop> {
+    if (t == box) {
+        return pointerAt(it, addr);
+    }
+    var base = addr;
+    var fields = Vector<u32>.create();
+    if (c.types.is(t, TypeKind.Struct)) {
+        let s = borrow c.types.structs[structDefOf(c, t) as usize];
+        if (s.dropFunction != none()) {
+            var arguments = Vector<Value>.create();
+            arguments.push(valueOf(addr, 8))!;
+            let f = nirFunctionOf(it, s.dropFunction, 0)?;
+            callFunction(it, c, n, f, arguments)?;
+        }
+        fields = droppableFields(c, s.fields);
+    } else {
+        base = addr + enumUnionOffset(c, t);
+        let index = variantIndex(it, c, t, addr)?;
+        let variant = enumVariantAt(c, t, index as usize);
+        fields = droppableFields(c, c.types.variants[variant as usize].payload);
+    }
+    var next: u64 = 0;
+    for (k in 0..fields.length) {
+        let field = borrow c.types.fields[fields[k] as usize];
+        let at = base + (field.offset as u64);
+        let isTail = k == fields.length - 1;
+        if (isTail && leadsTo(c, field.typ, box)) {
+            next = destroyExceptTail(it, c, n, field.typ, at, box)?;
+        } else {
+            destroy(it, c, n, field.typ, at)?;
+        }
+    }
+    return Ok(next);
+}
+
+/// A slot map's slot: { uint32_t gen; uint32_t next; T value; } by C's rules.
+struct SlotLayout {
+    size: u64;
+    valueOffset: u64;
+}
+
+fn slotLayout(c: borrow Checker, value: u32) -> Result<SlotLayout, Stop> {
+    let size = typeSize(c, value)? as u64;
+    let align = typeAlign(c, value)?;
+    let offset = alignUp(8, align);
+    let slotAlign = if (align > 4) align else 4;
+    return Ok(SlotLayout { size: alignUp(offset + size, slotAlign), valueOffset: offset });
+}
+
+fn vectorValue(pointer: u64, length: u64, capacity: u64) -> Value {
+    var vector = uninitialisedValue(24);
+    vector.put(0, valueOf(pointer, 8));
+    vector.put(8, valueOf(length, 8));
+    vector.put(16, valueOf(capacity, 8));
+    return vector;
+}
+
+/// nvKV_: the handle's index is in range and its generation matches.
+fn slotMapValid(
+    it: borrow Interp,
+    c: borrow Checker,
+    mapType: u32,
+    map: u64,
+    handle: borrow Value,
+) -> Result<bool, Stop> {
+    let index = handle.bits(0, 4)?;
+    let layout = slotLayout(c, elementOf(c, mapType))?;
+    if (index >= it.memory.loadBits(map + 8, 8)?) {
+        return Ok(false);
+    }
+    return Ok(it.memory.loadBits(pointerAt(it, map)? + index * layout.size, 4)? == handle.bits(4, 4)?);
+}
+
+/// nvKI_: a free slot or a new one (at most UINT32_MAX - 1); its generation becomes odd.
+fn slotMapInsert(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    mapType: u32,
+    map: u64,
+    value: Value,
+    resultType: u32,
+) -> Result<Value, Stop> {
+    let element = elementOf(c, mapType);
+    let layout = slotLayout(c, element)?;
+    var index: u64 = 0;
+    let free = it.memory.loadBits(map + 32, 4)?;
+    if (free != 0xFFFFFFFF) {
+        index = free;
+        let next = it.memory.loadBits(pointerAt(it, map)? + index * layout.size + 4, 4)?;
+        it.memory.storeBits(map + 32, next, 4)?;
+    } else {
+        let length = it.memory.loadBits(map + 8, 8)?;
+        var pointer: u64 = 0;
+        if (length < 0xFFFFFFFF - 1) {
+            let old = pointerAt(it, map)?;
+            pointer = vectorGrow(
+                it,
+                old,
+                length,
+                map + 16,
+                1,
+                layout.size,
+                allocatorId(c, c.types.info(mapType).allocator),
+            )?;
+        }
+        if (pointer == 0) {
+            destroyValue(it, c, n, element, value)?;
+            return outOfMemory(c, resultType);
+        }
+        it.memory.storeBits(map, pointer, 8)?;
+        index = length;
+        it.memory.storeBits(pointer + index * layout.size, 0, 4)?;
+        it.memory.storeBits(map + 8, length + 1, 8)?;
+    }
+    let slot = pointerAt(it, map)? + index * layout.size;
+    let generation = it.memory.loadBits(slot, 4)? + 1;
+    it.memory.storeBits(slot, generation, 4)?;
+    it.memory.store(slot + layout.valueOffset, value)?;
+    let count = it.memory.loadBits(map + 24, 8)?;
+    it.memory.storeBits(map + 24, count + 1, 8)?;
+    var handle = uninitialisedValue(8);
+    handle.put(0, valueOf(index, 4));
+    handle.put(4, valueOf(generation, 4));
+    return okValue(c, resultType, handle);
+}
+
+// ---- Built-ins ----
+
+fn builtinArgumentType(n: borrow NirProgram, arguments: Range, k: u32) -> u32 =>
+    n.operandTypes[n.at(arguments, k) as usize];
+
+fn argument(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow mut Frame,
+    arguments: Range,
+    k: u32,
+) -> Result<Value, Stop> =>
+    operand(it, c, n, frame, n.at(arguments, k));
+
+fn argumentInteger(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow mut Frame,
+    arguments: Range,
+    k: u32,
+) -> Result<IntValue, Stop> {
+    let v = argument(it, c, n, frame, arguments, k)?;
+    return integerOf(c, v, builtinArgumentType(n, arguments, k));
+}
+
+/// A number as Console.write prints it: integers in decimal, floats as nova_format_f64/f32 does.
+fn appendNumber(c: borrow Checker, out: borrow mut Vector<u8>, value: borrow Value, t: u32) -> Result<void, Stop> {
+    if (isFloatValueType(c, t)) {
+        appendFloatText(out, toDouble(c, value, t)?, c.types.info(t).bits)!;
+        return Ok();
+    }
+    let x = integerOf(c, value, t)?;
+    if (x.negative) {
+        out.push('-')!;
+    }
+    appendDecimal(out, x.magnitude)!;
+    return Ok();
+}
+
+fn builtin(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow mut Frame,
+    r: u32,
+) -> Result<Value?, Stop> {
+    let resultType = n.rvalueTypes[r as usize];
+    var b = none();
+    var arguments = emptyRange();
+    match (n.rvalues[r as usize]) {
+        NirRvalue.Builtin(number, args) => {
+            b = number;
+            arguments = args;
+        }
+        _ => {}
+    }
+    if (b == bfConsoleWrite() || b == bfConsoleWriteLine()) {
+        for (k in 0..arguments.count) {
+            let op = n.at(arguments, k);
+            let t = n.operandTypes[op as usize];
+            match (n.operands[op as usize]) {
+                NirOperand.String(text) => {
+                    let bytes = copyBytes(n.textOf(text))!;
+                    writeOutput(it, bytes.view());
+                    continue;
+                }
+                _ => {}
+            }
+            let value = operand(it, c, n, frame, op)?;
+            if (isBoolType(c, t)) {
+                writeOutput(it, if (value.bits(0, 1)? != 0) "true".bytes() else "false".bytes());
+            } else if (c.types.isStringView(t)) {
+                let bytes = bytesOf(it, value)?;
+                writeOutput(it, bytes.view());
+            } else {
+                var text = Vector<u8>.create();
+                appendNumber(c, mut text, value, t)?;
+                writeOutput(it, text.view());
+            }
+        }
+        if (b == bfConsoleWriteLine()) {
+            writeOutput(it, "\n".bytes());
+        }
+        return Ok(null);
+    }
+    if (b == bfConsoleWriteBytes()) {
+        let value = argument(it, c, n, frame, arguments, 0)?;
+        let bytes = bytesOf(it, value)?;
+        writeOutput(it, bytes.view());
+        return Ok(null);
+    }
+    if (b == bfConsoleWriteError() || b == bfConsoleWriteErrorLine()) {
+        for (k in 0..arguments.count) {
+            let value = argument(it, c, n, frame, arguments, k)?;
+            let bytes = bytesOf(it, value)?;
+            writeError(it, bytes.view());
+        }
+        if (b == bfConsoleWriteErrorLine()) {
+            writeError(it, "\n".bytes());
+        }
+        return Ok(null);
+    }
+    if (b == bfFailAfter()) {
+        it.failingArmed = true;
+        it.failingLeft = argumentInteger(it, c, n, frame, arguments, 0)?.magnitude;
+        return Ok(null);
+    }
+    if (b == bfFailReset()) {
+        it.failingArmed = false;
+        return Ok(null);
+    }
+    if (b == bfBoxCreate()) {
+        let value = argument(it, c, n, frame, arguments, arguments.count - 1)?;
+        let box = resultOkOf(c, resultType);
+        let pointer = allocBox(it, c, n, box)?;
+        if (pointer == 0) {
+            destroyValue(it, c, n, pointeeOf(c, box), value)?;
+            return Ok(outOfMemory(c, resultType)?);
+        }
+        it.memory.store(pointer, value)?;
+        return Ok(okValue(c, resultType, valueOf(pointer, 8))?);
+    }
+    if (b == bfArenaCreate()) {
+        var arena = uninitialisedValue(40);
+        arena.put(0, valueOf(0, 24)); // chunks, cur, end
+        arena.put(24, valueOf(argumentInteger(it, c, n, frame, arguments, 1)?.magnitude, 8));
+        arena.put(32, valueOf(allocatorId(c, builtinArgumentType(n, arguments, 0)), 8));
+        return Ok(arena);
+    }
+    if (b == bfArenaAlloc()) {
+        let region = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        let value = argument(it, c, n, frame, arguments, 1)?;
+        let contents = builtinArgumentType(n, arguments, 1);
+        let pointer = regionAlloc(
+            it,
+            c,
+            region,
+            builtinArgumentType(n, arguments, 0),
+            typeSize(c, contents)? as u64,
+            typeAlign(c, contents)?,
+        )?;
+        if (pointer == 0) {
+            return Ok(outOfMemory(c, resultType)?);
+        }
+        it.memory.store(pointer, value)?;
+        return Ok(okValue(c, resultType, valueOf(pointer, 8))?);
+    }
+    if (b == bfArenaAllocArray()) {
+        let region = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        let count = argumentInteger(it, c, n, frame, arguments, 1)?.magnitude;
+        let fill = argument(it, c, n, frame, arguments, 2)?;
+        let element = builtinArgumentType(n, arguments, 2);
+        let size = typeSize(c, element)? as u64;
+        if (size > 1 && count > 0xFFFFFFFFFFFFFFFF / size) {
+            return Ok(outOfMemory(c, resultType)?);
+        }
+        let pointer = regionAlloc(
+            it,
+            c,
+            region,
+            builtinArgumentType(n, arguments, 0),
+            if (count == 0) 1 else count * size,
+            typeAlign(c, element)?,
+        )?;
+        if (pointer == 0) {
+            return Ok(outOfMemory(c, resultType)?);
+        }
+        for (i in 0..count) {
+            it.memory.store(pointer + i * size, fill)?;
+        }
+        return Ok(okValue(c, resultType, viewValue(pointer, count))?);
+    }
+    if (b == bfArenaReset()) {
+        let region = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        arenaReset(it, region)?;
+        return Ok(null);
+    }
+    if (b == bfFixedBufferOver()) {
+        let storage = argument(it, c, n, frame, arguments, 0)?;
+        var fba = uninitialisedValue(24);
+        fba.put(0, storage); // base, capacity
+        fba.put(16, valueOf(0, 8));
+        return Ok(fba);
+    }
+    if (b == bfScratchNest()) {
+        let parent = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        it.scratchDepth = it.memory.loadBits(parent + 24, 8)? + 1;
+        return Ok(scratchFrame(it, it.scratchDepth));
+    }
+    if (b == bfPoolCreate()) {
+        var pool = valueOf(0, 48);
+        pool.put(16, valueOf(argumentInteger(it, c, n, frame, arguments, 1)?.magnitude, 8));
+        pool.put(40, valueOf(allocatorId(c, builtinArgumentType(n, arguments, 0)), 8));
+        return Ok(pool);
+    }
+    if (b == bfPoolTake()) {
+        let pool = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        let value = argument(it, c, n, frame, arguments, 1)?;
+        let contents = builtinArgumentType(n, arguments, 1);
+        let slot = poolTake(it, pool, typeSize(c, contents)? as u64)?;
+        if (slot == 0) {
+            destroyValue(it, c, n, contents, value)?;
+            return Ok(outOfMemory(c, resultType)?);
+        }
+        it.memory.store(slot, value)?;
+        var box = uninitialisedValue(16);
+        box.put(0, valueOf(slot, 8));
+        box.put(8, valueOf(pool, 8));
+        return Ok(okValue(c, resultType, box)?);
+    }
+    if (b == bfVectorCreate()) {
+        if (c.types.is(resultType, TypeKind.StableVector)) {
+            return Ok(valueOf(0, 264));
+        }
+        if (c.types.is(resultType, TypeKind.SlotMap)) {
+            var map = valueOf(0, 40);
+            map.put(0, valueOf(it.emptyVector, 8));
+            map.put(32, valueOf(0xFFFFFFFF, 4));
+            return Ok(map);
+        }
+        return Ok(vectorValue(it.emptyVector, 0, 0));
+    }
+    if (b == bfVectorWithCapacity()) {
+        let vectorType = resultOkOf(c, resultType);
+        let temporary = it.memory.allocate(allocationLocal(), 24, true, "a vector being created".bytes())?;
+        it.memory.store(temporary, vectorValue(it.emptyVector, 0, 0))?;
+        let capacityWanted = argumentInteger(it, c, n, frame, arguments, 0)?.magnitude;
+        let size = typeSize(c, elementOf(c, pointeeOf(c, vectorType)))? as u64;
+        let empty = it.emptyVector;
+        let pointer = vectorGrow(
+            it,
+            empty,
+            0,
+            temporary + 16,
+            capacityWanted,
+            size,
+            allocatorId(c, c.types.info(vectorType).allocator),
+        )?;
+        let capacity = it.memory.loadBits(temporary + 16, 8)?;
+        it.memory.end(temporary);
+        if (pointer == 0) {
+            return Ok(outOfMemory(c, resultType)?);
+        }
+        return Ok(okValue(c, resultType, vectorValue(pointer, 0, capacity))?);
+    }
+    if (b == bfVectorPush()) {
+        let vector = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        let value = argument(it, c, n, frame, arguments, 1)?;
+        let vectorType = pointeeOf(c, builtinArgumentType(n, arguments, 0));
+        let element = elementOf(c, pointeeOf(c, vectorType));
+        let size = typeSize(c, element)? as u64;
+        let length = it.memory.loadBits(vector + 8, 8)?;
+        let old = pointerAt(it, vector)?;
+        let pointer = vectorGrow(
+            it,
+            old,
+            length,
+            vector + 16,
+            1,
+            size,
+            allocatorId(c, c.types.info(vectorType).allocator),
+        )?;
+        if (pointer == 0) {
+            destroyValue(it, c, n, element, value)?;
+            return Ok(outOfMemory(c, resultType)?);
+        }
+        it.memory.storeBits(vector, pointer, 8)?;
+        it.memory.store(pointer + length * size, value)?;
+        it.memory.storeBits(vector + 8, length + 1, 8)?;
+        return Ok(okValue(c, resultType, null)?);
+    }
+    if (b == bfStringAppend()) {
+        let target = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        let text = argument(it, c, n, frame, arguments, 1)?;
+        let bytes = bytesOf(it, text)?;
+        return Ok(
+            appendTextAt(it, c, target, pointeeOf(c, builtinArgumentType(n, arguments, 0)), bytes.view(), resultType)?,
+        );
+    }
+    if (b == bfStringAppendNumber()) {
+        // Decimal, '-' before a negative value, no leading zeros (type-system.md §23.2).
+        let value = argument(it, c, n, frame, arguments, 1)?;
+        var number = Vector<u8>.create();
+        appendNumber(c, mut number, value, builtinArgumentType(n, arguments, 1))?;
+        let target = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        return Ok(
+            appendTextAt(it, c, target, pointeeOf(c, builtinArgumentType(n, arguments, 0)), number.view(), resultType)?,
+        );
+    }
+    if (b == bfVectorPop()) {
+        let vector = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        let element = elementOf(c, pointeeOf(c, pointeeOf(c, builtinArgumentType(n, arguments, 0))));
+        let length = it.memory.loadBits(vector + 8, 8)?;
+        if (length == 0) {
+            return Ok(noneValue(c, resultType)?);
+        }
+        it.memory.storeBits(vector + 8, length - 1, 8)?;
+        let size = typeSize(c, element)?;
+        let value = it.memory.load(pointerAt(it, vector)? + (length - 1) * (size as u64), size)?;
+        return Ok(someValue(c, resultType, value)?);
+    }
+    if (b == bfVectorTruncate() || b == bfVectorClear()) {
+        let vector = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        let element = elementOf(c, pointeeOf(c, pointeeOf(c, builtinArgumentType(n, arguments, 0))));
+        let length = it.memory.loadBits(vector + 8, 8)?;
+        let keep = if (b == bfVectorClear()) 0 else argumentInteger(it, c, n, frame, arguments, 1)?.magnitude;
+        if (keep < length) {
+            it.memory.storeBits(vector + 8, keep, 8)?;
+            if (c.types.needsDrop(element)) {
+                let size = typeSize(c, element)? as u64;
+                for (i in keep..length) {
+                    let at = pointerAt(it, vector)? + i * size;
+                    destroy(it, c, n, element, at)?;
+                }
+            }
+        } else if (b == bfVectorClear()) {
+            it.memory.storeBits(vector + 8, 0, 8)?;
+        }
+        return Ok(null);
+    }
+    if (b == bfVectorCapacity()) {
+        let vector = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        return Ok(it.memory.load(vector + 16, 8)?);
+    }
+    if (b == bfStableVectorPush()) {
+        let vector = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        let value = argument(it, c, n, frame, arguments, 1)?;
+        let vectorType = pointeeOf(c, builtinArgumentType(n, arguments, 0));
+        let element = elementOf(c, pointeeOf(c, vectorType));
+        let length = it.memory.loadBits(vector + 256, 8)?;
+        let slot = stableVectorSlot(
+            it,
+            vector,
+            length,
+            typeSize(c, element)? as u64,
+            allocatorId(c, c.types.info(vectorType).allocator),
+        )?;
+        if (slot == 0) {
+            destroyValue(it, c, n, element, value)?;
+            return Ok(outOfMemory(c, resultType)?);
+        }
+        it.memory.store(slot, value)?;
+        it.memory.storeBits(vector + 256, length + 1, 8)?;
+        return Ok(okValue(c, resultType, valueOf(length, 8))?);
+    }
+    if (b == bfSlotMapInsert()) {
+        let map = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        let value = argument(it, c, n, frame, arguments, 1)?;
+        return Ok(slotMapInsert(it, c, n, pointeeOf(c, builtinArgumentType(n, arguments, 0)), map, value, resultType)?);
+    }
+    if (b == bfSlotMapGet() || b == bfSlotMapRemove() || b == bfSlotMapContains()) {
+        let mapType = pointeeOf(c, builtinArgumentType(n, arguments, 0));
+        let map = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        let handle = argument(it, c, n, frame, arguments, 1)?;
+        let valid = slotMapValid(it, c, mapType, map, handle)?;
+        if (b == bfSlotMapContains()) {
+            return Ok(valueOf(if (valid) 1 else 0, 1));
+        }
+        if (!valid) {
+            return Ok(noneValue(c, resultType)?);
+        }
+        let layout = slotLayout(c, elementOf(c, mapType))?;
+        let index = handle.bits(0, 4)?;
+        let slot = pointerAt(it, map)? + index * layout.size;
+        if (b == bfSlotMapGet()) {
+            return Ok(someValue(c, resultType, valueOf(slot + layout.valueOffset, 8))?);
+        }
+        let generation = it.memory.loadBits(slot, 4)? + 1;
+        it.memory.storeBits(slot, generation, 4)?;
+        let count = it.memory.loadBits(map + 24, 8)?;
+        it.memory.storeBits(map + 24, count - 1, 8)?;
+        if (generation != 0xFFFFFFFF - 1) {
+            let free = it.memory.loadBits(map + 32, 4)?;
+            it.memory.storeBits(slot + 4, free, 4)?;
+            it.memory.storeBits(map + 32, index, 4)?;
+        }
+        let value = it.memory.load(slot + layout.valueOffset, typeSize(c, elementOf(c, mapType))?)?;
+        return Ok(someValue(c, resultType, value)?);
+    }
+    if (b == bfSlotMapLength()) {
+        let map = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        return Ok(it.memory.load(map + 24, 8)?);
+    }
+    if (b == bfPtrAdd() || b == bfPtrSub() || b == bfPtrOffset()) {
+        // Address arithmetic modulo 2^64 (type-system.md §27.3); only a later access is checked.
+        let pointerType = builtinArgumentType(n, arguments, 0);
+        if (c.types.isCLaidOut(pointeeOf(c, pointerType), 0)) {
+            var m = copyBytes("pointer arithmetic on '".bytes())!;
+            appendTypeName(c, mut m, pointerType);
+            appendText(mut m, "', whose element size only the C compiler knows (type-system.md §31.4)")!;
+            return Err(faultBytes(m.view()));
+        }
+        let count = argumentInteger(it, c, n, frame, arguments, 1)?;
+        let stride = intBits(count).wrappingMul(typeSize(c, pointeeOf(c, pointerType))? as u64);
+        let addr = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        return Ok(valueOf(if (b == bfPtrSub()) addr.wrappingSub(stride) else addr.wrappingAdd(stride), 8));
+    }
+    if (b == bfPtrIsNull()) {
+        let addr = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        return Ok(valueOf(if (addr == 0) 1 else 0, 1));
+    }
+    if (b == bfBoxIntoRaw() || b == bfBoxFromRaw() || b == bfSlicePtr()) {
+        // A box is its contents' address (type-system.md §34.2).
+        let addr = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        return Ok(valueOf(addr, 8));
+    }
+    if (b == bfSliceFromRaw()) {
+        let addr = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        let length = argumentInteger(it, c, n, frame, arguments, 1)?.magnitude;
+        return Ok(viewValue(addr, length));
+    }
+    if (b == bfStringViewFromUtf8()) {
+        let bytes = argument(it, c, n, frame, arguments, 0)?;
+        let text = bytesOf(it, bytes)?;
+        if (StringView.fromUtf8(text.view()) == null) {
+            return Ok(noneValue(c, resultType)?);
+        }
+        return Ok(someValue(c, resultType, viewValue(bytes.bits(0, 8)?, bytes.bits(8, 8)?))?);
+    }
+    if (b == bfSliceCopy()) {
+        // memmove semantics (type-system.md §16.5); the lengths are equal (NirLengthCheck).
+        let destination = argument(it, c, n, frame, arguments, 0)?;
+        let source = argument(it, c, n, frame, arguments, 1)?;
+        let size = typeSize(c, elementOf(c, pointeeOf(c, builtinArgumentType(n, arguments, 0))))? as u64;
+        let total = destination.bits(8, 8)? * size;
+        if (total > 0x7FFFFFFF) {
+            return Err(fault("a copy larger than the interpreter's memory"));
+        }
+        it.memory.copy(destination.bits(0, 8)?, source.bits(0, 8)?, total as usize)?;
+        return Ok(null);
+    }
+    if (b == bfSliceFill()) {
+        let slice = argument(it, c, n, frame, arguments, 0)?;
+        let value = argument(it, c, n, frame, arguments, 1)?;
+        let size = typeSize(c, elementOf(c, pointeeOf(c, builtinArgumentType(n, arguments, 0))))? as u64;
+        for (i in 0..slice.bits(8, 8)?) {
+            it.memory.store(slice.bits(0, 8)? + i * size, value)?;
+        }
+        return Ok(null);
+    }
+    if (b == bfSliceSwap()) {
+        // The indices were checked (NirBoundsCheck); the elements' bytes move (type-system.md §16.5).
+        let slice = argument(it, c, n, frame, arguments, 0)?;
+        let size = typeSize(c, elementOf(c, pointeeOf(c, builtinArgumentType(n, arguments, 0))))?;
+        let i = argumentInteger(it, c, n, frame, arguments, 1)?.magnitude;
+        let j = argumentInteger(it, c, n, frame, arguments, 2)?.magnitude;
+        let a = slice.bits(0, 8)? + i * (size as u64);
+        let bAddress = slice.bits(0, 8)? + j * (size as u64);
+        let first = it.memory.load(a, size)?;
+        let second = it.memory.load(bAddress, size)?;
+        it.memory.store(a, second)?;
+        it.memory.store(bAddress, first)?;
+        return Ok(null);
+    }
+    if (b == bfPtrReadVolatile() || b == bfPtrRead()) {
+        // The interpreter performs every access once, in order: volatile adds nothing to check (§29.1).
+        let pointee = pointeeOf(c, builtinArgumentType(n, arguments, 0));
+        let pointer = argument(it, c, n, frame, arguments, 0)?;
+        return Ok(it.memory.load(rawAddress(c, pointer, pointee)?, typeSize(c, pointee)?)?);
+    }
+    if (b == bfPtrWriteVolatile() || b == bfPtrWrite()) {
+        let pointer = argument(it, c, n, frame, arguments, 0)?;
+        let addr = rawAddress(c, pointer, pointeeOf(c, builtinArgumentType(n, arguments, 0)))?;
+        let value = argument(it, c, n, frame, arguments, 1)?;
+        it.memory.store(addr, value)?;
+        return Ok(null);
+    }
+    if (b == bfCallerAddress()) {
+        return Ok(valueOf(0, 8)); // no C frame called it (ADR 0030)
+    }
+    if (b == bfSpinHint()) {
+        return Ok(null);
+    }
+    if (b == bfLayoutOf() || b == bfOffsetOf()) {
+        return Err(
+            fault(
+                "unsupported: the layout of a type with C state (only the C compiler knows it; type-system.md §31.2)",
+            ),
+        );
+    }
+    if (b == bfPtrPlace()) {
+        // Only C state has @placed methods (§33.3), and the interpreter runs no C (§28).
+        return Err(fault("unsupported: placing C state (the interpreter runs no C code; type-system.md §33.3)"));
+    }
+    if (b == bfFloatBits() || b == bfFloatFromBits()) {
+        return Ok(argument(it, c, n, frame, arguments, 0)?); // the same bytes, read as the other type (§35.5)
+    }
+    if (b >= bfFloatSqrt() && b <= bfFloatMax()) {
+        let x = toDouble(c, argument(it, c, n, frame, arguments, 0)?, resultType)?;
+        let y = if (arguments.count > 1) toDouble(c, argument(it, c, n, frame, arguments, 1)?, resultType)? else 0.0;
+        let bits = c.types.info(resultType).bits;
+        var result: f64 = 0.0;
+        if (b == bfFloatSqrt()) {
+            result = if (bits == 32) round<f32>(x).sqrt() as f64 else x.sqrt();
+        } else if (b == bfFloatAbs()) {
+            result = x.abs();
+        } else if (b == bfFloatFloor()) {
+            result = x.floor();
+        } else if (b == bfFloatCeil()) {
+            result = x.ceil();
+        } else if (b == bfFloatMin()) {
+            result = x.min(y);
+        } else {
+            result = x.max(y);
+        }
+        return Ok(floatValue(c, roundFloat(result, bits), resultType)?);
+    }
+    if (b >= bfWrappingAdd() && b <= bfSaturatingMul()) {
+        let t = builtinArgumentType(n, arguments, 0);
+        let left = argument(it, c, n, frame, arguments, 0)?;
+        let right = argument(it, c, n, frame, arguments, 1)?;
+        return Ok(overflowMethod(c, b, t, left, right, resultType)?);
+    }
+    if (b == bfCallClosure()) {
+        // The closure points at its environment's code pointer (§36.2); the environment is the first argument.
+        let closure = argument(it, c, n, frame, arguments, 0)?;
+        let code = it.memory.loadBits(closure.bits(0, 8)?, 8)?;
+        var values = Vector<Value>.create();
+        values.push(closure)!;
+        for (k in 1..arguments.count) {
+            values.push(argument(it, c, n, frame, arguments, k)?)!;
+        }
+        return callThrough(it, c, n, code, values);
+    }
+    if (b == bfCallPointer() || b == bfCallFunction()) {
+        // The C types of the pointer's signature have the same bits as Nova's (§28.3); a Nova function value is an
+        // address of the same kind (§36.1).
+        let target = argument(it, c, n, frame, arguments, 0)?.bits(0, 8)?;
+        var values = Vector<Value>.create();
+        for (k in 1..arguments.count) {
+            values.push(argument(it, c, n, frame, arguments, k)?)!;
+        }
+        return callThrough(it, c, n, target, values);
+    }
+    if (b == bfTargetIsX8664()) {
+        return Ok(valueOf(if (hostIsX8664()) 1 else 0, 1));
+    }
+    if (b == bfTargetIsAArch64()) {
+        return Ok(valueOf(if (hostIsX8664()) 0 else 1, 1));
+    }
+    if (b == bfThreadSpawn() || b == bfThreadSpawnBoxed() || b == bfThreadBoth() || b == bfThreadJoin()) {
+        return threadBuiltin(it, c, n, frame, r, b, arguments);
+    }
+    return ioBuiltin(it, c, n, frame, r, b, arguments);
+}
+
+/// `a.wrappingAdd(b)` and the other explicit-overflow methods (type-system.md §6): the exact result, then its value
+/// modulo 2^bits, `Some` or `null`, or the bound it went past.
+fn overflowMethod(
+    c: borrow Checker,
+    b: u32,
+    t: u32,
+    left: borrow Value,
+    right: borrow Value,
+    resultType: u32,
+) -> Result<Value, Stop> {
+    let x = integerOf(c, left, t)?;
+    let y = integerOf(c, right, t)?;
+    let multiply = b == bfWrappingMul() || b == bfCheckedMul() || b == bfSaturatingMul();
+    let subtract = b == bfWrappingSub() || b == bfCheckedSub() || b == bfSaturatingSub();
+    let op = if (multiply) BinaryOp.Multiply else if (subtract) BinaryOp.Subtract else BinaryOp.Add;
+    let exact = arithmetic(c, op, x, y, t);
+    let wrapped = wrappedResult(c, op, x, y, t);
+    let fits = exact.panic == 0;
+    if (b == bfWrappingAdd() || b == bfWrappingSub() || b == bfWrappingMul()) {
+        return fromInteger(c, wrapped, t);
+    }
+    if (b == bfCheckedAdd() || b == bfCheckedSub() || b == bfCheckedMul()) {
+        return if (fits) someValue(c, resultType, fromInteger(c, exact.value, t)?) else noneValue(c, resultType);
+    }
+    if (fits) {
+        return fromInteger(c, exact.value, t);
+    }
+    // Past a bound: the product's sign, or the direction of the sum or difference.
+    var above = true;
+    if (multiply) {
+        above = x.negative == y.negative;
+    } else if (subtract) {
+        above = intCompare(x, y) > 0;
+    } else {
+        above = !y.negative;
+    }
+    return fromInteger(c, if (above) intMax(c, t) else intMin(c, t), t);
+}
+
+/// The result modulo 2^64 (the type's bytes keep the low bits).
+fn wrappedResult(c: borrow Checker, op: BinaryOp, x: IntValue, y: IntValue, t: u32) -> IntValue {
+    let a = intBits(x);
+    let b = intBits(y);
+    let k = binaryIndex(op);
+    let r = if (k == 15) a.wrappingMul(b) else if (k == 14) a.wrappingSub(b) else a.wrappingAdd(b);
+    return if (c.types.info(t).signed) intValue(truncate<i64>(r)) else intOfU64(r);
+}

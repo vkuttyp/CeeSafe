@@ -1,0 +1,92 @@
+// Program arguments, files, sockets and processes for the interpreter (the reference's Interpreter/IoRuntime.cs,
+// HostIo.cs; type-system.md §26, intermediate-representation.md §5.4).
+
+/// The runtime's host state: the program's arguments (static memory, as argv is natively).
+struct InterpRuntime {
+    argumentPointers: Vector<u64>;
+    argumentLengths: Vector<u64>;
+}
+
+fn newInterpRuntime() -> InterpRuntime =>
+    InterpRuntime { argumentPointers: Vector<u64>.create(), argumentLengths: Vector<u64>.create() };
+
+/// nova_rt_args: argv as static memory (never copied by the native runtime either).
+fn startRuntime(it: borrow mut Interp) -> Result<void, Stop> {
+    for (k in 0..it.options.arguments.length) {
+        let bytes = copyBytes(it.options.arguments[k].view())!;
+        let pointer = if (bytes.length == 0) it.emptyVector else it.memory.staticBytes(
+            bytes.view(),
+            "a program argument".bytes(),
+        )?;
+        it.runtime.argumentPointers.push(pointer)!;
+        it.runtime.argumentLengths.push(bytes.length as u64)!;
+    }
+    return Ok();
+}
+
+fn hostIsX8664() -> bool => targetIsX8664Host();
+
+/// Whether the interpreter itself runs on x86-64 (RuntimeInformation.ProcessArchitecture).
+fn targetIsX8664Host() -> bool => Target.isX86_64();
+
+fn closeDescriptor(it: borrow mut Interp, fd: i32) -> Result<void, Stop> => Ok();
+
+fn ioBuiltin(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow mut Frame,
+    r: u32,
+    b: u32,
+    arguments: Range,
+) -> Result<Value?, Stop> {
+    let resultType = n.rvalueTypes[r as usize];
+    if (b == bfArgumentCount()) {
+        return Ok(valueOf(it.runtime.argumentPointers.length as u64, 8));
+    }
+    if (b == bfArgument()) {
+        let index = argumentInteger(it, c, n, frame, arguments, 0)?;
+        if (index.negative || index.magnitude >= (it.runtime.argumentPointers.length as u64)) {
+            return Ok(noneValue(c, resultType)?);
+        }
+        let k = index.magnitude as usize;
+        return Ok(someValue(c, resultType, viewValue(it.runtime.argumentPointers[k], it.runtime.argumentLengths[k]))?);
+    }
+    var m = copyBytes("unsupported: the built-in ".bytes())!;
+    appendText(mut m, builtinFunctionName(b))!;
+    appendText(mut m, " (not yet ported to the CeeSafe interpreter)")!;
+    return Err(faultBytes(m.view()));
+}
+
+fn callC(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    hir: u32,
+    arguments: borrow Vector<Value>,
+) -> Result<Value?, Stop> {
+    var m = copyBytes("unsupported: a call of the C function '".bytes())!;
+    appendBytes(mut m, c.name(c.hir.functions[hir as usize].name))!;
+    appendText(mut m, "' (not yet ported to the CeeSafe interpreter)")!;
+    return Err(faultBytes(m.view()));
+}
+
+fn threadBuiltin(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    frame: borrow mut Frame,
+    r: u32,
+    b: u32,
+    arguments: Range,
+) -> Result<Value?, Stop> =>
+    Err(fault("unsupported: threads (not yet ported to the CeeSafe interpreter)"));
+
+fn threadJoin(
+    it: borrow mut Interp,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    t: u32,
+    thread: u64,
+) -> Result<Value?, Stop> =>
+    Err(fault("unsupported: threads (not yet ported to the CeeSafe interpreter)"));

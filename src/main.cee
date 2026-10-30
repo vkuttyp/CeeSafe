@@ -206,10 +206,13 @@ struct Options {
     cTexts: Vector<Vector<u8>>; // and texts
     defaultOutput: Vector<u8>;  // package mode: <package>/out/<name>
     files: Vector<String>;
-    offline: bool;       // --offline: package mode uses only what is fetched
-    absolutePaths: bool; // package files named by their absolute paths (Workspace.Packages without a mapping)
-    fixing: bool;        // `fix`: check, then apply the fixes (tooling.md §5.3)
-    dryRun: bool;        // fix --dry-run
+    offline: bool;                        // --offline: package mode uses only what is fetched
+    running: bool;                        // `run`
+    interp: bool;                         // run --interp
+    programArguments: Vector<Vector<u8>>; // run: after `--`
+    absolutePaths: bool;                  // package files named by their absolute paths (Workspace.Packages without a mapping)
+    fixing: bool;                         // `fix`: check, then apply the fixes (tooling.md §5.3)
+    dryRun: bool;                         // fix --dry-run
     fixRound: u32;
 }
 
@@ -337,19 +340,19 @@ fn readOptions(options: borrow mut Options) -> i32 {
             } else {
                 options.exportsHeader = copyBytes(value.bytes())!;
             }
-        } else if (options.building && arg == "--no-closure-specialisation") {
+        } else if ((options.building || options.running) && arg == "--no-closure-specialisation") {
             options.closureSpecialisation = false;
         } else if (options.building && arg == "--explain-closure-calls") {
             options.explainClosureCalls = true;
-        } else if (options.building && arg == "--no-placement") {
+        } else if ((options.building || options.running) && arg == "--no-placement") {
             options.placement = false;
         } else if (options.building && arg == "--explain-allocations") {
             options.explainAllocations = true;
-        } else if (options.building && arg == "--no-bce") {
+        } else if ((options.building || options.running) && arg == "--no-bce") {
             options.bce = false;
         } else if (options.building && arg == "--explain-bounds-checks") {
             options.explainBoundsChecks = true;
-        } else if (options.building && arg == "--no-oce") {
+        } else if ((options.building || options.running) && arg == "--no-oce") {
             options.oce = false;
         } else if (options.building && arg == "--explain-overflow-checks") {
             options.explainOverflowChecks = true;
@@ -396,6 +399,14 @@ fn readOptions(options: borrow mut Options) -> i32 {
             }
         } else if (arg == "--dump-tokens") {
             options.dumpTokens = true;
+        } else if (options.running && arg == "--interp") {
+            options.interp = true;
+        } else if (options.running && arg == "--") {
+            // The program's arguments.
+            while (a < Process.argumentCount()) {
+                options.programArguments.push(copyBytes(Process.argument(a)!.bytes())!)!;
+                a += 1;
+            }
         } else if (arg == "--offline") {
             options.offline = true;
         } else if (options.fixing && arg == "--dry-run") {
@@ -574,6 +585,9 @@ fn parseCommand() -> i32 {
         defaultOutput: Vector<u8>.create(),
         files: Vector<String>.create(),
         offline: false,
+        running: false,
+        interp: false,
+        programArguments: Vector<Vector<u8>>.create(),
         absolutePaths: false,
         fixing: false,
         dryRun: false,
@@ -760,6 +774,72 @@ fn reportPackage(json: bool, packageReport: borrow PackageReport) {
     report(json, packageReport.diagnostics, packageReport.sources);
 }
 
+/// `run --interp` after checking (Program.Run): the C is generated as `build` would (its diagnostics reported, the code
+/// discarded), then the NIR it was made from is interpreted.
+fn interpretChecked(
+    options: Options,
+    checker: borrow mut Checker,
+    nir: borrow mut NirProgram,
+    sources: borrow Vector<SourceText>,
+) -> i32 {
+    var files = Vector<CFile>.create();
+    let build = CBuildOptions {
+        requireMain: true,
+        freestanding: false,
+        lineDirectives: false,
+        split: false,
+        programName: copyBytes("program".bytes())!,
+        exportsHeader: copyBytes(options.exportsHeader.view())!,
+        closureSpecialisation: options.closureSpecialisation,
+        placement: options.placement,
+        bce: options.bce,
+        oce: options.oce,
+        structured: options.structured,
+    };
+    if (!generateC(checker, nir, sources, build, mut files)!) {
+        return report(options.json, checker.front.diagnostics, sources);
+    }
+    var user: usize = 0;
+    while (user + 1 < sources.length && checker.fileIsLibrary[user]) {
+        user += 1;
+    }
+    var arguments = Vector<Vector<u8>>.create();
+    arguments.push(copyBytes(sources[user].path.view())!)!;
+    for (a in options.programArguments.view()) {
+        arguments.push(copyBytes(a.view())!)!;
+    }
+    let interpreterOptions = InterpreterOptions {
+        arguments: arguments,
+        failAllocationAt: environmentNumber("NOVA_FAIL_ALLOC_AT"),
+        allocationReport: environmentNumber("NOVA_ALLOC_REPORT") != 0,
+        placement: options.placement,
+        bce: options.bce,
+        oce: options.oce,
+        stepLimit: 0,
+        memoryLimit: 0,
+        sandboxed: false,
+        workingDirectory: Vector<u8>.create(),
+    };
+    return interpretProgram(checker, nir, sources, interpreterOptions)!;
+}
+
+/// A number from the environment, as nova_platform_config reads it: leading digits, else 0.
+fn environmentNumber(name: StringView) -> u64 {
+    var value: u64 = 0;
+    match (Environment.variable(name)) {
+        Some(text) => {
+            for (c in text.bytes()) {
+                if (c < '0' || c > '9') {
+                    break;
+                }
+                value = value.wrappingMul(10).wrappingAdd((c - '0') as u64);
+            }
+        }
+        null => {}
+    }
+    return value;
+}
+
 /// The end of `check` (or of one round of `fix`): the diagnostics reported, or the fixes applied.
 fn finish(
     options: borrow Options,
@@ -832,19 +912,30 @@ fn defaultOptions(building: bool) -> Options => Options {
     defaultOutput: Vector<u8>.create(),
     files: Vector<String>.create(),
     offline: false,
+    running: false,
+    interp: false,
+    programArguments: Vector<Vector<u8>>.create(),
     absolutePaths: false,
     fixing: false,
     dryRun: false,
     fixRound: 0,
 };
 
-fn fileCommand(building: bool, fixing: bool, fixRound: u32) -> i32 {
+fn runCommand() -> i32 => fileCommandIn(false, true, false, 0);
+
+fn fileCommand(building: bool, fixing: bool, fixRound: u32) -> i32 => fileCommandIn(building, false, fixing, fixRound);
+
+fn fileCommandIn(building: bool, running: bool, fixing: bool, fixRound: u32) -> i32 {
     var options = defaultOptions(building);
+    options.running = running;
     options.fixing = fixing;
     options.fixRound = fixRound;
     let status = readOptions(mut options);
     if (status != 0) {
         return status;
+    }
+    if (running && !options.interp) {
+        return fail("'run' needs --interp (the only way to run without building is the interpreter)");
     }
     // C sources go to the C compiler with the generated code (type-system.md §28.6).
     var novaFiles = Vector<String>.create();
@@ -882,12 +973,19 @@ fn fileCommand(building: bool, fixing: bool, fixRound: u32) -> i32 {
 /// The type checking (and with `building`, the C) of the files named, or of the packages and their files (package
 /// mode); the diagnostics reported as `finish` does.
 fn compileFiles(
-    options: Options,
+    given: Options,
     building: bool,
     novaFiles: borrow Vector<String>,
     packages: Vector<PackageInfo>,
     packageFiles: Vector<Vector<Vector<u8>>>,
 ) -> i32 {
+    var options = given;
+    if (options.running) {
+        // The interpreter runs hosted code with floats (Program.Run's compilation).
+        options.freestanding = false;
+        options.noFloat = false;
+        options.kernel = false;
+    }
     var sources = Vector<SourceText>.create();
     var fileIsLibrary = Vector<bool>.create();
     // lib/core, then lib/std (hosted) or lib/kernel (freestanding with --kernel): library files come first
@@ -985,6 +1083,12 @@ fn compileFiles(
         var printer = HirPrinter.create();
         printer.printProgram(checker.hir, checker.types, checker.front.symbols)!;
         Console.writeBytes(printer.out.view());
+    }
+    if (options.running) {
+        if (checker.front.diagnostics.hasErrors()) {
+            return report(options.json, checker.front.diagnostics, sources);
+        }
+        return interpretChecked(options, mut checker, mut nir, sources);
     }
     if (building) {
         if (checker.front.diagnostics.hasErrors()) {
@@ -1093,6 +1197,9 @@ fn main() -> i32 {
     }
     if (command == "fix") {
         return fixCommand();
+    }
+    if (command == "run") {
+        return runCommand();
     }
     if (command == "fmt") {
         var arguments = Vector<Vector<u8>>.create();
