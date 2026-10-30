@@ -1,7 +1,7 @@
 // The C emitter (the reference's Backend.C/CEmitter.cs) in its flat form: one label per NIR block, terminators as
 // goto, switch and return, and every operation that can be undefined in C a call of a checked helper from nova/rt.h
-// (c-backend.md). P5 emits the C novac emits with --flat-c --no-placement --no-bce --no-oce
-// --no-closure-specialisation: no structuring, no placement, no check elimination, no closure variants.
+// (c-backend.md). P7 adds closure variants (S0), placement (S1) and check elimination (S2); the structured form is
+// still to come, so the C is novac's with --flat-c.
 //
 // The program is emitted twice, as by the reference: the first (trial) emission collects the helpers' location
 // constants and the boxes built in place, which the second writes before the code that uses them.
@@ -41,6 +41,9 @@ struct CEmitter {
     usedLibrary: Vector<bool>;             // by HIR function: library code that compiled code reaches (§29.2)
     usedVariants: Vector<u64>;             // the library (function, variant) pairs reached (variantKey)
     placements: Vector<FunctionPlacement>; // by NIR function: its stack-placed boxes (empty with --no-placement)
+    checks: CheckResults;                  // index and overflow checks proved not to fail (optimisations.md §2–§3)
+    bce: bool;                             // off: --no-bce
+    oce: bool;                             // off: --no-oce
     usedTypes: Vector<bool>;               // by type: mentioned by emitted code
     inPlaceResults: Vector<bool>;          // by type: Box.create results some site builds in place (nvBA_)
     headerStructs: Vector<u32>;            // defined by the exports header (ADR 0030)
@@ -77,6 +80,13 @@ struct CEmitter {
         usedLibrary: Vector<bool>.create(),
         usedVariants: Vector<u64>.create(),
         placements: Vector<FunctionPlacement>.create(),
+        checks: CheckResults {
+            removed: Vector<bool>.create(),
+            noOverflow: Vector<bool>.create(),
+            ascii: Vector<bool>.create(),
+        },
+        bce: false,
+        oce: false,
         usedTypes: Vector<bool>.create(),
         inPlaceResults: Vector<bool>.create(),
         headerStructs: Vector<u32>.create(),

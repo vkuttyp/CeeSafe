@@ -41,6 +41,8 @@ struct CBuildOptions {
     exportsHeader: Vector<u8>;
     closureSpecialisation: bool; // optimisations.md §5 (off: --no-closure-specialisation)
     placement: bool;             // memory-model.md §5 (off: --no-placement)
+    bce: bool;                   // optimisations.md §2 (off: --no-bce)
+    oce: bool;                   // optimisations.md §3 (off: --no-oce)
 }
 
 fn generateC(
@@ -87,6 +89,11 @@ fn generateC(
         let analysis = analyzePlacement(c, n, sources)?;
         trial.placements = analysis.functions;
     }
+    if (o.bce || o.oce) {
+        trial.checks = analyzeChecks(c, n)?;
+    }
+    trial.bce = o.bce;
+    trial.oce = o.oce;
     setUpEmitter(mut trial, c, n)?;
     emitProgram(mut trial, c, n, sources)?;
     var emitter = CEmitter.create(false);
@@ -104,6 +111,9 @@ fn generateC(
         let analysis = analyzePlacement(c, n, sources)?;
         emitter.placements = analysis.functions;
     }
+    emitter.checks = trial.checks;
+    emitter.bce = o.bce;
+    emitter.oce = o.oce;
     emitter.usedTypes = trial.usedTypes;
     setUpEmitter(mut emitter, c, n)?;
     emitProgram(mut emitter, c, n, sources)?;

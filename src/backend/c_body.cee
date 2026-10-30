@@ -884,6 +884,9 @@ fn emitStatement(
             return e.emit();
         }
         NirStatement.BoundsCheck(index, length) => {
+            if (e.bce && inSet(e.checks.removed, s)) {
+                return Ok(); // proved not to fail (optimisations.md §2)
+            }
             let i = operandText(e, c, n, sources, f, index)?;
             let l = operandText(e, c, n, sources, f, length)?;
             let site = siteText(e, c, n, sources, f, span.start)?;
@@ -897,6 +900,23 @@ fn emitStatement(
             return e.emit();
         }
         NirStatement.RangeCheck(low, high, length, text) => {
+            if (text != none() && e.bce && inSet(e.checks.ascii, s)) {
+                // ASCII text: every index is a character boundary (optimisations.md §2.9).
+                let lo = operandText(e, c, n, sources, f, low)?;
+                let hi = operandText(e, c, n, sources, f, high)?;
+                let place = appendPlaceIn(e, c, n, sources, f, text)?;
+                let site = siteText(e, c, n, sources, f, span.start)?;
+                e.t("    nv_check_range(")?;
+                e.b(lo.view())?;
+                e.t(", ")?;
+                e.b(hi.view())?;
+                e.t(", ")?;
+                e.b(place.view())?;
+                e.t(".len, ")?;
+                e.b(site.view())?;
+                e.t(");")?;
+                return e.emit();
+            }
             if (text != none()) {
                 // The text of a view or of a string: both have the bytes' (ptr, len).
                 let place = appendPlaceIn(e, c, n, sources, f, text)?;
@@ -1504,7 +1524,7 @@ fn appendRvalue(
     match (n.rvalues[r as usize]) {
         NirRvalue.Use(o) => { return appendOperand(e, c, n, sources, f, out, o); }
         NirRvalue.Binary(op, left, right) => {
-            return appendBinary(e, c, n, sources, f, out, op, left, right, span.start, t);
+            return appendBinary(e, c, n, sources, f, out, r, op, left, right, span.start, t);
         }
         NirRvalue.Unary(op, o) => {
             let operand = operandText(e, c, n, sources, f, o)?;
@@ -1514,6 +1534,13 @@ fn appendRvalue(
                     return appendBytes(out, operand.view());
                 }
                 UnaryOp.Negate => {
+                    if (uncheckedArithmetic(e, c, n, r)) {
+                        appendText(out, "((")?;
+                        appendCTypeName(c, out, t)?;
+                        appendText(out, ")(-")?;
+                        appendBytes(out, operand.view())?;
+                        return appendText(out, "))");
+                    }
                     if (c.types.is(t, TypeKind.Float)) {
                         appendText(out, "(-")?;
                         appendBytes(out, operand.view())?;
@@ -2214,6 +2241,10 @@ fn againstLimit(c: borrow Checker, n: borrow NirProgram, op: BinaryOp, left: u32
     return none();
 }
 
+/// Whether a checked + - * or negation was proved not to overflow (Unchecked).
+fn uncheckedArithmetic(e: borrow CEmitter, c: borrow Checker, n: borrow NirProgram, r: u32) -> bool =>
+    e.oce && isOverflowChecked(c, n, r) && inSet(e.checks.noOverflow, r);
+
 fn appendBinary(
     e: borrow mut CEmitter,
     c: borrow Checker,
@@ -2221,6 +2252,7 @@ fn appendBinary(
     sources: borrow Vector<SourceText>,
     f: u32,
     out: borrow mut Vector<u8>,
+    rv: u32,
     op: BinaryOp,
     left: u32,
     right: u32,
@@ -2266,6 +2298,19 @@ fn appendBinary(
         out.push(' ')?;
         appendBytes(out, r.view())?;
         return out.push(')');
+    }
+    if (uncheckedArithmetic(e, c, n, rv)) {
+        // Proved not to overflow (optimisations.md §3): the exact result fits, so C's arithmetic, in the type or
+        // after promotion to int, has no undefined behaviour.
+        appendText(out, "((")?;
+        appendCTypeName(c, out, t)?;
+        appendText(out, ")(")?;
+        appendBytes(out, l.view())?;
+        out.push(' ')?;
+        appendText(out, symbol)?;
+        out.push(' ')?;
+        appendBytes(out, r.view())?;
+        return appendText(out, "))");
     }
     let helper = match (op) {
         BinaryOp.Add => "nv_add_",

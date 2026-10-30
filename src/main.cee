@@ -53,6 +53,10 @@ struct Options {
     explainClosureCalls: bool;   // --explain-closure-calls
     placement: bool;             // on unless --no-placement (memory-model.md §5)
     explainAllocations: bool;    // --explain-allocations
+    bce: bool;                   // on unless --no-bce (optimisations.md §2)
+    explainBoundsChecks: bool;   // --explain-bounds-checks
+    oce: bool;                   // on unless --no-oce (optimisations.md §3)
+    explainOverflowChecks: bool; // --explain-overflow-checks
     emit: Vector<u8>;            // --emit c|exe|obj (build)
     output: Vector<u8>;          // -o (build), or empty
     exportsHeader: Vector<u8>;   // --exports-header (build)
@@ -162,7 +166,15 @@ fn readOptions(options: borrow mut Options) -> i32 {
             options.placement = false;
         } else if (options.building && arg == "--explain-allocations") {
             options.explainAllocations = true;
-        } else if (options.building && (arg == "--no-bce" || arg == "--no-oce" || arg == "--flat-c")) {
+        } else if (options.building && arg == "--no-bce") {
+            options.bce = false;
+        } else if (options.building && arg == "--explain-bounds-checks") {
+            options.explainBoundsChecks = true;
+        } else if (options.building && arg == "--no-oce") {
+            options.oce = false;
+        } else if (options.building && arg == "--explain-overflow-checks") {
+            options.explainOverflowChecks = true;
+        } else if (options.building && arg == "--flat-c") {
             // Not ported yet (docs/p7-plan.md): ceesafec emits as novac does with these.
         } else if (arg == "--no-float") {
             options.noFloat = true;
@@ -357,6 +369,10 @@ fn parseCommand() -> i32 {
         explainClosureCalls: false,
         placement: true,
         explainAllocations: false,
+        bce: true,
+        explainBoundsChecks: false,
+        oce: true,
+        explainOverflowChecks: false,
         emit: copyBytes("exe".bytes())!,
         output: Vector<u8>.create(),
         exportsHeader: copyBytes("nova_exports.h".bytes())!,
@@ -577,6 +593,10 @@ fn fileCommand(building: bool) -> i32 {
         explainClosureCalls: false,
         placement: true,
         explainAllocations: false,
+        bce: true,
+        explainBoundsChecks: false,
+        oce: true,
+        explainOverflowChecks: false,
         emit: copyBytes("exe".bytes())!,
         output: Vector<u8>.create(),
         exportsHeader: copyBytes("nova_exports.h".bytes())!,
@@ -757,6 +777,8 @@ fn fileCommand(building: bool) -> i32 {
             exportsHeader: copyBytes(options.exportsHeader.view())!,
             closureSpecialisation: options.closureSpecialisation,
             placement: options.placement,
+            bce: options.bce,
+            oce: options.oce,
         };
         if (!generateC(mut checker, mut nir, sources, build, mut files)!) {
             return report(options.json, checker.front.diagnostics, sources);
@@ -770,8 +792,18 @@ fn fileCommand(building: bool) -> i32 {
             let placement = analyzePlacement(checker, nir, sources)!;
             explainAllocations(checker, sources, placement, mut printed)!;
         }
+        if (options.explainBoundsChecks) {
+            // What the C backend omits unless --no-bce is given (optimisations.md §2.7).
+            let checks = analyzeChecks(checker, nir)!;
+            explainChecks(checker, nir, sources, checks, false, mut printed)!;
+        }
         if (options.explainClosureCalls) {
             explainClosureCalls(checker, nir, sources, closureReport, mut printed)!;
+        }
+        if (options.explainOverflowChecks) {
+            // What the C backend omits unless --no-oce is given (optimisations.md §3.4).
+            let checks = analyzeChecks(checker, nir)!;
+            explainChecks(checker, nir, sources, checks, true, mut printed)!;
         }
         Console.writeBytes(printed.view());
         for (k in 0..options.cNames.length) {
