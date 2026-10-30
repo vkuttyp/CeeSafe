@@ -1,0 +1,47 @@
+fn copy(path: StringView) -> Result<usize, IoError> {
+    var f = File.open(path)?;
+    var buffer = [0u8; 64];
+    let n = f.read(mut buffer[..])?;
+    var out = File.create("out.txt")?;
+    out.write(buffer[0..n])?;
+    File.remove("out.txt")?;
+    return Ok(n);
+}
+
+fn serve() -> Result<void, IoError> {
+    var listener = TcpListener.bind("127.0.0.1", 8080)?;
+    let port = listener.port()?;
+    var stream = listener.accept()?;
+    stream.write("hi".bytes())?;
+    stream.shutdownWrite()?;
+    var client = TcpStream.connect("localhost", port)?;
+    return Ok();
+}
+
+fn main() {
+    match (copy("in.txt")) {
+        Ok(n) => {}
+        Err(e) => { Console.writeErrorLine(e.message()); }
+    }
+    var input = [0u8; 16];
+    let got = Console.read(mut input[..]);
+    Console.writeBytes(input[0..2]);
+    Console.writeError("x");
+    Console.writeErrorLine();
+    var args = Vector<StringView>.create();
+    args.push("-l")!;
+    let status = Process.run("ls", args);
+    let a: u8 = 250;
+    let b = a.wrappingAdd(10) + a.saturatingAdd(10);
+    let c = a.checkedMul(2);
+    let r = borrow a;
+    let d = r.wrappingSub(1);
+    let x = 2.5;
+    let y = x.sqrt() + x.abs() + x.floor() + x.ceil() + x.min(1.0) + x.max(3.0);
+    let bits = x.bits();
+    let f: f32 = 1.5;
+    let fbits = f.bits();
+    Cpu.spinHint();
+    let wide = Target.pointerBits();
+    if (Target.isX86_64() || Target.isAArch64()) {}
+}

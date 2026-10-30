@@ -1,0 +1,331 @@
+// I/O and the number methods (the reference's CheckResourceFunction, CheckResourceMethod, `e.message()`, the I/O cases
+// of CheckBuiltinMemberCall, IntegerMethod, CheckIntegerMethod, FloatMethod and CheckFloatMethod): P3 S3e (§6, §26,
+// §35). `File.kind` and `Process.capture` call lib/std (S5).
+
+fn builtinFile() -> u32 => 16;
+fn builtinTcpListener() -> u32 => 17;
+fn builtinTcpStream() -> u32 => 18;
+
+fn ioResult(c: borrow mut Checker, ok: u32) -> Result<u32, AllocError> {
+    let ioError = c.ioErrorType;
+    return resultOf(c, ok, ioError);
+}
+
+/// `File.open(path)`, `File.create(path)`, `File.remove(path)`, `TcpListener.bind(address, port)`,
+/// `TcpStream.connect(address, port)` (CheckResourceFunction, §26).
+fn checkResourceFunction(
+    c: borrow mut Checker,
+    owner: u32,
+    member: u32,
+    arguments: Range,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let ident = c.front.ast.idents[member as usize];
+    var textBytes = Vector<u8>.create();
+    appendBytes(mut textBytes, c.name(ident.symbol))?;
+    let text = textBytes.view();
+    if (owner == builtinFile() && sameText(text, "kind")) {
+        c.notPorted(span.start, span.end, "File.kind (lib/std's host services)", "S5")?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var function = none();
+    var ok = none();
+    if (owner == builtinFile() && sameText(text, "open")) {
+        function = bfFileOpen();
+        ok = c.types.file;
+    } else if (owner == builtinFile() && sameText(text, "create")) {
+        function = bfFileCreate();
+        ok = c.types.file;
+    } else if (owner == builtinFile() && sameText(text, "remove")) {
+        function = bfFileRemove();
+        ok = c.types.voidType;
+    } else if (owner == builtinTcpListener() && sameText(text, "bind")) {
+        function = bfTcpListen();
+        ok = c.types.tcpListener;
+    } else if (owner == builtinTcpStream() && sameText(text, "connect")) {
+        function = bfTcpConnect();
+        ok = c.types.tcpStream;
+    }
+    if (function == none()) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendText(mut message, builtinName(owner))?;
+        appendText(mut message, "' has no function ")?;
+        appendQuotedName(mut message, c, ident.symbol)?;
+        c.error(undefinedName(), ident.start, ident.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let result = ioResult(c, ok)?;
+    let withPort = function == bfTcpListen() || function == bfTcpConnect();
+    if (arguments.count != (if (withPort) 2u32 else 1u32)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "write '")?;
+        appendText(mut message, resourceUsage(function))?;
+        appendText(mut message, "'")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var values = Vector<u32>.create();
+    let view = c.types.stringView;
+    let pathSyntax = c.front.ast.at(arguments, 0);
+    values.push(checkArgument(c, pathSyntax, view)?)?;
+    if (withPort) {
+        let u16Type = c.types.u16;
+        let portSyntax = c.front.ast.at(arguments, 1);
+        values.push(checkExpr(c, portSyntax, u16Type)?)?;
+    }
+    for (v in values.view()) {
+        if (c.isBottom(v)) {
+            return c.errorResult(span.start, span.end);
+        }
+    }
+    let list = c.hir.list(values.view())?;
+    return c.expr(HirExpr.BuiltinCall(function, list), result, span.start, span.end);
+}
+
+fn resourceUsage(function: u32) -> StringView {
+    if (function == bfFileOpen()) {
+        return "File.open(path)";
+    }
+    if (function == bfFileCreate()) {
+        return "File.create(path)";
+    }
+    if (function == bfFileRemove()) {
+        return "File.remove(path)";
+    }
+    if (function == bfTcpListen()) {
+        return "TcpListener.bind(address, port)";
+    }
+    return "TcpStream.connect(address, port)";
+}
+
+/// Methods of a file or socket place (CheckResourceMethod, §26.3, §26.4).
+fn checkResourceMethod(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    resource: u32,
+    targetSpan: Span,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let typ = c.typeOf(resource);
+    let kind = c.types.info(typ).resource;
+    let isFileOrStream = match (kind) {
+        ResourceKind.File => true,
+        ResourceKind.TcpStream => true,
+        _ => false,
+    };
+    let isStream = match (kind) {
+        ResourceKind.TcpStream => true,
+        _ => false,
+    };
+    let isListener = match (kind) {
+        ResourceKind.TcpListener => true,
+        _ => false,
+    };
+    let ident = c.front.ast.idents[member as usize];
+    var textBytes = Vector<u8>.create();
+    appendBytes(mut textBytes, c.name(ident.symbol))?;
+    let text = textBytes.view();
+    var function = none();
+    var arity: u32 = 0;
+    var mutable = true;
+    var ok = none();
+    if (isFileOrStream && sameText(text, "read")) {
+        function = bfResourceRead();
+        arity = 1;
+        ok = c.types.usize;
+    } else if (isFileOrStream && sameText(text, "write")) {
+        function = bfResourceWrite();
+        arity = 1;
+        ok = c.types.voidType;
+    } else if (isStream && sameText(text, "shutdownWrite")) {
+        function = bfTcpShutdownWrite();
+        ok = c.types.voidType;
+    } else if (isListener && sameText(text, "accept")) {
+        function = bfTcpAccept();
+        mutable = false;
+        ok = c.types.tcpStream;
+    } else if (isListener && sameText(text, "port")) {
+        function = bfTcpPort();
+        mutable = false;
+        ok = c.types.u16;
+    }
+    if (function == none()) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, " has no method ")?;
+        appendQuotedName(mut message, c, ident.symbol)?;
+        c.error(undefinedName(), ident.start, ident.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let result = ioResult(c, ok)?;
+    if (arguments.count != arity) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, text)?;
+        appendText(mut message, if (arity == 0) "' takes no arguments" else "' takes one argument")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var argument = none();
+    if (arity == 1) {
+        let u8Type = c.types.u8;
+        let bytes = c.types.sliceOf(u8Type, function == bfResourceRead())?;
+        let argumentSyntax = c.front.ast.at(arguments, 0);
+        argument = checkArgument(c, argumentSyntax, bytes)?;
+    }
+    let receiver = borrowPlace(c, resource, mutable, targetSpan)?;
+    if (c.isBottom(receiver) || (argument != none() && c.isBottom(argument))) {
+        return c.errorResult(span.start, span.end);
+    }
+    var values = Vector<u32>.create();
+    values.push(receiver)?;
+    if (argument != none()) {
+        values.push(argument)?;
+    }
+    let list = c.hir.list(values.view())?;
+    return c.expr(HirExpr.BuiltinCall(function, list), result, span.start, span.end);
+}
+
+/// `e.message()` on an IoError (§26.2): static text for the variant.
+fn checkIoErrorMessage(c: borrow mut Checker, receiver: u32, span: Span) -> Result<u32, AllocError> {
+    let read = autoDeref(c, receiver)?;
+    let values = [read];
+    let list = c.hir.list(values[..])?;
+    let view = c.types.stringView;
+    return c.expr(HirExpr.BuiltinCall(bfIoErrorMessage(), list), view, span.start, span.end);
+}
+
+/// The built-in arithmetic methods of integer types (IntegerMethod, §6, M11), or none.
+fn integerMethod(name: Slice<u8>) -> u32 {
+    if (sameText(name, "wrappingAdd")) {
+        return bfWrappingAdd();
+    }
+    if (sameText(name, "wrappingSub")) {
+        return bfWrappingSub();
+    }
+    if (sameText(name, "wrappingMul")) {
+        return bfWrappingMul();
+    }
+    if (sameText(name, "checkedAdd")) {
+        return bfCheckedAdd();
+    }
+    if (sameText(name, "checkedSub")) {
+        return bfCheckedSub();
+    }
+    if (sameText(name, "checkedMul")) {
+        return bfCheckedMul();
+    }
+    if (sameText(name, "saturatingAdd")) {
+        return bfSaturatingAdd();
+    }
+    if (sameText(name, "saturatingSub")) {
+        return bfSaturatingSub();
+    }
+    if (sameText(name, "saturatingMul")) {
+        return bfSaturatingMul();
+    }
+    return none();
+}
+
+/// The built-in methods of a float value (FloatMethod, §35.5, §35.8), or none.
+fn floatMethod(name: Slice<u8>) -> u32 {
+    if (sameText(name, "bits")) {
+        return bfFloatBits();
+    }
+    if (sameText(name, "sqrt")) {
+        return bfFloatSqrt();
+    }
+    if (sameText(name, "abs")) {
+        return bfFloatAbs();
+    }
+    if (sameText(name, "floor")) {
+        return bfFloatFloor();
+    }
+    if (sameText(name, "ceil")) {
+        return bfFloatCeil();
+    }
+    if (sameText(name, "min")) {
+        return bfFloatMin();
+    }
+    if (sameText(name, "max")) {
+        return bfFloatMax();
+    }
+    return none();
+}
+
+/// `x.wrappingAdd(y)` and the rest (CheckIntegerMethod): one argument of the receiver's type; never panics.
+fn checkIntegerMethod(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    receiver: u32,
+    function: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    if (arguments.count != 1) {
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, c.front.ast.idents[member as usize].symbol)?;
+        appendText(mut message, " takes one argument")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let typ = c.typeOf(receiver);
+    let argumentSyntax = c.front.ast.at(arguments, 0);
+    let argument = checkExpr(c, argumentSyntax, typ)?;
+    if (c.isBottom(argument)) {
+        return c.errorResult(span.start, span.end);
+    }
+    let checked = function == bfCheckedAdd() || function == bfCheckedSub() || function == bfCheckedMul();
+    let result = if (checked) optionOf(c, typ)? else typ;
+    let values = [receiver, argument];
+    let list = c.hir.list(values[..])?;
+    return c.expr(HirExpr.BuiltinCall(function, list), result, span.start, span.end);
+}
+
+/// `f.bits()`, `f.sqrt()` … `f.min(g)` (CheckFloatMethod, §35.5, §35.8).
+fn checkFloatMethod(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    receiver: u32,
+    function: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let binary = function == bfFloatMin() || function == bfFloatMax();
+    if (arguments.count != (if (binary) 1u32 else 0u32)) {
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, c.front.ast.idents[member as usize].symbol)?;
+        appendText(mut message, if (binary) " takes one argument" else " takes no arguments")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let typ = c.typeOf(receiver);
+    if (function == bfFloatBits()) {
+        let bitsType = if (c.types.info(typ).bits == 32) c.types.u32 else c.types.u64;
+        let values = [receiver];
+        let list = c.hir.list(values[..])?;
+        return c.expr(HirExpr.BuiltinCall(function, list), bitsType, span.start, span.end);
+    }
+    if (!binary) {
+        let values = [receiver];
+        let list = c.hir.list(values[..])?;
+        return c.expr(HirExpr.BuiltinCall(function, list), typ, span.start, span.end);
+    }
+    let otherSyntax = c.front.ast.at(arguments, 0);
+    let other = checkExpr(c, otherSyntax, typ)?;
+    if (c.isBottom(other)) {
+        return c.errorResult(span.start, span.end);
+    }
+    let values = [receiver, other];
+    let list = c.hir.list(values[..])?;
+    return c.expr(HirExpr.BuiltinCall(function, list), typ, span.start, span.end);
+}

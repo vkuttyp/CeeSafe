@@ -291,6 +291,12 @@ fn checkMethodCall(
     if (c.types.is(c.typeOf(vector), TypeKind.SlotMap) || c.types.is(c.typeOf(vector), TypeKind.StableVector)) {
         return checkContainerMethod(c, member, arguments, vector, targetSpan, span);
     }
+    if (c.types.is(c.typeOf(vector), TypeKind.Resource)) {
+        return checkResourceMethod(c, member, arguments, vector, targetSpan, span);
+    }
+    if (c.typeOf(vector) == c.ioErrorType && sameText(c.name(memberIdent.symbol), "message") && arguments.count == 0) {
+        return checkIoErrorMessage(c, receiver, span); // static text for the variant (§26.2)
+    }
     let receiverType = c.typeOf(receiver);
     let receiverPointee = c.types.info(receiverType).pointee;
     if (c.types.is(
@@ -312,6 +318,20 @@ fn checkMethodCall(
     }
     if (c.types.is(regionCandidate, TypeKind.Region)) {
         return checkArenaMethod(c, member, arguments, receiver, targetSpan, span);
+    }
+    if (c.types.is(regionCandidate, TypeKind.Integer)) {
+        let function = integerMethod(c.name(memberIdent.symbol));
+        if (function != none()) {
+            let number = autoDeref(c, receiver)?;
+            return checkIntegerMethod(c, member, arguments, number, function, span);
+        }
+    }
+    if (c.types.is(regionCandidate, TypeKind.Float)) {
+        let function = floatMethod(c.name(memberIdent.symbol));
+        if (function != none()) {
+            let number = autoDeref(c, receiver)?;
+            return checkFloatMethod(c, member, arguments, number, function, span);
+        }
     }
     if (!c.types.is(readType, TypeKind.Struct) || c.types.info(readType).structDef == none()) {
         return checkNonStructMethod(c, receiver, readType, member, arguments, span);

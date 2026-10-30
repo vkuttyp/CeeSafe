@@ -1,0 +1,29 @@
+fn main() {
+    let a = File.open();
+    let b = File.read("x");
+    let c = TcpListener.bind("x");
+    let d = TcpStream.connect(1, 2);
+    var f = File.open("x")!;
+    let e = f.accept();
+    let g = f.read();
+    var buffer = [0u8; 4];
+    let h = f.write(buffer[..], 1);
+    var l = TcpListener.bind("x", 70000)!;
+    let i = l.read(buffer[..]);
+    let j = l.port(1);
+    let k = Console.read("x");
+    Console.writeBytes();
+    Console.writeError(5);
+    let p = Process.run("x");
+    let q = Process.run(1, 2);
+    let n: u8 = 1;
+    let m = n.wrappingAdd();
+    let o = n.checkedAdd(true);
+    let x = 1.5;
+    let s = x.sqrt(1);
+    let t = x.min();
+    let u = x.max(true);
+    Cpu.halt();
+    let v = Target.wordSize();
+    let w = Target.pointerBits(1);
+}

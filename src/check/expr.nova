@@ -711,6 +711,9 @@ fn synthCall(
                                 if (b == builtinBox()) {
                                     return checkBoxCreate(c, member, arguments, expected, span);
                                 }
+                                if (b == builtinFile() || b == builtinTcpListener() || b == builtinTcpStream()) {
+                                    return checkResourceFunction(c, b, member, arguments, span);
+                                }
                                 if (b == builtinArena()) {
                                     return checkArenaCreate(c, member, arguments, span);
                                 }
@@ -850,15 +853,33 @@ fn checkBuiltinMemberCall(
         function = bfArgument();
         minArgs = 1;
         maxArgs = 1;
-    } else if ((owner == builtinProcess() && sameText(m, "run")) || (owner == builtinConsole() &&
-        (sameText(
-            m,
-            "read",
-        ) || sameText(m, "writeBytes") || sameText(m, "writeError") || sameText(m, "writeErrorLine"))) ||
-        (owner == 23 && sameText(m, "spinHint")) || (owner == 24 &&
-        (sameText(m, "isX86_64") || sameText(m, "isAArch64") || sameText(m, "pointerBits")))) {
-        c.notPorted(span.start, span.end, "this built-in function", "S1b")?;
-        return c.errorResult(span.start, span.end);
+    } else if (owner == builtinProcess() && sameText(m, "run")) {
+        function = bfProcessRun();
+        minArgs = 2;
+        maxArgs = 2;
+    } else if (owner == builtinConsole() && sameText(m, "read")) {
+        function = bfConsoleRead();
+        minArgs = 1;
+        maxArgs = 1;
+    } else if (owner == builtinConsole() && sameText(m, "writeBytes")) {
+        function = bfConsoleWriteBytes();
+        minArgs = 1;
+        maxArgs = 1;
+    } else if (owner == builtinConsole() && sameText(m, "writeError")) {
+        function = bfConsoleWriteError();
+        minArgs = 1;
+        maxArgs = 1;
+    } else if (owner == builtinConsole() && sameText(m, "writeErrorLine")) {
+        function = bfConsoleWriteErrorLine();
+        maxArgs = 1;
+    } else if (owner == 23 && sameText(m, "spinHint")) {
+        function = bfSpinHint();
+    } else if (owner == 24 && sameText(m, "isX86_64")) {
+        function = bfTargetIsX8664();
+    } else if (owner == 24 && sameText(m, "isAArch64")) {
+        function = bfTargetIsAArch64();
+    } else if (owner == 24 && sameText(m, "pointerBits")) {
+        function = bfTargetPointerBits();
     }
     if (function == none()) {
         var message = Vector<u8>.create();
@@ -899,6 +920,24 @@ fn checkBuiltinMemberCall(
         let never = c.types.never;
         return c.expr(HirExpr.BuiltinCall(function, list), never, span.start, span.end);
     }
+    if (function == bfSpinHint()) {
+        let voidType = c.types.voidType;
+        return c.expr(HirExpr.BuiltinCall(function, emptyRange()), voidType, span.start, span.end);
+    }
+    if (function == bfTargetIsX8664() || function == bfTargetIsAArch64()) {
+        let boolType = c.types.boolType; // decided by the C compiler (§29.3)
+        return c.expr(HirExpr.BuiltinCall(function, emptyRange()), boolType, span.start, span.end);
+    }
+    if (function == bfTargetPointerBits()) {
+        let u32Type = c.types.u32;
+        let bits = c.types.info(c.types.usize).bits;
+        return c.expr(
+            HirExpr.IntConst(IntValue { negative: false, magnitude: bits as u64 }),
+            u32Type,
+            span.start,
+            span.end,
+        );
+    }
     if (function == bfArgumentCount()) {
         let usize = c.types.usize;
         return c.expr(HirExpr.BuiltinCall(function, emptyRange()), usize, span.start, span.end);
@@ -912,6 +951,51 @@ fn checkBuiltinMemberCall(
         let view = c.types.stringView;
         let option = optionOf(c, view)?;
         return c.expr(HirExpr.BuiltinCall(function, list), option, span.start, span.end);
+    }
+    if (function == bfProcessRun()) {
+        let view = c.types.stringView;
+        let programSyntax = c.front.ast.at(arguments, 0);
+        let program = checkArgument(c, programSyntax, view)?;
+        let systemHeap = c.systemHeapType;
+        let vector = vectorType(c, view, systemHeap)?;
+        let views = c.types.referenceTo(vector, false)?;
+        let listSyntax = c.front.ast.at(arguments, 1);
+        let argumentList = checkArgument(c, listSyntax, views)?;
+        if (c.isBottom(program) || c.isBottom(argumentList)) {
+            return c.errorResult(span.start, span.end);
+        }
+        let i32Type = c.types.i32;
+        let result = ioResult(c, i32Type)?;
+        let values = [program, argumentList];
+        let list = c.hir.list(values[..])?;
+        return c.expr(HirExpr.BuiltinCall(function, list), result, span.start, span.end);
+    }
+    if (function == bfConsoleRead() || function == bfConsoleWriteBytes()) {
+        let read = function == bfConsoleRead();
+        let u8Type = c.types.u8;
+        let bytes = c.types.sliceOf(u8Type, read)?;
+        let bytesSyntax = c.front.ast.at(arguments, 0);
+        let argument = checkArgument(c, bytesSyntax, bytes)?;
+        let values = [argument];
+        let list = c.hir.list(values[..])?;
+        if (read) {
+            let usize = c.types.usize;
+            let result = ioResult(c, usize)?;
+            return c.expr(HirExpr.BuiltinCall(function, list), result, span.start, span.end);
+        }
+        let voidType = c.types.voidType;
+        return c.expr(HirExpr.BuiltinCall(function, list), voidType, span.start, span.end);
+    }
+    if (function == bfConsoleWriteError() || function == bfConsoleWriteErrorLine()) {
+        var texts = Vector<u32>.create();
+        let view = c.types.stringView;
+        for (k in 0..count) {
+            let argument = c.front.ast.at(arguments, k);
+            texts.push(checkArgument(c, argument, view)?)?;
+        }
+        let list = c.hir.list(texts.view())?;
+        let voidType = c.types.voidType;
+        return c.expr(HirExpr.BuiltinCall(function, list), voidType, span.start, span.end);
     }
     var values = Vector<u32>.create();
     for (k in 0..count) {
