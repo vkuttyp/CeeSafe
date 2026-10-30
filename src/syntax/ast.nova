@@ -328,6 +328,8 @@ struct Unit {
     namespaceName: QualifiedName;
     imports: Vector<QualifiedName>;
     items: Range;
+    identStart: u32; // the file's identifiers are Ast.idents[identStart..identEnd], in source order
+    identEnd: u32;
 }
 
 struct Ast {

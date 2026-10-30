@@ -1,0 +1,29 @@
+struct Hidden { x: u32; }
+enum Secret { A, B }
+struct Wrapper<T> { value: T; }
+public struct Shown {
+    public h: Hidden;
+    private p: Hidden;
+    open: u32;
+    public fn get(borrow this) -> Hidden => this.h;
+    fn quiet(borrow this) -> Hidden => this.h;
+    public fn fine(borrow this) -> u32 => this.open;
+}
+public struct Generic<T> {
+    public value: T;
+}
+public fn leak(h: Hidden) -> u32 => h.x;
+public fn secret() -> Secret? => null;
+public fn wrapped(w: Wrapper<u32>) -> u32 => w.value;
+public fn nested(v: Vector<Box<Hidden>>) {}
+public fn callback(f: fn(Secret) -> u32) {}
+public fn result() -> Result<u32, Secret> => Ok(1);
+public fn generic<T>(x: T, h: Hidden) -> T => x;
+public const LIMIT: u32 = 1;
+public static TABLE: [u32; 2] = [1, 2];
+public fn fine(x: u32) -> u32 => x;
+
+fn main() {
+    let p = app.Point { x: 1 };
+    let q = other.Thing {};
+}

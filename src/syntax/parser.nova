@@ -283,6 +283,7 @@ struct Parser {
     // ---- Items ----
 
     fn parseCompilationUnit(borrow mut this) -> Result<void, AllocError> {
+        let identStart = truncate<u32>(this.front.ast.idents.length);
         var hasNamespace = false;
         var namespaceName = QualifiedName { parts: emptyRange(), start: 0, end: 0 };
         if (this.at(TokenKind.NamespaceKeyword)) {
@@ -341,6 +342,8 @@ struct Parser {
             namespaceName: namespaceName,
             imports: imports,
             items: range,
+            identStart: identStart,
+            identEnd: truncate<u32>(this.front.ast.idents.length),
         })?;
         return Ok();
     }

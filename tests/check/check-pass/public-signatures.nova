@@ -1,0 +1,14 @@
+public struct Point {
+    public x: u32;
+    y: u32;
+    public fn sum(borrow this) -> u32 => this.x + this.y;
+}
+public enum Mode { On, Off }
+struct Private { x: u32; }
+fn helper(p: Private) -> u32 => p.x;
+public fn make() -> Point => Point { x: 1, y: helper(Private { x: 2 }) };
+public fn mode() -> Mode => Mode.On;
+
+fn main() {
+    Console.writeLine(make().sum());
+}

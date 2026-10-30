@@ -161,6 +161,7 @@ fn checkProgram(
         staticLocals: Vector<StaticLocal>.create(),
         freestanding: freestanding,
         profileReports: Vector<LayoutUse>.create(),
+        reportedQualified: Vector<LayoutUse>.create(),
     };
     // The constructor: the builtins' names, `this`, and a scratch frame's two parts.
     for (k in 0..26u32) {
@@ -176,6 +177,7 @@ fn checkProgram(
     }
     declareFrameFields(mut c)?;
     declareBuiltinItems(mut c)?;
+    checkQualifiedNames(mut c)?;
 
     // Interfaces, then structs and enums, then every other item, unit by unit (Check()).
     for (u in 0..c.front.ast.units.length) {
@@ -231,6 +233,7 @@ fn checkProgram(
     checkStructRecursion(mut c)?;
     computeCopyAndDrop(mut c)?;
     checkForeignInterfaces(mut c)?;
+    checkPublicSignatures(mut c)?;
     checkPendingElements(mut c)?;
 
     for (k in 0..c.constants.length) {

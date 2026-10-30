@@ -1,0 +1,270 @@
+// Names across packages in the checker (the reference's CheckQualifiedNames, CheckQualified, CheckPublicSignatures,
+// HiddenType and the qualified-name filter of Error): P3 S8 (type-system.md §2, ADR 0013). S8a is the single-package
+// model: a file names no dependency, so every qualified name is N0310.
+
+fn unknownPackage() -> u32 => 310;
+fn privateTypeInPublicSignature() -> u32 => 314;
+
+fn reportedQualified(c: borrow Checker, start: u32) -> bool {
+    for (r in c.reportedQualified.view()) {
+        if (r.file == c.file && r.start == start) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// N0310–N0313 before anything is declared (CheckQualifiedNames): every dotted name must name a public item of a
+/// dependency. A file's identifiers are visited in source order, which the reference's reflection walk follows for the
+/// names that can be dotted (a struct literal's type name).
+fn checkQualifiedNames(c: borrow mut Checker) -> Result<void, AllocError> {
+    let saved = c.file;
+    for (u in 0..c.front.ast.units.length) {
+        let file = c.front.ast.units[u].file;
+        if (c.fileIsLibrary[file as usize]) {
+            continue;
+        }
+        c.file = file;
+        let identStart = c.front.ast.units[u].identStart;
+        let identEnd = c.front.ast.units[u].identEnd;
+        for (k in identStart..identEnd) {
+            let id = c.front.ast.idents[k as usize];
+            var text = Vector<u8>.create();
+            appendBytes(mut text, c.name(id.symbol))?;
+            var dot = none();
+            for (j in 0..text.length) {
+                if (dot == none() && text[j] == '.') {
+                    dot = truncate<u32>(j);
+                }
+            }
+            if (dot != none() && dot > 0) {
+                let bytes = text.view();
+                checkQualified(c, bytes[..(dot as usize)], Span { start: id.start, end: id.end })?;
+            }
+        }
+    }
+    c.file = saved;
+    return Ok();
+}
+
+/// One qualified name `package.item` (CheckQualified). A single package has no dependencies: N0310.
+fn checkQualified(c: borrow mut Checker, packageName: Slice<u8>, span: Span) -> Result<void, AllocError> {
+    var message = Vector<u8>.create();
+    appendText(mut message, "'")?;
+    appendBytes(mut message, packageName)?;
+    appendText(mut message, "' is not a dependency of this package")?;
+    c.error(unknownPackage(), span.start, span.end, message)?;
+    let file = c.file;
+    return c.reportedQualified.push(LayoutUse { typ: 0, start: span.start, end: span.end, file: file });
+}
+
+fn isPublicVisibility(v: Visibility) -> bool => match (v) {
+    Visibility.Public => true,
+    _ => false,
+};
+
+/// A type of the current package, in `typ`, that other packages cannot see (HiddenType); none if there is none.
+fn hiddenType(c: borrow Checker, typ: u32, seen: borrow mut Vector<u32>) -> Result<u32, AllocError> {
+    if (containsU32(seen, typ)) {
+        return Ok(none());
+    }
+    seen.push(typ)?;
+    let t = c.types.info(typ);
+    if (t.structDef != none()) {
+        let s = borrow c.types.structs[t.structDef as usize];
+        if (!s.isClosureEnvironment && s.item != none() && !isPublicVisibility(
+            c.front.ast.items[s.item as usize].visibility,
+        ) &&
+            samePackage(c, s.file)) {
+            return Ok(typ);
+        }
+    }
+    if (t.enumDef != none()) {
+        let e = borrow c.types.enums[t.enumDef as usize];
+        if (e.item != none() && !isPublicVisibility(
+            c.front.ast.items[e.item as usize].visibility,
+        ) && samePackage(c, e.file)) {
+            return Ok(typ);
+        }
+    }
+    var parts = Vector<u32>.create();
+    parts.push(t.pointee)?;
+    parts.push(t.element)?;
+    parts.push(t.allocator)?;
+    parts.push(t.result)?;
+    if (t.enumDef != none()) {
+        parts.push(c.types.enums[t.enumDef as usize].optionType)?;
+        parts.push(c.types.enums[t.enumDef as usize].resultOk)?;
+        parts.push(c.types.enums[t.enumDef as usize].resultErr)?;
+    }
+    if (isKind(
+        t.kind,
+        TypeKind.Function,
+    ) || isKind(t.kind, TypeKind.Closure) || isKind(t.kind, TypeKind.FunctionPointer) ||
+        isKind(t.kind, TypeKind.Dyn)) {
+        for (k in 0..t.parameters.count) {
+            parts.push(c.types.listAt(t.parameters, k))?;
+        }
+    }
+    if (t.structDef != none()) {
+        let arguments = c.types.structs[t.structDef as usize].typeArguments;
+        for (k in 0..arguments.count) {
+            parts.push(c.types.listAt(arguments, k))?;
+        }
+    }
+    if (t.enumDef != none()) {
+        let arguments = c.types.enums[t.enumDef as usize].typeArguments;
+        for (k in 0..arguments.count) {
+            parts.push(c.types.listAt(arguments, k))?;
+        }
+    }
+    for (part in parts.view()) {
+        if (part != none()) {
+            let hidden = hiddenType(c, part, seen)?;
+            if (hidden != none()) {
+                return Ok(hidden);
+            }
+        }
+    }
+    return Ok(none());
+}
+
+/// Is `file` in the package being checked (PackageOf(source) == PackageOf(_source))? One package until S8b.
+fn samePackage(c: borrow Checker, file: u32) -> bool =>
+    file != none() && c.fileIsLibrary[file as usize] == c.fileIsLibrary[c.file as usize];
+
+/// N0314 for `name` if one of `types` hides a type (CheckSignature).
+fn checkSignature(c: borrow mut Checker, name: u32, types: Slice<u32>) -> Result<void, AllocError> {
+    var seen = Vector<u32>.create();
+    var hidden = none();
+    for (t in types) {
+        if (hidden == none()) {
+            hidden = hiddenType(c, t, mut seen)?;
+        }
+    }
+    if (hidden == none()) {
+        return Ok();
+    }
+    let id = c.front.ast.idents[name as usize];
+    var hiddenName = Vector<u8>.create();
+    appendBytes(mut hiddenName, c.types.name(hidden))?;
+    var message = Vector<u8>.create();
+    appendQuotedName(mut message, c, id.symbol)?;
+    appendText(mut message, " is public, but its signature names '")?;
+    appendBytes(mut message, hiddenName.view())?;
+    appendText(mut message, "', which is not public: make '")?;
+    appendBytes(mut message, hiddenName.view())?;
+    appendText(mut message, "' public, or ")?;
+    appendQuotedName(mut message, c, id.symbol)?;
+    appendText(mut message, " not (type-system.md §2)")?;
+    return c.error(privateTypeInPublicSignature(), id.start, id.end, message);
+}
+
+/// A function's parameter types and its result (FunctionTypes).
+fn functionTypes(c: borrow Checker, function: u32, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    for (p in c.hir.functions[function as usize].parameters.view()) {
+        out.push(c.hir.locals[p as usize].typ)?;
+    }
+    return out.push(c.hir.functions[function as usize].returnType);
+}
+
+/// N0314 (CheckPublicSignatures, §2): a public function, constant, static, or public field or method of a public
+/// struct, whose signature names a type of its own package that is not public.
+fn checkPublicSignatures(c: borrow mut Checker) -> Result<void, AllocError> {
+    let saved = c.file;
+    for (u in 0..c.front.ast.units.length) {
+        let file = c.front.ast.units[u].file;
+        if (c.fileIsLibrary[file as usize]) {
+            continue;
+        }
+        c.file = file;
+        let items = c.front.ast.units[u].items;
+        for (k in 0..items.count) {
+            let item = c.front.ast.at(items, k);
+            let entry = c.front.ast.items[item as usize];
+            if (!isPublicVisibility(entry.visibility)) {
+                continue;
+            }
+            let symbol = c.front.ast.idents[entry.name as usize].symbol;
+            var types = Vector<u32>.create();
+            match (ownEntity(c, symbol)) {
+                Entity.Function(function) => {
+                    let isItem = match (entry.kind) {
+                        ItemKind.Function(f) => c.hir.functions[function as usize].syntax == f,
+                        _ => false,
+                    };
+                    if (isItem) {
+                        functionTypes(c, function, mut types)?;
+                        checkSignature(c, entry.name, types.view())?;
+                    }
+                }
+                Entity.GenericFunction(g) => {
+                    let isItem = match (entry.kind) {
+                        ItemKind.Function(f) => c.genericFunctions[g as usize].syntax == f,
+                        _ => false,
+                    };
+                    if (isItem) {
+                        functionTypes(c, c.genericFunctions[g as usize].generic, mut types)?;
+                        checkSignature(c, entry.name, types.view())?;
+                    }
+                }
+                Entity.Constant(constant) => {
+                    if (c.constants[constant as usize].item == item) {
+                        types.push(c.hir.constants[c.constants[constant as usize].hir as usize].typ)?;
+                        checkSignature(c, entry.name, types.view())?;
+                    }
+                }
+                Entity.Static(s) => {
+                    if (c.statics[s as usize].item == item) {
+                        types.push(c.hir.statics[c.statics[s as usize].hir as usize].typ)?;
+                        checkSignature(c, entry.name, types.view())?;
+                    }
+                }
+                Entity.Struct(s) => {
+                    if (c.structs[s as usize].item == item) {
+                        let definition = c.types.info(c.structs[s as usize].typ).structDef;
+                        for (f in c.types.structs[definition as usize].fields.view()) {
+                            if (c.types.fields[f as usize].isPublic) {
+                                types.push(c.types.fields[f as usize].typ)?;
+                            }
+                        }
+                        checkSignature(c, entry.name, types.view())?;
+                        let methodCount = c.types.structs[definition as usize].functions.length;
+                        for (j in 0..methodCount) {
+                            let method = c.types.structs[definition as usize].functions[j];
+                            let syntax = c.front.ast.functions[c.hir.functions[method as usize].syntax as usize];
+                            if (isPublicVisibility(syntax.visibility)) {
+                                var methodTypes = Vector<u32>.create();
+                                functionTypes(c, method, mut methodTypes)?;
+                                checkSignature(c, syntax.name, methodTypes.view())?;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    c.file = saved;
+    return Ok();
+}
+
+/// The imports of a file (PackageNames.Rewrite's check, before type checking): each names a dependency of its
+/// package, N0310 otherwise. A single package has none.
+fn checkImports(front: borrow mut Frontend, unit: u32) -> Result<void, AllocError> {
+    let file = front.ast.units[unit as usize].file;
+    let count = front.ast.units[unit as usize].imports.length;
+    for (k in 0..count) {
+        let imported = front.ast.units[unit as usize].imports[k];
+        if (imported.parts.count == 0) {
+            continue;
+        }
+        let package = front.ast.idents[front.ast.at(imported.parts, 0) as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, front.symbols.name(Symbol { id: package.symbol }))?;
+        appendText(mut message, "' is not a dependency of this package")?;
+        front.diagnostics.error(unknownPackage(), file, package.start, package.end, message)?;
+    }
+    return Ok();
+}

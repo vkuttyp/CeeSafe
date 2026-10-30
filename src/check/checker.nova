@@ -124,7 +124,8 @@ struct Checker {
     statics: Vector<StaticEntry>;
     staticLocals: Vector<StaticLocal>; // each function's static-address locals (§39.2)
     freestanding: bool;                // --profile freestanding (cosmoos/profiles.md §4)
-    profileReports: Vector<LayoutUse>; // the places N0293 was reported, once each
+    profileReports: Vector<LayoutUse>;
+    reportedQualified: Vector<LayoutUse>; // where a qualified name was reported unknown (N0310, N0311): file and start // the places N0293 was reported, once each
 
     fn letKeywordOf(borrow this, local: u32) -> u32 {
         for (k in this.letKeywords.view()) {
@@ -137,8 +138,13 @@ struct Checker {
 
     // ---- Diagnostics ----
 
-    fn error(borrow mut this, code: u32, start: u32, end: u32, message: Vector<u8>) -> Result<void, AllocError> =>
-        this.front.diagnostics.error(code, this.file, start, end, message);
+    fn error(borrow mut this, code: u32, start: u32, end: u32, message: Vector<u8>) -> Result<void, AllocError> {
+        // A qualified name already reported as unknown (N0310, N0311) is not reported again as not found.
+        if ((code == 200 || code == 204 || code == 234) && reportedQualified(this, start)) {
+            return Ok();
+        }
+        return this.front.diagnostics.error(code, this.file, start, end, message);
+    }
 
     fn errorWithFix(
         borrow mut this,

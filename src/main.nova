@@ -374,6 +374,11 @@ fn checkCommand() -> i32 {
         let file = truncate<u32>(i);
         let lexed = lex(source.text.view(), file, mut front.symbols, mut front.diagnostics)!;
         front = parseFile(file, lexed, front)!;
+        // PackageNames.Rewrite: a package file, rewritten while nothing has failed yet.
+        if (!fileIsLibrary[i] && !front.diagnostics.hasErrors()) {
+            let unit = truncate<u32>(front.ast.units.length - 1);
+            checkImports(mut front, unit)!;
+        }
     }
     if (front.diagnostics.hasErrors()) {
         return report(options.json, front.diagnostics, sources);
