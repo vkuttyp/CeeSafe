@@ -504,7 +504,20 @@ fn checkNonStructMethod(
     }
     let isParameter = c.types.is(structType, TypeKind.TypeParameter);
     if (c.types.is(structType, TypeKind.Dyn)) {
-        c.notPorted(span.start, span.end, "a method through 'dyn'", "S4d")?;
+        let bound = c.types.info(structType).dynInterface;
+        var message = Vector<u8>.create();
+        if (bound == none()) {
+            c.notPorted(span.start, span.end, "a 'dyn fn' method", "S6")?;
+            return c.errorResult(span.start, span.end);
+        }
+        quotedBound(mut message, c, bound)?;
+        appendText(mut message, " has no method ")?;
+        appendQuotedName(mut message, c, memberIdent.symbol)?;
+        appendText(mut message, ": through a ")?;
+        appendQuotedType(mut message, c, structType)?;
+        appendText(mut message, ", only the interface's methods can be called (type-system.md §37.3)")?;
+        c.error(notAStruct(), memberIdent.start, memberIdent.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
         return c.errorResult(span.start, span.end);
     }
     var message = Vector<u8>.create();

@@ -1,0 +1,26 @@
+interface Shape { fn area(borrow this) -> i64; }
+interface Consume { fn eat(this); }
+interface Gen<T> { fn get(borrow this) -> T; }
+struct Square { side: i64; }
+struct Plain { x: i32; }
+impl Shape for Square { fn area(borrow this) -> i64 => this.side; }
+
+fn bare(s: dyn Shape) {}
+fn local() { let x: dyn Shape = 1; }
+fn eats(c: borrow dyn Consume) {}
+fn mutDyn(s: borrow dyn mut Shape) {}
+fn notInterface(s: borrow dyn Square) {}
+fn wrongArgs(s: borrow dyn Gen) {}
+fn measure(s: borrow dyn Shape) -> i64 => s.area();
+fn grow(s: borrow mut dyn Shape) {}
+
+fn main() {
+    let p = Plain { x: 1 };
+    let a = measure(p);
+    let sq = Square { side: 1 };
+    let b = sq;
+    grow(sq);
+    let r: borrow dyn Shape = borrow sq;
+    let c = r.perimeter();
+    let d: Box<dyn Shape> = Box.create(Plain { x: 2 })!;
+}

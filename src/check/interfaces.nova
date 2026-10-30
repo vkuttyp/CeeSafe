@@ -497,6 +497,9 @@ fn findMethod(c: borrow mut Checker, typ: u32, name: u32, span: Span) -> Result<
     if (implemented != none()) {
         return Ok(implemented);
     }
+    if (c.types.isDyn(typ)) {
+        return dynMethod(c, typ, name);
+    }
     if (!c.types.is(typ, TypeKind.TypeParameter)) {
         return Ok(none());
     }

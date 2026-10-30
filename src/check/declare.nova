@@ -130,6 +130,8 @@ fn checkProgram(
         impls: Vector<ImplRef>.create(),
         implsReady: false,
         registerNext: true,
+        dynAllowed: false,
+        dynTables: Vector<DynTable>.create(),
         implementations: Vector<Implementation>.create(),
         implMethods: Vector<ImplMethod>.create(),
         boundMethods: Vector<BoundMethod>.create(),

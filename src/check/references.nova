@@ -49,7 +49,7 @@ fn resolveReferenceType(
         c.notPorted(span.start, span.end, "a closure type", "S6")?;
         return Ok(c.types.error);
     }
-    let pointee = c.resolveType(pointeeSyntax, false)?;
+    let pointee = resolvePointee(c, pointeeSyntax)?;
     if (c.types.is(pointee, TypeKind.Reference)) {
         var message = Vector<u8>.create();
         appendText(mut message, "references to references are not supported")?;
@@ -173,8 +173,10 @@ fn checkArgument(c: borrow mut Checker, argument: u32, parameterType: u32) -> Re
             c.typeOf(target),
             TypeKind.Reference,
         )) {
-            c.notPorted(span.start, span.end, "a 'dyn' argument", "S4")?;
-            return c.errorResult(span.start, span.end);
+            // `mut x` for a `borrow mut dyn I` lends x (a box's contents) as a `borrow mut T`, then coerces (§37.2).
+            target = boxContents(c, target)?;
+            let lent = borrowPlace(c, target, true, span)?;
+            return coerce(c, lent, parameterType, span);
         }
         let targetType = c.typeOf(target);
         if (c.types.isBottom(targetType) || c.types.is(targetType, TypeKind.Reference)) {
@@ -202,8 +204,31 @@ fn checkArgument(c: borrow mut Checker, argument: u32, parameterType: u32) -> Re
         valueType,
         TypeKind.Reference,
     ) && !c.types.isDyn(valueType)) {
-        c.notPorted(span.start, span.end, "a 'dyn' argument", "S4")?;
-        return c.errorResult(span.start, span.end);
+        // A `T` (or a box's contents) for a `borrow dyn I` is borrowed as a `borrow T`, then coerced (§37.2).
+        value = boxContents(c, value)?;
+        if (c.types.info(parameterType).mutableReference) {
+            var message = Vector<u8>.create();
+            appendText(
+                mut message,
+                "this parameter is 'borrow mut': write 'mut' before the argument to let the call modify it",
+            )?;
+            mutArgumentError(c, value, span, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+        let lent = c.types.referenceTo(c.typeOf(value), false)?;
+        let place = toPlace(c, value)?;
+        let borrowed = if (place != none()) c.expr(
+            HirExpr.Borrow(false, place),
+            lent,
+            span.start,
+            span.end,
+        )? else c.expr(
+            HirExpr.BorrowTemp(false, value),
+            lent,
+            span.start,
+            span.end,
+        )?;
+        return coerce(c, borrowed, parameterType, span);
     }
     if (c.types.isBottom(valueType) || c.types.is(valueType, TypeKind.Reference)) {
         return coerce(c, value, parameterType, span);
@@ -226,13 +251,16 @@ fn checkArgument(c: borrow mut Checker, argument: u32, parameterType: u32) -> Re
         mutArgumentError(c, value, span, message)?;
         return c.errorResult(span.start, span.end);
     }
-    let isDynDeref = c.types.isDyn(valueType) && match (c.hir.exprs[value as usize]) {
-        HirExpr.Deref(_) => true,
-        _ => false,
-    };
-    if (isDynDeref) {
-        c.notPorted(span.start, span.end, "a 'dyn' argument", "S4")?;
-        return c.errorResult(span.start, span.end);
+    let dynBox = if (c.types.isDyn(valueType)) match (c.hir.exprs[value as usize]) {
+        HirExpr.Deref(reference) => reference,
+        _ => none(),
+    } else none();
+    if (dynBox != none() && toPlace(c, value)? == none()) {
+        // A temporary `Box<dyn I>`: lend the box, then reborrow its contents, which cannot be copied out (§37.2).
+        let boxType = c.typeOf(dynBox);
+        let lentType = c.types.referenceTo(boxType, false)?;
+        let lentBox = c.expr(HirExpr.BorrowTemp(false, dynBox), lentType, span.start, span.end)?;
+        return coerce(c, lentBox, parameterType, span);
     }
     // Implicit shared borrow: of the place itself, or of a temporary holding the value (lifetimes.md §6).
     let place = toPlace(c, value)?;
@@ -665,4 +693,14 @@ fn unknownRegionError(c: borrow mut Checker, ident: Ident) -> Result<void, Alloc
     appendBytes(mut message, c.name(ident.symbol))?;
     appendText(mut message, "' or use 'static'")?;
     return c.error(unknownRegion(), ident.start, ident.end, message);
+}
+
+/// A box's contents (not a `Box<dyn I>`'s), dereferenced; other values as they are.
+fn boxContents(c: borrow mut Checker, value: u32) -> Result<u32, AllocError> {
+    let t = c.typeOf(value);
+    if (c.types.is(t, TypeKind.Box) && !c.types.isDyn(c.types.info(t).pointee)) {
+        let s = c.spanOf(value);
+        return c.expr(HirExpr.Deref(value), c.types.info(t).pointee, s.start, s.end);
+    }
+    return Ok(value);
 }

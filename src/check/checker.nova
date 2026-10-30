@@ -90,6 +90,8 @@ struct Checker {
     impls: Vector<ImplRef>; // every impl, processed once every item is declared (§21.1)
     implsReady: bool;
     registerNext: bool; // false while declaring a signature only
+    dynAllowed: bool;   // set by resolvePointee for the next type resolved (the reference's _dynAllowed)
+    dynTables: Vector<DynTable>;
     implementations: Vector<Implementation>;
     implMethods: Vector<ImplMethod>;
     boundMethods: Vector<BoundMethod>;
@@ -296,6 +298,8 @@ struct Checker {
     /// "not ported yet".
     fn resolveTypeCore(borrow mut this, typ: u32, allowVoid: bool, allowSources: bool) -> Result<u32, AllocError> {
         let span = this.front.ast.typeSpans[typ as usize];
+        let dynAllowed = this.dynAllowed;
+        this.dynAllowed = false;
         match (this.front.ast.types[typ as usize]) {
             TypeNode.Named(q) => {
                 if (q.parts.count > 1) {
@@ -377,6 +381,9 @@ struct Checker {
             TypeNode.Missing => { return Ok(this.types.error); }
             TypeNode.Function(attributes, parameters, result) => {
                 return this.resolveFunctionType(attributes, parameters, result, span);
+            }
+            TypeNode.Dyn(interfaceType, mutable, send) => {
+                return resolveDynType(this, interfaceType, mutable, send, span, dynAllowed);
             }
             TypeNode.Optional(inner) => { return resolveOptionalType(this, inner, allowSources); }
             TypeNode.Array(element, length) => { return resolveArrayType(this, element, length); }

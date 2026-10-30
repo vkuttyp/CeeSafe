@@ -1,0 +1,43 @@
+interface Shape { fn area(borrow this) -> i64; fn scale(borrow mut this, by: i64); }
+struct Square { side: i64; }
+struct Circle { r: i64; }
+impl Shape for Square {
+    fn area(borrow this) -> i64 => this.side * this.side;
+    fn scale(borrow mut this, by: i64) {
+        this.side *= by;
+    }
+}
+impl Shape for Circle {
+    fn area(borrow this) -> i64 => 3 * this.r * this.r;
+    fn scale(borrow mut this, by: i64) {
+        this.r *= by;
+    }
+}
+
+fn measure(s: borrow dyn Shape) -> i64 => s.area();
+fn grow(s: borrow mut dyn Shape) {
+    s.scale(2);
+}
+fn make(big: bool) -> Result<Box<dyn Shape>, AllocError> {
+    if (big) {
+        let b: Box<dyn Shape> = Box.create(Square { side: 10 })?;
+        return Ok(b);
+    }
+    let c = Box.create(Circle { r: 1 })?;
+    return Ok(c);
+}
+
+fn main() {
+    var sq = Square { side: 2 };
+    let a = measure(sq) + measure(borrow sq);
+    grow(mut sq);
+    let shape: borrow dyn Shape = borrow sq;
+    let s = shape.area();
+    var boxed = make(true)!;
+    let t = boxed.area() + measure(boxed);
+    boxed.scale(3);
+    grow(mut boxed);
+    let u = measure(make(false)!);
+    let inBox = Box.create(Circle { r: 4 })!;
+    let v = measure(inBox);
+}

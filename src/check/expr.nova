@@ -538,6 +538,12 @@ fn coerce(c: borrow mut Checker, e: u32, expected: u32, span: Span) -> Result<u3
         }
         return Ok(e);
     }
+    if (c.types.isDynReference(expected) || c.types.isDynBox(expected)) {
+        let converted = coerceToDyn(c, e, expected, span)?;
+        if (converted != none()) {
+            return Ok(converted);
+        }
+    }
     let h = c.types.info(t);
     if (c.types.is(
         expected,

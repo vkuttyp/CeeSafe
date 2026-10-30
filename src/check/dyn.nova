@@ -1,0 +1,223 @@
+// `dyn I` (the reference's ResolveDynType, DynMethod and CoerceToDyn, and CheckArgument's dyn cases): P3 S4d
+// (type-system.md §37). `dyn fn` comes with closures (S6); the program's list of dyn signatures (DynSignatures) and
+// its tables are only read by the C backend (P5), which builds the list.
+
+fn dynNotBehindPointer() -> u32 => 330;
+fn dynIncompatible() -> u32 => 331;
+
+/// The table of one implementation of a dyn type (DynTable): its methods in the interface's order.
+struct DynTable {
+    implementation: u32;
+    dynType: u32;
+    methods: Range; // HIR functions, in Hir.lists
+}
+
+/// `dyn I` or `dyn I + Send` (ResolveDynType, §37.1): only behind a reference or in a box (`allowed`).
+fn resolveDynType(
+    c: borrow mut Checker,
+    interfaceSyntax: u32,
+    mutable: bool,
+    send: bool,
+    span: Span,
+    allowed: bool,
+) -> Result<u32, AllocError> {
+    let isFunction = match (c.front.ast.types[interfaceSyntax as usize]) {
+        TypeNode.Function(_, _, _) => true,
+        _ => false,
+    };
+    if (isFunction) {
+        c.notPorted(span.start, span.end, "a 'dyn fn' type", "S6")?;
+        return Ok(c.types.error);
+    }
+    if (mutable) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'dyn mut' is only for closure types: 'dyn mut fn(…) -> R' (type-system.md §36.5)")?;
+        c.error(unknownType(), span.start, span.end, message)?;
+        return Ok(c.types.error);
+    }
+    let bound = resolveInterface(c, interfaceSyntax)?;
+    if (bound == none()) {
+        return Ok(c.types.error);
+    }
+    if (!allowed) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'dyn ")?;
+        boundText(mut message, c, bound)?;
+        appendText(mut message, "' has no size the compiler knows: use it behind a reference or a box ('borrow dyn ")?;
+        boundText(mut message, c, bound)?;
+        appendText(mut message, "', 'Box<dyn ")?;
+        boundText(mut message, c, bound)?;
+        appendText(mut message, ">'; type-system.md §37.1)")?;
+        c.error(dynNotBehindPointer(), span.start, span.end, message)?;
+        return Ok(c.types.error);
+    }
+    let entry = c.types.bounds[bound as usize].interfaceEntry;
+    let methods = interfaceMethods(c, entry);
+    for (k in 0..methods.count) {
+        let m = c.front.ast.functions[c.front.ast.at(methods, k) as usize];
+        if (receiverIndex(m.receiver) == 1) {
+            var message = Vector<u8>.create();
+            quotedBound(mut message, c, bound)?;
+            appendText(mut message, " cannot be used as 'dyn ")?;
+            boundText(mut message, c, bound)?;
+            appendText(mut message, "': its method ")?;
+            appendQuotedName(mut message, c, c.front.ast.idents[m.name as usize].symbol)?;
+            appendText(
+                mut message,
+                " takes 'this' by value, which a call through a table cannot pass (type-system.md §37.1)",
+            )?;
+            c.error(dynIncompatible(), span.start, span.end, message)?;
+            return Ok(c.types.error);
+        }
+    }
+    return c.types.dynOf(bound, send);
+}
+
+/// A reference's pointee or a box's contents (ResolvePointee): the only types that may be a `dyn I` (§37.1).
+fn resolvePointee(c: borrow mut Checker, syntax: u32) -> Result<u32, AllocError> {
+    c.dynAllowed = true;
+    let t = c.resolveType(syntax, false)?;
+    c.dynAllowed = false;
+    return Ok(t);
+}
+
+/// The method `name` of `dyn I` (DynMethod, §37.3): the interface's signature with the dyn type as its receiver's,
+/// no body. None if `I` has no such method.
+fn dynMethod(c: borrow mut Checker, dynType: u32, name: u32) -> Result<u32, AllocError> {
+    let bound = c.types.info(dynType).dynInterface;
+    let b = c.types.bounds[bound as usize];
+    let methods = interfaceMethods(c, b.interfaceEntry);
+    var slot = none();
+    for (k in 0..methods.count) {
+        let m = c.front.ast.functions[c.front.ast.at(methods, k) as usize];
+        if (slot == none() && c.front.ast.idents[m.name as usize].symbol == name) {
+            slot = k;
+        }
+    }
+    if (slot == none()) {
+        return Ok(none());
+    }
+    for (m in c.boundMethods.view()) {
+        if (m.typ == dynType && m.bound == none() && m.name == name) {
+            return Ok(m.function);
+        }
+    }
+    let entry = c.interfaces[b.interfaceEntry as usize];
+    let interfaceParameters = match (c.front.ast.items[entry.item as usize].kind) {
+        ItemKind.Interface(_, t) => t,
+        _ => emptyRange(),
+    };
+    var arguments = Vector<u32>.create();
+    listTypes(c, b.arguments, mut arguments)?;
+    var pairs = Vector<EnvPair>.create();
+    zipEnvironment(c, interfaceParameters, arguments.view(), mut pairs)?;
+    let environment = storeEnvironment(c, pairs.view())?;
+    let savedFile = c.file;
+    c.file = entry.file;
+    let signature = c.front.ast.at(methods, slot);
+    let function = declareSignature(c, signature, dynType, environment)?;
+    c.file = savedFile;
+    c.hir.functions[function as usize].isDynMethod = true;
+    c.hir.functions[function as usize].dynSlot = slot;
+    c.boundMethods.push(BoundMethod { typ: dynType, bound: none(), name: name, function: function })?;
+    return Ok(function);
+}
+
+/// `e` (a `borrow T`, `borrow mut T` or `Box<T, A>`) as the dyn type `expected` (CoerceToDyn, §37.2): `T` must implement
+/// the interface (N0268). Records the table of the pair. None if `e` is not such a value.
+fn coerceToDyn(c: borrow mut Checker, e: u32, expected: u32, span: Span) -> Result<u32, AllocError> {
+    let x = c.types.info(expected);
+    let dynType = x.pointee;
+    let expectsReference = c.types.isDynReference(expected);
+    var value = e;
+    var actual = c.typeOf(e);
+    if (expectsReference && c.types.is(actual, TypeKind.Reference)) {
+        let box = c.types.info(actual).pointee;
+        if (c.types.is(box, TypeKind.Box) && !isPoolBox(c, box)) {
+            if (c.types.isDyn(c.types.info(box).pointee)) {
+                return Ok(none()); // `borrow Box<dyn I>` to `borrow dyn I`: a reborrow of the box's contents (§18.2)
+            }
+            // `borrow Box<T>` lends its contents, a `T` (§18.2), which then coerces.
+            let mutable = c.types.info(actual).mutableReference && x.mutableReference;
+            let contents = c.types.info(box).pointee;
+            let deref = c.expr(HirExpr.Deref(value), box, span.start, span.end)?;
+            let lent = c.types.referenceTo(contents, mutable)?;
+            value = c.expr(HirExpr.Reborrow(mutable, deref), lent, span.start, span.end)?;
+            actual = lent;
+        }
+    }
+    let a = c.types.info(actual);
+    let fits = if (expectsReference) c.types.is(
+        actual,
+        TypeKind.Reference,
+    ) && (a.mutableReference || !x.mutableReference) else c.types.is(
+        actual,
+        TypeKind.Box,
+    ) && a.allocator == x.allocator;
+    let pointee = a.pointee;
+    if (fits && c.types.isDyn(pointee) && c.types.info(pointee).sendDyn && !c.types.info(dynType).sendDyn &&
+        c.types.info(pointee).dynInterface != none() && c.types.info(dynType).dynInterface != none() && sameBound(
+        c,
+        c.types.info(pointee).dynInterface,
+        c.types.info(dynType).dynInterface,
+    )) {
+        return c.expr(HirExpr.Cast(value), expected, span.start, span.end); // forgetting `+ Send` (§38.4)
+    }
+    if (!fits || c.types.isDyn(pointee) || c.types.isUnsized(pointee) || c.types.info(pointee).isStr ||
+        c.types.isClosure(pointee)) {
+        return Ok(none());
+    }
+    let implementation = pointee;
+    if (c.types.info(dynType).sendDyn && !c.types.isSendType(implementation)?) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, implementation)?;
+        appendText(mut message, " is not Send, so it cannot be a ")?;
+        appendQuotedType(mut message, c, dynType)?;
+        appendText(mut message, " (type-system.md §38.4)")?;
+        c.error(notSend(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let bound = c.types.info(dynType).dynInterface;
+    if (bound == none()) {
+        c.notPorted(span.start, span.end, "a 'dyn fn' coercion", "S6")?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (!implements(c, implementation, bound)) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, implementation)?;
+        appendText(mut message, " does not implement ")?;
+        quotedBound(mut message, c, bound)?;
+        appendText(mut message, ", so it cannot be a ")?;
+        appendQuotedType(mut message, c, dynType)?;
+        appendText(mut message, " (type-system.md §37.2)")?;
+        c.error(boundNotSatisfied(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var recorded = false;
+    for (t in c.dynTables.view()) {
+        if (t.implementation == implementation && t.dynType == dynType) {
+            recorded = true;
+        }
+    }
+    if (!recorded) {
+        let methods = interfaceMethods(c, c.types.bounds[bound as usize].interfaceEntry);
+        var functions = Vector<u32>.create();
+        for (k in 0..methods.count) {
+            let m = c.front.ast.functions[c.front.ast.at(methods, k) as usize];
+            functions.push(implMethodFor(c, implementation, c.front.ast.idents[m.name as usize].symbol))?;
+        }
+        let list = c.hir.list(functions.view())?;
+        c.dynTables.push(DynTable { implementation: implementation, dynType: dynType, methods: list })?;
+    }
+    return c.expr(HirExpr.Cast(value), expected, span.start, span.end);
+}
+
+/// Two bounds of the same interface with the same arguments (SameDyn for interface dyns).
+fn sameBound(c: borrow Checker, a: u32, b: u32) -> bool {
+    let x = c.types.bounds[a as usize];
+    let y = c.types.bounds[b as usize];
+    return x.interfaceEntry == y.interfaceEntry && sameLists(c, x.arguments, y.arguments);
+}
+
+/// A pool's box (`PoolBox<T>`): a box whose allocator is a pool.
+fn isPoolBox(c: borrow Checker, box: u32) -> bool => regionIndex(c.types.info(c.types.info(box).allocator).region) == 4;

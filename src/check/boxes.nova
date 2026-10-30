@@ -17,7 +17,7 @@ fn boxOf(c: borrow mut Checker, contents: u32, allocator: u32) -> Result<u32, Al
 /// `Box<T>` and `Box<T, A>`.
 fn resolveBoxType(c: borrow mut Checker, arguments: Range) -> Result<u32, AllocError> {
     let contentsSyntax = c.front.ast.at(arguments, 0);
-    let contents = c.resolveType(contentsSyntax, false)?; // C-laid-out contents (§33.1) or a `dyn I` (§37.1): S7, S4
+    let contents = resolvePointee(c, contentsSyntax)?; // C-laid-out contents (§33.1): S7; or a `dyn I` (§37.1)
     if (c.types.isScoped(contents)) {
         let span = c.front.ast.typeSpans[contentsSyntax as usize];
         var message = Vector<u8>.create();
