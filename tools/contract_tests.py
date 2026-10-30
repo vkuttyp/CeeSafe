@@ -22,6 +22,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # The recorded divergences (ROADMAP §P4): novac's `check --dump-hir` crashes on three check-fail programs, and Nova #6.
 KNOWN_CHECK_DIFFERENCES = {"tests/corpus/check-fail/enums.nova", "tests/corpus/check-fail/optionals.nova",
                            "tests/corpus/check-fail/results.nova", "tests/corpus/check-fail/offset-of.nova"}
+# GCC 12 -O2 -Werror rejects novac's C for this program too (-Wuninitialized in an enum constructor; ROADMAP §P5).
+KNOWN_GCC_RUN_FAILURES = {"run-pass/nested-patterns.nova"}
+
+
+def is_gcc():
+    """Whether the default C compiler ($CC, else cc) is GCC."""
+    cc = os.environ.get("CC") or "cc"
+    version = subprocess.run([cc, "--version"], capture_output=True, text=True).stdout
+    return "Free Software Foundation" in version or version.startswith("gcc")
 
 
 def main():
@@ -70,6 +79,10 @@ def main():
             lines = [line for line in (p.stdout + p.stderr).splitlines() if line.strip()]
             summary = " | ".join(lines[-3:]) if name.startswith("run") else (lines[-1] if lines else "(no output)")
             ok = p.returncode == 0
+            failures = {line.split()[1] for line in lines if line.startswith("FAIL ")}
+            if name == "run -Werror" and not ok and failures and failures <= KNOWN_GCC_RUN_FAILURES and is_gcc():
+                ok = True
+                summary += f" (GCC: {', '.join(sorted(failures))}, recorded)"
             if name == "check" and os.path.exists(listing):
                 with open(listing, encoding="utf-8") as f:
                     differ = {line.strip() for line in f if line.strip()}

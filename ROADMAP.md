@@ -1,6 +1,6 @@
 # CeeSafe roadmap: port the Nova compiler to Nova, as CeeSafe
 
-Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P5 complete (P5 gate passed 2026-10-30, novac 0.6.0); next: P6**.
+Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P6 complete (P6 fixed point 2026-10-30, novac 0.6.0); next: P6R**.
 The probes, `src/support/`, the limits, the fault sweep and the skeleton exist (`docs/p1-probes.md`). No compiler code has been ported.
 Repository: `~/dev/CeeSafe`. Reference: `vkuttyp/Nova` (C#/.NET 10), pinned in `bootstrap/reference.md`.
 
@@ -452,13 +452,18 @@ CosmoOS architectures pass. **Passed (2026-10-30, novac 0.6.0)**: `docs/p5-plan.
 
 Dependencies: P5 and every feature CeeSafe uses.
 
-- [ ] Gen 1 is built by the pinned novac from CeeSafe's `.nova` sources.
-- [ ] Gen 1 builds gen 2, and gen 2 builds gen 3, with identical inputs, flags and toolchain.
-- [ ] Gen 2 and gen 3 emitted C and resources are byte-equal. Both pass the compiler contract tests.
-- [ ] Repeat from clean directories under different absolute paths. Check that no timestamp or path leaks into output.
-- [ ] Gen 2 onward builds with no `dotnet` or novac on `PATH`, and the subprocess logs are audited.
+- [x] Gen 1 is built by the pinned novac from CeeSafe's `.nova` sources.
+- [x] Gen 1 builds gen 2, and gen 2 builds gen 3, with identical inputs, flags and toolchain.
+- [x] Gen 2 and gen 3 emitted C and resources are byte-equal. Both pass the compiler contract tests
+  (`tools/contract_tests.py`).
+- [x] Repeat from clean directories under different absolute paths. Check that no timestamp or path leaks into output.
+- [x] Gen 2 onward builds with no `dotnet` or novac on `PATH`, and the subprocess logs are audited.
 
-Gate: a reproducible fixed point with archived manifests. This is a checkpoint, not release readiness.
+Gate: a reproducible fixed point with archived manifests. This is a checkpoint, not release readiness. **Passed
+(2026-10-30, CeeSafe `1b1aae4`, stage 0 novac 0.6.0)**: `docs/p6-fixed-point.md`, manifests in
+`bootstrap/fixed-point/`. On macOS (Apple clang 21) and Linux (GCC 12): C2 = C3 = C4 and gen 2 = gen 3 bit for bit,
+in two directories each; the C is the same on both hosts; from gen 1 on only the C compiler runs; every contract test
+passes on gen 2 but the recorded divergences.
 
 ### P6R — Rename cut-over
 
@@ -608,8 +613,9 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
 1. **Pinned to novac 0.5.0** (2026-10-30; 0.4.1 before it): M15 S1–S7 and the N7 fix shipped, every P1 workaround removed. The N
    track has no open blocking item.
 2. P2–P5 are done (`docs/p2-frontend.md`, `docs/p3-plan.md`, `docs/p4-plan.md`, `docs/p5-plan.md`), pinned to
-   novac 0.6.0; the C matrix is complete (P5). Next: P6, the first verified fixed point. P5 already showed that a
-   ceesafec built from its own C emits that C again (identical on macOS and Linux).
+   novac 0.6.0; the C matrix is complete (P5). P6, the first verified fixed point, holds on macOS and Linux
+   (`docs/p6-fixed-point.md`). Next: P6R, the rename cut-over, which needs CeeSafe decisions on the legacy `.nova`
+   mode and the diagnostic code letter first.
 4. Upstream (Nova #6, filed 2026-10-30): novac 0.6.0's `offsetOf<T>(field)` is 0 unless `T`'s layout was computed before (CheckOffsetOf reads
    `member.Offset` without `TypeTable.LayoutOf(measured)`); ceesafec gives the true offset.
 5. Owner's call: propose upstream that N0110 count `else if` links and `?` suffixes. novac's `--dump-ast` aborts on a
@@ -639,6 +645,7 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 | 2026-10-30 | Re-pinned to novac 0.6.0 (`93e0a46`, ADR 0030) after P3; `offsetOf`/`callerAddress` ported; every completed gate rerun (`bootstrap/reference.md`) | all pass; one upstream bug found (`offsetOf` before layout is 0) |
 | 2026-10-30 | P4: NIR (`src/nir/`: model, printer, builder, move paths, drop elaboration, move/in-place/borrow/effect checkers, `passes.nova`), `build --dump-nir`, diagnostic notes, `tools/compare_nir.py`, `tools/mutation_suite.py`, `docs/p4-evidence.md`; P3 gaps found and fixed (type-parameter flow names, `Box.create`'s `@placed` methods, HIR's dead `isGeneric`) | P4 gate passed: check programs 318/322, the 4 recorded divergences; other families 84/84; NIR 284/284 and CeeSafe's own package identical; mutations 1,152/1,152 against the oracle, as with novac; `check --dump-hir` identical on 186/186 check-pass and run-pass programs; packages 7/7; `ceesafec check` of CeeSafe clean (0.77 s); ceesafec under ASan+UBSan over 295 check-fail and run-pass programs (`build --dump-nir`) and its own package: no report, `live=0` |
 | 2026-10-30 | P5: the flat C backend (`src/backend/`), the runtime embedded (`tools/gen_runtime.py`), the toolchain and `build --emit c|exe|obj` with `-g`, `--split`, `--cc`, `--cflag`, `--ld` (`src/host/toolchain.nova`, `src/host/build.nova`); `tools/compare_c.py`, `tools/fault_injection.py`, `tools/collection_properties.py`, `tools/freestanding_check.py`; P3 gaps fixed (built-in items' `Used` marks, HirProgram's Structs and DynSignatures, InHostedLibrary), one NIR span fixed (an exhaustive match's Unreachable) | P5 gate passed: C identical for 284/284 programs in four forms (flat, split, `-g`, both) and for CeeSafe itself; run-pass 159/159, run-fail 40/40, ffi 8/8 under Apple clang 21, clang 18 and GCC 12 (`-O2`, `-O0`, overflow fallback, ASan+UBSan with leak checks, split, `-g`, `-Werror`) but one GCC report that novac's C shares; TSan 3/3; fault sweep 789 points on macOS and Linux, equal to novac's runs; collection properties 30/30 with 156 swept points; freestanding host and both triples clean; emit-c differences reviewed (P7's form); ceesafec built from its own C by GCC emits the same C on Linux |
+| 2026-10-30 | P6: `tools/fixed_point.py`, `tools/contract_tests.py`, `bootstrap/fixed-point/` | fixed point on macOS and Linux: C2 = C3 = C4, gen 2 = gen 3 bit for bit, in two directories, the same C on both hosts, only `cc` (and GCC's `as`, `ld`) started from gen 1 on; all contract tests pass on gen 2 but the recorded divergences |
 
 **Tests run for the skeleton** (2026-10-30, novac 0.3.1, Apple clang 21.0.0):
 - `novac check` and `novac fmt --check`: clean.
@@ -688,4 +695,8 @@ for CeeSafe itself; run-pass, run-fail and ffi pass under Apple clang 21, clang 
 (one GCC report that novac's C shares); the fault sweep (789 points), the collection properties and the freestanding
 checks pass on macOS and Linux.
 
-Not yet run: P6 or later.
+**P6 fixed point** (2026-10-30; `docs/p6-fixed-point.md`): gen 1 by novac 0.6.0, gen 2 and gen 3 by CeeSafe; C2 = C3
+and gen 2 = gen 3 on macOS (Apple clang 21) and Linux (GCC 12), in two directories each, with the same C on both
+hosts; only the C compiler runs from gen 1 on; `tools/contract_tests.py` passes on gen 2 on both hosts.
+
+Not yet run: P6R or later.
