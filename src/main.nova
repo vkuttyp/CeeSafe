@@ -1,0 +1,29 @@
+/// ceesafec: the CeeSafe compiler, being ported from Nova's C# novac (ROADMAP.md).
+/// This is the P0 skeleton: it answers `--version` and `--help`, and compiles nothing yet.
+fn usage() {
+    Console.writeLine("usage: ceesafec <command> [options]");
+    Console.writeLine("");
+    Console.writeLine("No commands are implemented yet; see ROADMAP.md.");
+    Console.writeLine("  --version    print the version");
+    Console.writeLine("  -h, --help   print this text");
+}
+
+fn main() -> i32 {
+    let argument = Process.argument(1);
+    if (argument == null) {
+        usage();
+        return 2;
+    }
+    let command = argument!;
+    if (command == "--version") {
+        Console.writeLine("ceesafec 0.0.0-dev");
+        return 0;
+    }
+    if (command == "-h" || command == "--help") {
+        usage();
+        return 0;
+    }
+    Console.writeError("ceesafec: unknown command: ");
+    Console.writeErrorLine(command);
+    return 2;
+}
