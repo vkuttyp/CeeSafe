@@ -114,10 +114,12 @@ fn declareInterface(c: borrow mut Checker, item: u32) -> Result<void, AllocError
         }
     }
     for (k in 0..methods.count) {
-        let f = c.front.ast.functions[c.front.ast.at(methods, k) as usize];
-        if (f.attributes.count > 0) {
-            c.notPorted(f.start, f.end, "attributes on an interface method", "S6")?;
-        }
+        let method = c.front.ast.at(methods, k);
+        let attributes = c.front.ast.functions[method as usize].attributes;
+        let words = "effects";
+        var known = Vector<u32>.create();
+        knownAttributes(c, attributes, "an interface method", words, mut known)?;
+        readEffectAttributes(c, method, known.view())?; // §37.3
     }
     return Ok();
 }
@@ -322,9 +324,11 @@ fn processImpl(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
             c.error(implMismatch(), id.start, id.end, message)?;
             continue;
         }
-        if (decl.attributes.count > 0) {
-            c.notPorted(decl.start, decl.end, "attributes on an impl method", "S6")?;
-        }
+        let words = "effects context";
+        var known = Vector<u32>.create();
+        knownAttributes(c, decl.attributes, "a method", words, mut known)?;
+        readEffectAttributes(c, f, known.view())?;
+        inheritEffects(c, signature, f)?;
         if (c.types.is(forType, TypeKind.Integer) && integerMethod(c.name(id.symbol)) != none()) {
             var message = Vector<u8>.create();
             appendQuotedName(mut message, c, id.symbol)?;

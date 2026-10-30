@@ -115,6 +115,36 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
         }
         ExprNode.Name(name, typeArguments) => {
             if (typeArguments.count > 0) {
+                let symbol = c.front.ast.idents[name as usize].symbol;
+                match (c.lookup(symbol)?) {
+                    Entity.GenericFunction(g) => {
+                        // An instance of a generic function as a value, named with its type arguments (§36.1).
+                        let generic = c.genericFunctions[g as usize];
+                        var parameterTypes = Vector<u32>.create();
+                        listTypes(c, generic.parameters, mut parameterTypes)?;
+                        var text = Vector<u8>.create();
+                        appendBytes(mut text, c.name(symbol))?;
+                        let pairs = Vector<InferencePair>.create();
+                        var found = Vector<u32>.create();
+                        let ok = typeArgumentsFor(
+                            c,
+                            text.view(),
+                            parameterTypes.view(),
+                            typeArguments,
+                            emptyRange(),
+                            false,
+                            pairs.view(),
+                            span,
+                            mut found,
+                        )?;
+                        let instance = if (ok) instantiateFunction(c, g, found.view(), span)? else none();
+                        if (instance == none()) {
+                            return c.errorResult(span.start, span.end);
+                        }
+                        return functionValue(c, instance, span);
+                    }
+                    _ => {}
+                }
                 c.notPorted(span.start, span.end, "a name with type arguments", "S4")?;
                 return c.errorResult(span.start, span.end);
             }
@@ -591,6 +621,22 @@ fn coerce(c: borrow mut Checker, e: u32, expected: u32, span: Span) -> Result<u3
         appendQuotedType(mut message, c, t)?;
         c.error(typeMismatch(), span.start, span.end, message)?;
         return c.errorResult(span.start, span.end);
+    }
+    if (c.types.is(expected, TypeKind.Function) && c.types.is(t, TypeKind.Function) && sameSignature(c, t, expected)) {
+        // Function types that differ only in their effect lists (§36.3): a named function takes the expected list,
+        // and the effect checker holds it to it; any other value needs its own list to be within the expected one.
+        let named = match (c.hir.exprs[e as usize]) {
+            HirExpr.FunctionAddress(_) => true,
+            _ => false,
+        };
+        if (named) {
+            c.hir.exprTypes[e as usize] = expected;
+            return Ok(e);
+        }
+        if (!effectsAllowed(c, t, expected, expected, t, span)?) {
+            return c.errorResult(span.start, span.end);
+        }
+        return c.expr(HirExpr.Cast(e), expected, span.start, span.end);
     }
     let h = c.types.info(t);
     if (c.types.is(

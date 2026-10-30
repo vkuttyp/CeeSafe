@@ -141,6 +141,11 @@ fn checkProgram(
         pendingAllocators: Vector<PendingAllocator>.create(),
         pendingElements: Vector<PendingElement>.create(),
         letKeywords: Vector<LetKeyword>.create(),
+        effectAttributes: Vector<EffectAttributes>.create(),
+        effectsOfAttributes: Vector<EffectsOfAttribute>.create(),
+        constantFunctions: Vector<u32>.create(),
+        callbacks: Vector<u32>.create(),
+        placedMethods: Vector<u32>.create(),
     };
     // The constructor: the builtins' names, `this`, and a scratch frame's two parts.
     for (k in 0..26u32) {
@@ -201,6 +206,7 @@ fn checkProgram(
         }
     }
 
+    processFunctionAttributes(mut c)?;
     processImpls(mut c)?;
     resolveAllMembers(mut c)?;
     checkStructRecursion(mut c)?;
@@ -242,6 +248,7 @@ fn checkProgram(
         f += 1;
     }
     checkMain(mut c)?;
+    finishFunctionFacts(mut c)?;
     return Ok(c);
 }
 
@@ -407,6 +414,8 @@ fn declare(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
                 start: entry.start,
                 end: entry.end,
                 value: none(),
+                exported: false,
+                exportName: emptyRange(),
             })?;
             c.constants.push(ConstEntry {
                 item: item,

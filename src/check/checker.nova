@@ -101,6 +101,11 @@ struct Checker {
     pendingAllocators: Vector<PendingAllocator>;
     pendingElements: Vector<PendingElement>;
     letKeywords: Vector<LetKeyword>;
+    effectAttributes: Vector<EffectAttributes>;      // `@effects`/`@context` by declaration (_effectAttributes)
+    effectsOfAttributes: Vector<EffectsOfAttribute>; // `@effectsOf` by declaration
+    constantFunctions: Vector<u32>;                  // Ast.functions declared `@constant`
+    callbacks: Vector<u32>;                          // Ast.functions declared `@callback`
+    placedMethods: Vector<u32>;                      // Ast.functions declared `@placed`
 
     fn letKeywordOf(borrow this, local: u32) -> u32 {
         for (k in this.letKeywords.view()) {
@@ -278,7 +283,7 @@ struct Checker {
         return Ok(resolved);
     }
 
-    /// ResolveFunctionType for `fn(A, B) -> R` without an effect list (effect lists come with S6).
+    /// ResolveFunctionType: `fn(A, B) -> R`, with the effect list of an `@effects(…)` before it (§36.3).
     fn resolveFunctionType(
         borrow mut this,
         attributes: Range,
@@ -286,10 +291,7 @@ struct Checker {
         result: u32,
         span: Span,
     ) -> Result<u32, AllocError> {
-        if (attributes.count > 0) {
-            this.notPorted(span.start, span.end, "an effect list on a function type", "S6")?;
-            return Ok(this.types.error);
-        }
+        let effects = functionTypeEffects(this, attributes)?;
         var types = Vector<u32>.create();
         var bottom = false;
         for (k in 0..parameters.count) {
@@ -308,7 +310,7 @@ struct Checker {
             this.notPorted(span.start, span.end, "a function type returning a reference", "S2")?;
             return Ok(this.types.error);
         }
-        return this.types.functionTo(types.view(), resultType, allEffects());
+        return this.types.functionTo(types.view(), resultType, effects);
     }
 
     /// ResolveTypeCore for what S1 supports: built-in named types and function types. Other forms are N0216

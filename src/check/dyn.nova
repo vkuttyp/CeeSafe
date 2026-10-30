@@ -119,6 +119,9 @@ fn dynMethod(c: borrow mut Checker, dynType: u32, name: u32) -> Result<u32, Allo
     c.file = savedFile;
     c.hir.functions[function as usize].isDynMethod = true;
     c.hir.functions[function as usize].dynSlot = slot;
+    let attributes = effectAttributesOf(c, signature);
+    c.hir.functions[function as usize].declaredEffects =
+        if (attributes == none()) none() else c.effectAttributes[attributes as usize].declared;
     c.boundMethods.push(BoundMethod { typ: dynType, bound: none(), name: name, function: function })?;
     return Ok(function);
 }

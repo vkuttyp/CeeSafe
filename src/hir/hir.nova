@@ -202,8 +202,13 @@ struct HirFunction {
     siteFile: u32; // where an instance was made, or none
     siteStart: u32;
     siteEnd: u32;
-    registered: bool;       // false for a signature only (an interface method's): not in the reference's _functions
-    closureCaptures: Range; // a closure's captures (Hir.captures), once its environment is finished
+    registered: bool;                 // false for a signature only (an interface method's): not in the reference's _functions
+    closureCaptures: Range;           // a closure's captures (Hir.captures), once its environment is finished
+    declaredEffects: u32;             // `@effects(…)` bits, or none (type-system.md §32.2)
+    context: u32;                     // `@context`: 0 none, 1 atomic, 2 irq (§32.3)
+    effectsOfParameters: Vector<u32>; // the parameters `@effectsOf(…)` names, by index (§32.5)
+    exported: bool;                   // `@export`: exportName is its C symbol (§28.4)
+    exportName: Range;                // Hir.text
 }
 
 struct HirConstant {
@@ -213,6 +218,8 @@ struct HirConstant {
     start: u32;
     end: u32;
     value: u32; // an expression, or none ("?")
+    exported: bool;
+    exportName: Range; // Hir.text
 }
 
 struct HirStatic {
@@ -396,6 +403,11 @@ struct HirProgram {
             siteEnd: 0,
             registered: registered,
             closureCaptures: Range { start: 0, count: 0 },
+            declaredEffects: 0xFFFFFFFF,
+            context: 0,
+            effectsOfParameters: Vector<u32>.create(),
+            exported: false,
+            exportName: Range { start: 0, count: 0 },
         })?;
         return Ok(truncate<u32>(this.functions.length - 1));
     }

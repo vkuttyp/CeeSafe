@@ -1,0 +1,82 @@
+interface Logger {
+    @effects()
+    fn note(borrow this, x: i32) -> i32;
+    @context(atomic)
+    fn other(borrow this) -> i32;
+}
+struct Loud { level: i32; }
+impl Logger for Loud {
+    @effects(alloc)
+    fn note(borrow this, x: i32) -> i32 => x;
+    @placed
+    fn other(borrow this) -> i32 => 1;
+}
+struct Cell {
+    value: i32;
+
+    @placed
+    fn init(borrow mut this) {
+        this.value = 0;
+    }
+
+    @placed
+    fn reset(borrow mut this) {
+        this.value = 1;
+    }
+
+    @placed(x)
+    fn bad(borrow mut this) {}
+
+    @placed
+    fn wrong(borrow this) -> i32 => 1;
+
+    @callback
+    fn c(borrow this) {}
+
+    @effectsOf(missing)
+    fn m(borrow this, f: borrow fn() -> i32) -> i32 => f();
+}
+
+@effects(fast)
+fn a() {}
+@effects
+fn b() {}
+@effects() @effects()
+fn c() {}
+@context(nowhere)
+fn d() {}
+@context
+fn e() {}
+@frobnicate
+fn f() {}
+@repr(C)
+fn g() {}
+@effectsOf
+fn h() {}
+@effectsOf(1)
+fn i() {}
+@effectsOf(x, nothing)
+fn j(x: i32) {}
+@callback(x)
+fn k() {}
+@export
+@callback
+fn l() {}
+@export(1)
+fn m() {}
+@export
+fn n<T>(x: T) {}
+@export
+fn main() {
+    let ok: @effects() fn() = b;
+    let wide: @effects(alloc) fn() = a;
+    let narrow: @effects() fn() = wide;
+    let typed: @context(atomic) fn() = a;
+    let twice: @effects() @effects(sleep) fn() = a;
+}
+@constant(1)
+fn p() -> i32 => 1;
+@export(x)
+const LIMIT: i32 = 10;
+@effects
+const OTHER: i32 = 1;

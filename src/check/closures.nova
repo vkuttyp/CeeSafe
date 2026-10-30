@@ -378,8 +378,9 @@ fn checkClosure(c: borrow mut Checker, closure: u32, expected: u32, span: Span) 
     }
     analyzeFlow(c, function)?;
     let returnType = c.hir.functions[function as usize].returnType;
-    // An expected effect list bounds the body, as `@effects` bounds a function's (§36.3): S6b.
+    // An expected effect list bounds the body, as `@effects` bounds a function's (§36.3).
     let effects = if (callable != none()) c.types.info(callable).effects else allEffects();
+    c.hir.functions[function as usize].declaredEffects = if (callable == none()) none() else boundOf(c, callable);
     let callableType = c.types.functionTo(parameterTypes.view(), returnType, effects)?;
     if (c.types.isBottom(returnType)) {
         return c.errorResult(span.start, span.end);
@@ -991,6 +992,7 @@ fn adapterClosure(c: borrow mut Checker, value: u32, expected: u32, span: Span) 
     let statements = [statement];
     let block = c.hir.list(statements[..])?;
     c.hir.functions[function as usize].body = c.hir.addStmt(HirStmt.Block(block), span.start, span.end)?;
+    c.hir.functions[function as usize].declaredEffects = boundOf(c, callable);
     let range = finishEnvironment(c, function, environment, captures.view(), effects, span)?;
     return c.expr(HirExpr.Closure(function, range), expected, span.start, span.end);
 }

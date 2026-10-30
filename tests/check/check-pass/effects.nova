@@ -1,0 +1,60 @@
+interface Logger {
+    @effects()
+    fn note(borrow this, x: i32) -> i32;
+}
+struct Quiet { level: i32; }
+impl Logger for Quiet {
+    fn note(borrow this, x: i32) -> i32 => x + this.level;
+}
+struct Cell {
+    value: i32;
+
+    @effects()
+    fn get(borrow this) -> i32 => this.value;
+
+    @effectsOf(f)
+    fn map(borrow this, f: borrow fn(i32) -> i32) -> i32 => f(this.value);
+}
+
+@effects()
+fn square(x: i64) -> i64 => x * x;
+fn identity<T>(x: T) -> T => x;
+fn twice(f: @effects() fn(i64) -> i64, x: i64) -> i64 => f(f(x));
+@effectsOf(keep)
+fn count(xs: Slice<i32>, keep: borrow fn(i32) -> bool) -> i32 {
+    var n = 0;
+    for (x in xs) {
+        if (keep(x)) {
+            n += 1;
+        }
+    }
+    return n;
+}
+@context(atomic)
+fn tick(x: i32) -> i32 => x + 1;
+@effects(sleep, alloc)
+fn noisy() {
+    Console.writeLine("noisy");
+}
+@export
+fn exported(x: i32) -> i32 => x;
+@export("c_name")
+fn renamed(x: i32) -> i32 => x;
+@export
+const LIMIT: i32 = 10;
+@constant
+fn seven() -> i32 => 7;
+
+fn main() {
+    let q = Quiet { level: 1 };
+    let cell = Cell { value: 4 };
+    let xs = [1, 2, 3, 4];
+    let quiet: @effects() fn(i64) -> i64 = square;
+    let loose: fn(i64) -> i64 = quiet;
+    let n = count(xs[..], (x) => x > 2);
+    Console.writeLine(twice(square, 3));
+    Console.writeLine(twice(identity<i64>, 3));
+    Console.writeLine(loose(2));
+    Console.writeLine(n + q.note(1) + cell.get() + cell.map((v) => v + 1) + tick(1) + exported(1) + renamed(2) + LIMIT + seven());
+    noisy();
+}
