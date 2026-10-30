@@ -1,0 +1,17 @@
+// profile: freestanding
+struct Point {
+    x: u32;
+}
+
+fn usesHosted() {
+    let v = Vector<u32>.create();
+    let b = Box.create(1)!;
+    Console.writeLine("x");
+    let e = IoError.NotFound;
+    let h = SystemHeap {};
+    let f: File? = null;
+    let k = File.kind("x");
+    let p = Point { x: 1 };
+}
+
+fn main() {}

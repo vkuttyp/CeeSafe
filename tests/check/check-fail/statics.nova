@@ -1,0 +1,39 @@
+struct Pair {
+    a: u32;
+    b: u32;
+}
+struct Holder<region r> {
+    view: borrow(r) u32;
+}
+
+static CELL: Box<u32> = Box.create(1)!;
+static VIEW: Slice<u8> = [1u8][..];
+static FROM_CALL: u32 = plain();
+static FROM_STATIC: u32 = LIMIT;
+static LIMIT: u32 = 3;
+static LOCAL: u32 = -LIMIT;
+static mut COUNT: u32 = 0;
+static ENUMED: Option = Option.None;
+static HERE: u32 = here;
+
+enum Option { None, Some(u32) }
+
+fn plain() -> u32 => 1;
+@constant
+fn twoStatements() -> u32 {
+    let x = 1;
+    return x;
+}
+@constant
+fn callsPlain() -> u32 => plain();
+
+fn main() {
+    LIMIT = 4;
+    let v = COUNT;
+    let pair = Pair { a: 1, b: 2 };
+    let p = borrow mut LIMIT;
+    let bad = layoutOf<Pair, u32>();
+    let unsized = layoutOf<Slice<u8>>();
+    let also = layoutOf<u32>(1);
+    let h = here;
+}

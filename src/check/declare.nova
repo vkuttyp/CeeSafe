@@ -86,6 +86,7 @@ fn checkProgram(
     fileTexts: Vector<Vector<u8>>,
     filePaths: Vector<Vector<u8>>,
     noFloat: bool,
+    freestanding: bool,
 ) -> Result<Checker, AllocError> {
     var c = Checker {
         front: front,
@@ -156,6 +157,10 @@ fn checkProgram(
         coreAllowImported: false,
         layoutUses: Vector<LayoutUse>.create(),
         headers: Vector<Vector<u8>>.create(),
+        statics: Vector<StaticEntry>.create(),
+        staticLocals: Vector<StaticLocal>.create(),
+        freestanding: freestanding,
+        profileReports: Vector<LayoutUse>.create(),
     };
     // The constructor: the builtins' names, `this`, and a scratch frame's two parts.
     for (k in 0..26u32) {
@@ -231,6 +236,7 @@ fn checkProgram(
     for (k in 0..c.constants.length) {
         evaluateConstant(mut c, truncate<u32>(k))?;
     }
+    checkStaticInitializers(mut c)?; // before the bodies, so the instances its calls make are checked with them
 
     // The body pass: every function in creation order, the libraries' included.
     var f: usize = 0;
@@ -265,6 +271,7 @@ fn checkProgram(
         f += 1;
     }
     checkMain(mut c)?;
+    foldStatics(mut c)?;
     finishFunctionFacts(mut c)?;
     finishAtomicStructs(mut c);
     return Ok(c);
@@ -421,10 +428,7 @@ fn declare(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
             let constant = truncate<u32>(c.constants.length - 1);
             ownItem(c, id.symbol, Entity.Constant(constant))?;
         }
-        ItemKind.Static(_, _, _) => {
-            c.notPorted(id.start, id.end, "a static item", "S7")?;
-            ownItem(c, id.symbol, Entity.LibraryItem(item))?;
-        }
+        ItemKind.Static(mutable, typ, _) => { declareStatic(c, item, mutable, typ)?; }
         _ => {}
     }
     return Ok();
@@ -580,6 +584,14 @@ fn checkMain(c: borrow mut Checker) -> Result<void, AllocError> {
     let id = c.front.ast.idents[syntax.name as usize];
     let okReturn = returnType == c.types.i32 || returnType == c.types.voidType;
     c.file = file;
+    if (c.freestanding) {
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            "a freestanding package has no 'main': nothing calls it; enter it through @export functions (cosmoos/profiles.md §4.1)",
+        )?;
+        return c.error(hostedOnlyCode(), id.start, id.end, message);
+    }
     if (parameterCount != 0 || !okReturn) {
         var message = Vector<u8>.create();
         appendText(mut message, "'main' must take no parameters and return 'i32' or 'void'")?;

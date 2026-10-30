@@ -68,6 +68,9 @@ fn numericHint(c: borrow Checker, expected: u32) -> u32 {
 /// CheckExpr: checks against an optional expected type (§5).
 fn checkExpr(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError> {
     let span = c.front.ast.exprSpans[e as usize];
+    if (isHere(c, e)?) {
+        return checkHere(c, expected, span);
+    }
     match (c.front.ast.exprs[e as usize]) {
         ExprNode.If(_, _, _) => { return checkBranching(c, e, expected); }
         ExprNode.Match(_, _) => { return checkBranching(c, e, expected); }
@@ -127,6 +130,9 @@ fn genericInstanceNamed(
 
 fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError> {
     let span = c.front.ast.exprSpans[e as usize];
+    if (c.freestanding && hostedOnlyCall(c, e)?) {
+        return c.errorResult(span.start, span.end);
+    }
     match (c.front.ast.exprs[e as usize]) {
         ExprNode.IntLiteral(value, suffix) => { return checkIntLiteral(c, value, suffix, false, expected, span); }
         ExprNode.BoolLiteral(value) => {
@@ -245,6 +251,12 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
         ExprNode.FloatLiteral(digits, suffix) => { return checkFloatLiteral(c, digits, suffix, expected, span); }
         ExprNode.CharLiteral(value) => { return checkCharLiteral(c, value, expected, span); }
         ExprNode.Cast(operand, typ) => { return synthCast(c, operand, typ, span); }
+        ExprNode.Block(_) => {
+            var message = Vector<u8>.create();
+            appendText(mut message, "a block is an expression only as a branch of an 'if' or 'match' expression")?;
+            c.error(branchCompletes(), span.start, span.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
         ExprNode.Unsafe(inner) => {
             c.usedUnsafe = true;
             c.unsafeDepth += 1;
@@ -352,6 +364,7 @@ fn synthName(c: borrow mut Checker, name: u32, span: Span) -> Result<u32, AllocE
             appendText(mut message, "<T>' (type-system.md §36.1)")?;
             c.error(notCallable(), span.start, span.end, message)?;
         }
+        Entity.Static(entry) => { return staticUse(c, entry, span); }
         Entity.LibraryItem(_) => { c.notPorted(span.start, span.end, "a library or not-yet-ported item", "S2-S7")?; }
         Entity.Struct(_) => {
             var message = Vector<u8>.create();
@@ -825,6 +838,9 @@ fn synthCall(
                     if (b == 4 || b == 5 || b == 6) {
                         return checkFloatConversion(c, b, name, typeArguments, arguments, calleeSpan, span);
                     }
+                    if (b == 3) {
+                        return checkLayoutOf(c, typeArguments, arguments, span);
+                    }
                     c.notPorted(span.start, span.end, "this built-in function", "S1b")?;
                     return c.errorResult(span.start, span.end);
                 }
@@ -1073,7 +1089,7 @@ fn checkBuiltinMemberCall(
     var memberText = Vector<u8>.create();
     appendBytes(mut memberText, c.name(memberIdent.symbol))?;
     let m = memberText.view();
-    if (owner == builtinProcess() && sameText(m, "capture")) {
+    if (owner == builtinProcess() && sameText(m, "capture") && !c.freestanding) {
         return checkHostService(c, member, arguments, span); // lib/std's HostServices.capture (§26.7, ADR 0028)
     }
     var function = none();

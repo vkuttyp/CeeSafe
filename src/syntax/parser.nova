@@ -710,6 +710,7 @@ struct Parser {
                 fields: emptyRange(),
                 functions: emptyRange(),
                 dropBlock: none(),
+                dropStart: 0,
                 hasDropDoc: false,
                 dropDoc: emptyRange(),
                 isImported: true,
@@ -721,6 +722,7 @@ struct Parser {
         var fields = Vector<u32>.create();
         var functions = Vector<u32>.create();
         var dropBlock = none();
+        var dropStartAt: u32 = 0;
         var dropDoc = noDoc();
         if (!this.at(TokenKind.OpenBrace)) {
             this.expect(TokenKind.OpenBrace)?;
@@ -728,6 +730,7 @@ struct Parser {
                 fields: emptyRange(),
                 functions: emptyRange(),
                 dropBlock: none(),
+                dropStart: 0,
                 hasDropDoc: false,
                 dropDoc: emptyRange(),
                 isImported: false,
@@ -770,6 +773,7 @@ struct Parser {
                     )?;
                 } else {
                     dropBlock = body;
+                    dropStartAt = dropStart;
                     dropDoc = docOr(memberDoc, this.docAt(startPos)?);
                 }
             } else if (this.atFunction()) {
@@ -812,6 +816,7 @@ struct Parser {
             fields: fieldRange,
             functions: functionRange,
             dropBlock: dropBlock,
+            dropStart: dropStartAt,
             hasDropDoc: dropDoc.found,
             dropDoc: dropDoc.text,
             isImported: imported,

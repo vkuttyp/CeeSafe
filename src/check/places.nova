@@ -104,6 +104,13 @@ fn isIndexProjection(p: HirProjection) -> bool => match (p.kind) {
 fn mutabilityError(c: borrow Checker, place: u32, reason: borrow mut Vector<u8>) -> Result<void, AllocError> {
     let p = c.hir.places[place as usize];
     let root = c.hir.locals[p.root as usize];
+    let item = staticOfLocal(c, p.root);
+    if (item != none() && !c.hir.statics[item as usize].mutable) {
+        return appendText(
+            reason,
+            "a static is changed only through its own methods, such as an atomic's or a lock's (type-system.md §39.2)",
+        );
+    }
     var mutable = root.mutable;
     var typ = root.typ;
     var throughShared = false;
@@ -153,6 +160,26 @@ fn mutabilityError(c: borrow Checker, place: u32, reason: borrow mut Vector<u8>)
 fn describePlace(c: borrow Checker, place: u32, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
     let p = c.hir.places[place as usize];
     let root = c.hir.locals[p.root as usize];
+    let item = staticOfLocal(c, p.root);
+    if (item != none()) {
+        // `*S` is the static itself (§39.2).
+        var path = Vector<u8>.create();
+        appendBytes(mut path, c.name(c.hir.statics[item as usize].name))?;
+        var indexed = false;
+        for (k in 0..p.projections.count) {
+            let projection = c.hir.projections[(p.projections.start + k) as usize];
+            if (isFieldProjection(projection)) {
+                path.push('.')?;
+                appendBytes(mut path, c.name(c.types.fields[projection.field as usize].name))?;
+            }
+            if (isIndexProjection(projection)) {
+                indexed = true;
+            }
+        }
+        appendText(out, if (indexed) "an element of static '" else "static '")?;
+        appendBytes(out, path.view())?;
+        return appendText(out, "'");
+    }
     var text = Vector<u8>.create();
     appendBytes(mut text, c.name(root.name))?;
     var hasField = false;
@@ -263,6 +290,33 @@ fn isPathThroughReference(c: borrow Checker, e: u32, mutable: bool) -> Result<bo
 
 /// BorrowPlace: `borrow p` or `borrow mut p` of the place a checked expression denotes (N0247, N0248).
 fn borrowPlace(c: borrow mut Checker, value: u32, mutable: bool, span: Span) -> Result<u32, AllocError> {
+    match (c.hir.exprs[value as usize]) {
+        HirExpr.FieldAccess(target, field) => {
+            let targetType = c.typeOf(target);
+            let holder = if (c.types.is(
+                targetType,
+                TypeKind.Reference,
+            )) c.types.info(targetType).pointee else targetType;
+            let definition = c.types.info(holder).structDef;
+            let fieldType = c.types.fields[field as usize].typ;
+            if (definition != none() && c.types.structs[definition as usize].isImported &&
+                (c.types.is(
+                    fieldType,
+                    TypeKind.RawPointer,
+                ) || fieldType == c.types.usize || fieldType == c.types.isize)) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "a ")?;
+                appendQuotedType(mut message, c, fieldType)?;
+                appendText(
+                    mut message,
+                    " field of an imported C type can be read and assigned, but not borrowed: its C type ('const', 'size_t') may differ from Nova's (type-system.md §31.2)",
+                )?;
+                c.error(importedTypeByValue(), span.start, span.end, message)?;
+                return c.errorResult(span.start, span.end);
+            }
+        }
+        _ => {}
+    }
     let place = toPlace(c, value)?;
     if (place == none() && isPathThroughReference(c, value, mutable)?) {
         let t = c.types.referenceTo(c.typeOf(value), mutable)?;

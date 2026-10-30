@@ -313,7 +313,8 @@ fn resolveStructMembers(c: borrow mut Checker, index: u32) -> Result<void, Alloc
     }
     if (s.dropBlock != none()) {
         // The drop block is checked as a `borrow mut this` method that user code cannot call.
-        let dropSpan = c.front.ast.stmtSpans[s.dropBlock as usize];
+        let blockSpan = c.front.ast.stmtSpans[s.dropBlock as usize];
+        let dropSpan = Span { start: s.dropStart, end: blockSpan.end }; // the DropBlock's span
         let dropSymbol = c.intern("drop")?;
         let dropIdent = c.front.ast.addIdent(
             Ident { symbol: dropSymbol, start: dropSpan.start, end: dropSpan.end, missing: false },

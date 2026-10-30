@@ -384,7 +384,7 @@ fn checkCommand() -> i32 {
         texts.push(copyBytes(sources[i].text.view())!)!;
         paths.push(copyBytes(sources[i].path.view())!)!;
     }
-    var checker = checkProgram(front, fileIsLibrary, texts, paths, options.noFloat)!;
+    var checker = checkProgram(front, fileIsLibrary, texts, paths, options.noFloat, options.freestanding)!;
     if (!options.libraryDiagnostics) {
         // The reference's libraries check cleanly: what is reported in them here is a porting gap (docs/p3-plan.md S5).
         checker.front.diagnostics.removeFiles(checker.fileIsLibrary.view());

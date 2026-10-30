@@ -409,6 +409,7 @@ fn checkClosureWith(
         }
         c.hir.functions[function as usize].returnType = c.types.voidType;
     }
+    declareStaticLocals(c, function)?;
     analyzeFlow(c, function)?;
     let returnType = c.hir.functions[function as usize].returnType;
     // An expected effect list bounds the body, as `@effects` bounds a function's (§36.3).

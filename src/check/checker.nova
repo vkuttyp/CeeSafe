@@ -19,6 +19,7 @@ enum Entity {
     Builtin(u32),         // Console, Process, ... (the reference's Builtin enum, by declaration index)
     GenericFunction(u32), // Checker.genericFunctions
     Interface(u32),       // Checker.interfaces
+    Static(u32),          // Checker.statics
 }
 
 /// The reference's Builtin enum members S1 uses, by declaration index.
@@ -120,6 +121,10 @@ struct Checker {
     coreAllowImported: bool;                         // resolveTypeWith's allowImported, for resolveTypeCore
     layoutUses: Vector<LayoutUse>;                   // struct types used by value before members are known
     headers: Vector<Vector<u8>>;                     // `@header`s of extern blocks, each once, in order (§31.3)
+    statics: Vector<StaticEntry>;
+    staticLocals: Vector<StaticLocal>; // each function's static-address locals (§39.2)
+    freestanding: bool;                // --profile freestanding (cosmoos/profiles.md §4)
+    profileReports: Vector<LayoutUse>; // the places N0293 was reported, once each
 
     fn letKeywordOf(borrow this, local: u32) -> u32 {
         for (k in this.letKeywords.view()) {
@@ -315,6 +320,13 @@ struct Checker {
                 let file = this.file;
                 this.layoutUses.push(LayoutUse { typ: resolved, start: span.start, end: span.end, file: file })?;
             }
+        }
+        if (this.freestanding && isHostedOnlyType(this, resolved)) {
+            let span = this.front.ast.typeSpans[typ as usize];
+            var what = Vector<u8>.create();
+            appendQuotedType(mut what, this, resolved)?;
+            hostedOnly(this, span, what.view())?;
+            return Ok(this.types.error);
         }
         if (this.noFloat && this.types.is(resolved, TypeKind.Float)) {
             let span = this.front.ast.typeSpans[typ as usize];

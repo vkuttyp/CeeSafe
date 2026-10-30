@@ -303,6 +303,7 @@ struct Struct {
     fields: Range;    // fields
     functions: Range; // functions
     dropBlock: u32;   // a block statement, or none
+    dropStart: u32;   // where the `drop` keyword starts (the DropBlock's span)
     hasDropDoc: bool;
     dropDoc: Range;
     isImported: bool;

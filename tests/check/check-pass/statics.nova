@@ -1,0 +1,30 @@
+struct Pair {
+    a: u32;
+    b: u32;
+}
+
+static LIMIT: u32 = 10 * 4;
+static GREETING: StringView = "hello";
+static ORIGIN: Pair = Pair { a: double(2), b: 0 };
+static TABLE: [u8; 4] = [1, 2, 3, 4];
+static mut SCRATCH: u64 = 0;
+
+@constant
+fn double(x: u32) -> u32 => x * 2;
+
+/// Safety: SCRATCH is only touched from this thread.
+fn bump() -> u64 {
+    unsafe {
+        SCRATCH += 1;
+        return SCRATCH;
+    }
+}
+
+fn main() {
+    let size = layoutOf<Pair>();
+    let wide = layoutOf<[u64; 3]>();
+    let read = () => LIMIT + ORIGIN.a;
+    Console.writeLine(GREETING);
+    Console.writeLine(LIMIT + ORIGIN.a + (TABLE[1] as u32) + read());
+    Console.writeLine(size.size + size.align + wide.size + (bump() as usize));
+}

@@ -73,6 +73,7 @@ fn checkFunctionBody(c: borrow mut Checker, function: u32) -> Result<void, Alloc
         c.error(missingSafetyComment(), id.start, id.end, message)?;
     }
     c.unsafeDepth = 0;
+    declareStaticLocals(c, function)?;
     analyzeFlow(c, function)?;
     c.function = none();
     c.regions = Vector<u32>.create();
@@ -337,6 +338,7 @@ fn resolveAssignmentTarget(c: borrow mut Checker, target: u32) -> Result<u32, Al
             let symbol = c.front.ast.idents[name as usize].symbol;
             match (c.lookup(symbol)?) {
                 Entity.Local(_) => {}
+                Entity.Static(_) => {} // a place behind its address (§39.2), checked below
                 Entity.None => {
                     var message = Vector<u8>.create();
                     appendText(mut message, "cannot find ")?;

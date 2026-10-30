@@ -104,6 +104,13 @@ fn synthStructLiteral(
         return c.errorResult(span.start, span.end);
     }
     let declared = c.types.info(c.structs[index as usize].typ).structDef;
+    let declaredType = c.structs[index as usize].typ;
+    if (!c.types.structs[declared as usize].isImported && c.freestanding && isAllocatorType(c, declaredType)) {
+        var what = Vector<u8>.create();
+        appendQuotedName(mut what, c, nameIdent.symbol)?;
+        hostedOnly(c, nameSpan, what.view())?;
+        return c.errorResult(span.start, span.end);
+    }
     if (c.types.structs[declared as usize].isImported) {
         var message = Vector<u8>.create();
         appendQuotedName(mut message, c, nameIdent.symbol)?;

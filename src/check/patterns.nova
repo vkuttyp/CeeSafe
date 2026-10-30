@@ -50,6 +50,14 @@ fn checkEnumValue(
     span: Span,
     expected: u32,
 ) -> Result<u32, AllocError> {
+    if (c.freestanding && c.enums[template as usize].typ == c.ioErrorType) {
+        hostedOnly(c, targetSpan, "'IoError'".bytes())?;
+        for (k in 0..arguments.count) {
+            let argument = c.front.ast.at(arguments, k);
+            synth(c, argument, none())?;
+        }
+        return c.errorResult(span.start, span.end);
+    }
     var index = template;
     let entryItem = c.enums[template as usize].item;
     if (isGenericItem(c, entryItem)) {
