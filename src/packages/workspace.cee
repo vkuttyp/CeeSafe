@@ -77,8 +77,8 @@ fn defaultHome() -> Result<Vector<u8>, AllocError> {
     return joinPath(user, ".ceesafe".bytes());
 }
 
-/// The default index, or `$CEESAFE_INDEX` (PackageIndex.DefaultUrl). The default is still Nova's index until the
-/// fork point names CeeSafe's (docs/p8-plan.md).
+/// The default index, or `$CEESAFE_INDEX` (PackageIndex.DefaultUrl): CeeSafe's own, since a Nova index lists Nova
+/// packages, which ceesafec does not read (Decision 0003).
 fn defaultIndexUrl() -> Result<Vector<u8>, AllocError> {
     match (Environment.variable("CEESAFE_INDEX")) {
         Some(index) => {
@@ -88,7 +88,7 @@ fn defaultIndexUrl() -> Result<Vector<u8>, AllocError> {
         }
         null => {}
     }
-    return copyBytes("https://github.com/vkuttyp/nova-index".bytes());
+    return copyBytes("https://github.com/vkuttyp/CeeSafe-index".bytes());
 }
 
 /// `to` relative to the directory `from`, both absolute and normalised (Path.GetRelativePath), with `/`.

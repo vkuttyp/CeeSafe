@@ -1,7 +1,8 @@
 """The rename contract's mapping back (ROADMAP §3.4): what ceesafec prints under CeeSafe's names, with Nova's names
 put back, so it can be compared with novac's output byte for byte. The pairs are applied in order, longest first."""
 
-MAP_BACK = ((b"ceesafe.toml", b"nova.toml"), (b"ceesafe.lock", b"nova.lock"), (b"CEESAFE_HOME", b"NOVA_HOME"),
+MAP_BACK = ((b"https://github.com/vkuttyp/CeeSafe-index", b"https://github.com/vkuttyp/nova-index"),
+            (b"ceesafe.toml", b"nova.toml"), (b"ceesafe.lock", b"nova.lock"), (b"CEESAFE_HOME", b"NOVA_HOME"),
             (b"CEESAFE_INDEX", b"NOVA_INDEX"), (b"<!--CEESAFE START-->", b"<!--NOVA START-->"),
             (b"<!--CEESAFE END-->", b"<!--NOVA END-->"), (b"the CeeSafe section", b"the Nova section"),
             (b"`ceesafe` MCP server", b"`nova` MCP server"), (b"'ceesafe' (ceesafec mcp)", b"'nova' (novac mcp)"),

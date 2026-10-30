@@ -54,8 +54,8 @@ The rename contract (ROADMAP §3.4) applied to the package commands: `ceesafe.to
 `$CEESAFE_HOME` (default `~/.ceesafe`), `$CEESAFE_INDEX`; the agent section between `<!--CEESAFE START-->` and
 `<!--CEESAFE END-->`, `.cursor/rules/ceesafe.mdc`, and the MCP server `ceesafe` (`ceesafec mcp`) with tools
 `ceesafe_*` in the agent template and configurations. Prose keeps "Nova" until the fork point (S7), and the default
-index stays Nova's (`github.com/vkuttyp/nova-index`) until the owner names CeeSafe's: a Nova index's packages are Nova
-packages, which ceesafec does not read (Decision 0003), so in practice `$CEESAFE_INDEX` names a CeeSafe index.
+index is CeeSafe's own, `github.com/vkuttyp/CeeSafe-index` (owner, 2026-10-31): a Nova index's packages are Nova
+packages, which ceesafec does not read (Decision 0003).
 
 ## Upstream gaps (lib/std at v0.6.0)
 
