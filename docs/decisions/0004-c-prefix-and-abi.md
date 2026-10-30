@@ -1,6 +1,6 @@
 # Decision 0004 — The C prefix and ABI version
 
-- Status: **Proposed** (2026-10-30, at P7 S4). Needs the owner's approval; nothing is changed until then.
+- Status: **Accepted** by the owner, 2026-10-30 ("Go with option 2, switch the prefix at P8"). Proposed at P7 S4.
 - Relates to: ROADMAP §P7's third item ("Switch to the approved CeeSafe C prefix and ABI version, keeping a versioned
   legacy mode with link-collision tests"), Decision 0003 (Nova and CeeSafe in parallel; CeeSafe tracks Nova until P8).
 
@@ -54,7 +54,7 @@ cee-utils library (of the Concord Discord client); that overlap is judged accept
 The link-collision test (ROADMAP P7) moves to P8 with the switch: one program linking a novac-built and a
 ceesafec-built library, which must link and run.
 
-## If approved
+## Consequences
 
-P7 closes without its third item, which moves to P8's list. ROADMAP §P7 and §P8 and the rename table are updated
-accordingly.
+P7 closes without its third item, which moves to P8's list with the link-collision test. ROADMAP §P7 and §P8 and the
+rename table say so. The names in the table above are the proposal's; the owner may still change the spelling at P8.

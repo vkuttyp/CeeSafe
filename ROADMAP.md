@@ -1,6 +1,6 @@
 # CeeSafe roadmap: port the Nova compiler to Nova, as CeeSafe
 
-Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P6R complete (CeeSafe names since `8941c10`, 2026-10-30; stage 0 novac 0.6.0 via the `3d6ac40` anchor); next: P7**.
+Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P7 complete (CeeSafe names since `8941c10`; P7 production C 2026-10-30; stage 0 novac 0.6.0 via the `3d6ac40` anchor); next: P8**.
 The probes, `src/support/`, the limits, the fault sweep and the skeleton exist (`docs/p1-probes.md`). No compiler code has been ported.
 Repository: `~/dev/CeeSafe`. Reference: `vkuttyp/Nova` (C#/.NET 10), pinned in `bootstrap/reference.md`.
 
@@ -197,8 +197,8 @@ Subdirectories under `src/` are only for organisation, since every `.nova` file 
 | Source extension | `.nova` (`Packages/Manifest.cs:271`, `Program.cs:697`) | `.cee` | P6R |
 | Manifest and lock | `nova.toml`, `nova.lock` (`Manifest.cs:32`, `Workspace.cs:28`) | `ceesafe.toml`, `ceesafe.lock` | P6R; conversion in P8 |
 | Home | `$NOVA_HOME`, `~/.nova` (`Workspace.cs:111`) | `$CEESAFE_HOME`, `~/.ceesafe` | P8 |
-| Generated C | `nv_`, `nvMk_`, `NOVA_PROGRAM_*_H`, `nova_exports.h` | versioned prefix (open) | P7, after parity |
-| Runtime | `nova_*` (~374), `nv*` (~424), `NOVA_*` (10), `runtime/include/nova/rt.h` | versioned prefix (open) | P7 |
+| Generated C | `nv_`, `nvMk_`, `NOVA_PROGRAM_*_H`, `nova_exports.h` | `cee_`, `cee<X>_`, `ceesafe_exports.h` (Decision 0004) | P8, at the fork point |
+| Runtime | `nova_*` (~374), `nv*` (~424), `NOVA_*` (10), `runtime/include/nova/rt.h` | `ceesafe_*`, `CEE_*`, `ceesafe/rt.h`, ABI version (Decision 0004) | P8, at the fork point |
 | Diagnostics | 126 `N####` codes (`Diagnostics/Diagnostic.cs:14`), used by 159 corpus files | letter open, with a mapping | P6R |
 | MCP/LSP | server `novac`, tools `nova_*` | `ceesafec`, `ceesafe_*` | P8 |
 | Agent files | `<!--NOVA START/END-->`, `nova.mdc` | CeeSafe markers | P8 |
@@ -491,13 +491,14 @@ and a legacy package ignores `.cee` files. `tools/contract_tests.py` passes on b
 
 Dependencies: P6R. Ownership and drop schedules do not change.
 
-- [ ] Port placement and escape analysis, `Box.create` built in place, bounds and overflow check elimination, closure
-  specialisation, and every `--explain-*` report.
-- [ ] Port `CStructurer` (structured C), `--flat-c`, `--split` and `--program`, with deterministic unit names.
-- [ ] Switch to the approved CeeSafe C prefix and ABI version, keeping a versioned legacy mode with link-collision tests.
-- [ ] Run each switch on and off (`--no-placement`, `--no-bce`, `--no-oce`, `--no-closure-specialisation`) against the
+- [x] Port placement and escape analysis, `Box.create` built in place, bounds and overflow check elimination, closure
+  specialisation, and every `--explain-*` report (S0–S2).
+- [x] Port `CStructurer` (structured C), `--flat-c`, `--split` and `--program`, with deterministic unit names (S3).
+- [x] ~~Switch to the approved CeeSafe C prefix and ABI version~~: moved to P8 by Decision 0004 (accepted 2026-10-30),
+  so the C stays byte-identical to novac's while CeeSafe tracks Nova.
+- [x] Run each switch on and off (`--no-placement`, `--no-bce`, `--no-oce`, `--no-closure-specialisation`) against the
   optimisation snapshots.
-- [ ] Rerun the fixed point with production defaults and `--split`.
+- [x] Rerun the fixed point with production defaults and `--split` (S4).
 
 Gate: optimisation tests pass, the on and off runs agree, and production builds reach the fixed point. Any performance
 claim needs a benchmark under `benchmarks/`, run on the Ryzen host.
@@ -525,6 +526,9 @@ Dependencies: P7. Parser-only tools may start after P2, and semantic tools after
 - [ ] The normal self-build uses package mode, and P6 is rerun through it.
 
 - [ ] Decide whether the command line accepts only `.cee` files (Decision 0003 §2).
+- [ ] With the fork point, switch to the CeeSafe C prefix and ABI version (Decision 0004: `cee_`/`ceesafe_*`,
+  `ceesafe/rt.h`, `CEESAFE_ABI_VERSION`), with a link-collision test: one program linking a novac-built and a
+  ceesafec-built library.
 - [ ] The fork point (Decision 0003 §3): the owner decides when CeeSafe stops tracking Nova; CeeSafe's own
   specifications and corpus start there, and the novac comparisons become regression tests against its output.
 
@@ -630,8 +634,10 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
 2. P2–P5 are done (`docs/p2-frontend.md`, `docs/p3-plan.md`, `docs/p4-plan.md`, `docs/p5-plan.md`), pinned to
    novac 0.6.0; the C matrix is complete (P5). P6, the first verified fixed point, holds on macOS and Linux
    (`docs/p6-fixed-point.md`). P6R is done (Decision 0002): CeeSafe's sources are `.cee` with `ceesafe.toml`,
-   legacy `.nova` packages still build, codes keep N, and `tools/bootstrap.sh` builds from novac. Next: P7,
-   optimisations and production C (the structured form, placement, check elimination, closure specialisation).
+   legacy `.nova` packages still build, codes keep N, and `tools/bootstrap.sh` builds from novac. P7 is done
+   (`docs/p7-plan.md`): ceesafec emits novac's production C (structured, placement, check elimination, closure
+   specialisation) byte for byte, and reaches the fixed point in that form. Next: P8, the CLI, packages and tools;
+   the C prefix switch waits for P8's fork point (Decision 0004).
 4. Upstream (Nova #6, filed 2026-10-30): novac 0.6.0's `offsetOf<T>(field)` is 0 unless `T`'s layout was computed before (CheckOffsetOf reads
    `member.Offset` without `TypeTable.LayoutOf(measured)`); ceesafec gives the true offset.
 5. Owner's call: propose upstream that N0110 count `else if` links and `?` suffixes. novac's `--dump-ast` aborts on a
@@ -663,6 +669,7 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 | 2026-10-30 | P5: the flat C backend (`src/backend/`), the runtime embedded (`tools/gen_runtime.py`), the toolchain and `build --emit c|exe|obj` with `-g`, `--split`, `--cc`, `--cflag`, `--ld` (`src/host/toolchain.nova`, `src/host/build.nova`); `tools/compare_c.py`, `tools/fault_injection.py`, `tools/collection_properties.py`, `tools/freestanding_check.py`; P3 gaps fixed (built-in items' `Used` marks, HirProgram's Structs and DynSignatures, InHostedLibrary), one NIR span fixed (an exhaustive match's Unreachable) | P5 gate passed: C identical for 284/284 programs in four forms (flat, split, `-g`, both) and for CeeSafe itself; run-pass 159/159, run-fail 40/40, ffi 8/8 under Apple clang 21, clang 18 and GCC 12 (`-O2`, `-O0`, overflow fallback, ASan+UBSan with leak checks, split, `-g`, `-Werror`) but one GCC report that novac's C shares; TSan 3/3; fault sweep 789 points on macOS and Linux, equal to novac's runs; collection properties 30/30 with 156 swept points; freestanding host and both triples clean; emit-c differences reviewed (P7's form); ceesafec built from its own C by GCC emits the same C on Linux |
 | 2026-10-30 | P6: `tools/fixed_point.py`, `tools/contract_tests.py`, `bootstrap/fixed-point/` | fixed point on macOS and Linux: C2 = C3 = C4, gen 2 = gen 3 bit for bit, in two directories, the same C on both hosts, only `cc` (and GCC's `as`, `ld`) started from gen 1 on; all contract tests pass on gen 2 but the recorded divergences |
 | 2026-10-30 | P6R: Decision 0002 (legacy `nova.toml`/`.nova` kept; codes keep N), `ceesafe.toml`/`.cee`/`ceesafe.lock` packages (`3d6ac40`), CeeSafe's own sources renamed (`8941c10`), `tools/bootstrap.sh`, `compare_packages.py --renamed` | gate passed: fixed point on CeeSafe names from a bootstrapped ceesafec on macOS and Linux, same C on both, only `src/` file names differ from the anchor's C; package fixtures legacy, renamed and mixed 7/7 each; contract tests pass on both hosts |
+| 2026-10-30 | P7: closure specialisation (`src/nir/closure_specialisation.cee`), placement (`src/nir/control_flow.cee`, `src/backend/placement.cee`), check elimination (`src/backend/check_elimination.cee`), structured C (`src/backend/c_structurer.cee`), all default on with their switches and `--explain-*` reports; `tools/compare_reports.py`, `tools/compare_self.py`, the contract suite and fixed point in the default form; Decision 0004 (C prefix at P8) | P7 gate passed: C identical to novac's default form over 308 programs (flat, `--split`, `-g`, both) and for CeeSafe itself; the four reports identical; emit-c 24/24; run corpus under Apple clang 21, clang 18 and GCC 12 (the recorded GCC report aside) and ASan+UBSan; fault sweep 783 points and collections 30/30 on both hosts; fixed point with production defaults and `--split` on macOS and Linux, the same C on both |
 
 **Tests run for the skeleton** (2026-10-30, novac 0.3.1, Apple clang 21.0.0):
 - `novac check` and `novac fmt --check`: clean.
@@ -720,4 +727,10 @@ hosts; only the C compiler runs from gen 1 on; `tools/contract_tests.py` passes 
 fixed point on CeeSafe names with a bootstrapped ceesafec as stage 0 on macOS and Linux, the same C on both; legacy,
 renamed and mixed package fixtures pass; contract tests pass on both hosts.
 
-Not yet run: P7 or later.
+**P7 production C** (2026-10-30; `docs/p7-plan.md`): closure specialisation, placement, check elimination and the
+structured form, on by default; C identical to novac 0.6.0's default form over 308 programs in four shapes and for
+CeeSafe itself, the four reports identical; the contract suite in the default form on macOS and Linux; the fixed
+point in the default form and with `--split` on both hosts, the same C on both. Decision 0004: the C prefix switches
+at P8.
+
+Not yet run: P8 or later.
