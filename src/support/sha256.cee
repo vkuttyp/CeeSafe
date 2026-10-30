@@ -1,0 +1,180 @@
+// SHA-256 (FIPS 180-4), for package hashes and the git cache's keys (the reference's IncrementalHash and SHA256).
+
+fn sha256Constant(k: usize) -> u32 => match (k) {
+    0 => 0x428a2f98,
+    1 => 0x71374491,
+    2 => 0xb5c0fbcf,
+    3 => 0xe9b5dba5,
+    4 => 0x3956c25b,
+    5 => 0x59f111f1,
+    6 => 0x923f82a4,
+    7 => 0xab1c5ed5,
+    8 => 0xd807aa98,
+    9 => 0x12835b01,
+    10 => 0x243185be,
+    11 => 0x550c7dc3,
+    12 => 0x72be5d74,
+    13 => 0x80deb1fe,
+    14 => 0x9bdc06a7,
+    15 => 0xc19bf174,
+    16 => 0xe49b69c1,
+    17 => 0xefbe4786,
+    18 => 0x0fc19dc6,
+    19 => 0x240ca1cc,
+    20 => 0x2de92c6f,
+    21 => 0x4a7484aa,
+    22 => 0x5cb0a9dc,
+    23 => 0x76f988da,
+    24 => 0x983e5152,
+    25 => 0xa831c66d,
+    26 => 0xb00327c8,
+    27 => 0xbf597fc7,
+    28 => 0xc6e00bf3,
+    29 => 0xd5a79147,
+    30 => 0x06ca6351,
+    31 => 0x14292967,
+    32 => 0x27b70a85,
+    33 => 0x2e1b2138,
+    34 => 0x4d2c6dfc,
+    35 => 0x53380d13,
+    36 => 0x650a7354,
+    37 => 0x766a0abb,
+    38 => 0x81c2c92e,
+    39 => 0x92722c85,
+    40 => 0xa2bfe8a1,
+    41 => 0xa81a664b,
+    42 => 0xc24b8b70,
+    43 => 0xc76c51a3,
+    44 => 0xd192e819,
+    45 => 0xd6990624,
+    46 => 0xf40e3585,
+    47 => 0x106aa070,
+    48 => 0x19a4c116,
+    49 => 0x1e376c08,
+    50 => 0x2748774c,
+    51 => 0x34b0bcb5,
+    52 => 0x391c0cb3,
+    53 => 0x4ed8aa4a,
+    54 => 0x5b9cca4f,
+    55 => 0x682e6ff3,
+    56 => 0x748f82ee,
+    57 => 0x78a5636f,
+    58 => 0x84c87814,
+    59 => 0x8cc70208,
+    60 => 0x90befffa,
+    61 => 0xa4506ceb,
+    62 => 0xbef9a3f7,
+    _ => 0xc67178f2,
+};
+
+fn rotateRight(x: u32, n: u32) -> u32 => (x >> n) | (x << (32 - n));
+
+/// An incremental SHA-256: `append` bytes, then `finish` for the 32-byte digest.
+struct Sha256 {
+    state: [u32; 8];
+    block: [u8; 64];
+    used: usize;
+    length: u64; // bytes appended
+
+    fn create() -> Sha256 => Sha256 {
+        state: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19],
+        block: [0u8; 64],
+        used: 0,
+        length: 0,
+    };
+
+    fn compress(borrow mut this) {
+        var w = [0u32; 64];
+        let words: usize = 16;
+        let rounds: usize = 64;
+        for (t in 0..words) {
+            w[t] = ((this.block[t * 4] as u32) << 24) | ((this.block[t * 4 + 1] as u32) << 16) |
+                ((this.block[t * 4 + 2] as u32) << 8) | (this.block[t * 4 + 3] as u32);
+        }
+        for (t in words..rounds) {
+            let s0 = rotateRight(w[t - 15], 7) ^ rotateRight(w[t - 15], 18) ^ (w[t - 15] >> 3);
+            let s1 = rotateRight(w[t - 2], 17) ^ rotateRight(w[t - 2], 19) ^ (w[t - 2] >> 10);
+            w[t] = w[t - 16].wrappingAdd(s0).wrappingAdd(w[t - 7]).wrappingAdd(s1);
+        }
+        var a = this.state[0];
+        var b = this.state[1];
+        var c = this.state[2];
+        var d = this.state[3];
+        var e = this.state[4];
+        var f = this.state[5];
+        var g = this.state[6];
+        var h = this.state[7];
+        for (t in 0..rounds) {
+            let s1 = rotateRight(e, 6) ^ rotateRight(e, 11) ^ rotateRight(e, 25);
+            let choice = (e & f) ^ ((e ^ 0xFFFFFFFF) & g);
+            let t1 = h.wrappingAdd(s1).wrappingAdd(choice).wrappingAdd(sha256Constant(t)).wrappingAdd(w[t]);
+            let s0 = rotateRight(a, 2) ^ rotateRight(a, 13) ^ rotateRight(a, 22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrappingAdd(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrappingAdd(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrappingAdd(t2);
+        }
+        this.state[0] = this.state[0].wrappingAdd(a);
+        this.state[1] = this.state[1].wrappingAdd(b);
+        this.state[2] = this.state[2].wrappingAdd(c);
+        this.state[3] = this.state[3].wrappingAdd(d);
+        this.state[4] = this.state[4].wrappingAdd(e);
+        this.state[5] = this.state[5].wrappingAdd(f);
+        this.state[6] = this.state[6].wrappingAdd(g);
+        this.state[7] = this.state[7].wrappingAdd(h);
+    }
+
+    fn append(borrow mut this, bytes: Slice<u8>) {
+        for (b in bytes) {
+            this.block[this.used] = b;
+            this.used += 1;
+            if (this.used == 64) {
+                this.compress();
+                this.used = 0;
+            }
+        }
+        this.length += bytes.length as u64;
+    }
+
+    fn finish(borrow mut this) -> [u8; 32] {
+        let bits = this.length * 8;
+        let pad = [0x80u8];
+        this.append(pad[..]);
+        let zero = [0u8];
+        while (this.used != 56) {
+            this.append(zero[..]);
+        }
+        var tail = [0u8; 8];
+        let bytes: usize = 8;
+        for (k in 0..bytes) {
+            tail[k] = truncate<u8>(bits >> (((7 - k) * 8) as u64));
+        }
+        this.append(tail[..]);
+        var digest = [0u8; 32];
+        let words: usize = 8;
+        for (k in 0..words) {
+            digest[k * 4] = truncate<u8>(this.state[k] >> 24);
+            digest[k * 4 + 1] = truncate<u8>(this.state[k] >> 16);
+            digest[k * 4 + 2] = truncate<u8>(this.state[k] >> 8);
+            digest[k * 4 + 3] = truncate<u8>(this.state[k]);
+        }
+        return digest;
+    }
+}
+
+/// The digest as lower-case hexadecimal (Convert.ToHexStringLower).
+fn appendHexDigest(out: borrow mut Vector<u8>, digest: [u8; 32]) -> Result<void, AllocError> {
+    for (b in digest) {
+        let high = b >> 4;
+        let low = b & 15;
+        out.push(if (high < 10) '0' + high else 'a' + (high - 10))?;
+        out.push(if (low < 10) '0' + low else 'a' + (low - 10))?;
+    }
+    return Ok();
+}

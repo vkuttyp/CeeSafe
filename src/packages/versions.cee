@@ -1,0 +1,200 @@
+// Package versions and version requirements (the reference's Packages/Versions.cs; tooling.md §4.6).
+
+/// MAJOR.MINOR.PATCH: no pre-release or build suffix in v1.
+struct PackageVersion {
+    major: i64;
+    minor: i64;
+    patch: i64;
+
+    fn compare(this, other: PackageVersion) -> i32 {
+        if (this.major != other.major) {
+            return if (this.major < other.major) -1 else 1;
+        }
+        if (this.minor != other.minor) {
+            return if (this.minor < other.minor) -1 else 1;
+        }
+        if (this.patch != other.patch) {
+            return if (this.patch < other.patch) -1 else 1;
+        }
+        return 0;
+    }
+
+    fn appendTo(this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        appendSigned(out, this.major)?;
+        out.push('.')?;
+        appendSigned(out, this.minor)?;
+        out.push('.')?;
+        appendSigned(out, this.patch)?;
+        return Ok();
+    }
+}
+
+fn appendSigned(out: borrow mut Vector<u8>, value: i64) -> Result<void, AllocError> {
+    if (value < 0) {
+        out.push('-')?;
+        return appendDecimal(out, truncate<u64>(0 - value));
+    }
+    return appendDecimal(out, truncate<u64>(value));
+}
+
+/// A decimal number with no sign and no leading zero, at most 15 digits; null otherwise.
+fn versionNumber(text: Slice<u8>) -> i64? {
+    if (text.length == 0 || text.length > 15 || (text.length > 1 && text[0] == '0')) {
+        return null;
+    }
+    var value: i64 = 0;
+    for (c in text) {
+        if (c < '0' || c > '9') {
+            return null;
+        }
+        value = value * 10 + ((c - '0') as i64);
+    }
+    return value;
+}
+
+/// The parts of `text` split at `separator`.
+fn splitAt(text: Slice<u8>, separator: u8, out: borrow mut Vector<Vector<u8>>) -> Result<void, AllocError> {
+    var start: usize = 0;
+    for (k in 0..text.length + 1) {
+        if (k == text.length || text[k] == separator) {
+            out.push(copyBytes(text[start..k])?)?;
+            start = k + 1;
+        }
+    }
+    return Ok();
+}
+
+fn parseVersion(text: Slice<u8>) -> Result<PackageVersion?, AllocError> {
+    var parts = Vector<Vector<u8>>.create();
+    splitAt(text, '.', mut parts)?;
+    if (parts.length != 3) {
+        return Ok(null);
+    }
+    let major = versionNumber(parts[0].view());
+    let minor = versionNumber(parts[1].view());
+    let patch = versionNumber(parts[2].view());
+    if (major == null || minor == null || patch == null) {
+        return Ok(null);
+    }
+    return Ok(PackageVersion { major: major!, minor: minor!, patch: patch! });
+}
+
+/// One comparison of a requirement: 0 =, 1 >, 2 >=, 3 <, 4 <=.
+struct VersionBound {
+    op: u32;
+    version: PackageVersion;
+}
+
+/// A version requirement: comparators separated by commas, all of which must hold. "1.4" and "^1.4" are caret
+/// requirements; =, >=, >, <, <= compare; * is any.
+struct VersionRequirement {
+    text: Vector<u8>; // as written, trimmed
+    bounds: Vector<VersionBound>;
+
+    fn isSatisfiedBy(borrow this, version: PackageVersion) -> bool {
+        for (b in this.bounds.view()) {
+            let c = version.compare(b.version);
+            let holds = match (b.op) {
+                0 => c == 0,
+                1 => c > 0,
+                2 => c >= 0,
+                3 => c < 0,
+                _ => c <= 0,
+            };
+            if (!holds) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// As written, with a caret shown: "1.4" is ^1.4 (VersionRequirement.ToString).
+    fn appendTo(borrow this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        var comma = false;
+        for (b in this.text.view()) {
+            comma = comma || b == ',';
+        }
+        if (this.text.length > 0 && this.text[0] >= '0' && this.text[0] <= '9' && !comma) {
+            out.push('^')?;
+        }
+        return appendBytes(out, this.text.view());
+    }
+}
+
+fn trimAscii(text: Slice<u8>) -> Slice<u8> {
+    let start = trimStartLength(text);
+    let rest = text[start..];
+    return rest[0..trimEndLength(rest)];
+}
+
+/// The requirement; null if `text` is not one.
+fn parseRequirement(text: Slice<u8>) -> Result<VersionRequirement?, AllocError> {
+    var bounds = Vector<VersionBound>.create();
+    var raws = Vector<Vector<u8>>.create();
+    splitAt(text, ',', mut raws)?;
+    for (raw in raws.view()) {
+        let part = trimAscii(raw.view());
+        if (sameText(part, "*")) {
+            continue;
+        }
+        var op: u32 = 5; // a caret
+        var skip: usize = 0;
+        if (startsWithText(part, ">=")) {
+            op = 2;
+            skip = 2;
+        } else if (startsWithText(part, "<=")) {
+            op = 4;
+            skip = 2;
+        } else if (startsWithText(part, ">")) {
+            op = 1;
+            skip = 1;
+        } else if (startsWithText(part, "<")) {
+            op = 3;
+            skip = 1;
+        } else if (startsWithText(part, "=")) {
+            op = 0;
+            skip = 1;
+        } else if (startsWithText(part, "^")) {
+            skip = 1;
+        }
+        let rest = part[skip..];
+        var numbers = Vector<Vector<u8>>.create();
+        splitAt(trimAscii(rest), '.', mut numbers)?;
+        if (numbers.length < 1 || numbers.length > 3) {
+            return Ok(null);
+        }
+        var values = Vector<i64>.create();
+        for (n in numbers.view()) {
+            match (versionNumber(n.view())) {
+                Some(v) => { values.push(v)?; }
+                null => { return Ok(null); }
+            }
+        }
+        let version = PackageVersion {
+            major: values[0],
+            minor: if (values.length > 1) values[1] else 0,
+            patch: if (values.length > 2) values[2] else 0,
+        };
+        if (op != 5) {
+            if (op == 0 && values.length != 3) {
+                return Ok(null); // `=` names one version
+            }
+            bounds.push(VersionBound { op: op, version: version })?;
+            continue;
+        }
+        // Caret: from the version to the next change of its first nonzero part, among those written.
+        bounds.push(VersionBound { op: 2, version: version })?;
+        var upper = PackageVersion { major: 0, minor: 0, patch: version.patch + 1 };
+        if (version.major > 0 || values.length == 1) {
+            upper = PackageVersion { major: version.major + 1, minor: 0, patch: 0 };
+        } else if (version.minor > 0 || values.length == 2) {
+            upper = PackageVersion { major: 0, minor: version.minor + 1, patch: 0 };
+        }
+        bounds.push(VersionBound { op: 3, version: upper })?;
+    }
+    let trimmed = trimAscii(text);
+    if (trimmed.length == 0) {
+        return Ok(null);
+    }
+    return Ok(VersionRequirement { text: copyBytes(trimmed)?, bounds: bounds });
+}

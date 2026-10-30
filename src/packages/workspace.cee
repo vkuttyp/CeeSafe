@@ -1,0 +1,567 @@
+// A package and every package it depends on, resolved (the reference's Packages/Workspace.cs; tooling.md
+// §4.2–§4.3): `fetch` resolves and writes `ceesafe.lock`; every other command resolves through the lock. Nothing
+// runs but `git` (through `env`, which sets GIT_TERMINAL_PROMPT=0; lib/std cannot set a child's environment).
+
+/// One dependency as the lock records it (LockEntry): a registry package has a version and a repository.
+struct LockEntry {
+    name: Vector<u8>;
+    source: Vector<u8>;
+    hasCommit: bool;
+    commit: Vector<u8>;
+    hasHash: bool;
+    hash: Vector<u8>;
+    hasVersion: bool;
+    version: Vector<u8>;
+    hasRepository: bool;
+    repository: Vector<u8>;
+}
+
+fn newLockEntry(name: Slice<u8>, source: Slice<u8>) -> Result<LockEntry, AllocError> => Ok(
+    LockEntry {
+        name: copyBytes(name)?,
+        source: copyBytes(source)?,
+        hasCommit: false,
+        commit: Vector<u8>.create(),
+        hasHash: false,
+        hash: Vector<u8>.create(),
+        hasVersion: false,
+        version: Vector<u8>.create(),
+        hasRepository: false,
+        repository: Vector<u8>.create(),
+    },
+);
+
+fn copyLockEntry(e: borrow LockEntry) -> Result<LockEntry, AllocError> => Ok(
+    LockEntry {
+        name: copyBytes(e.name.view())?,
+        source: copyBytes(e.source.view())?,
+        hasCommit: e.hasCommit,
+        commit: copyBytes(e.commit.view())?,
+        hasHash: e.hasHash,
+        hash: copyBytes(e.hash.view())?,
+        hasVersion: e.hasVersion,
+        version: copyBytes(e.version.view())?,
+        hasRepository: e.hasRepository,
+        repository: copyBytes(e.repository.view())?,
+    },
+);
+
+/// A package of the build: its manifest, its lock entry, and the package it was first reached from.
+struct ResolvedPackage {
+    manifest: Manifest;
+    entry: LockEntry;
+    via: Vector<u8>;
+}
+
+/// A dependency waiting to be resolved: the manifest that names it (none for the root, else a resolved package's
+/// index), and the spec.
+struct PendingDependency {
+    dependent: u32;
+    spec: DependencySpec;
+}
+
+/// `$CEESAFE_HOME`, or `~/.ceesafe` (Workspace.DefaultHome).
+fn defaultHome() -> Result<Vector<u8>, AllocError> {
+    match (Environment.variable("CEESAFE_HOME")) {
+        Some(home) => {
+            if (home.bytes().length > 0) {
+                return copyBytes(home.bytes());
+            }
+        }
+        null => {}
+    }
+    let user = match (Environment.variable("HOME")) {
+        Some(h) => h.bytes(),
+        null => "".bytes(),
+    };
+    return joinPath(user, ".ceesafe".bytes());
+}
+
+/// The default index, or `$CEESAFE_INDEX` (PackageIndex.DefaultUrl). The default is still Nova's index until the
+/// fork point names CeeSafe's (docs/p8-plan.md).
+fn defaultIndexUrl() -> Result<Vector<u8>, AllocError> {
+    match (Environment.variable("CEESAFE_INDEX")) {
+        Some(index) => {
+            if (index.bytes().length > 0) {
+                return copyBytes(index.bytes());
+            }
+        }
+        null => {}
+    }
+    return copyBytes("https://github.com/vkuttyp/nova-index".bytes());
+}
+
+/// `to` relative to the directory `from`, both absolute and normalised (Path.GetRelativePath), with `/`.
+fn relativePath(from: Slice<u8>, to: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var a = Vector<Vector<u8>>.create();
+    var b = Vector<Vector<u8>>.create();
+    splitAt(from, '/', mut a)?;
+    splitAt(to, '/', mut b)?;
+    var aParts = Vector<Vector<u8>>.create();
+    var bParts = Vector<Vector<u8>>.create();
+    for (p in a.view()) {
+        if (p.length > 0) {
+            aParts.push(copyBytes(p.view())?)?;
+        }
+    }
+    for (p in b.view()) {
+        if (p.length > 0) {
+            bParts.push(copyBytes(p.view())?)?;
+        }
+    }
+    var common: usize = 0;
+    while (common < aParts.length && common < bParts.length && sameBytes(
+        aParts[common].view(),
+        bParts[common].view(),
+    )) {
+        common += 1;
+    }
+    var out = Vector<u8>.create();
+    for (k in common..aParts.length) {
+        if (out.length > 0) {
+            out.push('/')?;
+        }
+        appendText(mut out, "..")?;
+    }
+    for (k in common..bParts.length) {
+        if (out.length > 0) {
+            out.push('/')?;
+        }
+        appendBytes(mut out, bParts[k].view())?;
+    }
+    if (out.length == 0) {
+        out.push('.')?;
+    }
+    return Ok(out);
+}
+
+/// SHA-256 over the manifest and each source file (CeeSafe and C) in ordinal order of their paths relative to the
+/// package: path, a zero byte, the bytes, a zero byte (Workspace.Hash; tooling.md §4.3).
+fn packageHash(manifest: borrow Manifest) -> Result<Vector<u8>, AllocError> {
+    var full = Vector<Vector<u8>>.create();
+    manifestSourceFiles(manifest, mut full)?;
+    for (c in manifest.cFiles.view()) {
+        full.push(joinPath(manifest.directory.view(), c.view())?)?;
+    }
+    full.push(joinPath(manifest.directory.view(), manifestName().bytes())?)?;
+    var relative = Vector<Vector<u8>>.create();
+    var paths = Vector<Vector<u8>>.create();
+    for (f in full.view()) {
+        if (!fileExists(f.view())) {
+            continue;
+        }
+        let r = relativePath(manifest.directory.view(), f.view())?;
+        var seen = false;
+        for (x in relative.view()) {
+            seen = seen || sameBytes(x.view(), r.view());
+        }
+        if (!seen) {
+            relative.push(r)?;
+            paths.push(copyBytes(f.view())?)?;
+        }
+    }
+    for (i in 1..relative.length) {
+        var j = i;
+        while (j > 0 && lessBytes(relative[j].view(), relative[j - 1].view())) {
+            relative.swap(j, j - 1);
+            paths.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+    var sha = Sha256.create();
+    let zero = [0u8];
+    for (k in 0..relative.length) {
+        sha.append(relative[k].view());
+        sha.append(zero[..]);
+        match (readFile(StringView.fromUtf8(paths[k].view())!)) {
+            Ok(bytes) => { sha.append(bytes.view()); }
+            Err(_) => {}
+        }
+        sha.append(zero[..]);
+    }
+    var out = copyBytes("sha256:".bytes())?;
+    appendHexDigest(mut out, sha.finish())?;
+    return Ok(out);
+}
+
+// ---- The lock file ----
+
+fn tableText(
+    table: borrow TomlTable,
+    key: StringView,
+    has: borrow mut bool,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    match (textCopy(table, key)?) {
+        Some(t) => {
+            has = true;
+            out = t;
+        }
+        null => {}
+    }
+    return Ok();
+}
+
+/// The lock's entries (Workspace.ReadLock); null after N0320 against file `file`.
+fn readLock(file: u32, report: borrow mut PackageReport) -> Result<Vector<LockEntry>?, AllocError> {
+    let text = copyBytes(report.sources[file as usize].text.view())?;
+    let tables = match (parseToml(text.view(), file, mut report.diagnostics)?) {
+        Some(t) => t,
+        null => { return Ok(null); }
+    };
+    var entries = Vector<LockEntry>.create();
+    for (t in tables.view()) {
+        if (!sameText(t.name.view(), "[]package")) {
+            continue;
+        }
+        let name = textCopy(t, "name")?;
+        let source = textCopy(t, "source")?;
+        if (name == null || source == null) {
+            report.error(
+                320,
+                file,
+                t.start,
+                t.end,
+                copyBytes("a [[package]] of the lock needs 'name' and 'source'".bytes())?,
+            )?;
+            return Ok(null);
+        }
+        let nameText = name!;
+        let sourceText = source!;
+        var entry = newLockEntry(nameText.view(), sourceText.view())?;
+        tableText(t, "commit", mut entry.hasCommit, mut entry.commit)?;
+        tableText(t, "hash", mut entry.hasHash, mut entry.hash)?;
+        tableText(t, "version", mut entry.hasVersion, mut entry.version)?;
+        tableText(t, "repository", mut entry.hasRepository, mut entry.repository)?;
+        // A name written twice keeps its last entry, in its first place (a dictionary's assignment).
+        var replaced = false;
+        for (k in 0..entries.length) {
+            if (!replaced && sameBytes(entries[k].name.view(), entry.name.view())) {
+                entries[k] = copyLockEntry(entry)?;
+                replaced = true;
+            }
+        }
+        if (!replaced) {
+            entries.push(entry)?;
+        }
+    }
+    return Ok(entries);
+}
+
+fn appendLockLine(out: borrow mut Vector<u8>, key: StringView, value: Slice<u8>) -> Result<void, AllocError> {
+    appendText(out, key)?;
+    appendText(out, " = ")?;
+    appendTomlQuoted(out, value)?;
+    out.push('\n')?;
+    return Ok();
+}
+
+/// The lock's text: entries by name, so that it changes only when the resolution does (Workspace.WriteLock).
+fn writeLockText(entries: borrow Vector<LockEntry>) -> Result<Vector<u8>, AllocError> {
+    var order = Vector<usize>.create();
+    for (k in 0..entries.length) {
+        order.push(k)?;
+        var at = order.length - 1;
+        while (at > 0 && lessBytes(entries[k].name.view(), entries[order[at - 1]].name.view())) {
+            order[at] = order[at - 1];
+            at -= 1;
+        }
+        order[at] = k;
+    }
+    var text = copyBytes("# Written by ceesafec fetch (docs/tooling.md §4.3). Commit it with ceesafe.toml.\n".bytes())?;
+    for (k in order.view()) {
+        let e = borrow entries[k];
+        appendText(mut text, "\n[[package]]\n")?;
+        appendLockLine(mut text, "name", e.name.view())?;
+        appendLockLine(mut text, "source", e.source.view())?;
+        if (e.hasVersion) {
+            appendLockLine(mut text, "version", e.version.view())?;
+        }
+        if (e.hasRepository) {
+            appendLockLine(mut text, "repository", e.repository.view())?;
+        }
+        if (e.hasCommit) {
+            appendLockLine(mut text, "commit", e.commit.view())?;
+        }
+        if (e.hasHash) {
+            appendLockLine(mut text, "hash", e.hash.view())?;
+        }
+    }
+    return Ok(text);
+}
+
+// ---- The git cache ($CEESAFE_HOME/git: a bare clone per repository, a checkout per commit) ----
+
+struct GitCache {
+    home: Vector<u8>;
+    lastError: Vector<u8>;
+
+    /// Runs git with `arguments` (in `directory` if not empty): its trimmed output, or null with `lastError` set.
+    fn run(
+        borrow mut this,
+        directory: Slice<u8>,
+        arguments: borrow Vector<Vector<u8>>,
+    ) -> Result<Vector<u8>?, AllocError> {
+        var all = Vector<Vector<u8>>.create();
+        all.push(copyBytes("GIT_TERMINAL_PROMPT=0".bytes())?)?;
+        all.push(copyBytes("git".bytes())?)?;
+        if (directory.length > 0) {
+            all.push(copyBytes("-C".bytes())?)?;
+            all.push(copyBytes(directory)?)?;
+        }
+        for (a in arguments.view()) {
+            all.push(copyBytes(a.view())?)?;
+        }
+        let outcome = runTool("env".bytes(), all)?;
+        if (!outcome.started || outcome.status == 127) {
+            this.lastError = copyBytes("git is not installed or not on the PATH".bytes())?;
+            return Ok(null);
+        }
+        if (outcome.status != 0) {
+            var message = copyBytes("git".bytes())?;
+            for (a in arguments.view()) {
+                message.push(' ')?;
+                appendBytes(mut message, a.view())?;
+            }
+            appendText(mut message, ": ")?;
+            appendBytes(mut message, trimAscii(outcome.stderr.view()))?;
+            this.lastError = message;
+            return Ok(null);
+        }
+        return Ok(copyBytes(trimAscii(outcome.stdout.view()))?);
+    }
+
+    fn git(
+        borrow mut this,
+        directory: Slice<u8>,
+        words: borrow Vector<StringView>,
+        extra: Slice<u8>,
+    ) -> Result<Vector<u8>?, AllocError> {
+        var arguments = Vector<Vector<u8>>.create();
+        for (w in words.view()) {
+            arguments.push(copyBytes(w.bytes())?)?;
+        }
+        if (extra.length > 0) {
+            arguments.push(copyBytes(extra)?)?;
+        }
+        return this.run(directory, arguments);
+    }
+
+    /// The first 16 hexadecimal digits of the URL's SHA-256 (GitCache.Key).
+    fn key(url: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+        var sha = Sha256.create();
+        sha.append(url);
+        var hex = Vector<u8>.create();
+        appendHexDigest(mut hex, sha.finish())?;
+        return copyBytes(hex[0..16]);
+    }
+
+    fn databasePath(borrow this, url: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+        let key = GitCache.key(url)?;
+        let db = joinPath(this.home.view(), "git/db".bytes())?;
+        return joinPath(db.view(), key.view());
+    }
+
+    /// The repository's bare clone, made or brought up to date (not when offline).
+    fn database(borrow mut this, url: Slice<u8>, offline: bool, update: bool) -> Result<Vector<u8>?, AllocError> {
+        let database = this.databasePath(url)?;
+        if (!isDirectory(database.view())) {
+            if (offline) {
+                var message = copyBytes("'".bytes())?;
+                appendBytes(mut message, url)?;
+                appendText(mut message, "' is not in the cache, and --offline forbids fetching it")?;
+                this.lastError = message;
+                return Ok(null);
+            }
+            var parent = database.length;
+            while (parent > 0 && database[parent - 1] != '/') {
+                parent -= 1;
+            }
+            match (makeDirectories(database[0..parent - 1])) {
+                Ok() => {}
+                Err(_) => {}
+            }
+            var arguments = Vector<Vector<u8>>.create();
+            arguments.push(copyBytes("clone".bytes())?)?;
+            arguments.push(copyBytes("--quiet".bytes())?)?;
+            arguments.push(copyBytes("--bare".bytes())?)?;
+            arguments.push(copyBytes(url)?)?;
+            arguments.push(copyBytes(database.view())?)?;
+            if (this.run("".bytes(), arguments)? == null) {
+                return Ok(null);
+            }
+            return Ok(database);
+        }
+        if (update && !offline) {
+            var arguments = Vector<Vector<u8>>.create();
+            for (w in 0..6) {
+                let word: StringView = match (w) {
+                    0 => "fetch",
+                    1 => "--quiet",
+                    2 => "--tags",
+                    3 => "--force",
+                    4 => "origin",
+                    _ => "+refs/heads/*:refs/heads/*",
+                };
+                arguments.push(copyBytes(word.bytes())?)?;
+            }
+            if (this.run(database.view(), arguments)? == null) {
+                return Ok(null);
+            }
+        }
+        return Ok(database);
+    }
+
+    fn revParse(borrow mut this, database: Slice<u8>, reference: Slice<u8>) -> Result<Vector<u8>?, AllocError> {
+        var arguments = Vector<Vector<u8>>.create();
+        arguments.push(copyBytes("rev-parse".bytes())?)?;
+        arguments.push(copyBytes("--verify".bytes())?)?;
+        arguments.push(copyBytes("--quiet".bytes())?)?;
+        var spec = copyBytes(reference)?;
+        appendText(mut spec, "^{commit}")?;
+        arguments.push(spec)?;
+        return this.run(database, arguments);
+    }
+
+    /// The commit a dependency names: its rev, or what its tag or branch names now (GitCache.Resolve).
+    fn resolve(
+        borrow mut this,
+        url: Slice<u8>,
+        spec: borrow DependencySpec,
+        offline: bool,
+    ) -> Result<Vector<u8>?, AllocError> {
+        let database = match (this.database(url, offline, true)?) {
+            Some(d) => d,
+            null => { return Ok(null); }
+        };
+        var reference = Vector<u8>.create();
+        if (spec.hasRev) {
+            reference = copyBytes(spec.rev.view())?;
+        } else if (spec.hasTag) {
+            reference = copyBytes("refs/tags/".bytes())?;
+            appendBytes(mut reference, spec.tag.view())?;
+        } else {
+            reference = copyBytes("refs/heads/".bytes())?;
+            appendBytes(mut reference, spec.branch.view())?;
+        }
+        let commit = this.revParse(database.view(), reference.view())?;
+        if (commit == null) {
+            var message = copyBytes("'".bytes())?;
+            appendBytes(mut message, url)?;
+            appendText(
+                mut message,
+                if (spec.hasRev) "' has no commit '" else if (spec.hasTag) "' has no tag '" else "' has no branch '",
+            )?;
+            appendBytes(
+                mut message,
+                if (spec.hasRev) spec.rev.view() else if (spec.hasTag) spec.tag.view() else spec.branch.view(),
+            )?;
+            message.push('\'')?;
+            this.lastError = message;
+        }
+        return Ok(commit);
+    }
+
+    /// A checkout of an index's newest commit (GitCache.IndexCheckout): fetched first unless offline.
+    fn indexCheckout(borrow mut this, url: Slice<u8>, offline: bool) -> Result<Vector<u8>?, AllocError> {
+        this.lastError.clear();
+        var commit: Vector<u8>? = null;
+        match (this.database(url, offline, true)?) {
+            Some(database) => { commit = this.revParse(database.view(), "HEAD".bytes())?; }
+            null => {}
+        }
+        match (commit) {
+            Some(c) => { return this.checkout(url, c.view(), offline); }
+            null => {
+                if (this.lastError.length == 0) {
+                    var message = copyBytes("'".bytes())?;
+                    appendBytes(mut message, url)?;
+                    appendText(mut message, "' has no commits")?;
+                    this.lastError = message;
+                }
+                return Ok(null);
+            }
+        }
+    }
+
+    fn hasCommit(borrow mut this, database: Slice<u8>, commit: Slice<u8>) -> Result<bool, AllocError> {
+        var arguments = Vector<Vector<u8>>.create();
+        arguments.push(copyBytes("cat-file".bytes())?)?;
+        arguments.push(copyBytes("-e".bytes())?)?;
+        var spec = copyBytes(commit)?;
+        appendText(mut spec, "^{commit}")?;
+        arguments.push(spec)?;
+        return Ok(this.run(database, arguments)? != null);
+    }
+
+    /// A checkout of the commit, made from the bare clone if missing (GitCache.Checkout).
+    fn checkout(borrow mut this, url: Slice<u8>, commit: Slice<u8>, offline: bool) -> Result<Vector<u8>?, AllocError> {
+        let key = GitCache.key(url)?;
+        let checkouts = joinPath(this.home.view(), "git/checkouts".bytes())?;
+        let byKey = joinPath(checkouts.view(), key.view())?;
+        let checkout = joinPath(byKey.view(), commit)?;
+        if (isDirectory(checkout.view())) {
+            return Ok(checkout);
+        }
+        let database = match (this.database(url, offline, false)?) {
+            Some(d) => d,
+            null => { return Ok(null); }
+        };
+        if (!this.hasCommit(database.view(), commit)?) {
+            var found = false;
+            if (!offline) {
+                match (this.database(url, offline, true)?) {
+                    Some(_) => { found = this.hasCommit(database.view(), commit)?; }
+                    null => {}
+                }
+            }
+            if (!found) {
+                var message = copyBytes("'".bytes())?;
+                appendBytes(mut message, url)?;
+                appendText(mut message, "' has no commit ")?;
+                appendBytes(mut message, commit)?;
+                this.lastError = message;
+                return Ok(null);
+            }
+        }
+        var temporary = copyBytes(checkout.view())?;
+        appendText(mut temporary, ".partial")?;
+        if (isDirectory(temporary.view())) {
+            removeTree(temporary.view());
+        }
+        match (makeDirectories(byKey.view())) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        var clone = Vector<Vector<u8>>.create();
+        clone.push(copyBytes("clone".bytes())?)?;
+        clone.push(copyBytes("--quiet".bytes())?)?;
+        clone.push(copyBytes("--no-checkout".bytes())?)?;
+        clone.push(copyBytes(database.view())?)?;
+        clone.push(copyBytes(temporary.view())?)?;
+        if (this.run("".bytes(), clone)? == null) {
+            return Ok(null);
+        }
+        var check = Vector<Vector<u8>>.create();
+        check.push(copyBytes("-c".bytes())?)?;
+        check.push(copyBytes("advice.detachedHead=false".bytes())?)?;
+        check.push(copyBytes("checkout".bytes())?)?;
+        check.push(copyBytes("--quiet".bytes())?)?;
+        check.push(copyBytes(commit)?)?;
+        if (this.run(temporary.view(), check)? == null) {
+            return Ok(null);
+        }
+        // Directory.Move: lib/std has no rename (docs/p8-plan.md, upstream gaps), so `mv` does it.
+        var moving = Vector<Vector<u8>>.create();
+        moving.push(copyBytes(temporary.view())?)?;
+        moving.push(copyBytes(checkout.view())?)?;
+        let moved = runTool("mv".bytes(), moving)?;
+        if (!moved.started || moved.status != 0) {
+            var message = copyBytes("cannot move the checkout into place: ".bytes())?;
+            appendBytes(mut message, trimAscii(moved.stderr.view()))?;
+            this.lastError = message;
+            return Ok(null);
+        }
+        return Ok(checkout);
+    }
+}

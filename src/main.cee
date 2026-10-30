@@ -206,8 +206,10 @@ struct Options {
     cTexts: Vector<Vector<u8>>; // and texts
     defaultOutput: Vector<u8>;  // package mode: <package>/out/<name>
     files: Vector<String>;
-    fixing: bool; // `fix`: check, then apply the fixes (tooling.md §5.3)
-    dryRun: bool; // fix --dry-run
+    offline: bool;       // --offline: package mode uses only what is fetched
+    absolutePaths: bool; // package files named by their absolute paths (Workspace.Packages without a mapping)
+    fixing: bool;        // `fix`: check, then apply the fixes (tooling.md §5.3)
+    dryRun: bool;        // fix --dry-run
     fixRound: u32;
 }
 
@@ -394,6 +396,8 @@ fn readOptions(options: borrow mut Options) -> i32 {
             }
         } else if (arg == "--dump-tokens") {
             options.dumpTokens = true;
+        } else if (arg == "--offline") {
+            options.offline = true;
         } else if (options.fixing && arg == "--dry-run") {
             options.dryRun = true;
         } else if (arg.length > 0 && arg[0] == '-') {
@@ -569,6 +573,8 @@ fn parseCommand() -> i32 {
         cTexts: Vector<Vector<u8>>.create(),
         defaultOutput: Vector<u8>.create(),
         files: Vector<String>.create(),
+        offline: false,
+        absolutePaths: false,
         fixing: false,
         dryRun: false,
         fixRound: 0,
@@ -578,7 +584,16 @@ fn parseCommand() -> i32 {
         return status;
     }
     if (options.files.length == 0) {
-        return fail("package mode is not implemented yet (ROADMAP P8); name the files");
+        // Package mode (tooling.md §4.4): the root package's sources.
+        var packages = Vector<PackageInfo>.create();
+        var packageFiles = Vector<Vector<Vector<u8>>>.create();
+        let loaded = loadPackage(mut options, mut packages, mut packageFiles);
+        if (loaded != 0) {
+            return loaded;
+        }
+        for (f in packageFiles[0].view()) {
+            options.files.push(copyText(StringView.fromUtf8(f.view())!))!;
+        }
     }
     var sources = Vector<SourceText>.create();
     let loaded = loadFiles(options.files, mut sources);
@@ -640,9 +655,9 @@ fn report(json: bool, diagnostics: borrow Diagnostics, sources: borrow Vector<So
     return if (diagnostics.hasErrors()) 1 else 0;
 }
 
-/// `check`: the hosted libraries and the files, parsed; then checked if they parse (Compilation.Create, P3).
-/// Package mode's loading (Program.LoadPackage): the packages, root first, and their files; the root manifest's
-/// profile, float and kernel where the command line does not say otherwise. Returns the exit status of a failure.
+/// Package mode's loading (Program.LoadPackage): the package and its dependencies, resolved through the lock, root
+/// first, and their files; the root manifest's profile, float and kernel where the command line does not say
+/// otherwise. Returns the exit status of a failure.
 fn loadPackage(
     options: borrow mut Options,
     packages: borrow mut Vector<PackageInfo>,
@@ -656,99 +671,93 @@ fn loadPackage(
         Some(d) => d,
         null => {
             if (hasNovaManifest(cwd.view().bytes())!) {
-                return fail(
-                    "no input files, and no ceesafe.toml here or above; this is a Nova package (nova.toml), which CeeSafe does not read (Decision 0003)",
+                fail(
+                    "no Nova input files, and no ceesafe.toml here or above; this is a Nova package (nova.toml), which CeeSafe does not read (Decision 0003)",
                 );
+                return 1;
             }
-            return fail("no input files, and no ceesafe.toml here or above");
+            fail("no Nova input files, and no ceesafe.toml here or above");
+            return 1;
         }
     };
-    var problem = Vector<u8>.create();
-    var loaded = Vector<LoadedPackage>.create();
-    match (readManifest(directory.view(), mut problem)!) {
-        Some(root) => {
-            let manifestPath = joinPath(directory.view(), manifestName().bytes())!;
-            let lock = joinPath(directory.view(), lockName().bytes())!;
-            if (root.dependencies.length > 0 && !fileExists(lock.view())) {
-                // The manifest is the file the error names (Workspace.Resolve, N0324).
-                let text = readFile(StringView.fromUtf8(manifestPath.view())!)!;
-                let name = sourcePath(StringView.fromUtf8(manifestPath.view())!);
-                var sources = Vector<SourceText>.create();
-                sources.push(SourceText.create(name.view(), text.view())!)!;
-                var diagnostics = Diagnostics.create();
-                var message = Vector<u8>.create();
-                appendText(
-                    mut message,
-                    "there is no ceesafe.lock: run 'ceesafec fetch'",
-                )!;
-                diagnostics.error(324, 0, 0, 0, message)!;
-                return report(options.json, diagnostics, sources);
-            }
-        }
-        null => { return fail(StringView.fromUtf8(problem.view())!); }
+    var report = PackageReport.create();
+    let noUpdate = Vector<Vector<u8>>.create();
+    let resolved = resolveWorkspace(directory.view(), mut report, false, options.offline, false, noUpdate)!;
+    if (report.count() > 0) {
+        reportPackage(options.json, report);
     }
-    if (!resolvePackages(directory.view(), mut loaded, mut problem)!) {
-        return fail(StringView.fromUtf8(problem.view())!);
-    }
-    if (loaded[0].files.length == 0) {
+    let workspace = match (resolved) {
+        Some(w) => w,
+        null => { return 1; }
+    };
+    var rootFiles = Vector<Vector<u8>>.create();
+    manifestSourceFiles(workspace.root, mut rootFiles)!;
+    if (rootFiles.length == 0) {
         var message = String.create();
         message.append("package '")!;
-        message.append(StringView.fromUtf8(loaded[0].manifest.name.view())!)!;
+        message.append(StringView.fromUtf8(workspace.root.name.view())!)!;
         message.append("' has no .cee files under ")!;
-        for (k in 0..loaded[0].manifest.sources.length) {
+        for (k in 0..workspace.root.sources.length) {
             if (k > 0) {
                 message.append(", ")!;
             }
-            message.append(StringView.fromUtf8(loaded[0].manifest.sources[k].view())!)!;
+            message.append(StringView.fromUtf8(workspace.root.sources[k].view())!)!;
         }
-        return fail(message.view());
+        fail(message.view());
+        return 1;
     }
     if (!options.profileGiven) {
-        options.freestanding = loaded[0].manifest.freestanding;
+        options.freestanding = workspace.root.freestanding;
     }
-    if (!loaded[0].manifest.floatAllowed) {
+    if (!workspace.root.floatAllowed) {
         options.noFloat = true;
     }
-    if (loaded[0].manifest.kernel) {
+    if (workspace.root.kernel) {
         options.kernel = true;
     }
-    if (!options.emitGiven && loaded[0].manifest.object) {
+    if (!options.emitGiven && workspace.root.kind == 2) {
         options.emit = copyBytes("obj".bytes())!;
     }
-    options.defaultOutput = joinPath(loaded[0].manifest.directory.view(), "out".bytes())!;
+    options.defaultOutput = joinPath(workspace.root.directory.view(), "out".bytes())!;
     options.defaultOutput.push('/')!;
-    appendBytes(mut options.defaultOutput, loaded[0].manifest.name.view())!;
+    appendBytes(mut options.defaultOutput, workspace.root.name.view())!;
     if (options.programName.length == 0) {
-        options.programName = copyBytes(loaded[0].manifest.name.view())!;
+        options.programName = copyBytes(workspace.root.name.view())!;
     }
-    for (p in loaded.view()) {
-        for (c in p.manifest.cFiles.view()) {
-            let path = joinPath(p.manifest.directory.view(), c.view())!;
+    // The C files of every package, root first (Workspace.CFiles).
+    for (p in 0..workspace.resolved.length + 1) {
+        let manifest = workspace.dependentManifest(if (p == 0) none() else truncate<u32>(p - 1));
+        for (c in manifest.cFiles.view()) {
+            let path = joinPath(manifest.directory.view(), c.view())!;
             let status = addCFile(mut options, path.view());
             if (status != 0) {
-                return status;
+                return 1;
             }
         }
     }
-    for (p in loaded.view()) {
+    for (p in 0..workspace.resolved.length + 1) {
+        let manifest = workspace.dependentManifest(if (p == 0) none() else truncate<u32>(p - 1));
         var dependencies = Vector<Vector<u8>>.create();
-        for (d in p.manifest.dependencies.view()) {
+        for (d in manifest.dependencies.view()) {
             dependencies.push(copyBytes(d.name.view())!)!;
         }
         packages.push(
             PackageInfo {
-                name: copyBytes(p.manifest.name.view())!,
+                name: copyBytes(manifest.name.view())!,
                 dependencies: dependencies,
-                trusted: p.manifest.trusted,
+                trusted: manifest.trusted,
             },
         )!;
         var paths = Vector<Vector<u8>>.create();
-        for (f in p.files.view()) {
-            paths.push(copyBytes(f.view())!)!;
-        }
+        manifestSourceFiles(manifest, mut paths)!;
         files.push(paths)!;
     }
     return 0;
+}
+
+/// Package diagnostics, as text on stderr or as the JSON document on stdout.
+fn reportPackage(json: bool, packageReport: borrow PackageReport) {
+    report(json, packageReport.diagnostics, packageReport.sources);
 }
 
 /// The end of `check` (or of one round of `fix`): the diagnostics reported, or the fixes applied.
@@ -782,50 +791,57 @@ fn fixCommand() -> i32 {
 /// optimisations turned off. Building C is P5.
 fn buildCommand() -> i32 => fileCommand(true, false, 0);
 
+/// The options of a file command before the command line is read.
+fn defaultOptions(building: bool) -> Options => Options {
+    json: false,
+    dumpTokens: false,
+    dumpAst: false,
+    dumpHir: false,
+    noFloat: false,
+    libraryDiagnostics: false,
+    freestanding: false,
+    kernel: false,
+    profileGiven: false,
+    building: building,
+    dumpNir: false,
+    closureSpecialisation: true,
+    explainClosureCalls: false,
+    placement: true,
+    explainAllocations: false,
+    bce: true,
+    explainBoundsChecks: false,
+    oce: true,
+    explainOverflowChecks: false,
+    structured: true,
+    emit: copyBytes("exe".bytes())!,
+    output: Vector<u8>.create(),
+    exportsHeader: copyBytes("nova_exports.h".bytes())!,
+    emitGiven: false,
+    lineDirectives: false,
+    debug: false,
+    split: false,
+    programName: Vector<u8>.create(),
+    cc: match (Environment.variable("CC")) {
+        Some(v) => copyBytes(v.bytes())!,
+        null => Vector<u8>.create(),
+    },
+    cflags: Vector<Vector<u8>>.create(),
+    linker: Vector<u8>.create(),
+    cNames: Vector<Vector<u8>>.create(),
+    cTexts: Vector<Vector<u8>>.create(),
+    defaultOutput: Vector<u8>.create(),
+    files: Vector<String>.create(),
+    offline: false,
+    absolutePaths: false,
+    fixing: false,
+    dryRun: false,
+    fixRound: 0,
+};
+
 fn fileCommand(building: bool, fixing: bool, fixRound: u32) -> i32 {
-    var options = Options {
-        json: false,
-        dumpTokens: false,
-        dumpAst: false,
-        dumpHir: false,
-        noFloat: false,
-        libraryDiagnostics: false,
-        freestanding: false,
-        kernel: false,
-        profileGiven: false,
-        building: building,
-        dumpNir: false,
-        closureSpecialisation: true,
-        explainClosureCalls: false,
-        placement: true,
-        explainAllocations: false,
-        bce: true,
-        explainBoundsChecks: false,
-        oce: true,
-        explainOverflowChecks: false,
-        structured: true,
-        emit: copyBytes("exe".bytes())!,
-        output: Vector<u8>.create(),
-        exportsHeader: copyBytes("nova_exports.h".bytes())!,
-        emitGiven: false,
-        lineDirectives: false,
-        debug: false,
-        split: false,
-        programName: Vector<u8>.create(),
-        cc: match (Environment.variable("CC")) {
-            Some(v) => copyBytes(v.bytes())!,
-            null => Vector<u8>.create(),
-        },
-        cflags: Vector<Vector<u8>>.create(),
-        linker: Vector<u8>.create(),
-        cNames: Vector<Vector<u8>>.create(),
-        cTexts: Vector<Vector<u8>>.create(),
-        defaultOutput: Vector<u8>.create(),
-        files: Vector<String>.create(),
-        fixing: fixing,
-        dryRun: false,
-        fixRound: fixRound,
-    };
+    var options = defaultOptions(building);
+    options.fixing = fixing;
+    options.fixRound = fixRound;
     let status = readOptions(mut options);
     if (status != 0) {
         return status;
@@ -847,8 +863,6 @@ fn fileCommand(building: bool, fixing: bool, fixRound: u32) -> i32 {
     if (options.files.length > 0 && novaFiles.length == 0) {
         return fail("no Nova input files");
     }
-    var sources = Vector<SourceText>.create();
-    var fileIsLibrary = Vector<bool>.create();
     var packages = Vector<PackageInfo>.create();
     var packageFiles = Vector<Vector<Vector<u8>>>.create();
     if (options.files.length == 0) {
@@ -862,6 +876,20 @@ fn fileCommand(building: bool, fixing: bool, fixRound: u32) -> i32 {
             PackageInfo { name: Vector<u8>.create(), dependencies: Vector<Vector<u8>>.create(), trusted: false },
         )!;
     }
+    return compileFiles(options, building, novaFiles, packages, packageFiles);
+}
+
+/// The type checking (and with `building`, the C) of the files named, or of the packages and their files (package
+/// mode); the diagnostics reported as `finish` does.
+fn compileFiles(
+    options: Options,
+    building: bool,
+    novaFiles: borrow Vector<String>,
+    packages: Vector<PackageInfo>,
+    packageFiles: Vector<Vector<Vector<u8>>>,
+) -> i32 {
+    var sources = Vector<SourceText>.create();
+    var fileIsLibrary = Vector<bool>.create();
     // lib/core, then lib/std (hosted) or lib/kernel (freestanding with --kernel): library files come first
     // (CoreLibrary.SourcesFor).
     for (k in 0..libraryFileCount()) {
@@ -899,7 +927,7 @@ fn fileCommand(building: bool, fixing: bool, fixRound: u32) -> i32 {
                         return fail(message.view());
                     }
                 };
-                let name = sourcePath(path);
+                let name = if (options.absolutePaths) copyBytes(path.bytes())! else sourcePath(path);
                 sources.push(SourceText.create(name.view(), bytes.view())!)!;
                 filePackage.push(truncate<u32>(p))!;
             }
@@ -1075,6 +1103,28 @@ fn main() -> i32 {
         }
         return fmtCommand(arguments, json);
     }
+    if (command == "fetch" || command == "publish" || command == "index-check" || command == "new" ||
+        command == "agents") {
+        var arguments = Vector<Vector<u8>>.create();
+        var json = false;
+        let status = plainArguments(mut arguments, mut json);
+        if (status != 0) {
+            return status;
+        }
+        if (command == "fetch") {
+            return fetchCommand(arguments, json);
+        }
+        if (command == "publish") {
+            return publishCommand(arguments, json);
+        }
+        if (command == "index-check") {
+            return indexCheckCommand(arguments, json);
+        }
+        if (command == "new") {
+            return newCommand(arguments);
+        }
+        return agentsCommand(arguments);
+    }
     if (command == "doc") {
         var arguments = Vector<Vector<u8>>.create();
         var json = false;
@@ -1082,7 +1132,7 @@ fn main() -> i32 {
         if (status != 0) {
             return status;
         }
-        return docCommand(arguments);
+        return docCommand(arguments, json);
     }
     if (command == "explain") {
         var arguments = Vector<Vector<u8>>.create();

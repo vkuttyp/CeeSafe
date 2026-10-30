@@ -1,0 +1,292 @@
+// A package's agent instructions (the reference's Packages/AgentFiles.cs; tooling.md §7): AGENTS.md's CeeSafe
+// section between markers, the files other agents read, and their MCP configurations. Written by `new`, refreshed by
+// `agents`. The section is Nova's template with CeeSafe's names (tools/gen_docs.py).
+
+fn agentStartMarker() -> StringView => "<!--CEESAFE START-->";
+
+fn agentEndMarker() -> StringView => "<!--CEESAFE END-->";
+
+fn agentCount() -> usize => 5;
+
+/// The agents of §7.2, in the order their files are written; `agents` first, since the others refer to it.
+fn agentName(k: usize) -> StringView => match (k) {
+    0 => "agents",
+    1 => "claude",
+    2 => "gemini",
+    3 => "copilot",
+    _ => "cursor",
+};
+
+fn agentInstructions(k: usize) -> StringView => match (k) {
+    0 => "AGENTS.md",
+    1 => "CLAUDE.md",
+    2 => "GEMINI.md",
+    3 => ".github/copilot-instructions.md",
+    _ => ".cursor/rules/ceesafe.mdc",
+};
+
+/// 0: the section itself; 1: a file that imports AGENTS.md; 2: a copy of the section after a preamble.
+fn agentForm(k: usize) -> u32 => match (k) {
+    0 => 0,
+    1 => 1,
+    2 => 1,
+    _ => 2,
+};
+
+fn agentMcpPath(k: usize) -> StringView => match (k) {
+    0 => "",
+    1 => ".mcp.json",
+    2 => ".gemini/settings.json",
+    3 => ".vscode/mcp.json",
+    _ => ".cursor/mcp.json",
+};
+
+fn agentMcpJson(k: usize) -> StringView => match (k) {
+    3 =>
+        "{\n  \"servers\": {\n    \"ceesafe\": { \"type\": \"stdio\", \"command\": \"ceesafec\", \"args\": [\"mcp\"] }\n  }\n}\n",
+    _ => "{\n  \"mcpServers\": {\n    \"ceesafe\": { \"command\": \"ceesafec\", \"args\": [\"mcp\"] }\n  }\n}\n",
+};
+
+fn agentPreamble(k: usize) -> StringView => match (k) {
+    4 => "---\ndescription: Nova: how to check, fix and run this package\nalwaysApply: true\n---\n\n",
+    _ => "",
+};
+
+/// The section, from the start marker to the end marker and a newline.
+fn agentSection() -> Result<Vector<u8>, AllocError> {
+    var text = Vector<u8>.create();
+    match (documentIndex("templates/AGENTS.md".bytes())) {
+        Some(k) => { appendDocumentText(mut text, k)?; }
+        null => {}
+    }
+    return Ok(text);
+}
+
+/// The agents that `--agent` values name (each a comma-separated list), with `agents` added when any is chosen; the
+/// default without values is `agents` (AgentFiles.Choose). Null with `error` set for an unknown name.
+fn chooseAgents(values: borrow Vector<Vector<u8>>, error: borrow mut Vector<u8>) -> Result<Vector<usize>?, AllocError> {
+    var names = Vector<Vector<u8>>.create();
+    for (v in values.view()) {
+        var parts = Vector<Vector<u8>>.create();
+        splitAt(v.view(), ',', mut parts)?;
+        for (p in parts.view()) {
+            let trimmed = trimAscii(p.view());
+            if (trimmed.length == 0) {
+                continue;
+            }
+            var lower = Vector<u8>.create();
+            for (c in trimmed) {
+                lower.push(if (c >= 'A' && c <= 'Z') c + 32 else c)?;
+            }
+            names.push(lower)?;
+        }
+    }
+    if (names.length == 0) {
+        names.push(copyBytes("agents".bytes())?)?;
+    }
+    for (n in names.view()) {
+        var known = false;
+        for (k in 0..agentCount()) {
+            known = known || sameText(n.view(), agentName(k));
+        }
+        if (!known) {
+            var m = copyBytes("unknown agent '".bytes())?;
+            appendBytes(mut m, n.view())?;
+            appendText(mut m, "'; the agents are agents, claude, gemini, copilot, cursor")?;
+            error = m;
+            return Ok(null);
+        }
+    }
+    var chosen = Vector<usize>.create();
+    for (k in 0..agentCount()) {
+        var wanted = k == 0;
+        for (n in names.view()) {
+            wanted = wanted || sameText(n.view(), agentName(k));
+        }
+        if (wanted) {
+            chosen.push(k)?;
+        }
+    }
+    return Ok(chosen);
+}
+
+fn findText(text: Slice<u8>, part: Slice<u8>, from: usize) -> usize? {
+    if (part.length > text.length) {
+        return null;
+    }
+    for (k in from..text.length - part.length + 1) {
+        if (sameBytes(text[k..k + part.length], part)) {
+            return k;
+        }
+    }
+    return null;
+}
+
+/// Writes a file, making its directory.
+fn createFile(path: Slice<u8>, text: Slice<u8>) {
+    var parent = path.length;
+    while (parent > 0 && path[parent - 1] != '/') {
+        parent -= 1;
+    }
+    if (parent > 1) {
+        match (makeDirectories(path[0..parent - 1])) {
+            Ok() => {}
+            Err(_) => {}
+        }
+    }
+    match (writeFile(StringView.fromUtf8(path)!, text)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+}
+
+/// .NET's ReplaceLineEndings("\n") for the text of an existing file.
+fn withNewlines(text: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    var k: usize = 0;
+    while (k < text.length) {
+        let c = text[k];
+        if (c == '\r') {
+            out.push('\n')?;
+            if (k + 1 < text.length && text[k + 1] == '\n') {
+                k += 1;
+            }
+        } else if (c == 0x0C) {
+            out.push('\n')?;
+        } else if (c == 0xC2 && k + 1 < text.length && text[k + 1] == 0x85) {
+            out.push('\n')?;
+            k += 1;
+        } else if (c == 0xE2 && k + 2 < text.length && text[k + 1] == 0x80 &&
+            (text[k + 2] == 0xA8 || text[k + 2] == 0xA9)) {
+            out.push('\n')?;
+            k += 2;
+        } else {
+            out.push(c)?;
+        }
+        k += 1;
+    }
+    return Ok(out);
+}
+
+/// Writes or refreshes one agent's instructions file; what was done.
+fn writeInstructions(path: Slice<u8>, agent: usize) -> Result<StringView, AllocError> {
+    let section = agentSection()?;
+    var fresh = Vector<u8>.create();
+    if (agentForm(agent) == 0) {
+        fresh = copyBytes(section.view())?;
+    } else if (agentForm(agent) == 1) {
+        appendText(mut fresh, "@AGENTS.md\n")?;
+    } else {
+        appendText(mut fresh, agentPreamble(agent))?;
+        appendBytes(mut fresh, section.view())?;
+    }
+    if (!fileExists(path)) {
+        createFile(path, fresh.view());
+        return Ok("wrote");
+    }
+    let raw = match (readFile(StringView.fromUtf8(path)!)) {
+        Ok(t) => t,
+        Err(_) => Vector<u8>.create(),
+    };
+    var start: usize = 0;
+    var skip: usize = 0;
+    while (skip < 2 && raw.length >= start + 3 && raw[start] == 0xEF &&
+        raw[start + 1] == 0xBB && raw[start + 2] == 0xBF) {
+        start += 3;
+        skip += 1;
+    }
+    let text = withNewlines(raw[start..])?;
+    if (agentForm(agent) == 1) {
+        var lines = Vector<Vector<u8>>.create();
+        splitAt(text.view(), '\n', mut lines)?;
+        for (l in lines.view()) {
+            if (sameText(trimAscii(l.view()), "@AGENTS.md")) {
+                return Ok("left as it is: it imports AGENTS.md");
+            }
+        }
+    }
+    var updated = Vector<u8>.create();
+    var refreshed = false;
+    let begin = findText(text.view(), agentStartMarker().bytes(), 0);
+    var end: usize? = null;
+    match (begin) {
+        Some(b) => { end = findText(text.view(), agentEndMarker().bytes(), b); }
+        null => {}
+    }
+    if (begin != null && end != null) {
+        var after = end! + agentEndMarker().bytes().length;
+        if (after < text.length && text[after] == '\n') {
+            after += 1;
+        }
+        appendBytes(mut updated, text[0..begin!])?;
+        appendBytes(mut updated, section.view())?;
+        appendBytes(mut updated, text[after..])?;
+        refreshed = true;
+    } else {
+        appendBytes(mut updated, text.view())?;
+        if (!(text.length == 0 || text[text.length - 1] == '\n')) {
+            updated.push('\n')?;
+        }
+        if (text.length > 0) {
+            updated.push('\n')?;
+        }
+        appendBytes(mut updated, section.view())?;
+    }
+    if (sameBytes(updated.view(), text.view())) {
+        return Ok("up to date");
+    }
+    match (writeFile(StringView.fromUtf8(path)!, updated.view())) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    return Ok(if (refreshed) "refreshed the CeeSafe section" else "appended the CeeSafe section");
+}
+
+/// Writes or refreshes the files of `agents` in `directory` (AgentFiles.Write), printing what was done to each as
+/// `ceesafec: <shown>/<path>: <outcome>`.
+fn writeAgentFiles(directory: Slice<u8>, shown: Slice<u8>, agents: borrow Vector<usize>) -> Result<void, AllocError> {
+    var out = Vector<u8>.create();
+    for (agent in agents.view()) {
+        let path = joinPath(directory, agentInstructions(agent).bytes())?;
+        let outcome = writeInstructions(path.view(), agent)?;
+        appendAgentOutcome(mut out, shown, agentInstructions(agent).bytes(), outcome)?;
+        let mcp = agentMcpPath(agent);
+        if (mcp.bytes().length > 0) {
+            let mcpPath = joinPath(directory, mcp.bytes())?;
+            if (fileExists(mcpPath.view())) {
+                appendAgentOutcome(
+                    mut out,
+                    shown,
+                    mcp.bytes(),
+                    "left as it is: it exists, and may configure other servers; add 'ceesafe' (ceesafec mcp) yourself if it lacks it",
+                )?;
+            } else {
+                createFile(mcpPath.view(), agentMcpJson(agent).bytes());
+                appendAgentOutcome(mut out, shown, mcp.bytes(), "wrote")?;
+            }
+        }
+    }
+    Console.writeError(StringView.fromUtf8(out.view())!);
+    return Ok();
+}
+
+/// `ceesafec: <directory>/<path>: <outcome>` (Path.Combine: no separator after an empty directory).
+fn appendAgentOutcome(
+    out: borrow mut Vector<u8>,
+    directory: Slice<u8>,
+    path: Slice<u8>,
+    outcome: StringView,
+) -> Result<void, AllocError> {
+    appendText(out, "ceesafec: ")?;
+    if (directory.length > 0) {
+        appendBytes(out, directory)?;
+        if (directory[directory.length - 1] != '/') {
+            out.push('/')?;
+        }
+    }
+    appendBytes(out, path)?;
+    appendText(out, ": ")?;
+    appendText(out, outcome)?;
+    out.push('\n')?;
+    return Ok();
+}

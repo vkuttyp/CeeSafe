@@ -48,6 +48,22 @@ compared.
 
 Slices S0–S6 keep ceesafec's C byte-identical to novac's, so every P5–P7 gate keeps running unchanged.
 
+## Names (S3)
+
+The rename contract (ROADMAP §3.4) applied to the package commands: `ceesafe.toml`, `ceesafe.lock`, `.cee`,
+`$CEESAFE_HOME` (default `~/.ceesafe`), `$CEESAFE_INDEX`; the agent section between `<!--CEESAFE START-->` and
+`<!--CEESAFE END-->`, `.cursor/rules/ceesafe.mdc`, and the MCP server `ceesafe` (`ceesafec mcp`) with tools
+`ceesafe_*` in the agent template and configurations. Prose keeps "Nova" until the fork point (S7), and the default
+index stays Nova's (`github.com/vkuttyp/nova-index`) until the owner names CeeSafe's: a Nova index's packages are Nova
+packages, which ceesafec does not read (Decision 0003), so in practice `$CEESAFE_INDEX` names a CeeSafe index.
+
+## Upstream gaps (lib/std at v0.6.0)
+
+- No way to set a child process's environment: git runs as `env GIT_TERMINAL_PROMPT=0 git …` (POSIX).
+- No rename: a finished git checkout is moved into place by `mv` (POSIX).
+
+Both are host-service items for Nova's N track (type-system.md §26); Windows needs them before S6's host parity.
+
 ## Known differences
 
 - A file that cannot be read: novac's message is .NET's exception text, which names the absolute path
@@ -62,3 +78,5 @@ Slices S0–S6 keep ceesafec's C byte-identical to novac's, so every P5–P7 gat
 | 2026-10-31 | S1 | the formatter (`src/formatting/formatter.cee`: containers, continuations, glue, the line-breaking loop, trailing-comment alignment, widths in UTF-16 units; `fmt_command.cee`: the §6 self-check, `--check`, `--stdout`, package mode); CeeSafe's sources formatted by `out/ceesafec fmt`, and the generators format with it; `tools/compare_fmt.py` | `fmt --stdout` (text and JSON diagnostics) identical over the 545 `.nova` files of Nova `v0.6.0` and CeeSafe's 85 sources; idempotent on all; the 211 corpus files without inline comments squashed onto one line identical (the line breaker); `fmt --check` and in-place `fmt` over 45 copied files identical; ceesafec formats its own sources in 0.3 s (novac 0.7 s) |
 | 2026-10-31 | S2 | the doc generator (`src/documentation/doc_generator.cee`: entries from the syntax, signatures cut from the formatted text, doc comments, `impl` lists, GitHub anchors, `--missing`, `-o`, `--title`, package mode); `tools/compare_doc.py` | `doc`, `doc --missing` and `doc -o … --title` identical for each of the 545 `.nova` files, lib/core, lib/std and lib/kernel as pages, and CeeSafe's sources as one page (549/549); lib/core's page equals Nova's `docs/api/core.md` |
 | 2026-10-31 | S0–S2 | the contract suite with the `cli`, `fmt` and `doc` steps (`tools/contract_tests.py`) | every step ok on macOS (Apple clang 21): the P2–P7 steps unchanged (C 284/284 ×4 and 308/308 ×4, reports 308/308 ×4, CeeSafe's own C identical, 431,331 lines; 501,249 with `--split -g`), packages 7/7, cli, fmt, doc, run corpus under `-Werror` and ASan+UBSan, mutations, fault sweep 783 points, collections 30/30, freestanding |
+| 2026-10-31 | S3 | packages (`src/packages/`): the TOML subset, versions and requirements, manifests, the workspace (path, git and registry dependencies, the lock, SHA-256 package hashes in `src/support/sha256.cee`, the git cache in `$CEESAFE_HOME/git`), the index and the backtracking version solver, `publish` and `index-check`, agent files; the commands `fetch`, `publish`, `index-check`, `new`, `agents`; package mode for `parse` too, and `check`/`build`/`fmt`/`doc`/`fix` through the new resolver; `tools/compare_package_commands.py` | 8 scenarios after PackageManagerTests and AgentFilesTests (31 bad manifests; path dependencies, lock out of date, conflicts, shared and cyclic graphs, missing and executable dependencies; git by tag, branch and rev, unknown tag, offline with an empty cache, a changed checkout; a local index with three versions, dependencies, `--update`, conflicts, a missing and an invalid entry, `index-check`; `publish` refusals and a published entry; agent files written, refreshed and left; `new`), each built with Nova's and CeeSafe's names: 382/382 runs identical after the mapping, the lock and agent files too; ceesafec's git package hashes equal the script's SHA-256 |
+| 2026-10-31 | S3 | the contract suite with the `package cmds` step | all 30 steps ok on macOS (Apple clang 21); CeeSafe's own C identical (461,390 lines; 538,065 with `--split -g`) |

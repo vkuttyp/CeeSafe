@@ -1,0 +1,341 @@
+// Publishing (the reference's Packages/Publishing.cs; tooling.md §4.8): `publish` makes sure a package can be
+// published and prints its index entry; `index-check` is what an index's continuous integration runs.
+
+fn publishRefuse(
+    report: borrow mut PackageReport,
+    manifest: borrow Manifest,
+    message: Vector<u8>,
+) -> Result<void, AllocError> =>
+    report.error(335, manifest.file, 0, 0, message);
+
+/// Runs git in the package's directory: its trimmed output, or null if it failed.
+fn gitIn(directory: Slice<u8>, words: borrow Vector<Vector<u8>>, extra: Slice<u8>) -> Result<Vector<u8>?, AllocError> {
+    var arguments = Vector<Vector<u8>>.create();
+    arguments.push(copyBytes("-C".bytes())?)?;
+    arguments.push(copyBytes(directory)?)?;
+    for (w in words.view()) {
+        arguments.push(copyBytes(w.view())?)?;
+    }
+    if (extra.length > 0) {
+        arguments.push(copyBytes(extra)?)?;
+    }
+    let outcome = runTool("git".bytes(), arguments)?;
+    if (!outcome.started || outcome.status != 0) {
+        return Ok(null);
+    }
+    return Ok(copyBytes(trimAscii(outcome.stdout.view()))?);
+}
+
+fn words(
+    a: StringView,
+    b: StringView,
+    c: StringView,
+    d: StringView,
+    count: usize,
+) -> Result<Vector<Vector<u8>>, AllocError> {
+    var out = Vector<Vector<u8>>.create();
+    for (k in 0..count) {
+        let w = if (k == 0) a else if (k == 1) b else if (k == 2) c else d;
+        out.push(copyBytes(w.bytes())?)?;
+    }
+    return Ok(out);
+}
+
+/// One `[[version]]` table of an index file (Publishing.Entry).
+fn indexEntryText(
+    version: Slice<u8>,
+    git: Slice<u8>,
+    commit: Slice<u8>,
+    hash: Slice<u8>,
+    dependencies: borrow Vector<DependencySpec>,
+) -> Result<Vector<u8>, AllocError> {
+    var text = copyBytes("[[version]]\n".bytes())?;
+    appendLockLine(mut text, "version", version)?;
+    appendLockLine(mut text, "git", git)?;
+    appendLockLine(mut text, "commit", commit)?;
+    appendLockLine(mut text, "hash", hash)?;
+    var order = Vector<usize>.create();
+    for (k in 0..dependencies.length) {
+        order.push(k)?;
+        var at = order.length - 1;
+        while (at > 0 && lessBytes(dependencies[k].name.view(), dependencies[order[at - 1]].name.view())) {
+            order[at] = order[at - 1];
+            at -= 1;
+        }
+        order[at] = k;
+    }
+    if (order.length > 0) {
+        appendText(mut text, "dependencies = { ")?;
+        for (i in 0..order.length) {
+            if (i > 0) {
+                appendText(mut text, ", ")?;
+            }
+            appendBytes(mut text, dependencies[order[i]].name.view())?;
+            appendText(mut text, " = ")?;
+            appendTomlQuoted(mut text, dependencies[order[i]].version.view())?;
+        }
+        appendText(mut text, " }\n")?;
+    }
+    return Ok(text);
+}
+
+/// The index entry for the package in `directory`, or null after N0335 (Publishing.Check): a library with a version,
+/// registry dependencies only, that type-checks (`check` says whether it does), at a clean commit on a remote.
+fn publishCheck(
+    directory: Slice<u8>,
+    report: borrow mut PackageReport,
+    typeChecks: fn(borrow Workspace) -> bool,
+) -> Result<Vector<u8>?, AllocError> {
+    let manifest = match (loadManifest(directory, report, "".bytes())?) {
+        Some(m) => m,
+        null => { return Ok(null); }
+    };
+    if (manifest.kind != 1) {
+        var m = Words.create();
+        m.t("only a library can be published: '")?;
+        m.b(manifest.name.view())?;
+        m.t("' has kind = \"")?;
+        m.t(if (manifest.kind == 2) "relocatableobject" else "executable")?;
+        m.t("\"")?;
+        publishRefuse(report, manifest, m.out)?;
+        return Ok(null);
+    }
+    if (!manifest.hasVersion) {
+        publishRefuse(
+            report,
+            manifest,
+            copyBytes("[package] needs a version to publish: version = \"MAJOR.MINOR.PATCH\"".bytes())?,
+        )?;
+        return Ok(null);
+    }
+    for (d in manifest.dependencies.view()) {
+        if (!d.isRegistry) {
+            var m = Words.create();
+            m.t("'")?;
+            m.b(d.name.view())?;
+            m.t("' is a path or git dependency: a published package depends only on the registry (tooling.md §4.8)")?;
+            publishRefuse(report, manifest, m.out)?;
+            return Ok(null);
+        }
+    }
+    // It must check, with the dependencies its lock names.
+    let noUpdate = Vector<Vector<u8>>.create();
+    let workspace = match (resolveWorkspace(manifest.directory.view(), report, false, false, false, noUpdate)?) {
+        Some(w) => w,
+        null => { return Ok(null); }
+    };
+    if (!typeChecks(workspace)) {
+        var m = Words.create();
+        m.t("'")?;
+        m.b(manifest.name.view())?;
+        m.t("' does not type-check")?;
+        publishRefuse(report, manifest, m.out)?;
+        return Ok(null);
+    }
+    let dir = manifest.directory.view();
+    let commit = match (gitIn(dir, words("rev-parse", "--verify", "--quiet", "HEAD", 4)?, "".bytes())?) {
+        Some(c) => c,
+        null => Vector<u8>.create(),
+    };
+    if (commit.length != 40) {
+        publishRefuse(report, manifest, copyBytes("the package is not in a git repository with a commit".bytes())?)?;
+        return Ok(null);
+    }
+    var clean = false;
+    var status = words("status", "--porcelain", "--untracked-files=no", "--", 4)?;
+    status.push(copyBytes(".".bytes())?)?;
+    match (gitIn(dir, status, "".bytes())?) {
+        Some(s) => { clean = s.length == 0; }
+        null => {}
+    }
+    if (!clean) {
+        publishRefuse(
+            report,
+            manifest,
+            copyBytes(
+                "the package has uncommitted changes: commit them, so the published commit is what you checked".bytes(),
+            )?,
+        )?;
+        return Ok(null);
+    }
+    let remote = match (gitIn(dir, words("branch", "--remotes", "--contains", "", 3)?, commit.view())?) {
+        Some(r) => r,
+        null => Vector<u8>.create(),
+    };
+    if (remote.length == 0) {
+        var m = Words.create();
+        m.t("commit ")?;
+        m.b(commit[0..12])?;
+        m.t(" is on no remote branch: push it first")?;
+        publishRefuse(report, manifest, m.out)?;
+        return Ok(null);
+    }
+    let url = match (gitIn(dir, words("remote", "get-url", "origin", "", 3)?, "".bytes())?) {
+        Some(u) => u,
+        null => Vector<u8>.create(),
+    };
+    if (url.length == 0) {
+        publishRefuse(
+            report,
+            manifest,
+            copyBytes("the repository has no remote 'origin': the index needs a URL to fetch the commit from".bytes())?,
+        )?;
+        return Ok(null);
+    }
+    let hash = packageHash(manifest)?;
+    return Ok(indexEntryText(manifest.version.view(), url.view(), commit.view(), hash.view(), manifest.dependencies)?);
+}
+
+/// The checks of an index's continuous integration over the index in `directory` (Publishing.CheckIndex): each
+/// entry's commit exists; its manifest has the entry's name, version and registry dependencies; its hash is the entry's;
+/// and each package's versions increase in file order. Returns the number of entries checked.
+fn checkIndex(directory: Slice<u8>, report: borrow mut PackageReport, offline: bool) -> Result<u32, AllocError> {
+    var index = PackageIndex { directory: copyBytes(directory)?, packages: Vector<IndexPackage>.create() };
+    var git = GitCache { home: defaultHome()?, lastError: Vector<u8>.create() };
+    var checked: u32 = 0;
+    let packages = joinPath(directory, "packages".bytes())?;
+    var files = Vector<Vector<u8>>.create();
+    if (isDirectory(packages.view())) {
+        match (Directory.list(StringView.fromUtf8(packages.view())!)) {
+            Ok(names) => {
+                for (n in names.view()) {
+                    let name = n.view().bytes();
+                    if (name.length > 5 && sameText(name[name.length - 5..], ".toml")) {
+                        files.push(copyBytes(name)?)?;
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    for (file in files.view()) {
+        let name = file[0..file.length - 5];
+        var display = copyBytes("index:packages/".bytes())?;
+        appendBytes(mut display, file.view())?;
+        let filePath = joinPath(packages.view(), file.view())?;
+        let text = match (readFile(StringView.fromUtf8(filePath.view())!)) {
+            Ok(t) => t,
+            Err(_) => Vector<u8>.create(),
+        };
+        let source = report.add(display.view(), text.view())?;
+        if (!isPackageName(name)) {
+            report.error(328, source, 0, 0, message2("'", name, "' is not a package name")?)?;
+            continue;
+        }
+        let package = index.versions(name, report)?;
+        if (!index.packages[package].valid) {
+            continue; // reported by the index
+        }
+        var hasPrevious = false;
+        var previous = PackageVersion { major: 0, minor: 0, patch: 0 };
+        for (e in 0..index.packages[package].entries.length) {
+            let entry = copyIndexEntry(index.packages[package].entries[e])?;
+            checked += 1;
+            if (hasPrevious && entry.version.compare(previous) <= 0) {
+                var m = Words.create();
+                m.t("'")?;
+                m.b(name)?;
+                m.t("' ")?;
+                entry.version.appendTo(mut m.out)?;
+                m.t(" is not newer than ")?;
+                previous.appendTo(mut m.out)?;
+                m.t(", which comes before it")?;
+                report.error(328, source, 0, 0, m.out)?;
+            }
+            hasPrevious = true;
+            previous = entry.version;
+            let checkout = match (git.checkout(entry.git.view(), entry.commit.view(), offline)?) {
+                Some(c) => c,
+                null => {
+                    var m = Words.create();
+                    m.t("'")?;
+                    m.b(name)?;
+                    m.t("' ")?;
+                    entry.version.appendTo(mut m.out)?;
+                    m.t(": ")?;
+                    m.b(git.lastError.view())?;
+                    report.error(323, source, 0, 0, m.out)?;
+                    continue;
+                }
+            };
+            var manifestDisplay = copyBytes(name)?;
+            manifestDisplay.push('@')?;
+            entry.version.appendTo(mut manifestDisplay)?;
+            appendText(mut manifestDisplay, "/ceesafe.toml")?;
+            let manifest = match (loadManifest(checkout.view(), report, manifestDisplay.view())?) {
+                Some(m) => m,
+                null => { continue; }
+            };
+            var versionText = Vector<u8>.create();
+            entry.version.appendTo(mut versionText)?;
+            if (!sameBytes(manifest.name.view(), name) || !manifest.hasVersion || !sameBytes(
+                manifest.version.view(),
+                versionText.view(),
+            )) {
+                var m = Words.create();
+                m.t("the commit of '")?;
+                m.b(name)?;
+                m.t("' ")?;
+                m.b(versionText.view())?;
+                m.t(" is '")?;
+                m.b(manifest.name.view())?;
+                m.t("' ")?;
+                if (manifest.hasVersion) {
+                    m.b(manifest.version.view())?;
+                } else {
+                    m.t("(no version)")?;
+                }
+                report.error(328, source, 0, 0, m.out)?;
+            }
+            let hash = packageHash(manifest)?;
+            if (!sameBytes(hash.view(), entry.hash.view())) {
+                var m = Words.create();
+                m.t("'")?;
+                m.b(name)?;
+                m.t("' ")?;
+                m.b(versionText.view())?;
+                m.t(": the commit's hash is ")?;
+                m.b(hash.view())?;
+                m.t(", not the entry's")?;
+                report.error(328, source, 0, 0, m.out)?;
+            }
+            // The manifest's registry dependencies, by name, against the entry's.
+            var local = false;
+            var declared = Vector<usize>.create();
+            for (k in 0..manifest.dependencies.length) {
+                if (!manifest.dependencies[k].isRegistry) {
+                    local = true;
+                    continue;
+                }
+                declared.push(k)?;
+                var at = declared.length - 1;
+                while (at > 0 && lessBytes(
+                    manifest.dependencies[k].name.view(),
+                    manifest.dependencies[declared[at - 1]].name.view(),
+                )) {
+                    declared[at] = declared[at - 1];
+                    at -= 1;
+                }
+                declared[at] = k;
+            }
+            var same = declared.length == entry.dependencyNames.length;
+            for (k in 0..declared.length) {
+                if (same) {
+                    let d = borrow manifest.dependencies[declared[k]];
+                    same = sameBytes(d.name.view(), entry.dependencyNames[k].view()) &&
+                        sameBytes(d.version.view(), entry.dependencyRequirements[k].view());
+                }
+            }
+            if (local || !same) {
+                var m = Words.create();
+                m.t("'")?;
+                m.b(name)?;
+                m.t("' ")?;
+                m.b(versionText.view())?;
+                m.t(": the entry's dependencies are not its manifest's registry dependencies")?;
+                report.error(328, source, 0, 0, m.out)?;
+            }
+        }
+    }
+    return Ok(checked);
+}

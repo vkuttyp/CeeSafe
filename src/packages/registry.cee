@@ -1,0 +1,529 @@
+// The package registry (the reference's Packages/Registry.cs; tooling.md §4.6–§4.7): an index's entries and version
+// solving.
+
+/// One published version of a package, as the index records it (IndexEntry); dependencies by name, in order.
+struct IndexEntry {
+    name: Vector<u8>;
+    version: PackageVersion;
+    git: Vector<u8>;
+    commit: Vector<u8>;
+    hash: Vector<u8>;
+    dependencyNames: Vector<Vector<u8>>;
+    dependencyRequirements: Vector<Vector<u8>>;
+    yanked: bool;
+}
+
+/// A package's versions, loaded once: `valid` false after N0328.
+struct IndexPackage {
+    name: Vector<u8>;
+    valid: bool;
+    entries: Vector<IndexEntry>;
+}
+
+/// An index (PackageIndex): a checkout holding `packages/<name>.toml`, one `[[version]]` per published version.
+struct PackageIndex {
+    directory: Vector<u8>;
+    packages: Vector<IndexPackage>;
+
+    /// The package's entry, loading it on first use.
+    fn versions(borrow mut this, name: Slice<u8>, report: borrow mut PackageReport) -> Result<usize, AllocError> {
+        for (k in 0..this.packages.length) {
+            if (sameBytes(this.packages[k].name.view(), name)) {
+                return Ok(k);
+            }
+        }
+        let loaded = loadIndexPackage(this.directory.view(), name, report)?;
+        this.packages.push(loaded)?;
+        return Ok(this.packages.length - 1);
+    }
+}
+
+fn loadIndexPackage(
+    directory: Slice<u8>,
+    name: Slice<u8>,
+    report: borrow mut PackageReport,
+) -> Result<IndexPackage, AllocError> {
+    var package = IndexPackage { name: copyBytes(name)?, valid: true, entries: Vector<IndexEntry>.create() };
+    let packages = joinPath(directory, "packages".bytes())?;
+    var fileName = copyBytes(name)?;
+    appendText(mut fileName, ".toml")?;
+    let path = joinPath(packages.view(), fileName.view())?;
+    if (!fileExists(path.view())) {
+        return Ok(package);
+    }
+    var display = copyBytes("index:packages/".bytes())?;
+    appendBytes(mut display, fileName.view())?;
+    let text = match (readFile(StringView.fromUtf8(path.view())!)) {
+        Ok(t) => t,
+        Err(_) => Vector<u8>.create(),
+    };
+    let file = report.add(display.view(), text.view())?;
+    let tables = match (parseToml(text.view(), file, mut report.diagnostics)?) {
+        Some(t) => t,
+        null => {
+            package.valid = false;
+            return Ok(package);
+        }
+    };
+    for (t in tables.view()) {
+        if (!sameText(t.name.view(), "[]version")) {
+            continue;
+        }
+        var valid = false;
+        var version = PackageVersion { major: 0, minor: 0, patch: 0 };
+        match (textCopy(t, "version")?) {
+            Some(v) => {
+                match (parseVersion(v.view())?) {
+                    Some(parsed) => {
+                        version = parsed;
+                        valid = true;
+                    }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+        valid = valid && t.textAt("git") != null;
+        valid = valid && match (t.textAt("commit")) {
+            Some(c) => t.entries[c].value.text.length == 40,
+            null => false,
+        };
+        valid = valid && match (t.textAt("hash")) {
+            Some(h) => startsWithText(t.entries[h].value.text.view(), "sha256:"),
+            null => false,
+        };
+        var dependencyNames = Vector<Vector<u8>>.create();
+        var dependencyRequirements = Vector<Vector<u8>>.create();
+        match (t.find("dependencies")) {
+            Some(k) => {
+                let listed = borrow t.entries[k].value;
+                if (!listed.isTable()) {
+                    valid = false;
+                } else {
+                    for (d in 0..listed.keys.length) {
+                        if (!isPackageName(
+                            listed.keys[d].view(),
+                        ) || parseRequirement(listed.strings[d].view())? == null) {
+                            valid = false;
+                        }
+                    }
+                    if (valid) {
+                        // In ordinal order of the names.
+                        var order = Vector<usize>.create();
+                        for (d in 0..listed.keys.length) {
+                            order.push(d)?;
+                            var at = order.length - 1;
+                            while (at > 0 && lessBytes(listed.keys[d].view(), listed.keys[order[at - 1]].view())) {
+                                order[at] = order[at - 1];
+                                at -= 1;
+                            }
+                            order[at] = d;
+                        }
+                        for (d in order.view()) {
+                            dependencyNames.push(copyBytes(listed.keys[d].view())?)?;
+                            dependencyRequirements.push(copyBytes(listed.strings[d].view())?)?;
+                        }
+                    }
+                }
+            }
+            null => {}
+        }
+        if (!valid) {
+            report.error(
+                328,
+                file,
+                t.start,
+                t.end,
+                copyBytes(
+                    "an index entry needs 'version' (MAJOR.MINOR.PATCH), 'git', 'commit' (a full commit id), 'hash' (sha256:…), and valid 'dependencies'".bytes(),
+                )?,
+            )?;
+            package.valid = false;
+            return Ok(package);
+        }
+        var yanked = false;
+        match (t.find("yanked")) {
+            Some(k) => { yanked = t.entries[k].value.isBool() && t.entries[k].value.flag; }
+            null => {}
+        }
+        package.entries.push(
+            IndexEntry {
+                name: copyBytes(name)?,
+                version: version,
+                git: textCopy(t, "git")?!,
+                commit: textCopy(t, "commit")?!,
+                hash: textCopy(t, "hash")?!,
+                dependencyNames: dependencyNames,
+                dependencyRequirements: dependencyRequirements,
+                yanked: yanked,
+            },
+        )?;
+    }
+    return Ok(package);
+}
+
+/// A requirement on a registry package, and where it came from: a manifest, or a version of another package.
+struct Requirement {
+    name: Vector<u8>;
+    text: Vector<u8>; // the requirement as written
+    from: Vector<u8>;
+}
+
+/// Version solving (VersionSolver): one version of each registry package, the newest that satisfies every
+/// requirement on it (or the locked one while it still does), found by backtracking.
+struct VersionSolver {
+    chosenNames: Vector<Vector<u8>>;
+    chosen: Vector<IndexEntry>;
+    requirements: Vector<Requirement>; // in the order added
+    order: Vector<Vector<u8>>;         // the names in the order first required
+    preferredNames: Vector<Vector<u8>>;
+    preferred: Vector<PackageVersion>;
+    steps: u32;
+    failure: Vector<u8>;
+
+    fn chosenIndex(borrow this, name: Slice<u8>) -> usize? {
+        for (k in 0..this.chosenNames.length) {
+            if (sameBytes(this.chosenNames[k].view(), name)) {
+                return k;
+            }
+        }
+        return null;
+    }
+
+    fn add(borrow mut this, requirement: Requirement) -> Result<void, AllocError> {
+        var known = false;
+        for (n in this.order.view()) {
+            known = known || sameBytes(n.view(), requirement.name.view());
+        }
+        if (!known) {
+            this.order.push(copyBytes(requirement.name.view())?)?;
+        }
+        return this.requirements.push(requirement);
+    }
+
+    /// Removes the last requirement added (Remove), and its name if no requirement on it is left.
+    fn removeLast(borrow mut this) {
+        let name = copyBytes(this.requirements[this.requirements.length - 1].name.view())!;
+        this.requirements.truncate(this.requirements.length - 1);
+        for (r in this.requirements.view()) {
+            if (sameBytes(r.name.view(), name.view())) {
+                return;
+            }
+        }
+        for (k in 0..this.order.length) {
+            if (sameBytes(this.order[k].view(), name.view())) {
+                for (m in k..this.order.length - 1) {
+                    this.order.swap(m, m + 1);
+                }
+                this.order.truncate(this.order.length - 1);
+                return;
+            }
+        }
+    }
+
+    /// "{requirement} (from {from}) and …" for the requirements on `name`.
+    fn describe(borrow this, name: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        var first = true;
+        for (r in this.requirements.view()) {
+            if (!sameBytes(r.name.view(), name)) {
+                continue;
+            }
+            if (!first) {
+                appendText(out, " and ")?;
+            }
+            first = false;
+            parseRequirement(r.text.view())?!.appendTo(out)?;
+            appendText(out, " (from ")?;
+            appendBytes(out, r.from.view())?;
+            out.push(')')?;
+        }
+        return Ok();
+    }
+}
+
+fn copyIndexEntry(e: borrow IndexEntry) -> Result<IndexEntry, AllocError> {
+    var names = Vector<Vector<u8>>.create();
+    var requirements = Vector<Vector<u8>>.create();
+    for (k in 0..e.dependencyNames.length) {
+        names.push(copyBytes(e.dependencyNames[k].view())?)?;
+        requirements.push(copyBytes(e.dependencyRequirements[k].view())?)?;
+    }
+    return Ok(
+        IndexEntry {
+            name: copyBytes(e.name.view())?,
+            version: e.version,
+            git: copyBytes(e.git.view())?,
+            commit: copyBytes(e.commit.view())?,
+            hash: copyBytes(e.hash.view())?,
+            dependencyNames: names,
+            dependencyRequirements: requirements,
+            yanked: e.yanked,
+        },
+    );
+}
+
+fn maxSolverSteps() -> u32 => 100000;
+
+/// The solver's next choice (VersionSolver.Next): true when every required package has a version.
+fn solveNext(
+    s: borrow mut VersionSolver,
+    index: borrow mut PackageIndex,
+    report: borrow mut PackageReport,
+) -> Result<bool, AllocError> {
+    var name = Vector<u8>.create();
+    var open = false;
+    for (n in s.order.view()) {
+        if (!open && s.chosenIndex(n.view()) == null) {
+            name = copyBytes(n.view())?;
+            open = true;
+        }
+    }
+    if (!open) {
+        return Ok(true);
+    }
+    s.steps += 1;
+    if (s.steps > maxSolverSteps()) {
+        var m = copyBytes("no solution was found within 100000 steps: the requirements on '".bytes())?;
+        appendBytes(mut m, name.view())?;
+        appendText(mut m, "' and its dependencies leave too many combinations")?;
+        s.failure = m;
+        return Ok(false);
+    }
+    let package = index.versions(name.view(), report)?;
+    if (!index.packages[package].valid) {
+        var m = copyBytes("the index's entry for '".bytes())?;
+        appendBytes(mut m, name.view())?;
+        appendText(mut m, "' is not valid")?;
+        s.failure = m;
+        return Ok(false);
+    }
+    if (index.packages[package].entries.length == 0) {
+        var m = copyBytes("the index has no package '".bytes())?;
+        appendBytes(mut m, name.view())?;
+        appendText(mut m, "' (required by ")?;
+        for (r in s.requirements.view()) {
+            if (sameBytes(r.name.view(), name.view())) {
+                appendBytes(mut m, r.from.view())?;
+                break;
+            }
+        }
+        m.push(')')?;
+        s.failure = m;
+        return Ok(false);
+    }
+    var hasLocked = false;
+    var locked = PackageVersion { major: 0, minor: 0, patch: 0 };
+    for (k in 0..s.preferredNames.length) {
+        if (sameBytes(s.preferredNames[k].view(), name.view())) {
+            hasLocked = true;
+            locked = s.preferred[k];
+        }
+    }
+    // The candidates: not yanked (unless locked), satisfying every requirement; the locked one first, then newest first.
+    var candidates = Vector<IndexEntry>.create();
+    for (e in index.packages[package].entries.view()) {
+        let isLocked = hasLocked && e.version.compare(locked) == 0;
+        if (e.yanked && !isLocked) {
+            continue;
+        }
+        var fits = true;
+        for (r in s.requirements.view()) {
+            if (sameBytes(r.name.view(), name.view()) && !parseRequirement(r.text.view())?!.isSatisfiedBy(e.version)) {
+                fits = false;
+            }
+        }
+        if (fits) {
+            candidates.push(copyIndexEntry(e)?)?;
+            var at = candidates.length - 1;
+            while (at > 0 && candidateBefore(candidates[at], candidates[at - 1], hasLocked, locked)) {
+                candidates.swap(at, at - 1);
+                at -= 1;
+            }
+        }
+    }
+    if (candidates.length == 0) {
+        var m = copyBytes("no version of '".bytes())?;
+        appendBytes(mut m, name.view())?;
+        appendText(mut m, "' satisfies ")?;
+        s.describe(name.view(), mut m)?;
+        s.failure = m;
+        return Ok(false);
+    }
+    for (candidate in candidates.view()) {
+        s.chosenNames.push(copyBytes(name.view())?)?;
+        s.chosen.push(copyIndexEntry(candidate)?)?;
+        var added: usize = 0;
+        var consistent = true;
+        for (d in 0..candidate.dependencyNames.length) {
+            let dependency = candidate.dependencyNames[d].view();
+            var from = copyBytes(name.view())?;
+            from.push(' ')?;
+            candidate.version.appendTo(mut from)?;
+            s.add(
+                Requirement {
+                    name: copyBytes(dependency)?,
+                    text: copyBytes(candidate.dependencyRequirements[d].view())?,
+                    from: from,
+                },
+            )?;
+            added += 1;
+            match (s.chosenIndex(dependency)) {
+                Some(already) => {
+                    let requirement = parseRequirement(candidate.dependencyRequirements[d].view())?!;
+                    if (!requirement.isSatisfiedBy(s.chosen[already].version)) {
+                        var m = copyBytes("no version of '".bytes())?;
+                        appendBytes(mut m, dependency)?;
+                        appendText(mut m, "' satisfies ")?;
+                        s.describe(dependency, mut m)?;
+                        s.failure = m;
+                        consistent = false;
+                        break;
+                    }
+                }
+                null => {}
+            }
+        }
+        if (consistent && solveNext(s, index, report)?) {
+            return Ok(true);
+        }
+        for (k in 0..added) {
+            s.removeLast();
+        }
+        let at = s.chosenIndex(name.view())!;
+        for (m in at..s.chosenNames.length - 1) {
+            s.chosenNames.swap(m, m + 1);
+            s.chosen.swap(m, m + 1);
+        }
+        s.chosenNames.truncate(s.chosenNames.length - 1);
+        s.chosen.truncate(s.chosen.length - 1);
+        if (s.steps > maxSolverSteps()) {
+            return Ok(false);
+        }
+    }
+    return Ok(false);
+}
+
+/// Whether candidate `a` comes before `b`: the locked version first, then the newer.
+fn candidateBefore(a: borrow IndexEntry, b: borrow IndexEntry, hasLocked: bool, locked: PackageVersion) -> bool {
+    let aLocked = hasLocked && a.version.compare(locked) == 0;
+    let bLocked = hasLocked && b.version.compare(locked) == 0;
+    if (aLocked != bLocked) {
+        return aLocked;
+    }
+    return a.version.compare(b.version) > 0;
+}
+
+/// Chooses a version of each registry package (Workspace.Solve), per index, preferring the locked versions unless
+/// updating. False after N0329 (or N0328 for an index entry that is not valid).
+fn solve(w: borrow mut Workspace, report: borrow mut PackageReport) -> Result<bool, AllocError> {
+    let defaultUrl = defaultIndexUrl()?;
+    // The indexes in the order first named.
+    var urls = Vector<Vector<u8>>.create();
+    for (p in w.registry.view()) {
+        let url = copyBytes(if (p.spec.hasIndex) p.spec.index.view() else defaultUrl.view())?;
+        var known = false;
+        for (u in urls.view()) {
+            known = known || sameBytes(u.view(), url.view());
+        }
+        if (!known) {
+            urls.push(url)?;
+        }
+    }
+    for (url in urls.view()) {
+        var first: usize = 0;
+        var seenFirst = false;
+        for (k in 0..w.registry.length) {
+            let spec = borrow w.registry[k].spec;
+            let mine = if (spec.hasIndex) sameBytes(
+                spec.index.view(),
+                url.view(),
+            ) else sameBytes(defaultUrl.view(), url.view());
+            if (mine && !seenFirst) {
+                first = k;
+                seenFirst = true;
+            }
+        }
+        let directory = match (w.git.indexCheckout(url.view(), w.offline)?) {
+            Some(d) => d,
+            null => {
+                var m = Words.create();
+                m.t("the index '")?;
+                m.b(url.view())?;
+                m.t("': ")?;
+                m.b(w.git.lastError.view())?;
+                w.error(report, 323, w.registry[first].dependent, w.registry[first].spec, m.out)?;
+                return Ok(false);
+            }
+        };
+        var index = PackageIndex { directory: directory, packages: Vector<IndexPackage>.create() };
+        var solver = VersionSolver {
+            chosenNames: Vector<Vector<u8>>.create(),
+            chosen: Vector<IndexEntry>.create(),
+            requirements: Vector<Requirement>.create(),
+            order: Vector<Vector<u8>>.create(),
+            preferredNames: Vector<Vector<u8>>.create(),
+            preferred: Vector<PackageVersion>.create(),
+            steps: 0,
+            failure: Vector<u8>.create(),
+        };
+        var source = copyBytes("registry+".bytes())?;
+        appendBytes(mut source, url.view())?;
+        for (e in w.locked.view()) {
+            if (!sameBytes(e.source.view(), source.view()) || !e.hasVersion) {
+                continue;
+            }
+            var updating = false;
+            if (w.hasUpdate) {
+                updating = w.update.length == 0;
+                for (u in w.update.view()) {
+                    updating = updating || sameBytes(u.view(), e.name.view());
+                }
+            }
+            match (parseVersion(e.version.view())?) {
+                Some(v) => {
+                    if (!updating) {
+                        solver.preferredNames.push(copyBytes(e.name.view())?)?;
+                        solver.preferred.push(v)?;
+                    }
+                }
+                null => {}
+            }
+        }
+        for (p in w.registry.view()) {
+            let mine = if (p.spec.hasIndex) sameBytes(
+                p.spec.index.view(),
+                url.view(),
+            ) else sameBytes(defaultUrl.view(), url.view());
+            if (mine) {
+                solver.add(
+                    Requirement {
+                        name: copyBytes(p.spec.name.view())?,
+                        text: copyBytes(p.spec.version.view())?,
+                        from: w.dependentName(p.dependent)?,
+                    },
+                )?;
+            }
+        }
+        if (!solveNext(mut solver, mut index, report)?) {
+            if (!report.hasErrors()) {
+                let message = copyBytes(solver.failure.view())?;
+                w.error(report, 329, w.registry[first].dependent, w.registry[first].spec, message)?;
+            }
+            return Ok(false);
+        }
+        for (k in 0..solver.chosen.length) {
+            let chosen = borrow solver.chosen[k];
+            var entry = newLockEntry(solver.chosenNames[k].view(), source.view())?;
+            entry.hasCommit = true;
+            entry.commit = copyBytes(chosen.commit.view())?;
+            entry.hasHash = true;
+            entry.hash = copyBytes(chosen.hash.view())?;
+            entry.hasVersion = true;
+            chosen.version.appendTo(mut entry.version)?;
+            entry.hasRepository = true;
+            entry.repository = copyBytes(chosen.git.view())?;
+            w.solution.push(entry)?;
+        }
+    }
+    return Ok(true);
+}

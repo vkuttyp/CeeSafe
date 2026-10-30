@@ -1,0 +1,603 @@
+// Resolving a package's dependencies (the reference's Workspace.Resolve, ResolveAll, Drain, Solve, Locate, Load and
+// CheckCycles; tooling.md §4.2–§4.3, §4.7).
+
+/// A message built from pieces.
+struct Words {
+    out: Vector<u8>;
+
+    fn create() -> Words => Words { out: Vector<u8>.create() };
+
+    fn t(borrow mut this, text: StringView) -> Result<void, AllocError> => appendText(mut this.out, text);
+
+    fn b(borrow mut this, bytes: Slice<u8>) -> Result<void, AllocError> => appendBytes(mut this.out, bytes);
+}
+
+struct Workspace {
+    root: Manifest;
+    fetch: bool;
+    offline: bool;
+    hasLock: bool;
+    locked: Vector<LockEntry>;
+    resolved: Vector<ResolvedPackage>;   // in the order reached
+    registry: Vector<PendingDependency>; // with fetch: registry dependencies, solved once the rest is resolved
+    solution: Vector<LockEntry>;         // with fetch: the chosen version of each registry package
+    hasUpdate: bool;                     // --update: choose these registry packages (all if empty) afresh
+    update: Vector<Vector<u8>>;
+    resolvedHashes: Vector<LockEntry>; // with fetch: git packages' hashes, set once every checkout is known
+    git: GitCache;
+
+    fn dependentManifest(borrow this, dependent: u32) -> borrow Manifest {
+        if (dependent == none()) {
+            return borrow this.root;
+        }
+        return borrow this.resolved[dependent as usize].manifest;
+    }
+
+    fn dependentName(borrow this, dependent: u32) -> Result<Vector<u8>, AllocError> {
+        let manifest = this.dependentManifest(dependent);
+        return copyBytes(manifest.name.view());
+    }
+
+    fn dependentDirectory(borrow this, dependent: u32) -> Result<Vector<u8>, AllocError> {
+        let manifest = this.dependentManifest(dependent);
+        return copyBytes(manifest.directory.view());
+    }
+
+    fn findResolved(borrow this, name: Slice<u8>) -> usize? {
+        for (k in 0..this.resolved.length) {
+            if (sameBytes(this.resolved[k].manifest.name.view(), name)) {
+                return k;
+            }
+        }
+        return null;
+    }
+
+    fn findLocked(borrow this, name: Slice<u8>) -> usize? {
+        for (k in 0..this.locked.length) {
+            if (sameBytes(this.locked[k].name.view(), name)) {
+                return k;
+            }
+        }
+        return null;
+    }
+
+    fn error(
+        borrow this,
+        report: borrow mut PackageReport,
+        code: u32,
+        dependent: u32,
+        spec: borrow DependencySpec,
+        message: Vector<u8>,
+    ) -> Result<void, AllocError> {
+        let file = this.dependentManifest(dependent).file;
+        return report.error(code, file, spec.start, spec.end, message);
+    }
+}
+
+fn describeEntry(words: borrow mut Words, entry: borrow LockEntry) -> Result<void, AllocError> {
+    words.b(entry.source.view())?;
+    if (entry.hasCommit) {
+        words.t(" at ")?;
+        words.b(entry.commit[0..(if (entry.commit.length < 12) entry.commit.length else 12)])?;
+    }
+    return Ok();
+}
+
+/// Resolves the package in `directory` (Workspace.Resolve). With `fetch`, from the manifests (fetching git
+/// repositories and resolving tags and branches), and writes the lock; otherwise through the lock, which must match the
+/// manifests (N0324). Null after reporting.
+fn resolveWorkspace(
+    directory: Slice<u8>,
+    report: borrow mut PackageReport,
+    fetch: bool,
+    offline: bool,
+    hasUpdate: bool,
+    update: borrow Vector<Vector<u8>>,
+) -> Result<Workspace?, AllocError> {
+    let root = match (loadManifest(directory, report, "".bytes())?) {
+        Some(m) => m,
+        null => { return Ok(null); }
+    };
+    var hasLock = false;
+    var locked = Vector<LockEntry>.create();
+    let lockPath = joinPath(root.directory.view(), lockName().bytes())?;
+    if (fetch && fileExists(lockPath.view())) {
+        // The versions it records are preferred while they still satisfy the requirements (§4.7).
+        var scratch = PackageReport.create();
+        let text = match (readFile(StringView.fromUtf8(lockPath.view())!)) {
+            Ok(t) => t,
+            Err(_) => Vector<u8>.create(),
+        };
+        let file = scratch.add(lockPath.view(), text.view())?;
+        match (readLock(file, mut scratch)?) {
+            Some(entries) => {
+                hasLock = true;
+                locked = entries;
+            }
+            null => {}
+        }
+    } else if (!fetch && root.dependencies.length > 0) {
+        if (!fileExists(lockPath.view())) {
+            report.error(324, root.file, 0, 0, copyBytes("there is no ceesafe.lock: run 'ceesafec fetch'".bytes())?)?;
+            return Ok(null);
+        }
+        let text = match (readFile(StringView.fromUtf8(lockPath.view())!)) {
+            Ok(t) => t,
+            Err(_) => Vector<u8>.create(),
+        };
+        let file = report.add(lockPath.view(), text.view())?;
+        match (readLock(file, report)?) {
+            Some(entries) => {
+                hasLock = true;
+                locked = entries;
+            }
+            null => { return Ok(null); }
+        }
+    }
+    var names = Vector<Vector<u8>>.create();
+    for (u in update.view()) {
+        names.push(copyBytes(u.view())?)?;
+    }
+    var workspace = Workspace {
+        root: root,
+        fetch: fetch,
+        offline: offline,
+        hasLock: hasLock,
+        locked: locked,
+        resolved: Vector<ResolvedPackage>.create(),
+        registry: Vector<PendingDependency>.create(),
+        solution: Vector<LockEntry>.create(),
+        hasUpdate: hasUpdate,
+        update: names,
+        resolvedHashes: Vector<LockEntry>.create(),
+        git: GitCache { home: defaultHome()?, lastError: Vector<u8>.create() },
+    };
+    let before = report.count();
+    resolveAll(mut workspace, report)?;
+    if (report.count() != before) {
+        return Ok(null);
+    }
+    if (fetch) {
+        var entries = Vector<LockEntry>.create();
+        for (p in workspace.resolved.view()) {
+            entries.push(copyLockEntry(p.entry)?)?;
+        }
+        let text = writeLockText(entries)?;
+        match (writeFile(StringView.fromUtf8(lockPath.view())!, text.view())) {
+            Ok() => {}
+            Err(_) => {}
+        }
+    }
+    return Ok(workspace);
+}
+
+fn resolveAll(w: borrow mut Workspace, report: borrow mut PackageReport) -> Result<void, AllocError> {
+    var queue = Vector<PendingDependency>.create();
+    for (d in w.root.dependencies.view()) {
+        queue.push(PendingDependency { dependent: none(), spec: copyDependency(d)? })?;
+    }
+    drain(w, mut queue, report)?;
+    if (w.fetch && w.registry.length > 0 && !report.hasErrors()) {
+        // Every path and git package is known, so every requirement on the registry is: solve, then load (§4.7).
+        if (!solve(w, report)?) {
+            return Ok();
+        }
+        for (p in w.registry.view()) {
+            queue.push(PendingDependency { dependent: p.dependent, spec: copyDependency(p.spec)? })?;
+        }
+        w.registry.clear();
+        drain(w, mut queue, report)?;
+        for (k in 0..w.registry.length) {
+            // Its manifest asks for a package its index entry does not list: the index is out of step with it.
+            let dependent = w.registry[k].dependent;
+            var m = Words.create();
+            let dependentName = w.dependentName(dependent)?;
+            m.t("'")?;
+            m.b(dependentName.view())?;
+            m.t("' needs '")?;
+            m.b(w.registry[k].spec.name.view())?;
+            m.t("', which its index entry does not list among its dependencies")?;
+            w.error(report, 328, dependent, w.registry[k].spec, m.out)?;
+        }
+    }
+    if (report.hasErrors()) {
+        return Ok();
+    }
+    checkCycles(w, report)?;
+    return Ok();
+}
+
+fn drain(
+    w: borrow mut Workspace,
+    queue: borrow mut Vector<PendingDependency>,
+    report: borrow mut PackageReport,
+) -> Result<void, AllocError> {
+    var next: usize = 0;
+    while (next < queue.length) {
+        let dependent = queue[next].dependent;
+        let spec = copyDependency(queue[next].spec)?;
+        next += 1;
+        var solved = false;
+        for (s in w.solution.view()) {
+            solved = solved || sameBytes(s.name.view(), spec.name.view());
+        }
+        if (w.fetch && spec.isRegistry && !solved) {
+            w.registry.push(PendingDependency { dependent: dependent, spec: spec })?; // solved once the rest is resolved
+            continue;
+        }
+        if (sameBytes(spec.name.view(), w.root.name.view())) {
+            var m = Words.create();
+            let dependentName = w.dependentName(dependent)?;
+            m.t("'")?;
+            m.b(dependentName.view())?;
+            m.t("' depends on '")?;
+            m.b(spec.name.view())?;
+            m.t("', which depends on it: a cycle")?;
+            w.error(report, 327, dependent, spec, m.out)?;
+            continue;
+        }
+        let entry = match (locate(w, dependent, spec, report)?) {
+            Some(e) => e,
+            null => { continue; }
+        };
+        match (w.findResolved(spec.name.view())) {
+            Some(k) => {
+                let existing = borrow w.resolved[k].entry;
+                var conflict = !sameBytes(existing.source.view(), entry.source.view()) ||
+                    existing.hasCommit != entry.hasCommit || !sameBytes(existing.commit.view(), entry.commit.view());
+                if (!conflict && spec.isRegistry) {
+                    let requirement = parseRequirement(spec.version.view())?!;
+                    let version = parseVersion(entry.version.view())?!;
+                    conflict = !requirement.isSatisfiedBy(version);
+                }
+                if (conflict) {
+                    var m = Words.create();
+                    m.t("'")?;
+                    m.b(spec.name.view())?;
+                    m.t("' is reached through two sources: ")?;
+                    describeEntry(mut m, w.resolved[k].entry)?;
+                    m.t(" (from '")?;
+                    m.b(w.resolved[k].via.view())?;
+                    m.t("') and ")?;
+                    describeEntry(mut m, entry)?;
+                    m.t(" (from '")?;
+                    let dependentName = w.dependentName(dependent)?;
+                    m.b(dependentName.view())?;
+                    m.t("')")?;
+                    w.error(report, 326, dependent, spec, m.out)?;
+                }
+                continue;
+            }
+            null => {}
+        }
+        let manifest = match (loadDependency(w, dependent, spec, entry, report)?) {
+            Some(m) => m,
+            null => { continue; }
+        };
+        let via = w.dependentName(dependent)?;
+        let fromRegistry = entry.hasVersion;
+        let version = copyBytes(entry.version.view())?;
+        w.resolved.push(ResolvedPackage { manifest: manifest, entry: entry, via: via })?;
+        let index = truncate<u32>(w.resolved.length - 1);
+        for (d in 0..w.resolved[index as usize].manifest.dependencies.length) {
+            let following = copyDependency(w.resolved[index as usize].manifest.dependencies[d])?;
+            if (fromRegistry && !following.isRegistry) {
+                var m = Words.create();
+                m.t("'")?;
+                m.b(w.resolved[index as usize].manifest.name.view())?;
+                m.t("' ")?;
+                m.b(version.view())?;
+                m.t(" comes from the registry, so its dependencies must too, but '")?;
+                m.b(following.name.view())?;
+                m.t("' is a path or git dependency")?;
+                w.error(report, 328, index, following, m.out)?;
+                continue;
+            }
+            queue.push(PendingDependency { dependent: index, spec: following })?;
+        }
+    }
+    queue.clear();
+    return Ok();
+}
+
+fn lockOutOfDate(
+    w: borrow Workspace,
+    report: borrow mut PackageReport,
+    dependent: u32,
+    spec: borrow DependencySpec,
+) -> Result<void, AllocError> {
+    var m = Words.create();
+    m.t("ceesafe.lock does not record '")?;
+    m.b(spec.name.view())?;
+    m.t("' as the manifest names it: run 'ceesafec fetch'")?;
+    return w.error(report, 324, dependent, spec, m.out);
+}
+
+/// Where a dependency comes from: its lock entry, made now (fetch) or read from the lock (Locate).
+fn locate(
+    w: borrow mut Workspace,
+    dependent: u32,
+    spec: borrow DependencySpec,
+    report: borrow mut PackageReport,
+) -> Result<LockEntry?, AllocError> {
+    if (spec.isRegistry) {
+        // A registry package's own dependencies come from the index that published it (§4.6).
+        var source = copyBytes("registry+".bytes())?;
+        if (spec.hasIndex) {
+            appendBytes(mut source, spec.index.view())?;
+        } else {
+            var publishedBy = false;
+            if (dependent != none()) {
+                let from = w.resolved[dependent as usize].entry.source.view();
+                if (startsWithText(from, "registry+")) {
+                    appendBytes(mut source, from[9..])?;
+                    publishedBy = true;
+                }
+            }
+            if (!publishedBy) {
+                let defaultUrl = defaultIndexUrl()?;
+                appendBytes(mut source, defaultUrl.view())?;
+            }
+        }
+        if (w.fetch) {
+            for (s in w.solution.view()) {
+                if (sameBytes(s.name.view(), spec.name.view())) {
+                    return Ok(copyLockEntry(s)?);
+                }
+            }
+            return Ok(null);
+        }
+        let requirement = parseRequirement(spec.version.view())?!;
+        var good = false;
+        var found: usize = 0;
+        match (w.findLocked(spec.name.view())) {
+            Some(k) => {
+                let e = borrow w.locked[k];
+                if (e.hasCommit && e.hasRepository && e.hasVersion && sameBytes(e.source.view(), source.view())) {
+                    match (parseVersion(e.version.view())?) {
+                        Some(v) => {
+                            good = requirement.isSatisfiedBy(v);
+                            found = k;
+                        }
+                        null => {}
+                    }
+                }
+            }
+            null => {}
+        }
+        if (!good) {
+            var m = Words.create();
+            m.t("ceesafe.lock has no version of '")?;
+            m.b(spec.name.view())?;
+            m.t("' that satisfies ")?;
+            requirement.appendTo(mut m.out)?;
+            m.t(": run 'ceesafec fetch'")?;
+            w.error(report, 324, dependent, spec, m.out)?;
+            return Ok(null);
+        }
+        return Ok(copyLockEntry(w.locked[found])?);
+    }
+    if (spec.hasPath) {
+        let base = w.dependentDirectory(dependent)?;
+        let full = joinPath(base.view(), spec.path.view())?;
+        var source = copyBytes("path+".bytes())?;
+        let relative = relativePath(w.root.directory.view(), full.view())?;
+        appendBytes(mut source, relative.view())?;
+        let entry = newLockEntry(spec.name.view(), source.view())?;
+        if (w.fetch) {
+            return Ok(entry);
+        }
+        match (w.findLocked(spec.name.view())) {
+            Some(k) => {
+                if (sameBytes(w.locked[k].source.view(), entry.source.view())) {
+                    return Ok(entry);
+                }
+            }
+            null => {}
+        }
+        lockOutOfDate(w, report, dependent, spec)?;
+        return Ok(null);
+    }
+    var git = copyBytes("git+".bytes())?;
+    appendBytes(mut git, spec.git.view())?;
+    if (!w.fetch) {
+        match (w.findLocked(spec.name.view())) {
+            Some(k) => {
+                let e = borrow w.locked[k];
+                let revMatches = !spec.hasRev || startsWithBytes(e.commit.view(), spec.rev.view());
+                if (sameBytes(e.source.view(), git.view()) && e.hasCommit && revMatches) {
+                    var entry = newLockEntry(spec.name.view(), git.view())?;
+                    entry.hasCommit = true;
+                    entry.commit = copyBytes(e.commit.view())?;
+                    entry.hasHash = e.hasHash;
+                    entry.hash = copyBytes(e.hash.view())?;
+                    return Ok(entry);
+                }
+            }
+            null => {}
+        }
+        lockOutOfDate(w, report, dependent, spec)?;
+        return Ok(null);
+    }
+    match (w.git.resolve(spec.git.view(), spec, w.offline)?) {
+        Some(commit) => {
+            var entry = newLockEntry(spec.name.view(), git.view())?;
+            entry.hasCommit = true;
+            entry.commit = commit;
+            return Ok(entry);
+        }
+        null => {
+            let message = copyBytes(w.git.lastError.view())?;
+            w.error(report, 323, dependent, spec, message)?;
+            return Ok(null);
+        }
+    }
+}
+
+fn startsWithBytes(text: Slice<u8>, prefix: Slice<u8>) -> bool =>
+    text.length >= prefix.length && sameBytes(text[0..prefix.length], prefix);
+
+/// The dependency's manifest: from its directory, or from its git checkout, fetched if needed and its hash checked
+/// (Workspace.Load).
+fn loadDependency(
+    w: borrow mut Workspace,
+    dependent: u32,
+    spec: borrow DependencySpec,
+    entry: borrow LockEntry,
+    report: borrow mut PackageReport,
+) -> Result<Manifest?, AllocError> {
+    var directory = Vector<u8>.create();
+    if (spec.hasPath) {
+        let base = w.dependentDirectory(dependent)?;
+        directory = joinPath(base.view(), spec.path.view())?;
+        let manifestPath = joinPath(directory.view(), manifestName().bytes())?;
+        if (!fileExists(manifestPath.view())) {
+            var m = Words.create();
+            m.t("'")?;
+            m.b(spec.name.view())?;
+            m.t("': no ceesafe.toml in '")?;
+            m.b(spec.path.view())?;
+            m.t("'")?;
+            w.error(report, 322, dependent, spec, m.out)?;
+            return Ok(null);
+        }
+    } else {
+        let url = if (spec.hasGit) spec.git.view() else entry.repository.view();
+        match (w.git.checkout(url, entry.commit.view(), w.offline)?) {
+            Some(checkout) => { directory = checkout; }
+            null => {
+                let message = copyBytes(w.git.lastError.view())?;
+                w.error(report, 323, dependent, spec, message)?;
+                return Ok(null);
+            }
+        }
+    }
+    let manifest = match (loadManifest(directory.view(), report, "".bytes())?) {
+        Some(m) => m,
+        null => { return Ok(null); }
+    };
+    if (!sameBytes(manifest.name.view(), spec.name.view())) {
+        var m = Words.create();
+        m.t("the package at the source of '")?;
+        m.b(spec.name.view())?;
+        m.t("' is named '")?;
+        m.b(manifest.name.view())?;
+        m.t("'")?;
+        w.error(report, 322, dependent, spec, m.out)?;
+        return Ok(null);
+    }
+    if (manifest.kind == 0) {
+        var m = Words.create();
+        m.t("'")?;
+        m.b(spec.name.view())?;
+        m.t("' is an executable: a dependency must be a library (kind = \"library\")")?;
+        w.error(report, 321, dependent, spec, m.out)?;
+        return Ok(null);
+    }
+    if (entry.hasVersion) {
+        // A registry package (§4.7): the commit must hold what the index published.
+        if (!manifest.hasVersion || !sameBytes(manifest.version.view(), entry.version.view())) {
+            var m = Words.create();
+            m.t("the commit published as '")?;
+            m.b(spec.name.view())?;
+            m.t("' ")?;
+            m.b(entry.version.view())?;
+            m.t(" has version ")?;
+            if (manifest.hasVersion) {
+                m.b(manifest.version.view())?;
+            } else {
+                m.t("(none)")?;
+            }
+            m.t(" in its manifest")?;
+            w.error(report, 328, dependent, spec, m.out)?;
+            return Ok(null);
+        }
+        let hash = packageHash(manifest)?;
+        if (!entry.hasHash || !sameBytes(hash.view(), entry.hash.view())) {
+            var m = Words.create();
+            m.t("'")?;
+            m.b(spec.name.view())?;
+            m.t("' ")?;
+            m.b(entry.version.view())?;
+            m.t(
+                if (w.fetch) " does not match its hash in the index" else " does not match its hash in the ceesafe.lock",
+            )?;
+            m.t(": its files differ from what was published")?;
+            w.error(report, 325, dependent, spec, m.out)?;
+            return Ok(null);
+        }
+    } else if (spec.hasGit) {
+        let hash = packageHash(manifest)?;
+        if (w.fetch) {
+            var recorded = newLockEntry(spec.name.view(), "".bytes())?;
+            recorded.hasHash = true;
+            recorded.hash = hash;
+            w.resolvedHashes.push(recorded)?;
+        } else if (!entry.hasHash || !sameBytes(entry.hash.view(), hash.view())) {
+            var m = Words.create();
+            m.t("the checkout of '")?;
+            m.b(spec.name.view())?;
+            m.t(
+                "' does not match ceesafe.lock (its files changed): delete it from the cache, or run 'ceesafec fetch'",
+            )?;
+            w.error(report, 325, dependent, spec, m.out)?;
+            return Ok(null);
+        }
+    }
+    return Ok(manifest);
+}
+
+/// N0327 for a cycle among dependencies (one through the root is reported as it is reached).
+fn checkCycles(w: borrow mut Workspace, report: borrow mut PackageReport) -> Result<void, AllocError> {
+    var state = Vector<u32>.create(); // per resolved package: 0 unvisited, 1 on the path, 2 done
+    for (k in 0..w.resolved.length) {
+        state.push(0)?;
+    }
+    for (k in 0..w.resolved.length) {
+        if (state[k] == 0 && !visitCycles(w, report, mut state, truncate<u32>(k))?) {
+            return Ok();
+        }
+    }
+    // With fetch, the git entries get their hashes now that every checkout is known.
+    for (h in w.resolvedHashes.view()) {
+        match (w.findResolved(h.name.view())) {
+            Some(k) => {
+                w.resolved[k].entry.hasHash = true;
+                w.resolved[k].entry.hash = copyBytes(h.hash.view())?;
+            }
+            null => {}
+        }
+    }
+    return Ok();
+}
+
+fn visitCycles(
+    w: borrow Workspace,
+    report: borrow mut PackageReport,
+    state: borrow mut Vector<u32>,
+    k: u32,
+) -> Result<bool, AllocError> {
+    state[k as usize] = 1;
+    let manifest = borrow w.resolved[k as usize].manifest;
+    for (spec in manifest.dependencies.view()) {
+        let next = match (w.findResolved(spec.name.view())) {
+            Some(n) => n,
+            null => { continue; }
+        };
+        if (state[next] == 1) {
+            var m = Words.create();
+            m.t("'")?;
+            m.b(manifest.name.view())?;
+            m.t("' depends on '")?;
+            m.b(spec.name.view())?;
+            m.t("', which depends on it: a cycle")?;
+            report.error(327, manifest.file, spec.start, spec.end, m.out)?;
+            return Ok(false);
+        }
+        if (state[next] == 0 && !visitCycles(w, report, state, truncate<u32>(next))?) {
+            return Ok(false);
+        }
+    }
+    state[k as usize] = 2;
+    return Ok(true);
+}

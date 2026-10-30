@@ -1,0 +1,317 @@
+// The package commands (the reference's Program.Fetch, Publish, IndexCheck, Agents and NewPackage; tooling.md §4,
+// §7): `fetch`, `publish`, `index-check`, `agents` and `new`.
+
+/// Prints package diagnostics as `Report` does for a command that prints no JSON document: text unless --json.
+fn reportPackageText(json: bool, packageReport: borrow PackageReport) {
+    if (json) {
+        return; // collected for a document these commands never print
+    }
+    var text = Vector<u8>.create();
+    for (d in packageReport.diagnostics.items.view()) {
+        render(mut text, d, packageReport.sources[d.file as usize])!;
+    }
+    Console.writeError(StringView.fromUtf8(text.view())!);
+}
+
+fn currentManifestDirectory() -> Vector<u8>? {
+    let cwd = match (Directory.current()) {
+        Ok(d) => d,
+        Err(_) => { return null; }
+    };
+    return findManifestDirectory(cwd.view().bytes())!;
+}
+
+/// `ceesafec fetch [--offline] [--update [name…]]`: resolves and writes ceesafe.lock (tooling.md §4.3, §4.7).
+fn fetchCommand(arguments: borrow Vector<Vector<u8>>, json: bool) -> i32 {
+    var hasUpdate = false;
+    var update = Vector<Vector<u8>>.create();
+    var offline = false;
+    for (a in arguments.view()) {
+        if (sameText(a.view(), "--offline")) {
+            offline = true;
+        } else if (sameText(a.view(), "--update")) {
+            hasUpdate = true;
+        } else if (hasUpdate && !(a.length > 0 && a[0] == '-')) {
+            update.push(copyBytes(a.view())!)!;
+        } else {
+            var message = copyBytes("unknown fetch option '".bytes())!;
+            appendBytes(mut message, a.view())!;
+            message.push('\'')!;
+            return fail(StringView.fromUtf8(message.view())!);
+        }
+    }
+    let directory = match (currentManifestDirectory()) {
+        Some(d) => d,
+        null => { return fail("no ceesafe.toml here or above"); }
+    };
+    var packageReport = PackageReport.create();
+    let resolved = resolveWorkspace(directory.view(), mut packageReport, true, offline, hasUpdate, update)!;
+    reportPackageText(json, packageReport);
+    let workspace = match (resolved) {
+        Some(w) => w,
+        null => { return 1; }
+    };
+    var message = copyBytes("ceesafec: ceesafe.lock: ".bytes())!;
+    appendDecimal(mut message, workspace.resolved.length as u64)!;
+    appendText(mut message, if (workspace.resolved.length == 1) " dependency\n" else " dependencies\n")!;
+    Console.writeError(StringView.fromUtf8(message.view())!);
+    return 0;
+}
+
+/// Whether the workspace's root package type-checks with its dependencies, its diagnostics printed if not
+/// (Publishing.Check's compilation).
+fn workspaceTypeChecks(workspace: borrow Workspace) -> bool {
+    var options = defaultOptions(false);
+    options.freestanding = workspace.root.freestanding;
+    options.noFloat = !workspace.root.floatAllowed;
+    options.kernel = workspace.root.kernel;
+    options.absolutePaths = true;
+    var packages = Vector<PackageInfo>.create();
+    var files = Vector<Vector<Vector<u8>>>.create();
+    for (p in 0..workspace.resolved.length + 1) {
+        let manifest = workspace.dependentManifest(if (p == 0) none() else truncate<u32>(p - 1));
+        var dependencies = Vector<Vector<u8>>.create();
+        for (d in manifest.dependencies.view()) {
+            dependencies.push(copyBytes(d.name.view())!)!;
+        }
+        packages.push(
+            PackageInfo {
+                name: copyBytes(manifest.name.view())!,
+                dependencies: dependencies,
+                trusted: manifest.trusted,
+            },
+        )!;
+        var paths = Vector<Vector<u8>>.create();
+        manifestSourceFiles(manifest, mut paths)!;
+        files.push(paths)!;
+    }
+    let noFiles = Vector<String>.create();
+    return compileFiles(options, false, noFiles, packages, files) == 0;
+}
+
+/// `ceesafec publish`: checks the package and prints its index entry (tooling.md §4.8).
+fn publishCommand(arguments: borrow Vector<Vector<u8>>, json: bool) -> i32 {
+    if (arguments.length > 0) {
+        var message = copyBytes("unknown publish option '".bytes())!;
+        appendBytes(mut message, arguments[0].view())!;
+        message.push('\'')!;
+        return fail(StringView.fromUtf8(message.view())!);
+    }
+    let directory = match (currentManifestDirectory()) {
+        Some(d) => d,
+        null => { return fail("no ceesafe.toml here or above"); }
+    };
+    var packageReport = PackageReport.create();
+    let entry = publishCheck(directory.view(), mut packageReport, workspaceTypeChecks)!;
+    reportPackageText(json, packageReport);
+    match (entry) {
+        Some(text) => {
+            Console.writeBytes(text.view());
+            Console.writeError(
+                "ceesafec: add this entry to packages/<name>.toml in the index, by pull request (tooling.md §4.8)\n",
+            );
+            return 0;
+        }
+        null => { return 1; }
+    }
+}
+
+/// `ceesafec index-check [--offline] [index directory]`: an index's checks, for its continuous integration.
+fn indexCheckCommand(arguments: borrow Vector<Vector<u8>>, json: bool) -> i32 {
+    var offline = false;
+    var rest = Vector<Vector<u8>>.create();
+    for (a in arguments.view()) {
+        if (sameText(a.view(), "--offline")) {
+            offline = true;
+        } else {
+            rest.push(copyBytes(a.view())!)!;
+        }
+    }
+    var dashed = false;
+    for (r in rest.view()) {
+        dashed = dashed || (r.length > 0 && r[0] == '-');
+    }
+    if (rest.length > 1 || dashed) {
+        return fail("usage: ceesafec index-check [--offline] [index directory]");
+    }
+    let cwd = match (Directory.current()) {
+        Ok(d) => d,
+        Err(_) => { return fail("cannot read the current directory"); }
+    };
+    let directory = if (rest.length == 1) joinPath(
+        cwd.view().bytes(),
+        rest[0].view(),
+    )! else copyBytes(cwd.view().bytes())!;
+    var packageReport = PackageReport.create();
+    let count = checkIndex(directory.view(), mut packageReport, offline)!;
+    reportPackageText(json, packageReport);
+    var message = copyBytes("ceesafec: ".bytes())!;
+    appendDecimal(mut message, count as u64)!;
+    appendText(mut message, if (count == 1) " index entry checked\n" else " index entries checked\n")!;
+    Console.writeError(StringView.fromUtf8(message.view())!);
+    return if (packageReport.hasErrors()) 1 else 0;
+}
+
+/// The `--agent` values (`--agent x` or `--agent=x`), `--no-agent`, and the other arguments (Program.AgentOptions);
+/// a status other than 0 after a usage error.
+fn agentOptions(
+    arguments: borrow Vector<Vector<u8>>,
+    agents: borrow mut Vector<Vector<u8>>,
+    noAgent: borrow mut bool,
+    rest: borrow mut Vector<Vector<u8>>,
+) -> i32 {
+    var i: usize = 0;
+    while (i < arguments.length) {
+        let a = arguments[i].view();
+        if (sameText(a, "--agent")) {
+            if (i + 1 >= arguments.length) {
+                return fail("option '--agent' needs a value: agents, claude, gemini, copilot or cursor");
+            }
+            agents.push(copyBytes(arguments[i + 1].view())!)!;
+            i += 1;
+        } else if (startsWithText(a, "--agent=")) {
+            agents.push(copyBytes(a[8..])!)!;
+        } else if (sameText(a, "--no-agent")) {
+            noAgent = true;
+        } else {
+            rest.push(copyBytes(a)!)!;
+        }
+        i += 1;
+    }
+    if (noAgent && agents.length > 0) {
+        return fail("--agent and --no-agent cannot be used together");
+    }
+    return 0;
+}
+
+/// `ceesafec agents [--agent …]` (tooling.md §7.3): the agent files of the package here or above.
+fn agentsCommand(arguments: borrow Vector<Vector<u8>>) -> i32 {
+    var names = Vector<Vector<u8>>.create();
+    var noAgent = false;
+    var rest = Vector<Vector<u8>>.create();
+    let status = agentOptions(arguments, mut names, mut noAgent, mut rest);
+    if (status != 0) {
+        return status;
+    }
+    if (noAgent || rest.length > 0) {
+        return fail("usage: ceesafec agents [--agent <names>]");
+    }
+    var error = Vector<u8>.create();
+    let agents = match (chooseAgents(names, mut error)!) {
+        Some(a) => a,
+        null => { return fail(StringView.fromUtf8(error.view())!); }
+    };
+    let directory = match (currentManifestDirectory()) {
+        Some(d) => d,
+        null => { return fail("no ceesafe.toml here or above: run ceesafec agents in a package"); }
+    };
+    let cwd = match (Directory.current()) {
+        Ok(d) => d,
+        Err(_) => { return fail("cannot read the current directory"); }
+    };
+    let shown = relativePath(cwd.view().bytes(), directory.view())!;
+    writeAgentFiles(directory.view(), shown.view(), agents)!;
+    return 0;
+}
+
+/// `ceesafec new <name> [--lib] [--agent …] [--no-agent]` (tooling.md §4.4): a manifest and a first source file.
+fn newCommand(arguments: borrow Vector<Vector<u8>>) -> i32 {
+    var agentNames = Vector<Vector<u8>>.create();
+    var noAgent = false;
+    var rest = Vector<Vector<u8>>.create();
+    let status = agentOptions(arguments, mut agentNames, mut noAgent, mut rest);
+    if (status != 0) {
+        return status;
+    }
+    var library = false;
+    var names = Vector<Vector<u8>>.create();
+    for (r in rest.view()) {
+        if (sameText(r.view(), "--lib")) {
+            library = true;
+        } else {
+            names.push(copyBytes(r.view())!)!;
+        }
+    }
+    if (names.length != 1 || (names[0].length > 0 && names[0][0] == '-')) {
+        return fail("usage: ceesafec new <name> [--lib] [--agent <names>] [--no-agent]");
+    }
+    var error = Vector<u8>.create();
+    let agents = match (chooseAgents(agentNames, mut error)!) {
+        Some(a) => a,
+        null => { return fail(StringView.fromUtf8(error.view())!); }
+    };
+    let target = names[0].view();
+    // The package's name: the path's last part (Path.GetFileName after trimming separators).
+    var end = target.length;
+    while (end > 0 && (target[end - 1] == '/' || target[end - 1] == '\\')) {
+        end -= 1;
+    }
+    var start = end;
+    while (start > 0 && target[start - 1] != '/' && target[start - 1] != '\\') {
+        start -= 1;
+    }
+    let name = target[start..end];
+    if (!isPackageName(name)) {
+        var message = copyBytes("'".bytes())!;
+        appendBytes(mut message, name)!;
+        appendText(mut message, "' is not a package name: an identifier that is not a keyword or 'core'")!;
+        return fail(StringView.fromUtf8(message.view())!);
+    }
+    if (isDirectory(target)) {
+        let listed = Directory.list(StringView.fromUtf8(target)!);
+        let empty = match (listed) {
+            Ok(entries) => entries.length == 0,
+            Err(_) => false,
+        };
+        if (!empty) {
+            var message = copyBytes("'".bytes())!;
+            appendBytes(mut message, target)!;
+            appendText(mut message, "' exists and is not empty")!;
+            return fail(StringView.fromUtf8(message.view())!);
+        }
+    }
+    let cwd = match (Directory.current()) {
+        Ok(d) => d,
+        Err(_) => { return fail("cannot read the current directory"); }
+    };
+    let directory = joinPath(cwd.view().bytes(), target)!;
+    let sourceDirectory = joinPath(directory.view(), "src".bytes())!;
+    match (makeDirectories(sourceDirectory.view())) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    var manifest = copyBytes("[package]\nname = \"".bytes())!;
+    appendBytes(mut manifest, name)!;
+    appendText(mut manifest, "\"\nversion = \"0.1.0\"\nkind = \"")!;
+    appendText(mut manifest, if (library) "library" else "executable")!;
+    appendText(mut manifest, "\"\n\n[dependencies]\n")!;
+    let manifestPath = joinPath(directory.view(), manifestName().bytes())!;
+    createFile(manifestPath.view(), manifest.view());
+    var source = Vector<u8>.create();
+    if (library) {
+        appendText(mut source, "/// The answer ")!;
+        appendBytes(mut source, name)!;
+        appendText(mut source, " gives.\npublic fn answer() -> i32 => 42;\n")!;
+    } else {
+        appendText(mut source, "fn main() {\n    Console.writeLine(\"Hello from ")!;
+        appendBytes(mut source, name)!;
+        appendText(mut source, "\");\n}\n")!;
+    }
+    let sourceName: StringView = if (library) "lib.cee" else "main.cee";
+    let sourcePath = joinPath(sourceDirectory.view(), sourceName.bytes())!;
+    createFile(sourcePath.view(), source.view());
+    let ignorePath = joinPath(directory.view(), ".gitignore".bytes())!;
+    createFile(ignorePath.view(), "out/\n".bytes());
+    var message = copyBytes("ceesafec: made ".bytes())!;
+    appendText(mut message, if (library) "library" else "executable")!;
+    appendText(mut message, " package '")!;
+    appendBytes(mut message, name)!;
+    appendText(mut message, "' in ")!;
+    appendBytes(mut message, target)!;
+    message.push('\n')!;
+    Console.writeError(StringView.fromUtf8(message.view())!);
+    if (!noAgent) {
+        writeAgentFiles(directory.view(), target, agents)!; // tooling.md §7
+    }
+    return 0;
+}

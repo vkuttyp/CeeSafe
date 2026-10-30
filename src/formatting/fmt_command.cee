@@ -143,8 +143,12 @@ fn namedSourceFiles(paths: borrow Vector<Vector<u8>>, out: borrow mut Vector<Vec
 }
 
 /// The root package's own sources, as paths relative to the working directory, if there is a manifest here or above
-/// and no path was named; `status` is set after an error.
-fn packageSourceFiles(out: borrow mut Vector<Vector<u8>>, found: borrow mut bool) -> Result<i32, AllocError> {
+/// (`found`); a status other than 0 after its diagnostics are reported.
+fn packageSourceFiles(
+    out: borrow mut Vector<Vector<u8>>,
+    found: borrow mut bool,
+    json: bool,
+) -> Result<i32, AllocError> {
     let cwd = match (Directory.current()) {
         Ok(d) => d,
         Err(_) => { return Ok(0); }
@@ -154,13 +158,13 @@ fn packageSourceFiles(out: borrow mut Vector<Vector<u8>>, found: borrow mut bool
         null => { return Ok(0); }
     };
     found = true;
-    var problem = Vector<u8>.create();
-    let manifest = match (readManifest(directory.view(), mut problem)?) {
+    var packageReport = PackageReport.create();
+    let manifest = match (loadManifest(directory.view(), mut packageReport, "".bytes())?) {
         Some(m) => m,
-        null => { return Ok(fail(StringView.fromUtf8(problem.view())!)); }
+        null => { return Ok(report(json, packageReport.diagnostics, packageReport.sources)); }
     };
     var files = Vector<Vector<u8>>.create();
-    sourceFiles(manifest, mut files)?;
+    manifestSourceFiles(manifest, mut files)?;
     for (f in files.view()) {
         out.push(sourcePath(StringView.fromUtf8(f.view())!))?;
     }
@@ -204,9 +208,9 @@ fn fmtCommand(arguments: borrow Vector<Vector<u8>>, json: bool) -> i32 {
     if (paths.length == 0) {
         var found = false;
         var packageFiles = Vector<Vector<u8>>.create();
-        let status = packageSourceFiles(mut packageFiles, mut found)!;
+        let status = packageSourceFiles(mut packageFiles, mut found, json)!;
         if (status != 0) {
-            return finishFmt(json, status, Diagnostics.create(), Vector<SourceText>.create());
+            return status; // the manifest's diagnostics were the document
         }
         if (found) {
             files = packageFiles;

@@ -519,7 +519,7 @@ fn missingDocs(
 }
 
 /// `ceesafec doc [-o file] [--title text] [--missing] path...` (Program.Document).
-fn docCommand(arguments: borrow Vector<Vector<u8>>) -> i32 {
+fn docCommand(arguments: borrow Vector<Vector<u8>>, json: bool) -> i32 {
     var output = Vector<u8>.create();
     var hasOutput = false;
     var title = Vector<u8>.create();
@@ -564,13 +564,19 @@ fn docCommand(arguments: borrow Vector<Vector<u8>>) -> i32 {
         match (findManifestDirectory(cwd.view().bytes())!) {
             Some(directory) => {
                 // The package's own public items (tooling.md §4.4).
-                var problem = Vector<u8>.create();
-                let manifest = match (readManifest(directory.view(), mut problem)!) {
+                var packageReport = PackageReport.create();
+                let manifest = match (loadManifest(directory.view(), mut packageReport, "".bytes())!) {
                     Some(m) => m,
-                    null => { return fail(StringView.fromUtf8(problem.view())!); }
+                    null => {
+                        // Report(diagnostics): with JSON they would join a document `doc` never prints.
+                        if (!json) {
+                            report(false, packageReport.diagnostics, packageReport.sources);
+                        }
+                        return 1;
+                    }
                 };
                 var found = Vector<Vector<u8>>.create();
-                sourceFiles(manifest, mut found)!;
+                manifestSourceFiles(manifest, mut found)!;
                 files.clear();
                 for (f in found.view()) {
                     files.push(sourcePath(StringView.fromUtf8(f.view())!))!;

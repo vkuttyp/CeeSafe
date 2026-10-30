@@ -1,0 +1,470 @@
+// The TOML subset of `ceesafe.toml`, `ceesafe.lock` and index files (the reference's Packages/Toml.cs; tooling.md
+// §4.1): `[table]` and `[[array]]` headers, `key = value`, basic strings with the escapes \" \\ \n \t, true/false,
+// arrays of strings, inline tables of strings, and `#` comments. Anything else is N0320.
+
+/// A value: kind 0 a string (`text`), 1 a boolean (`flag`), 2 an array of strings, 3 an inline table of strings
+/// (`keys` and `strings` in the order written).
+struct TomlValue {
+    kind: u32;
+    text: Vector<u8>;
+    flag: bool;
+    strings: Vector<Vector<u8>>;
+    keys: Vector<Vector<u8>>;
+    start: u32;
+    end: u32;
+
+    fn isString(borrow this) -> bool => this.kind == 0;
+
+    fn isBool(borrow this) -> bool => this.kind == 1;
+
+    fn isArray(borrow this) -> bool => this.kind == 2;
+
+    fn isTable(borrow this) -> bool => this.kind == 3;
+
+    /// The index of an inline table's `key`, or null.
+    fn fieldAt(borrow this, key: StringView) -> usize? {
+        for (k in 0..this.keys.length) {
+            if (sameText(this.keys[k].view(), key)) {
+                return k;
+            }
+        }
+        return null;
+    }
+}
+
+struct TomlEntry {
+    key: Vector<u8>;
+    value: TomlValue;
+    keyStart: u32;
+    keyEnd: u32;
+}
+
+/// A table: its keys in the order written. An array-of-tables header is named "[]" and its name.
+struct TomlTable {
+    name: Vector<u8>;
+    start: u32;
+    end: u32;
+    entries: Vector<TomlEntry>;
+
+    /// The entry for `key`, or null.
+    fn find(borrow this, key: StringView) -> usize? {
+        for (k in 0..this.entries.length) {
+            if (sameText(this.entries[k].key.view(), key)) {
+                return k;
+            }
+        }
+        return null;
+    }
+
+    /// The entry of `key` if its value is a string, or null.
+    fn textAt(borrow this, key: StringView) -> usize? {
+        match (this.find(key)) {
+            Some(k) => { return if (this.entries[k].value.isString()) k else null; }
+            null => { return null; }
+        }
+    }
+}
+
+fn newValue(kind: u32, start: u32) -> TomlValue => TomlValue {
+    kind: kind,
+    text: Vector<u8>.create(),
+    flag: false,
+    strings: Vector<Vector<u8>>.create(),
+    keys: Vector<Vector<u8>>.create(),
+    start: start,
+    end: start,
+};
+
+struct TomlReader {
+    position: usize;
+    failed: bool;
+    file: u32;
+
+    fn atEnd(borrow this, text: Slice<u8>) -> bool => this.position >= text.length;
+
+    fn fail(
+        borrow mut this,
+        text: Slice<u8>,
+        diagnostics: borrow mut Diagnostics,
+        message: Vector<u8>,
+        start: u32,
+        end: u32,
+    ) -> Result<void, AllocError> {
+        if (!this.failed) {
+            diagnostics.error(320, this.file, start, end, message)?;
+        }
+        this.failed = true;
+        return Ok();
+    }
+
+    /// A failure at the current position (an empty span).
+    fn failHere(
+        borrow mut this,
+        text: Slice<u8>,
+        diagnostics: borrow mut Diagnostics,
+        message: StringView,
+    ) -> Result<void, AllocError> {
+        let at = truncate<u32>(if (this.position < text.length) this.position else text.length);
+        return this.fail(text, diagnostics, copyBytes(message.bytes())?, at, at);
+    }
+
+    fn take(borrow mut this, text: Slice<u8>, expected: StringView) -> bool {
+        let bytes = expected.bytes();
+        if (this.position + bytes.length > text.length || !sameBytes(
+            text[this.position..this.position + bytes.length],
+            bytes,
+        )) {
+            return false;
+        }
+        this.position += bytes.length;
+        return true;
+    }
+
+    fn skipSpaces(borrow mut this, text: Slice<u8>) {
+        while (this.position < text.length && (text[this.position] == ' ' || text[this.position] == '\t')) {
+            this.position += 1;
+        }
+    }
+
+    /// Spaces, blank lines and comment lines.
+    fn skipBlank(borrow mut this, text: Slice<u8>) {
+        while (this.position < text.length) {
+            this.skipSpaces(text);
+            if (this.position < text.length && text[this.position] == '#') {
+                while (this.position < text.length && text[this.position] != '\n') {
+                    this.position += 1;
+                }
+            }
+            if (this.position < text.length && (text[this.position] == '\r' || text[this.position] == '\n')) {
+                this.position += 1;
+                continue;
+            }
+            return;
+        }
+    }
+
+    /// After a line's content: spaces, an optional comment, then the end of the line.
+    fn endOfLine(borrow mut this, text: Slice<u8>, diagnostics: borrow mut Diagnostics) -> Result<void, AllocError> {
+        this.skipSpaces(text);
+        if (this.position < text.length && text[this.position] == '#') {
+            while (this.position < text.length && text[this.position] != '\n') {
+                this.position += 1;
+            }
+        }
+        if (this.position < text.length && text[this.position] == '\r') {
+            this.position += 1;
+        }
+        if (this.position < text.length && !this.take(text, "\n")) {
+            this.failHere(text, diagnostics, "expected the end of the line")?;
+        }
+        return Ok();
+    }
+
+    /// A bare key: letters, digits, '-', '_', and '.'.
+    fn key(borrow mut this, text: Slice<u8>) -> Result<Vector<u8>?, AllocError> {
+        let start = this.position;
+        while (this.position < text.length) {
+            let c = text[this.position];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                c == '.') {
+                this.position += 1;
+            } else {
+                break;
+            }
+        }
+        if (this.position == start) {
+            return Ok(null);
+        }
+        return Ok(copyBytes(text[start..this.position])?);
+    }
+
+    /// A basic string at the opening quote.
+    fn string(
+        borrow mut this,
+        text: Slice<u8>,
+        diagnostics: borrow mut Diagnostics,
+    ) -> Result<Vector<u8>?, AllocError> {
+        this.position += 1; // the opening quote
+        var out = Vector<u8>.create();
+        while (this.position < text.length && text[this.position] != '"' && text[this.position] != '\n') {
+            let c = text[this.position];
+            if (c == '\\') {
+                this.position += 1;
+                if (this.position >= text.length) {
+                    break;
+                }
+                let e = text[this.position];
+                if (e == '"' || e == '\\') {
+                    out.push(e)?;
+                } else if (e == 'n') {
+                    out.push('\n')?;
+                } else if (e == 't') {
+                    out.push('\t')?;
+                } else {
+                    var message = copyBytes("unknown escape '\\".bytes())?;
+                    // The escaped character, whole.
+                    var end = this.position + 1;
+                    while (end < text.length && text[end] >= 0x80 && text[end] < 0xC0) {
+                        end += 1;
+                    }
+                    appendBytes(mut message, text[this.position..end])?;
+                    message.push('\'')?;
+                    let at = truncate<u32>(this.position);
+                    this.fail(text, diagnostics, message, at, at)?;
+                    return Ok(null);
+                }
+            } else {
+                out.push(c)?;
+            }
+            this.position += 1;
+        }
+        if (!this.take(text, "\"")) {
+            this.failHere(text, diagnostics, "unterminated string")?;
+            return Ok(null);
+        }
+        return Ok(out);
+    }
+
+    fn value(borrow mut this, text: Slice<u8>, diagnostics: borrow mut Diagnostics) -> Result<TomlValue?, AllocError> {
+        let start = truncate<u32>(this.position);
+        if (this.position < text.length && text[this.position] == '"') {
+            match (this.string(text, diagnostics)?) {
+                Some(s) => {
+                    var v = newValue(0, start);
+                    v.text = s;
+                    v.end = truncate<u32>(this.position);
+                    return Ok(v);
+                }
+                null => { return Ok(null); }
+            }
+        }
+        if (this.take(text, "true") || this.take(text, "false")) {
+            var v = newValue(1, start);
+            v.flag = text[start as usize] == 't';
+            v.end = truncate<u32>(this.position);
+            return Ok(v);
+        }
+        if (this.take(text, "[")) {
+            var v = newValue(2, start);
+            this.skipBlank(text);
+            while (!this.take(text, "]")) {
+                if (this.position >= text.length || text[this.position] != '"') {
+                    this.failHere(text, diagnostics, "an array holds strings: [\"a\", \"b\"]")?;
+                    return Ok(null);
+                }
+                match (this.string(text, diagnostics)?) {
+                    Some(item) => { v.strings.push(item)?; }
+                    null => {
+                        this.failHere(text, diagnostics, "an array holds strings: [\"a\", \"b\"]")?;
+                        return Ok(null);
+                    }
+                }
+                this.skipBlank(text);
+                if (this.take(text, ",")) {
+                    this.skipBlank(text);
+                } else if (this.position < text.length && text[this.position] != ']') {
+                    this.failHere(text, diagnostics, "expected ',' or ']'")?;
+                    return Ok(null);
+                }
+            }
+            v.end = truncate<u32>(this.position);
+            return Ok(v);
+        }
+        if (this.take(text, "{")) {
+            var v = newValue(3, start);
+            this.skipSpaces(text);
+            while (!this.take(text, "}")) {
+                let key = this.key(text)?;
+                this.skipSpaces(text);
+                let name = match (key) {
+                    Some(k) => k,
+                    null => {
+                        this.failHere(text, diagnostics, "an inline table is { key = \"value\", … }")?;
+                        return Ok(null);
+                    }
+                };
+                if (!this.take(text, "=")) {
+                    this.failHere(text, diagnostics, "an inline table is { key = \"value\", … }")?;
+                    return Ok(null);
+                }
+                this.skipSpaces(text);
+                var item: Vector<u8>? = null;
+                if (this.position < text.length && text[this.position] == '"') {
+                    item = this.string(text, diagnostics)?;
+                }
+                let itemText = match (item) {
+                    Some(s) => s,
+                    null => {
+                        var message = copyBytes("'".bytes())?;
+                        appendBytes(mut message, name.view())?;
+                        appendText(mut message, "' in an inline table takes a string")?;
+                        let at = truncate<u32>(if (this.position < text.length) this.position else text.length);
+                        this.fail(text, diagnostics, message, at, at)?;
+                        return Ok(null);
+                    }
+                };
+                for (k in v.keys.view()) {
+                    if (sameBytes(k.view(), name.view())) {
+                        var message = copyBytes("'".bytes())?;
+                        appendBytes(mut message, name.view())?;
+                        appendText(mut message, "' appears twice in the inline table")?;
+                        let at = truncate<u32>(if (this.position < text.length) this.position else text.length);
+                        this.fail(text, diagnostics, message, at, at)?;
+                        return Ok(null);
+                    }
+                }
+                v.keys.push(name)?;
+                v.strings.push(itemText)?;
+                this.skipSpaces(text);
+                if (this.take(text, ",")) {
+                    this.skipSpaces(text);
+                } else if (this.position < text.length && text[this.position] != '}') {
+                    this.failHere(text, diagnostics, "expected ',' or '}'")?;
+                    return Ok(null);
+                }
+            }
+            v.end = truncate<u32>(this.position);
+            return Ok(v);
+        }
+        this.failHere(
+            text,
+            diagnostics,
+            "expected a value: a string, true, false, an array of strings or an inline table",
+        )?;
+        return Ok(null);
+    }
+}
+
+/// The tables of a TOML file in order (Toml.Parse), the first named "" for the keys before any header; null after
+/// N0320, reported against file `file`.
+fn parseToml(
+    text: Slice<u8>,
+    file: u32,
+    diagnostics: borrow mut Diagnostics,
+) -> Result<Vector<TomlTable>?, AllocError> {
+    var tables = Vector<TomlTable>.create();
+    tables.push(TomlTable { name: Vector<u8>.create(), start: 0, end: 0, entries: Vector<TomlEntry>.create() })?;
+    var reader = TomlReader { position: 0, failed: false, file: file };
+    while (reader.position < text.length) {
+        reader.skipBlank(text);
+        if (reader.position >= text.length) {
+            break;
+        }
+        if (text[reader.position] == '[') {
+            let start = reader.position;
+            let array = reader.take(text, "[[");
+            if (!array) {
+                reader.take(text, "[");
+            }
+            let key = reader.key(text)?;
+            let closed = match (key) {
+                Some(_) => reader.take(text, if (array) "]]" else "]"),
+                null => false,
+            };
+            if (!closed) {
+                reader.failHere(text, diagnostics, "expected a table header such as '[package]'")?;
+                return Ok(null);
+            }
+            let name = key!;
+            var header = Vector<u8>.create();
+            if (array) {
+                appendText(mut header, "[]")?;
+            }
+            appendBytes(mut header, name.view())?;
+            if (!array) {
+                for (t in tables.view()) {
+                    if (sameBytes(t.name.view(), header.view())) {
+                        var message = copyBytes("the table '[".bytes())?;
+                        appendBytes(mut message, name.view())?;
+                        appendText(mut message, "]' appears twice")?;
+                        reader.fail(text, diagnostics, message, truncate<u32>(start), truncate<u32>(reader.position))?;
+                        return Ok(null);
+                    }
+                }
+            }
+            tables.push(
+                TomlTable {
+                    name: header,
+                    start: truncate<u32>(start),
+                    end: truncate<u32>(reader.position),
+                    entries: Vector<TomlEntry>.create(),
+                },
+            )?;
+        } else {
+            let keyStart = reader.position;
+            let key = match (reader.key(text)?) {
+                Some(k) => k,
+                null => {
+                    reader.failHere(text, diagnostics, "expected a key, a table header or a comment")?;
+                    return Ok(null);
+                }
+            };
+            let keyEnd = reader.position;
+            reader.skipSpaces(text);
+            if (!reader.take(text, "=")) {
+                var message = copyBytes("expected '=' after '".bytes())?;
+                appendBytes(mut message, key.view())?;
+                message.push('\'')?;
+                let at = truncate<u32>(if (reader.position < text.length) reader.position else text.length);
+                reader.fail(text, diagnostics, message, at, at)?;
+                return Ok(null);
+            }
+            reader.skipSpaces(text);
+            let value = match (reader.value(text, diagnostics)?) {
+                Some(v) => v,
+                null => { return Ok(null); }
+            };
+            let last = tables.length - 1;
+            match (tables[last].find(StringView.fromUtf8(key.view())!)) {
+                Some(_) => {
+                    var message = copyBytes("'".bytes())?;
+                    appendBytes(mut message, key.view())?;
+                    appendText(mut message, "' appears twice in its table")?;
+                    reader.fail(text, diagnostics, message, truncate<u32>(keyStart), truncate<u32>(keyEnd))?;
+                    return Ok(null);
+                }
+                null => {}
+            }
+            tables[last].entries.push(
+                TomlEntry { key: key, value: value, keyStart: truncate<u32>(keyStart), keyEnd: truncate<u32>(keyEnd) },
+            )?;
+        }
+        reader.endOfLine(text, diagnostics)?;
+        if (reader.failed) {
+            return Ok(null);
+        }
+    }
+    if (reader.failed) {
+        return Ok(null);
+    }
+    return Ok(tables);
+}
+
+/// A TOML basic string: the text in quotes, with `"` and `\` escaped (Toml.Quote).
+fn appendTomlQuoted(out: borrow mut Vector<u8>, text: Slice<u8>) -> Result<void, AllocError> {
+    out.push('"')?;
+    for (b in text) {
+        if (b == '\\' || b == '"') {
+            out.push('\\')?;
+        }
+        out.push(b)?;
+    }
+    out.push('"')?;
+    return Ok();
+}
+
+/// An inline table's value for `key`, copied, or null.
+fn fieldCopy(v: borrow TomlValue, key: StringView) -> Result<Vector<u8>?, AllocError> {
+    match (v.fieldAt(key)) {
+        Some(k) => { return Ok(copyBytes(v.strings[k].view())?); }
+        null => { return Ok(null); }
+    }
+}
+
+/// The string value of `key` in a table, copied, or null if it is missing or not a string.
+fn textCopy(table: borrow TomlTable, key: StringView) -> Result<Vector<u8>?, AllocError> {
+    match (table.textAt(key)) {
+        Some(k) => { return Ok(copyBytes(table.entries[k].value.text.view())?); }
+        null => { return Ok(null); }
+    }
+}

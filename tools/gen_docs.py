@@ -21,6 +21,12 @@ from gen_library import literal
 PATTERNS = (("docs", None), ("docs/api", None), ("docs/decisions", None), ("docs/cosmoos", "profiles.md"),
             ("site/guide", None), ("site/guide/coming-from", None), ("templates", "AGENTS.md"))
 
+# templates/AGENTS.md under CeeSafe's names (ROADMAP §3.4): its markers, commands, files and MCP server and tools. The
+# prose still says Nova until the fork point (docs/p8-plan.md S7); tools/names.py maps these back.
+TEMPLATE_NAMES = (("<!--NOVA START-->", "<!--CEESAFE START-->"), ("<!--NOVA END-->", "<!--CEESAFE END-->"),
+                  ("nova.toml", "ceesafe.toml"), ("nova.lock", "ceesafe.lock"), ("`.nova`", "`.cee`"),
+                  ("`nova` MCP server", "`ceesafe` MCP server"), ("nova_", "ceesafe_"), ("novac", "ceesafec"))
+
 # .NET's String.ReplaceLineEndings: CR LF, then any of CR, LF, FF, NEL, LS, PS.
 LINE_ENDINGS = re.compile("\r\n|[\r\n\f\u0085  ]")
 
@@ -48,7 +54,11 @@ def main():
                               check=True).stdout.decode("utf-8")
         if text.startswith("﻿"):
             text = text[1:]
-        files.append((path, LINE_ENDINGS.sub("\n", text)))
+        text = LINE_ENDINGS.sub("\n", text)
+        if path == "templates/AGENTS.md":
+            for old, new in TEMPLATE_NAMES:
+                text = text.replace(old, new)
+        files.append((path, text))
     chunks = []
     for k, (_, t) in enumerate(files):
         current, size = [], 0

@@ -1,0 +1,616 @@
+// `ceesafe.toml` (the reference's Packages/Manifest.cs; tooling.md §4.1, ADR 0013 D1), and the texts package
+// diagnostics are reported against.
+
+/// The texts that package diagnostics name (manifests, locks, index files) and the diagnostics.
+struct PackageReport {
+    sources: Vector<SourceText>;
+    diagnostics: Diagnostics;
+
+    fn create() -> PackageReport =>
+        PackageReport { sources: Vector<SourceText>.create(), diagnostics: Diagnostics.create() };
+
+    fn add(borrow mut this, path: Slice<u8>, text: Slice<u8>) -> Result<u32, AllocError> {
+        this.sources.push(SourceText.create(path, text)?)?;
+        return Ok(truncate<u32>(this.sources.length - 1));
+    }
+
+    fn error(
+        borrow mut this,
+        code: u32,
+        file: u32,
+        start: u32,
+        end: u32,
+        message: Vector<u8>,
+    ) -> Result<void, AllocError> =>
+        this.diagnostics.error(code, file, start, end, message);
+
+    fn count(borrow this) -> usize => this.diagnostics.items.length;
+
+    fn hasErrors(borrow this) -> bool => this.diagnostics.hasErrors();
+}
+
+/// A dependency as a manifest writes it (DependencySpec): exactly one of a path, a git repository (with one of rev,
+/// tag and branch), or a registry version requirement (with its index, or the default one).
+struct DependencySpec {
+    name: Vector<u8>;
+    hasPath: bool;
+    path: Vector<u8>;
+    hasGit: bool;
+    git: Vector<u8>;
+    hasRev: bool;
+    rev: Vector<u8>;
+    hasTag: bool;
+    tag: Vector<u8>;
+    hasBranch: bool;
+    branch: Vector<u8>;
+    isRegistry: bool;
+    version: Vector<u8>; // the requirement as written
+    hasIndex: bool;
+    index: Vector<u8>;
+    start: u32;
+    end: u32;
+}
+
+fn newDependency(name: Slice<u8>, start: u32, end: u32) -> Result<DependencySpec, AllocError> => Ok(
+    DependencySpec {
+        name: copyBytes(name)?,
+        hasPath: false,
+        path: Vector<u8>.create(),
+        hasGit: false,
+        git: Vector<u8>.create(),
+        hasRev: false,
+        rev: Vector<u8>.create(),
+        hasTag: false,
+        tag: Vector<u8>.create(),
+        hasBranch: false,
+        branch: Vector<u8>.create(),
+        isRegistry: false,
+        version: Vector<u8>.create(),
+        hasIndex: false,
+        index: Vector<u8>.create(),
+        start: start,
+        end: end,
+    },
+);
+
+fn copyDependency(d: borrow DependencySpec) -> Result<DependencySpec, AllocError> => Ok(
+    DependencySpec {
+        name: copyBytes(d.name.view())?,
+        hasPath: d.hasPath,
+        path: copyBytes(d.path.view())?,
+        hasGit: d.hasGit,
+        git: copyBytes(d.git.view())?,
+        hasRev: d.hasRev,
+        rev: copyBytes(d.rev.view())?,
+        hasTag: d.hasTag,
+        tag: copyBytes(d.tag.view())?,
+        hasBranch: d.hasBranch,
+        branch: copyBytes(d.branch.view())?,
+        isRegistry: d.isRegistry,
+        version: copyBytes(d.version.view())?,
+        hasIndex: d.hasIndex,
+        index: copyBytes(d.index.view())?,
+        start: d.start,
+        end: d.end,
+    },
+);
+
+/// 0 executable, 1 library, 2 object.
+fn packageKindText(kind: u32) -> StringView => match (kind) {
+    1 => "library",
+    2 => "object",
+    _ => "executable",
+};
+
+struct Manifest {
+    file: u32;             // the manifest's text in the report
+    directory: Vector<u8>; // absolute
+    name: Vector<u8>;
+    hasVersion: bool;
+    version: Vector<u8>;
+    kind: u32;
+    freestanding: bool;
+    floatAllowed: bool; // float = false is --no-float
+    kernel: bool;       // kernel = "cosmoos": lib/kernel is part of the build (ADR 0025)
+    trusted: bool;      // trusted = true: the package's types may be declared @threadSafe (ADR 0025 §3.2)
+    sources: Vector<Vector<u8>>;
+    cFiles: Vector<Vector<u8>>;
+    dependencies: Vector<DependencySpec>;
+}
+
+/// The manifest's file name. Nova's `nova.toml` packages are not read (Decision 0003).
+fn manifestName() -> StringView => "ceesafe.toml";
+
+fn lockName() -> StringView => "ceesafe.lock";
+
+fn hasManifest(directory: Slice<u8>) -> Result<bool, AllocError> {
+    let path = joinPath(directory, manifestName().bytes())?;
+    return Ok(fileExists(path.view()));
+}
+
+/// Whether a directory holds a Nova package (`nova.toml`), which CeeSafe does not read: its messages say so.
+fn hasNovaManifest(directory: Slice<u8>) -> Result<bool, AllocError> {
+    let path = joinPath(directory, "nova.toml".bytes())?;
+    return Ok(fileExists(path.view()));
+}
+
+/// The nearest directory, from `start` up, that holds a manifest (Manifest.FindDirectory).
+fn findManifestDirectory(start: Slice<u8>) -> Result<Vector<u8>?, AllocError> {
+    var directory = joinPath(start, ".".bytes())?;
+    loop {
+        if (hasManifest(directory.view())?) {
+            return Ok(directory);
+        }
+        if (directory.length <= 1) {
+            return Ok(null);
+        }
+        directory = joinPath(directory.view(), "..".bytes())?;
+    }
+}
+
+/// An identifier that is not a keyword, and not "core" (lib/core's name).
+fn isPackageName(name: Slice<u8>) -> bool {
+    if (name.length == 0 ||
+        !((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= 'A' && name[0] <= 'Z') || name[0] == '_')) {
+        return false;
+    }
+    for (c in name) {
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) {
+            return false;
+        }
+    }
+    if (sameText(name, "core")) {
+        return false;
+    }
+    return match (keywordOf(name)) {
+        Some(_) => false,
+        null => true,
+    };
+}
+
+fn message2(a: StringView, b: Slice<u8>, c: StringView) -> Result<Vector<u8>, AllocError> {
+    var m = copyBytes(a.bytes())?;
+    appendBytes(mut m, b)?;
+    appendText(mut m, c)?;
+    return Ok(m);
+}
+
+/// The manifest in `directory`, read and parsed (Manifest.Load); null after reporting N0320–N0322. `display` names
+/// its text in diagnostics, or empty for the path relative to the working directory.
+fn loadManifest(
+    directory: Slice<u8>,
+    report: borrow mut PackageReport,
+    display: Slice<u8>,
+) -> Result<Manifest?, AllocError> {
+    let path = joinPath(directory, manifestName().bytes())?;
+    var name = copyBytes(display)?;
+    if (name.length == 0) {
+        name = sourcePath(StringView.fromUtf8(path.view())!);
+    }
+    if (!fileExists(path.view())) {
+        let file = report.add(name.view(), "".bytes())?;
+        var message = copyBytes("no ceesafe.toml in '".bytes())?;
+        appendBytes(mut message, directory)?;
+        message.push('\'')?;
+        report.error(322, file, 0, 0, message)?;
+        return Ok(null);
+    }
+    let text = match (readFile(StringView.fromUtf8(path.view())!)) {
+        Ok(t) => t,
+        Err(_) => Vector<u8>.create(),
+    };
+    let file = report.add(name.view(), text.view())?;
+    return parseManifest(file, joinPath(directory, ".".bytes())?, report);
+}
+
+fn manifestError(
+    report: borrow mut PackageReport,
+    file: u32,
+    start: u32,
+    end: u32,
+    message: Vector<u8>,
+) -> Result<void, AllocError> =>
+    report.error(321, file, start, end, message);
+
+fn parseManifest(file: u32, directory: Vector<u8>, report: borrow mut PackageReport) -> Result<Manifest?, AllocError> {
+    let text = copyBytes(report.sources[file as usize].text.view())?;
+    let tables = match (parseToml(text.view(), file, mut report.diagnostics)?) {
+        Some(t) => t,
+        null => { return Ok(null); }
+    };
+    let errors = report.count();
+    for (k in 1..tables.length) {
+        let t = borrow tables[k];
+        if (!sameText(t.name.view(), "package") && !sameText(t.name.view(), "dependencies")) {
+            // TrimStart('[', ']'): an array table's "[]" goes.
+            var start: usize = 0;
+            while (start < t.name.length && (t.name[start] == '[' || t.name[start] == ']')) {
+                start += 1;
+            }
+            manifestError(
+                report,
+                file,
+                t.start,
+                t.end,
+                message2("unknown table '[", t.name[start..], "]': a manifest has [package] and [dependencies]")?,
+            )?;
+        }
+    }
+    for (e in tables[0].entries.view()) {
+        manifestError(
+            report,
+            file,
+            e.keyStart,
+            e.keyEnd,
+            message2("'", e.key.view(), "' must be in a table: [package] or [dependencies]")?,
+        )?;
+    }
+    var packageTable: usize = 0;
+    for (k in 1..tables.length) {
+        if (packageTable == 0 && sameText(tables[k].name.view(), "package")) {
+            packageTable = k;
+        }
+    }
+    if (packageTable == 0) {
+        manifestError(report, file, 0, 0, copyBytes("the manifest needs a [package] table with a name".bytes())?)?;
+        return Ok(null);
+    }
+    let package = borrow tables[packageTable];
+    var nameStart = package.start;
+    var nameEnd = package.end;
+    var name = Vector<u8>.create();
+    var named = false;
+    match (package.find("name")) {
+        Some(k) => {
+            nameStart = package.entries[k].value.start;
+            nameEnd = package.entries[k].value.end;
+            if (package.entries[k].value.isString() && isPackageName(package.entries[k].value.text.view())) {
+                name = copyBytes(package.entries[k].value.text.view())?;
+                named = true;
+            }
+        }
+        null => {}
+    }
+    if (!named) {
+        manifestError(
+            report,
+            file,
+            nameStart,
+            nameEnd,
+            copyBytes(
+                "[package] needs 'name', an identifier that is not a keyword or 'core': what other packages call this one".bytes(),
+            )?,
+        )?;
+        return Ok(null);
+    }
+    var sources = Vector<Vector<u8>>.create();
+    sources.push(copyBytes("src".bytes())?)?;
+    var manifest = Manifest {
+        file: file,
+        directory: directory,
+        name: name,
+        hasVersion: false,
+        version: Vector<u8>.create(),
+        kind: 0,
+        freestanding: false,
+        floatAllowed: true,
+        kernel: false,
+        trusted: false,
+        sources: sources,
+        cFiles: Vector<Vector<u8>>.create(),
+        dependencies: Vector<DependencySpec>.create(),
+    };
+    for (e in package.entries.view()) {
+        let key = e.key.view();
+        let v = borrow e.value;
+        var valid = true;
+        var known = true;
+        if (sameText(key, "name")) {} else if (sameText(key, "version")) {
+            valid = v.isString() && parseVersion(v.text.view())? != null;
+            if (valid) {
+                manifest.hasVersion = true;
+                manifest.version = copyBytes(v.text.view())?;
+            }
+        } else if (sameText(key, "kind")) {
+            valid = v.isString() &&
+                (sameText(
+                    v.text.view(),
+                    "executable",
+                ) || sameText(v.text.view(), "library") || sameText(v.text.view(), "object"));
+            if (valid) {
+                manifest.kind = if (sameText(
+                    v.text.view(),
+                    "library",
+                )) 1 else if (sameText(v.text.view(), "object")) 2 else 0;
+            }
+        } else if (sameText(key, "profile")) {
+            valid = v.isString() && (sameText(v.text.view(), "hosted") || sameText(v.text.view(), "freestanding"));
+            if (valid) {
+                manifest.freestanding = sameText(v.text.view(), "freestanding");
+            }
+        } else if (sameText(key, "float")) {
+            valid = v.isBool();
+            if (valid) {
+                manifest.floatAllowed = v.flag;
+            }
+        } else if (sameText(key, "kernel")) {
+            valid = v.isString() && sameText(v.text.view(), "cosmoos");
+            if (valid) {
+                manifest.kernel = true;
+            }
+        } else if (sameText(key, "trusted")) {
+            valid = v.isBool();
+            if (valid) {
+                manifest.trusted = v.flag;
+            }
+        } else if (sameText(key, "sources")) {
+            valid = v.isArray() && v.strings.length > 0;
+            if (valid) {
+                manifest.sources.clear();
+                for (s in v.strings.view()) {
+                    manifest.sources.push(copyBytes(s.view())?)?;
+                }
+            }
+        } else if (sameText(key, "c")) {
+            valid = v.isArray();
+            if (valid) {
+                manifest.cFiles.clear();
+                for (s in v.strings.view()) {
+                    manifest.cFiles.push(copyBytes(s.view())?)?;
+                }
+            }
+        } else {
+            known = false;
+        }
+        if (!known) {
+            manifestError(report, file, e.keyStart, e.keyEnd, message2("unknown field '", key, "' in [package]")?)?;
+        } else if (!valid) {
+            let message: StringView = if (sameText(
+                key,
+                "kind",
+            )) "'kind' is \"executable\", \"library\" or \"object\"" else if (sameText(
+                key,
+                "profile",
+            )) "'profile' is \"hosted\" or \"freestanding\"" else if (sameText(
+                key,
+                "float",
+            )) "'float' is true or false" else if (sameText(
+                key,
+                "kernel",
+            )) "'kernel' is \"cosmoos\", the one kernel lib/kernel is for (ADR 0025)" else if (sameText(
+                key,
+                "trusted",
+            )) "'trusted' is true or false" else if (sameText(
+                key,
+                "sources",
+            )) "'sources' is a non-empty array of directories: [\"src\"]" else if (sameText(
+                key,
+                "c",
+            )) "'c' is an array of C files: [\"src/shim.c\"]" else "'version' is MAJOR.MINOR.PATCH: \"1.4.0\" (tooling.md §4.6)";
+            manifestError(report, file, v.start, v.end, copyBytes(message.bytes())?)?;
+        }
+    }
+    if (manifest.kernel && !manifest.freestanding) {
+        var start = package.start;
+        var end = package.end;
+        match (package.find("kernel")) {
+            Some(k) => {
+                start = package.entries[k].value.start;
+                end = package.entries[k].value.end;
+            }
+            null => {}
+        }
+        manifestError(
+            report,
+            file,
+            start,
+            end,
+            copyBytes("'kernel' needs profile = \"freestanding\": lib/kernel is for a kernel (ADR 0025)".bytes())?,
+        )?;
+    }
+    var dependencyTable: usize = 0;
+    for (k in 1..tables.length) {
+        if (dependencyTable == 0 && sameText(tables[k].name.view(), "dependencies")) {
+            dependencyTable = k;
+        }
+    }
+    if (dependencyTable > 0) {
+        for (e in tables[dependencyTable].entries.view()) {
+            readDependency(mut manifest, file, e, report)?;
+        }
+    }
+    if (report.count() != errors) {
+        return Ok(null);
+    }
+    return Ok(manifest);
+}
+
+fn invalidRequirement(
+    report: borrow mut PackageReport,
+    file: u32,
+    v: borrow TomlValue,
+    requirement: Slice<u8>,
+) -> Result<void, AllocError> {
+    var message = copyBytes("'".bytes())?;
+    appendBytes(mut message, requirement)?;
+    appendText(mut message, "' is not a version requirement: \"1.4\", \"=1.4.2\", \">=1.4, <2\" (tooling.md §4.6)")?;
+    return report.error(328, file, v.start, v.end, message);
+}
+
+fn readDependency(
+    manifest: borrow mut Manifest,
+    file: u32,
+    e: borrow TomlEntry,
+    report: borrow mut PackageReport,
+) -> Result<void, AllocError> {
+    let key = e.key.view();
+    let v = borrow e.value;
+    if (!isPackageName(key)) {
+        return manifestError(report, file, e.keyStart, e.keyEnd, message2("'", key, "' is not a package name")?);
+    }
+    if (v.isString()) {
+        // A registry dependency (§4.6): `shapes = "2.1"`.
+        if (parseRequirement(v.text.view())? == null) {
+            return invalidRequirement(report, file, v, v.text.view());
+        }
+        var d = newDependency(key, e.keyStart, v.end)?;
+        d.isRegistry = true;
+        d.version = copyBytes(v.text.view())?;
+        return manifest.dependencies.push(d);
+    }
+    if (!v.isTable()) {
+        var message = message2("'", key, "' takes a version requirement or an inline table: \"1.4\", { path = \"../")?;
+        appendBytes(mut message, key)?;
+        appendText(mut message, "\" } or { git = \"…\", tag = \"…\" }")?;
+        return manifestError(report, file, v.start, v.end, message);
+    }
+    match (fieldCopy(v, "version")?) {
+        Some(requirementText) => {
+            let requirement = requirementText.view();
+            // `json = { version = "0.9", index = "https://…" }`.
+            var extra: usize = v.keys.length;
+            for (k in 0..v.keys.length) {
+                if (extra == v.keys.length && !sameText(
+                    v.keys[k].view(),
+                    "version",
+                ) && !sameText(v.keys[k].view(), "index")) {
+                    extra = k;
+                }
+            }
+            if (extra < v.keys.length) {
+                var message = message2("the registry dependency '", key, "' takes 'version' and 'index', not '")?;
+                appendBytes(mut message, v.keys[extra].view())?;
+                message.push('\'')?;
+                return manifestError(report, file, v.start, v.end, message);
+            }
+            if (parseRequirement(requirement)? == null) {
+                return invalidRequirement(report, file, v, requirement);
+            }
+            var d = newDependency(key, e.keyStart, v.end)?;
+            d.isRegistry = true;
+            d.version = copyBytes(requirement)?;
+            match (fieldCopy(v, "index")?) {
+                Some(index) => {
+                    d.hasIndex = true;
+                    d.index = index;
+                }
+                null => {}
+            }
+            return manifest.dependencies.push(d);
+        }
+        null => {}
+    }
+    var unknown: usize = v.keys.length;
+    var references = Vector<Vector<u8>>.create(); // in the order rev, tag, branch
+    for (r in 0..3) {
+        let reference: StringView = if (r == 0) "rev" else if (r == 1) "tag" else "branch";
+        match (v.fieldAt(reference)) {
+            Some(_) => { references.push(copyBytes(reference.bytes())?)?; }
+            null => {}
+        }
+    }
+    for (k in 0..v.keys.length) {
+        let n = v.keys[k].view();
+        if (unknown == v.keys.length && !sameText(n, "path") && !sameText(n, "git") && !sameText(n, "rev") &&
+            !sameText(n, "tag") && !sameText(n, "branch")) {
+            unknown = k;
+        }
+    }
+    let path = fieldCopy(v, "path")?;
+    let git = fieldCopy(v, "git")?;
+    if (unknown < v.keys.length) {
+        var message = copyBytes("unknown field '".bytes())?;
+        appendBytes(mut message, v.keys[unknown].view())?;
+        appendText(mut message, "' in the dependency '")?;
+        appendBytes(mut message, key)?;
+        message.push('\'')?;
+        return manifestError(report, file, v.start, v.end, message);
+    }
+    if ((path == null) == (git == null)) {
+        return manifestError(
+            report,
+            file,
+            v.start,
+            v.end,
+            message2("the dependency '", key, "' needs exactly one of 'path' and 'git'")?,
+        );
+    }
+    if (path != null && references.length > 0) {
+        var message = message2("the path dependency '", key, "' takes no '")?;
+        appendBytes(mut message, references[0].view())?;
+        message.push('\'')?;
+        return manifestError(report, file, v.start, v.end, message);
+    }
+    if (git != null && references.length != 1) {
+        return manifestError(
+            report,
+            file,
+            v.start,
+            v.end,
+            message2("the git dependency '", key, "' needs exactly one of 'rev', 'tag' and 'branch'")?,
+        );
+    }
+    var d = newDependency(key, e.keyStart, v.end)?;
+    match (path) {
+        Some(p) => {
+            d.hasPath = true;
+            d.path = p;
+        }
+        null => {}
+    }
+    match (git) {
+        Some(g) => {
+            d.hasGit = true;
+            d.git = g;
+        }
+        null => {}
+    }
+    match (fieldCopy(v, "rev")?) {
+        Some(r) => {
+            d.hasRev = true;
+            d.rev = r;
+        }
+        null => {}
+    }
+    match (fieldCopy(v, "tag")?) {
+        Some(t) => {
+            d.hasTag = true;
+            d.tag = t;
+        }
+        null => {}
+    }
+    match (fieldCopy(v, "branch")?) {
+        Some(b) => {
+            d.hasBranch = true;
+            d.branch = b;
+        }
+        null => {}
+    }
+    return manifest.dependencies.push(d);
+}
+
+/// The package's sources, absolute, in ordinal order of their paths relative to the package, without repeats
+/// (Manifest.SourceFiles).
+fn manifestSourceFiles(manifest: borrow Manifest, out: borrow mut Vector<Vector<u8>>) -> Result<void, AllocError> {
+    var found = Vector<Vector<u8>>.create();
+    for (source in manifest.sources.view()) {
+        let directory = joinPath(manifest.directory.view(), source.view())?;
+        if (isDirectory(directory.view())) {
+            sourceFilesUnder(directory.view(), mut found)?;
+        }
+    }
+    // Paths below one directory sort as their relative paths do.
+    for (i in 1..found.length) {
+        var j = i;
+        while (j > 0 && lessBytes(found[j].view(), found[j - 1].view())) {
+            found.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+    for (k in 0..found.length) {
+        if (k == 0 || !sameBytes(found[k].view(), found[k - 1].view())) {
+            out.push(copyBytes(found[k].view())?)?;
+        }
+    }
+    return Ok();
+}
