@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Writes src/library/runtime.nova: the C runtime novac embeds (the reference's CBackend: HostedRuntime, FloatRuntime,
+"""Writes src/library/runtime.cee: the C runtime novac embeds (the reference's CBackend: HostedRuntime, FloatRuntime,
 ThreadRuntime; Nova.Compiler.csproj's embedded resources).
 
 The files are read with `git show TAG:PATH` from a Nova repository, so its working tree may be anywhere; line endings
@@ -90,7 +90,7 @@ fn appendRuntimeText(out: borrow mut Vector<u8>, k: usize) -> Result<void, Alloc
     return Ok();
 }}
 """
-    path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "src", "library", "runtime.nova"))
+    path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "src", "library", "runtime.cee"))
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(source)
     novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/0.6.0/bin/novac"))

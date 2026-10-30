@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Writes src/hir/builtins.nova: the reference's BuiltinFunction members (Hir/Hir.cs), each as a function returning
+"""Writes src/hir/builtins.cee: the reference's BuiltinFunction members (Hir/Hir.cs), each as a function returning
 its declaration index, which HirExpr.BuiltinCall stores. The source is a Nova checkout at the pinned tag, which must
 be clean.
 
@@ -57,7 +57,7 @@ def main():
         out.append(f'    {index} => "{name}",')
     out.append(f'    _ => "{names[-1]}",')
     out.append("};")
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "hir", "builtins.nova")
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "hir", "builtins.cee")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(out) + "\n")
     novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/0.6.0/bin/novac"))

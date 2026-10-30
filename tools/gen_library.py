@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Writes src/library/sources.nova: the Nova libraries novac embeds (the reference's CoreLibrary.cs).
+"""Writes src/library/sources.cee: the Nova libraries novac embeds (the reference's CoreLibrary.cs).
 
 lib/core, lib/std and lib/kernel, each in ordinal path order, with line endings made "\\n" as CoreLibrary.Load does.
 Each file is one string literal; its path is "lib/core/NAME.nova" and so on, which marks it as library code. The files
@@ -119,7 +119,7 @@ fn libraryText(k: usize) -> Result<Vector<u8>, AllocError> {{
     return Ok(text);
 }}
 """
-    path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "src", "library", "sources.nova"))
+    path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "src", "library", "sources.cee"))
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(source)

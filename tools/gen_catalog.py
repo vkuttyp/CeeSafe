@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Writes src/diagnostics/catalog.nova: each diagnostic code's one-line meaning, the JSON format's "summary".
+"""Writes src/diagnostics/catalog.cee: each diagnostic code's one-line meaning, the JSON format's "summary".
 
 It replicates the reference's DiagnosticCatalog.Load (Documentation/EmbeddedDocs.cs): rows `| N0123 | meaning | ... |`
 of docs/diagnostics.md first, then of the other embedded documents under docs/ in ordinal path order (docs/*.md,
@@ -69,7 +69,7 @@ fn summaryOf(number: u32) -> StringView => match (number) {{
     _ => "",
 }};
 """
-    path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "src", "diagnostics", "catalog.nova"))
+    path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "src", "diagnostics", "catalog.cee"))
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(source)

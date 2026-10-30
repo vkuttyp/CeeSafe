@@ -3,7 +3,7 @@
 
 From CeeSafe's sources at a commit (`git archive`, so nothing outside the tree leaks in):
 
-  gen 1 = the pinned novac's build of CeeSafe                      (stage 0, the only use of novac)
+  gen 1 = stage 0's build of CeeSafe (the pinned novac, or since P6R a ceesafec from tools/bootstrap.sh)
   gen 2 = gen 1's build of CeeSafe, and C2 the C gen 1 emits for it
   gen 3 = gen 2's build of CeeSafe, and C3 the C gen 2 emits for it
 
@@ -78,7 +78,10 @@ def chain(args, root, log):
         shutil.rmtree(root)
     source = os.path.join(root, "ceesafe")
     os.makedirs(source)
-    archive = subprocess.run(["git", "-C", args.repo, "archive", args.commit, "nova.toml", "src"], capture_output=True,
+    # CeeSafe's names since P6R (ceesafe.toml), Nova's before (nova.toml).
+    manifest = "ceesafe.toml" if subprocess.run(["git", "-C", args.repo, "cat-file", "-e", f"{args.commit}:ceesafe.toml"],
+                                                capture_output=True).returncode == 0 else "nova.toml"
+    archive = subprocess.run(["git", "-C", args.repo, "archive", args.commit, manifest, "src"], capture_output=True,
                              check=True).stdout
     subprocess.run(["tar", "-x", "-C", source], input=archive, check=True)
     audit = os.path.join(root, "subprocesses.log")
@@ -89,7 +92,7 @@ def chain(args, root, log):
     os.makedirs(env["TMPDIR"])
     gen = os.path.join(root, "gen")
     os.makedirs(gen)
-    # Stage 0: novac, with the full environment (it is .NET); its output is gen 1.
+    # Stage 0 (novac, or a ceesafec), with the full environment (novac is .NET); its output is gen 1.
     stage0_env = dict(os.environ)
     # Each generation is gen/<n>/ceesafec: one file name, since macOS's ad-hoc signature records it.
     def exe(n):
@@ -123,7 +126,8 @@ def chain(args, root, log):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--novac", required=True)
+    parser.add_argument("--novac", "--stage0", dest="novac", required=True,
+                        help="the stage-0 compiler: the pinned novac, or since P6R a ceesafec (tools/bootstrap.sh)")
     parser.add_argument("--repo", default=os.path.normpath(os.path.join(os.path.dirname(__file__), "..")))
     parser.add_argument("--commit", default="HEAD")
     parser.add_argument("--cc", default="cc")
