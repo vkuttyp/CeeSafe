@@ -16,7 +16,10 @@ tools cc itself runs), so no novac or dotnet is reachable; the shims' log is the
 
 A manifest (inputs, toolchain versions, sha256 of every output, the audit) is written to --manifest.
 
-usage: python3 tools/fixed_point.py --novac ~/.nova/0.6.0/bin/novac [--commit HEAD] [--cc cc]
+Every build is in the compiler's default form (since P7, novac's production defaults); --extra adds a switch to every
+build, e.g. --extra=--split.
+
+usage: python3 tools/fixed_point.py --novac ~/.nova/0.6.0/bin/novac [--commit HEAD] [--cc cc] [--extra=--split]
            --work DIR --manifest FILE
 """
 import argparse
@@ -98,19 +101,19 @@ def chain(args, root, log):
     def exe(n):
         return os.path.join(gen, str(n), "ceesafec")
 
-    run([args.novac, "build", "--cc", args.cc, "-o", exe(1)], source, stage0_env, log)
+    run([args.novac, "build", "--cc", args.cc, "-o", exe(1)] + args.extra, source, stage0_env, log)
     hashes = {"gen1": sha256(exe(1))}
     with open(audit, "w"):
         pass  # the audit starts with gen 1
     for n in (1, 2):
         c_dir = os.path.join(gen, f"c{n + 1}")
-        run([exe(n), "build", "--emit", "c", "-o", c_dir], source, env, log)
-        run([exe(n), "build", "--cc", args.cc, "-o", exe(n + 1)], source, env, log)
+        run([exe(n), "build", "--emit", "c", "-o", c_dir] + args.extra, source, env, log)
+        run([exe(n), "build", "--cc", args.cc, "-o", exe(n + 1)] + args.extra, source, env, log)
         hashes[f"c{n + 1}"] = tree_hashes(c_dir)
         hashes[f"gen{n + 1}"] = sha256(exe(n + 1))
     # gen 3 emits C once more: gen 3 is gen 2 rebuilt, so this must equal C3 too.
     c4 = os.path.join(gen, "c4")
-    run([exe(3), "build", "--emit", "c", "-o", c4], source, env, log)
+    run([exe(3), "build", "--emit", "c", "-o", c4] + args.extra, source, env, log)
     hashes["c4"] = tree_hashes(c4)
     # No output names the work directory.
     for c in ("c2", "c3", "c4"):
@@ -133,6 +136,7 @@ def main():
     parser.add_argument("--cc", default="cc")
     parser.add_argument("--work", required=True)
     parser.add_argument("--manifest", required=True)
+    parser.add_argument("--extra", action="append", default=[], help="another switch for every build")
     args = parser.parse_args()
     args.novac = os.path.abspath(os.path.expanduser(args.novac))
     commit = subprocess.run(["git", "-C", args.repo, "rev-parse", args.commit], capture_output=True, text=True,
@@ -162,6 +166,7 @@ def main():
         f"host: {platform.system()} {platform.machine()} {platform.release()}",
         f"stage 0: {novac_version} ({args.novac}, sha256 {sha256(args.novac)})",
         f"cc: {args.cc}: {cc_version}",
+        f"switches: {' '.join(args.extra) or '(none: the default form)'}",
         f"runs: {os.path.join(work, 'a')} and {os.path.join(work, 'deeper', 'second-run', 'b')}",
         f"result: {'FIXED POINT' if not problems else 'FAILED: ' + '; '.join(problems)}",
         "",

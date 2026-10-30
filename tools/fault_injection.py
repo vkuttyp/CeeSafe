@@ -8,7 +8,7 @@ the first 50, the last 50 and 100 evenly spaced. Every run must end with a norma
 with the panic of `!` on the failed allocation (exit 134); a leak, any other panic or a sanitizer report fails.
 
 With --reference, the reference compiler's build of each program must give the same stdout, stderr and status at
-every point. The interpreter's agreement (the reference's other half of the test) is P8's.
+every point. Both compilers build in novac's default form (P7), or in P5's with --flat. The interpreter's agreement (the reference's other half of the test) is P8's.
 
 usage: python3 tools/fault_injection.py --compiler out/ceesafec [--reference ~/.nova/0.6.0/bin/novac]
            [--corpus DIR] [--filter TEXT] [--jobs N]
@@ -23,7 +23,8 @@ import tempfile
 
 ALLOCATION_CALLS = ("nova_alloc(", "nova_region_alloc(", "nova_scratch_enter_root(", "nova_pool_take(", "nova_vec_grow(",
                     "nova_svec_slot(")
-SWITCHES = ["--flat-c", "--no-closure-specialisation", "--no-placement", "--no-bce", "--no-oce"]
+P5_SWITCHES = ["--flat-c", "--no-closure-specialisation", "--no-placement", "--no-bce", "--no-oce"]
+SWITCHES = []  # the default form; --flat sets P5_SWITCHES
 SANITIZERS = ["-O1", "-Werror", "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"]
 REPORT = re.compile(r"nova alloc: attempts=(\d+) live=(\d+)")
 MAX_ATTEMPTS = 200
@@ -61,7 +62,7 @@ def problem(outcome):
 
 
 def build(compiler, corpus, path, out, reference):
-    switches = SWITCHES if reference else []
+    switches = SWITCHES
     c_dir = out + "-c"
     emitted = subprocess.run([compiler, "build", "--emit", "c", "-o", c_dir] + switches + [path], cwd=corpus,
                              capture_output=True)
@@ -124,7 +125,10 @@ def main():
     parser.add_argument("--corpus", default=os.path.expanduser("~/Nova/tests/corpus"))
     parser.add_argument("--filter")
     parser.add_argument("--jobs", type=int, default=os.cpu_count())
+    parser.add_argument("--flat", action="store_true", help="build in P5's form (everything off)")
     args = parser.parse_args()
+    if args.flat:
+        SWITCHES[:] = P5_SWITCHES
     compiler = os.path.abspath(os.path.expanduser(args.compiler))
     reference = os.path.abspath(os.path.expanduser(args.reference)) if args.reference else None
     directory = os.path.join(args.corpus, "run-pass")

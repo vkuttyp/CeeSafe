@@ -2,12 +2,14 @@
 """Every contract test of the port against one ceesafec (ROADMAP P6: "both pass the compiler contract tests").
 
 Runs, against the pinned novac and the reference corpus at the pinned tag:
-- parse and check comparisons (text, JSON, dumps), NIR comparisons, C comparisons in four forms (flat, --split, -g,
-  -g --split), the package fixtures;
-- the corpus runner over run-pass, run-fail, ffi (and freestanding) under -Werror and ASan+UBSan with leak checks;
+- parse and check comparisons (text, JSON, dumps), NIR comparisons, C comparisons in four shapes (flat, --split, -g,
+  -g --split) both in P5's form (everything off) and in novac's default form (everything on, P7), the latter also over
+  the benchmarks and programs, the four optimisation reports, CeeSafe's own C, the package fixtures;
+- the corpus runner over run-pass, run-fail, ffi (and freestanding) under -Werror and ASan+UBSan with leak checks, and
+  over the optimisation families and emit-c's snapshots, all in the default form;
 - the M2 mutation suite, the M3 fault sweep, the collection properties and the freestanding checks.
 
-Each step's last line is printed; the expected results are the P2–P5 gates' (docs/p*-plan.md).
+Each step's last line is printed; the expected results are the P2–P7 gates' (docs/p*-plan.md).
 
 usage: python3 tools/contract_tests.py --ceesafec PATH --novac PATH --root <Nova checkout at the pinned tag>
 """
@@ -46,6 +48,10 @@ def main():
     families = sorted("tests/corpus/" + d for d in os.listdir(corpus) if os.path.isdir(os.path.join(corpus, d)))
     parse_families = [f for f in families if f.endswith("parse-pass") or f.endswith("parse-fail")]
     check_families = [f for f in families if f not in parse_families]
+    others = sorted({os.path.relpath(base, root) for top in ("benchmarks", "programs")
+                     for base, _, names in os.walk(os.path.join(root, top)) if any(n.endswith(".nova") for n in names)})
+    everything = [x for part in ("bce", "oce", "placement", "closure-specialisation", "structured")
+                  for x in ("--on", part)]
     py = [sys.executable, "-B"]
     common = ["--ceesafec", cee, "--novac", novac, "--root", root]
     run_families = ["--family", "run-pass", "--family", "run-fail", "--family", "ffi"]
@@ -58,12 +64,27 @@ def main():
         ("c split", py + [f"{HERE}/compare_c.py"] + common + ["--extra=--split"] + families),
         ("c -g", py + [f"{HERE}/compare_c.py"] + common + ["--extra=-g"] + families),
         ("c -g split", py + [f"{HERE}/compare_c.py"] + common + ["--extra=-g", "--extra=--split"] + families),
+        ("nir default", py + [f"{HERE}/compare_nir.py"] + common + ["--on", "closure-specialisation"] + families),
+        ("c default", py + [f"{HERE}/compare_c.py"] + common + everything + families + others),
+        ("c d. split", py + [f"{HERE}/compare_c.py"] + common + everything + ["--extra=--split"] + families + others),
+        ("c d. -g", py + [f"{HERE}/compare_c.py"] + common + everything + ["--extra=-g"] + families + others),
+        ("c d. -g split", py + [f"{HERE}/compare_c.py"] + common + everything + ["--extra=-g", "--extra=--split"] +
+         families + others),
+    ] + [
+        (f"report {report[:10]}", py + [f"{HERE}/compare_reports.py"] + common + ["--report", report] + families + others)
+        for report in ("allocations", "bounds-checks", "closure-calls", "overflow-checks")
+    ] + [
+        ("self default", py + [f"{HERE}/compare_self.py", "--ceesafec", cee, "--novac", novac] + everything),
+        ("self d. split", py + [f"{HERE}/compare_self.py", "--ceesafec", cee, "--novac", novac] + everything +
+         ["--extra=--split", "--extra=-g"]),
         ("packages", py + [f"{HERE}/compare_packages.py", "--ceesafec", cee, "--novac", novac]),
         ("run -Werror", py + [f"{HERE}/run_corpus.py", "--compiler", cee, "--corpus", corpus] + run_families +
          ["--cflag=-Werror"]),
         ("run asan", py + [f"{HERE}/run_corpus.py", "--compiler", cee, "--corpus", corpus] + run_families +
          ["--cc", "clang", "--cflag=-O1", "--cflag=-Werror", "--cflag=-fsanitize=address,undefined",
           "--cflag=-fno-sanitize-recover=all", "--check-leaks"]),
+        ("families", py + [f"{HERE}/run_corpus.py", "--compiler", cee, "--corpus", corpus] +
+         [x for f in ("emit-c", "bounds-checks", "overflow-checks", "placement", "closure-calls") for x in ("--family", f)]),
         ("mutations", py + [f"{HERE}/mutation_suite.py", "--compiler", cee]),
         ("fault sweep", py + [f"{HERE}/fault_injection.py", "--compiler", cee, "--reference", novac, "--corpus",
                               corpus]),
@@ -88,7 +109,7 @@ def main():
                     differ = {line.strip() for line in f if line.strip()}
                 ok = differ == KNOWN_CHECK_DIFFERENCES
                 summary += " (the recorded divergences)" if ok else f" (unexpected: {sorted(differ ^ KNOWN_CHECK_DIFFERENCES)})"
-            print(f"{name:13} {'ok  ' if ok else 'FAIL'} {summary}")
+            print(f"{name:17} {'ok  ' if ok else 'FAIL'} {summary}")
             failed += not ok
     return 1 if failed else 0
 
