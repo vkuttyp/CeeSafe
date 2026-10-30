@@ -1,0 +1,23 @@
+struct Item { id: u32; }
+
+fn main() {
+    let a = SlotMap.create();
+    let b = SlotMap<Item>.make();
+    let c = SlotMap<Item>.create(1);
+    let d = SlotMap<Item, SystemHeap, u8>.create();
+    let e: SlotMap<Item, u8> = SlotMap.create();
+    let f: StableVector<StringView> = StableVector.create();
+    var m = SlotMap<Item>.create();
+    let h = m.insert(1);
+    let g = m.get(5);
+    let x = m.fly(1);
+    let y = m.contains();
+    let z = m.size;
+    var v = StableVector<u8>.create();
+    v.insert(1)!;
+    v.push(300)!;
+    let w = v.capacity;
+    for (x2 in v) {}
+    let q: Handle<Item, Item> = 1;
+    let r: Handle = 1;
+}

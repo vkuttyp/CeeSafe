@@ -1,0 +1,242 @@
+// Slot maps, stable vectors and handles (the reference's ResolveContainerType, ContainerType, CheckContainerCreate,
+// CheckContainerMethod, the slot map case of SynthMember, and `Handle<T>`): P3 S3c (§24).
+
+fn builtinSlotMap() -> u32 => 14;
+fn builtinStableVector() -> u32 => 15;
+
+fn containerName(isMap: bool) -> StringView => if (isMap) "SlotMap" else "StableVector";
+
+/// The slot map or stable vector, with the types its built-in operations return (ContainerType, §24).
+fn containerType(c: borrow mut Checker, isMap: bool, element: u32, allocator: u32) -> Result<u32, AllocError> {
+    let allocError = c.allocErrorType;
+    if (isMap) {
+        let handle = c.types.handleOf(element)?;
+        resultOf(c, handle, allocError)?;
+        let shared = c.types.referenceTo(element, false)?;
+        optionOf(c, shared)?;
+        let mutable = c.types.referenceTo(element, true)?;
+        optionOf(c, mutable)?;
+        optionOf(c, element)?;
+    } else {
+        let usize = c.types.usize;
+        resultOf(c, usize, allocError)?;
+    }
+    let systemHeap = c.systemHeapType;
+    let kind = if (isMap) TypeKind.SlotMap else TypeKind.StableVector;
+    return c.types.containerOf(kind, element, allocator, allocator == systemHeap);
+}
+
+/// `SlotMap<T, A>` or `StableVector<T, A>` from type syntax (ResolveContainerType).
+fn resolveContainerType(c: borrow mut Checker, isMap: bool, arguments: Range) -> Result<u32, AllocError> {
+    let elementSyntax = c.front.ast.at(arguments, 0);
+    let element = c.resolveType(elementSyntax, false)?;
+    var allocator = c.systemHeapType;
+    if (arguments.count > 1) {
+        let allocatorSyntax = c.front.ast.at(arguments, 1);
+        allocator = c.resolveType(allocatorSyntax, false)?;
+    }
+    if (c.types.isBottom(element) || c.types.isBottom(allocator)) {
+        return Ok(c.types.error);
+    }
+    if (!isAllocatorType(c, allocator)) {
+        let span = c.front.ast.typeSpans[c.front.ast.at(arguments, 1) as usize];
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, allocator)?;
+        appendText(mut message, " is not an allocator type; use 'SystemHeap' or 'FailingAllocator'")?;
+        c.error(notAnAllocator(), span.start, span.end, message)?;
+        return Ok(c.types.error);
+    }
+    if (c.types.holdsRegionValue(element)) {
+        let span = c.front.ast.typeSpans[elementSyntax as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "a '")?;
+        appendText(mut message, containerName(isMap))?;
+        appendText(mut message, "' cannot hold ")?;
+        appendQuotedType(mut message, c, element)?;
+        appendText(mut message, ": region values and pool boxes stay in locals (type-system.md §25.4)")?;
+        c.error(referenceNotAllowed(), span.start, span.end, message)?;
+        return Ok(c.types.error);
+    }
+    return containerType(c, isMap, element, allocator); // scoped elements make a scoped container (§25.3, §25.4)
+}
+
+/// `Handle<T>`: a handle holds no loan, whatever it names (§25.3).
+fn resolveHandleType(c: borrow mut Checker, arguments: Range) -> Result<u32, AllocError> {
+    let handledSyntax = c.front.ast.at(arguments, 0);
+    let handled = c.resolveType(handledSyntax, false)?;
+    if (c.types.isBottom(handled)) {
+        return Ok(c.types.error);
+    }
+    return c.types.handleOf(handled);
+}
+
+/// `SlotMap<T>.create()` / `StableVector<T>.create()` (CheckContainerCreate, §24): type arguments as for vectors.
+fn checkContainerCreate(
+    c: borrow mut Checker,
+    member: u32,
+    target: u32,
+    typeArguments: Range,
+    isMap: bool,
+    arguments: Range,
+    expected: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let kindName = containerName(isMap);
+    let isCreate = sameText(c.name(c.front.ast.idents[member as usize].symbol), "create");
+    if (!isCreate || arguments.count != 0) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "a '")?;
+        appendText(mut message, kindName)?;
+        appendText(mut message, "' is made with '")?;
+        appendText(mut message, kindName)?;
+        appendText(mut message, "<T>.create()'")?;
+        c.error(if (isCreate) argumentCount() else undefinedName(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var container = none();
+    let kind = if (isMap) TypeKind.SlotMap else TypeKind.StableVector;
+    if (typeArguments.count > 0) {
+        if (typeArguments.count > 2) {
+            let targetSpan = c.front.ast.exprSpans[target as usize];
+            var message = Vector<u8>.create();
+            appendText(mut message, "'")?;
+            appendText(mut message, kindName)?;
+            appendText(mut message, "' takes one or two type arguments: '")?;
+            appendText(mut message, kindName)?;
+            appendText(mut message, "<T>' or '")?;
+            appendText(mut message, kindName)?;
+            appendText(mut message, "<T, A>'")?;
+            c.error(unknownType(), targetSpan.start, targetSpan.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+        container = resolveContainerType(c, isMap, typeArguments)?;
+    } else if (expected != none() && c.types.is(expected, kind)) {
+        container = expected;
+    }
+    if (container == none()) {
+        if (expected == none() || !c.types.isBottom(expected)) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "the element type of '")?;
+            appendText(mut message, kindName)?;
+            appendText(mut message, ".create()' is unknown here; write '")?;
+            appendText(mut message, kindName)?;
+            appendText(mut message, "<T>.create()' or give the variable a type")?;
+            c.error(resultTypeUnknown(), span.start, span.end, message)?;
+        }
+        return c.errorResult(span.start, span.end);
+    }
+    if (c.types.isBottom(container)) {
+        return c.errorResult(span.start, span.end);
+    }
+    return c.expr(HirExpr.BuiltinCall(bfVectorCreate(), emptyRange()), container, span.start, span.end);
+}
+
+/// A slot map's or stable vector's methods (CheckContainerMethod, §24).
+fn checkContainerMethod(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    container: u32,
+    targetSpan: Span,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let typ = c.typeOf(container);
+    let isMap = c.types.is(typ, TypeKind.SlotMap);
+    let element = if (isMap) c.types.info(typ).element else c.types.info(c.types.info(typ).pointee).element;
+    let ident = c.front.ast.idents[member as usize];
+    var textBytes = Vector<u8>.create();
+    appendBytes(mut textBytes, c.name(ident.symbol))?;
+    let text = textBytes.view();
+    let known = if (isMap) sameText(text, "insert") || sameText(text, "get") || sameText(text, "getMut") ||
+        sameText(text, "remove") || sameText(text, "contains") else sameText(text, "push");
+    if (!known) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, " has no method ")?;
+        appendQuotedName(mut message, c, ident.symbol)?;
+        appendText(
+            mut message,
+            if (isMap) "; it has 'insert', 'get', 'getMut', 'remove', 'contains'" else "; it has 'push'",
+        )?;
+        c.error(undefinedName(), ident.start, ident.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (arguments.count != 1) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, text)?;
+        appendText(mut message, "' takes one argument")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    // The argument first: for `insert`, two-phase (B5).
+    let argumentSyntax = c.front.ast.at(arguments, 0);
+    let inserts = sameText(text, "insert") || sameText(text, "push");
+    var argument = none();
+    if (inserts) {
+        argument = checkExpr(c, argumentSyntax, element)?;
+    } else {
+        let handle = c.types.handleOf(element)?;
+        argument = checkExpr(c, argumentSyntax, handle)?;
+    }
+    let mutable = sameText(text, "insert") || sameText(text, "getMut") || sameText(text, "remove");
+    let receiver = borrowPlace(c, container, mutable, targetSpan)?;
+    if (c.isBottom(receiver) || c.isBottom(argument)) {
+        return c.errorResult(span.start, span.end);
+    }
+    let values = [receiver, argument];
+    let list = c.hir.list(values[..])?;
+    let allocError = c.allocErrorType;
+    if (sameText(text, "push")) {
+        let usize = c.types.usize;
+        let result = resultOf(c, usize, allocError)?;
+        return c.expr(HirExpr.BuiltinCall(bfStableVectorPush(), list), result, span.start, span.end);
+    }
+    if (sameText(text, "insert")) {
+        let handle = c.types.handleOf(element)?;
+        let result = resultOf(c, handle, allocError)?;
+        return c.expr(HirExpr.BuiltinCall(bfSlotMapInsert(), list), result, span.start, span.end);
+    }
+    if (sameText(text, "get") || sameText(text, "getMut")) {
+        let reference = c.types.referenceTo(element, sameText(text, "getMut"))?;
+        let option = optionOf(c, reference)?;
+        return c.expr(HirExpr.BuiltinCall(bfSlotMapGet(), list), option, span.start, span.end);
+    }
+    if (sameText(text, "remove")) {
+        let option = optionOf(c, element)?;
+        return c.expr(HirExpr.BuiltinCall(bfSlotMapRemove(), list), option, span.start, span.end);
+    }
+    let boolType = c.types.boolType;
+    return c.expr(HirExpr.BuiltinCall(bfSlotMapContains(), list), boolType, span.start, span.end);
+}
+
+/// `m.length` on a slot map (SynthMember's slot map case).
+fn slotMapMember(
+    c: borrow mut Checker,
+    map: u32,
+    member: u32,
+    targetSpan: Span,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let ident = c.front.ast.idents[member as usize];
+    if (!sameText(c.name(ident.symbol), "length")) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, c.typeOf(map))?;
+        appendText(mut message, " has no field ")?;
+        appendQuotedName(mut message, c, ident.symbol)?;
+        appendText(mut message, "; it has 'length'")?;
+        c.error(unknownField(), ident.start, ident.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let borrowed = borrowPlace(c, map, false, targetSpan)?;
+    if (c.isBottom(borrowed)) {
+        return Ok(borrowed);
+    }
+    let values = [borrowed];
+    let list = c.hir.list(values[..])?;
+    let usize = c.types.usize;
+    return c.expr(HirExpr.BuiltinCall(bfSlotMapLength(), list), usize, span.start, span.end);
+}

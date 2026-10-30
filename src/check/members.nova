@@ -288,6 +288,9 @@ fn checkMethodCall(
     if (c.types.is(c.typeOf(vector), TypeKind.Vector)) {
         return checkVectorMethod(c, member, arguments, vector, targetSpan, span);
     }
+    if (c.types.is(c.typeOf(vector), TypeKind.SlotMap) || c.types.is(c.typeOf(vector), TypeKind.StableVector)) {
+        return checkContainerMethod(c, member, arguments, vector, targetSpan, span);
+    }
     let receiverType = c.typeOf(receiver);
     let receiverPointee = c.types.info(receiverType).pointee;
     if (c.types.is(

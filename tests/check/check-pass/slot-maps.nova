@@ -1,0 +1,30 @@
+struct Item { id: u32; }
+struct Store { items: SlotMap<Item>; order: StableVector<u32, FailingAllocator>; }
+
+fn find(m: borrow SlotMap<Item>, h: Handle<Item>) -> u32 {
+    match (m.get(h)) {
+        Some(item) => { return item.id; }
+        null => { return 0; }
+    }
+}
+
+fn main() {
+    var m = SlotMap<Item>.create();
+    let h = m.insert(Item { id: 7 })!;
+    let id = find(m, h);
+    if (m.contains(h)) {
+        let n = m.length;
+    }
+    match (m.getMut(h)) {
+        Some(item) => { item.id = 8; }
+        null => {}
+    }
+    let removed = m.remove(h);
+    var v: StableVector<i64> = StableVector.create();
+    let at = v.push(3)!;
+    let first = v[0];
+    let count = v.length;
+    var s = Store { items: SlotMap.create(), order: StableVector<u32, FailingAllocator>.create() };
+    let k = s.items.insert(Item { id: 1 })!;
+    s.order.push(1)!;
+}

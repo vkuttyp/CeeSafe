@@ -676,6 +676,19 @@ fn synthCall(
                                     span,
                                 );
                             }
+                            if (b == builtinSlotMap() || b == builtinStableVector()) {
+                                let isMap = b == builtinSlotMap();
+                                return checkContainerCreate(
+                                    c,
+                                    member,
+                                    target,
+                                    typeArguments,
+                                    isMap,
+                                    arguments,
+                                    expected,
+                                    span,
+                                );
+                            }
                             if (b == builtinStringView() && typeArguments.count == 0) {
                                 return checkStringViewFunction(c, member, arguments, span);
                             }
@@ -1123,8 +1136,8 @@ fn synthMember(c: borrow mut Checker, target: u32, member: u32, span: Span) -> R
     }
     let throughType = c.typeOf(through);
     if (c.types.is(throughType, TypeKind.SlotMap)) {
-        c.notPorted(span.start, span.end, "a slot map's length", "S3c")?;
-        return c.errorResult(span.start, span.end);
+        let targetSpan = c.front.ast.exprSpans[target as usize];
+        return slotMapMember(c, through, member, targetSpan, span);
     }
     if (c.types.is(throughType, TypeKind.Vector) && sameText(
         c.name(c.front.ast.idents[member as usize].symbol),

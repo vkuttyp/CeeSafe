@@ -97,6 +97,13 @@ fn resolveGenericType(
         let isString = sameText(n, "String");
         return resolveVectorType(c, isString, arguments);
     }
+    if ((sameText(n, "SlotMap") || sameText(n, "StableVector")) && (arguments.count == 1 || arguments.count == 2)) {
+        let isMap = sameText(n, "SlotMap");
+        return resolveContainerType(c, isMap, arguments);
+    }
+    if (sameText(n, "Handle") && arguments.count == 1) {
+        return resolveHandleType(c, arguments);
+    }
     if (sameText(n, "Box") && (arguments.count == 1 || arguments.count == 2)) {
         return resolveBoxType(c, arguments);
     }
