@@ -113,6 +113,7 @@ fn checkProgram(
         scopes: Vector<ScopeEntry>.create(),
         scopeStarts: Vector<usize>.create(),
         loopDepth: 0,
+        deferDepth: 0,
         letKeywords: Vector<LetKeyword>.create(),
     };
     // The constructor: the builtins' names, `this`, and a scratch frame's two parts.

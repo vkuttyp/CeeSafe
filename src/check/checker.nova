@@ -76,6 +76,7 @@ struct Checker {
     scopes: Vector<ScopeEntry>;
     scopeStarts: Vector<usize>;
     loopDepth: u32;
+    deferDepth: u32;
     letKeywords: Vector<LetKeyword>;
 
     fn letKeywordOf(borrow this, local: u32) -> u32 {
@@ -328,6 +329,8 @@ struct Checker {
             TypeNode.Function(attributes, parameters, result) => {
                 return this.resolveFunctionType(attributes, parameters, result, span);
             }
+            TypeNode.Optional(inner) => { return resolveOptionalType(this, inner); }
+            TypeNode.Generic(name, arguments) => { return resolveGenericType(this, name, arguments, span); }
             _ => {
                 this.notPorted(span.start, span.end, "this kind of type", "S2-S7")?;
                 return Ok(this.types.error);

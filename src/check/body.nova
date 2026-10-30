@@ -108,7 +108,7 @@ fn checkStmt(c: borrow mut Checker, stmt: u32) -> Result<u32, AllocError> {
         }
         StmtNode.Match(scrutinee, arms) => { return checkMatchStmt(c, scrutinee, arms, span); }
         StmtNode.Unsafe(_) => { c.notPorted(span.start, span.end, "an 'unsafe' block", "S7")?; }
-        StmtNode.Defer(_) => { c.notPorted(span.start, span.end, "a 'defer' statement", "S2")?; }
+        StmtNode.Defer(body) => { return checkDefer(c, body, span); }
     }
     let error = c.errorResult(span.start, span.end)?;
     return c.hir.addStmt(HirStmt.Expression(error), span.start, span.end);

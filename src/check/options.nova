@@ -1,0 +1,475 @@
+// Results and optionals (the reference's OptionOf, ResultOf, CheckNull, CheckSomeValue, CheckResultValue,
+// CheckResultOperand, CheckTry, SynthNullTest, the `T?` and `Result<T, E>` cases of ResolveTypeCore, and `defer`):
+// P3 S2c.
+
+fn jumpInDefer() -> u32 => 254;
+fn resultTypeUnknown() -> u32 => 260;
+fn tryReturnMismatch() -> u32 => 261;
+fn notAResult() -> u32 => 262;
+
+fn resultOf(c: borrow mut Checker, ok: u32, err: u32) -> Result<u32, AllocError> {
+    let okName = c.intern("Ok")?;
+    let errName = c.intern("Err")?;
+    let payloadName = c.intern("_0")?;
+    return c.types.resultOf(ok, err, okName, errName, payloadName);
+}
+
+fn isResultType(c: borrow Checker, typ: u32) -> bool {
+    if (!c.types.is(typ, TypeKind.Enum)) {
+        return false;
+    }
+    let definition = c.types.info(typ).enumDef;
+    return c.types.enums[definition as usize].resultOk != none();
+}
+
+fn resultOk(c: borrow Checker, typ: u32) -> u32 => c.types.enums[c.types.info(typ).enumDef as usize].resultOk;
+
+fn resultErr(c: borrow Checker, typ: u32) -> u32 => c.types.enums[c.types.info(typ).enumDef as usize].resultErr;
+
+/// `T?` (ResolveTypeCore's OptionalType case).
+fn resolveOptionalType(c: borrow mut Checker, inner: u32) -> Result<u32, AllocError> {
+    let value = c.resolveType(inner, false)?;
+    if (c.types.isBottom(value)) {
+        return Ok(c.types.error);
+    }
+    return optionOf(c, value);
+}
+
+/// `Name<…>` for the built-in generic types; S2c resolves `Result<T, E>` and reports the wrong-arity and unknown
+/// cases; the containers come with S3 and user generics with S4.
+fn resolveGenericType(
+    c: borrow mut Checker,
+    name: QualifiedName,
+    arguments: Range,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let first = c.front.ast.idents[c.front.ast.at(name.parts, 0) as usize];
+    if (name.parts.count == 1) {
+        match (c.item(first.symbol)) {
+            Entity.Struct(_) => {
+                c.notPorted(span.start, span.end, "type arguments on a struct", "S4")?;
+                return Ok(c.types.error);
+            }
+            Entity.Enum(_) => {
+                c.notPorted(span.start, span.end, "type arguments on an enum", "S4")?;
+                return Ok(c.types.error);
+            }
+            Entity.LibraryItem(_) => {
+                c.notPorted(span.start, span.end, "a generic struct or enum", "S4/S5")?;
+                return Ok(c.types.error);
+            }
+            _ => {}
+        }
+    }
+    var text = Vector<u8>.create();
+    if (name.parts.count == 1) {
+        appendBytes(mut text, c.name(first.symbol))?;
+    }
+    let n = text.view();
+    if (sameText(n, "Result") && arguments.count == 2) {
+        let ok = c.resolveType(c.front.ast.at(arguments, 0), true)?;
+        let err = c.resolveType(c.front.ast.at(arguments, 1), false)?;
+        // A result holding a reference or slice is itself scoped (§19.1).
+        if (c.types.isBottom(ok) || c.types.isBottom(err)) {
+            return Ok(c.types.error);
+        }
+        return resultOf(c, ok, err);
+    }
+    let one = arguments.count == 1;
+    let oneOrTwo = arguments.count == 1 || arguments.count == 2;
+    let known = (sameText(n, "StringView") && one) || ((sameText(n, "Slice") || sameText(n, "SliceMut")) && (one ||
+        arguments.count == 2)) || (sameText(
+        n,
+        "Box",
+    ) && oneOrTwo) || ((sameText(n, "Pool") || sameText(n, "PoolBox")) &&
+        one) || (sameText(n, "Vector") && oneOrTwo) || (sameText(n, "String") && one) || ((sameText(n, "SlotMap") ||
+        sameText(n, "StableVector")) && oneOrTwo) || (sameText(n, "Thread") && one) || (sameText(n, "Handle") && one);
+    if (known) {
+        c.notPorted(span.start, span.end, "this built-in generic type", "S2e/S3")?;
+        return Ok(c.types.error);
+    }
+    var message = Vector<u8>.create();
+    if (sameText(n, "Slice") || sameText(n, "SliceMut")) {
+        appendText(mut message, "'")?;
+        appendBytes(mut message, n)?;
+        appendText(mut message, "' takes one type argument: '")?;
+        appendBytes(mut message, n)?;
+        appendText(mut message, "<T>'")?;
+    } else if (sameText(n, "Result")) {
+        appendText(mut message, "'Result' takes two type arguments: 'Result<T, E>'")?;
+    } else if (sameText(n, "Box")) {
+        appendText(mut message, "'Box' takes one or two type arguments: 'Box<T>' or 'Box<T, A>'")?;
+    } else if (sameText(n, "Pool") || sameText(n, "PoolBox")) {
+        appendText(mut message, "'")?;
+        appendBytes(mut message, n)?;
+        appendText(mut message, "' takes one type argument: '")?;
+        appendBytes(mut message, n)?;
+        appendText(mut message, "<T>'")?;
+    } else if (sameText(n, "Vector")) {
+        appendText(mut message, "'Vector' takes one or two type arguments: 'Vector<T>' or 'Vector<T, A>'")?;
+    } else if (sameText(n, "String")) {
+        appendText(mut message, "'String' takes at most one type argument: 'String' or 'String<A>'")?;
+    } else if (sameText(n, "SlotMap") || sameText(n, "StableVector")) {
+        appendText(mut message, "'")?;
+        appendBytes(mut message, n)?;
+        appendText(mut message, "' takes one or two type arguments: '")?;
+        appendBytes(mut message, n)?;
+        appendText(mut message, "<T>' or '")?;
+        appendBytes(mut message, n)?;
+        appendText(mut message, "<T, A>'")?;
+    } else if (sameText(n, "Handle")) {
+        appendText(mut message, "'Handle' takes one type argument: 'Handle<T>'")?;
+    } else {
+        appendText(
+            mut message,
+            "only 'Slice<T>', 'SliceMut<T>', 'Result<T, E>', 'Box<T, A>', 'Pool<T>', 'PoolBox<T>', 'Vector<T, A>' and 'String<A>' take type arguments",
+        )?;
+    }
+    c.error(unknownType(), span.start, span.end, message)?;
+    return Ok(c.types.error);
+}
+
+/// `null` (CheckNull): needs an expected optional type (§22.1, N0260).
+fn checkNull(c: borrow mut Checker, expected: u32, span: Span) -> Result<u32, AllocError> {
+    if (expected != none() && c.types.optionType(expected) != none()) {
+        let variant = variantAt(c, expected, 0);
+        return c.expr(HirExpr.EnumValue(variant, emptyRange()), expected, span.start, span.end);
+    }
+    if (expected == none() || !c.types.isBottom(expected)) {
+        var message = Vector<u8>.create();
+        if (expected == none()) {
+            appendText(
+                mut message,
+                "the optional type of 'null' is unknown here; give the variable or parameter a type 'T?'",
+            )?;
+        } else {
+            appendText(mut message, "'null' is an absent optional, but ")?;
+            appendQuotedType(mut message, c, expected)?;
+            appendText(mut message, " is expected here")?;
+        }
+        c.error(resultTypeUnknown(), span.start, span.end, message)?;
+    }
+    return c.errorResult(span.start, span.end);
+}
+
+/// `Some(e)` (CheckSomeValue, §22.1): against the expected `T?`, or of `e`'s own type.
+fn checkSomeValue(c: borrow mut Checker, arguments: Range, expected: u32, span: Span) -> Result<u32, AllocError> {
+    if (arguments.count != 1) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'Some' takes one value: 'Some(v)'")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let argument = c.front.ast.at(arguments, 0);
+    let wrapped = if (expected == none()) none() else c.types.optionType(expected);
+    if (wrapped != none()) {
+        let payload = checkExpr(c, argument, wrapped)?;
+        if (c.isBottom(payload)) {
+            return Ok(payload);
+        }
+        let some = variantAt(c, expected, 1);
+        return enumValue(c, some, payload, expected, span);
+    }
+    let argumentSpan = c.front.ast.exprSpans[argument as usize];
+    var value = synth(c, argument, none())?;
+    let ownType = c.typeOf(value);
+    value = coerce(c, value, ownType, argumentSpan)?; // a `borrow mut` variable is reborrowed
+    if (c.isBottom(value)) {
+        return Ok(value);
+    }
+    if (c.types.is(c.typeOf(value), TypeKind.Void)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'Some' needs a value; 'void' has none")?;
+        c.error(voidNotAllowed(), argumentSpan.start, argumentSpan.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let valueType = c.typeOf(value);
+    let option = optionOf(c, valueType)?;
+    let some = variantAt(c, option, 1);
+    return enumValue(c, some, value, option, span);
+}
+
+fn enumValue(c: borrow mut Checker, variant: u32, payload: u32, typ: u32, span: Span) -> Result<u32, AllocError> {
+    let values = [payload];
+    let list = c.hir.list(values[..])?;
+    return c.expr(HirExpr.EnumValue(variant, list), typ, span.start, span.end);
+}
+
+/// `Ok(e)`, `Ok()` or `Err(e)` against the expected `Result` type (CheckResultValue, §17.2).
+fn checkResultValue(
+    c: borrow mut Checker,
+    name: u32,
+    arguments: Range,
+    expected: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let variant = if (expected != none() && isResultType(c, expected)) findVariant(
+        c,
+        c.types.info(expected).enumDef,
+        name,
+    ) else none();
+    if (variant == none()) {
+        if (expected == none() || !c.types.isBottom(expected)) {
+            var message = Vector<u8>.create();
+            if (expected == none()) {
+                appendText(mut message, "the 'Result' type of ")?;
+                appendQuotedCall(mut message, c, name)?;
+                appendText(mut message, " is unknown here; give the variable or parameter a 'Result<T, E>' type")?;
+            } else {
+                appendQuotedCall(mut message, c, name)?;
+                appendText(mut message, " makes a 'Result', but ")?;
+                appendQuotedType(mut message, c, expected)?;
+                appendText(mut message, " is expected here")?;
+            }
+            c.error(resultTypeUnknown(), span.start, span.end, message)?;
+        }
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let count = payloadCount(c, variant);
+    if (arguments.count as usize != count) {
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, name)?;
+        appendText(mut message, " of ")?;
+        appendQuotedType(mut message, c, expected)?;
+        if (count == 0) {
+            appendText(mut message, " takes no value: write '")?;
+            appendBytes(mut message, c.name(name))?;
+            appendText(mut message, "()'")?;
+        } else {
+            appendText(mut message, " takes one value")?;
+        }
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (count == 0) {
+        return c.expr(HirExpr.EnumValue(variant, emptyRange()), expected, span.start, span.end);
+    }
+    let argument = c.front.ast.at(arguments, 0);
+    let t = payloadType(c, variant, 0);
+    let payload = checkExpr(c, argument, t)?;
+    return enumValue(c, variant, payload, expected, span);
+}
+
+/// `'Name(...)'`.
+fn appendQuotedCall(out: borrow mut Vector<u8>, c: borrow Checker, name: u32) -> Result<void, AllocError> {
+    appendText(out, "'")?;
+    appendBytes(out, c.name(name))?;
+    return appendText(out, "(...)'");
+}
+
+/// The operand of `e?` or `e!`: a `Result` or optional value (CheckResultOperand, N0262), or none.
+fn checkResultOperand(c: borrow mut Checker, operand: u32, text: StringView) -> Result<u32, AllocError> {
+    let value = synth(c, operand, none())?;
+    if (c.isBottom(value)) {
+        return Ok(none());
+    }
+    let t = c.typeOf(value);
+    if (!isResultType(c, t) && c.types.optionType(t) == none()) {
+        let pointee = c.types.info(t).pointee;
+        let toResult = pointee != none() && (isResultType(c, pointee) || c.types.optionType(pointee) != none());
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendText(mut message, text)?;
+        if (toResult) {
+            appendText(mut message, "' needs a 'Result' or optional value, but this is a reference to one; '")?;
+            appendText(mut message, text)?;
+            appendText(mut message, "' consumes the value")?;
+        } else {
+            appendText(mut message, "' needs a 'Result<T, E>' or optional value, found ")?;
+            appendQuotedType(mut message, c, t)?;
+        }
+        let span = c.front.ast.exprSpans[operand as usize];
+        c.error(notAResult(), span.start, span.end, message)?;
+        return Ok(none());
+    }
+    return Ok(value);
+}
+
+/// `e?` (CheckTry, §17.4, §22.1).
+fn checkTry(c: borrow mut Checker, operandSyntax: u32, span: Span) -> Result<u32, AllocError> {
+    let operand = checkResultOperand(c, operandSyntax, "?")?;
+    if (operand == none()) {
+        return c.errorResult(span.start, span.end);
+    }
+    let returnType = if (c.function == none()) none() else c.hir.functions[c.function as usize].returnType;
+    let t = c.typeOf(operand);
+    let value = c.types.optionType(t);
+    if (value != none()) {
+        if (c.deferDepth > 0) {
+            tryInDefer(c, span)?;
+        } else if ((returnType == none() || c.types.optionType(returnType) == none()) && (returnType == none() ||
+            !c.types.isBottom(returnType))) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "'?' on an optional returns 'null' from the function, so ")?;
+            appendFunctionName(mut message, c)?;
+            appendText(mut message, " must return an optional 'T?'")?;
+            c.error(tryReturnMismatch(), span.start, span.end, message)?;
+        }
+        return c.expr(HirExpr.Try(operand), value, span.start, span.end);
+    }
+    let ok = resultOk(c, t);
+    let err = resultErr(c, t);
+    if (c.deferDepth > 0) {
+        tryInDefer(c, span)?;
+    } else {
+        let returnsResult = returnType != none() && isResultType(c, returnType);
+        if (!returnsResult || resultErr(c, returnType) != err) {
+            if (returnType == none() || !c.types.isBottom(returnType)) {
+                var message = Vector<u8>.create();
+                if (returnsResult) {
+                    appendText(mut message, "'?' would return 'Err' of type ")?;
+                    appendQuotedType(mut message, c, err)?;
+                    appendText(mut message, ", but ")?;
+                    appendFunctionName(mut message, c)?;
+                    appendText(mut message, " returns errors of type ")?;
+                    appendQuotedType(mut message, c, resultErr(c, returnType))?;
+                    appendText(mut message, " (the types must be the same in v0)")?;
+                } else {
+                    appendText(mut message, "'?' returns 'Err' from the function, so ")?;
+                    appendFunctionName(mut message, c)?;
+                    appendText(mut message, " must return 'Result<_, ")?;
+                    appendBytes(mut message, c.typeName(err))?;
+                    appendText(mut message, ">'")?;
+                }
+                c.error(tryReturnMismatch(), span.start, span.end, message)?;
+            }
+        }
+    }
+    return c.expr(HirExpr.Try(operand), ok, span.start, span.end);
+}
+
+fn tryInDefer(c: borrow mut Checker, span: Span) -> Result<void, AllocError> {
+    var message = Vector<u8>.create();
+    appendText(mut message, "a deferred statement cannot contain '?': it would return from the function")?;
+    return c.error(jumpInDefer(), span.start, span.end, message);
+}
+
+/// `'f'`, or `'this'` outside a function.
+fn appendFunctionName(out: borrow mut Vector<u8>, c: borrow Checker) -> Result<void, AllocError> {
+    if (c.function == none()) {
+        return appendText(out, "'this'");
+    }
+    return appendQuotedName(out, c, c.hir.functions[c.function as usize].name);
+}
+
+/// `e!` (§17.5, §22.1).
+fn checkUnwrap(c: borrow mut Checker, operandSyntax: u32, span: Span) -> Result<u32, AllocError> {
+    let operand = checkResultOperand(c, operandSyntax, "!")?;
+    if (operand == none()) {
+        return c.errorResult(span.start, span.end);
+    }
+    let t = c.typeOf(operand);
+    let option = c.types.optionType(t);
+    let value = if (option != none()) option else resultOk(c, t);
+    return c.expr(HirExpr.Unwrap(operand), value, span.start, span.end);
+}
+
+/// `o == null` and `o != null` (SynthNullTest, §22.1): reads the tag through a shared borrow, so the optional is not
+/// consumed.
+fn synthNullTest(
+    c: borrow mut Checker,
+    leftSyntax: u32,
+    rightSyntax: u32,
+    isNull: bool,
+    leftIsNull: bool,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let operandSyntax = if (leftIsNull) rightSyntax else leftSyntax;
+    let operandIsNull = match (c.front.ast.exprs[operandSyntax as usize]) {
+        ExprNode.NullLiteral => true,
+        _ => false,
+    };
+    if (operandIsNull) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "comparing 'null' with 'null' is always true; compare an optional value with 'null'")?;
+        c.error(invalidOperandTypes(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let operandSpan = c.front.ast.exprSpans[operandSyntax as usize];
+    var value = synth(c, operandSyntax, none())?;
+    loop {
+        let t = c.typeOf(value);
+        if (!c.types.is(t, TypeKind.Reference) || !c.types.is(c.types.info(t).pointee, TypeKind.Reference)) {
+            break;
+        }
+        let pointee = c.types.info(t).pointee;
+        value = c.expr(HirExpr.Deref(value), pointee, operandSpan.start, operandSpan.end)?;
+    }
+    let t = c.typeOf(value);
+    if (c.types.isBottom(t)) {
+        return c.errorResult(span.start, span.end);
+    }
+    let isReference = c.types.is(t, TypeKind.Reference);
+    let option = if (isReference) c.types.info(t).pointee else t;
+    if (c.types.optionType(option) == none()) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "only an optional value can be compared with 'null', found ")?;
+        appendQuotedType(mut message, c, t)?;
+        c.error(invalidOperandTypes(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let reference = c.types.referenceTo(option, false)?;
+    var borrowed = none();
+    if (isReference) {
+        borrowed = c.expr(HirExpr.Reborrow(false, value), reference, operandSpan.start, operandSpan.end)?;
+    } else {
+        let place = toPlace(c, value)?;
+        borrowed = if (place != none()) c.expr(
+            HirExpr.Borrow(false, place),
+            reference,
+            operandSpan.start,
+            operandSpan.end,
+        )? else c.expr(HirExpr.BorrowTemp(false, value), reference, operandSpan.start, operandSpan.end)?;
+    }
+    let boolType = c.types.boolType;
+    return c.expr(HirExpr.IsNull(borrowed, isNull), boolType, span.start, span.end);
+}
+
+// ---- defer ----
+
+/// `defer s;` (§24): the body may not jump out (N0254).
+fn checkDefer(c: borrow mut Checker, body: u32, span: Span) -> Result<u32, AllocError> {
+    c.deferDepth += 1;
+    let checked = checkStmt(c, body)?;
+    c.deferDepth -= 1;
+    let jump = findJump(c, body);
+    if (jump != none()) {
+        let jumpSpan = c.front.ast.stmtSpans[jump as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "a deferred statement cannot contain 'return', 'break', 'continue' or 'defer'")?;
+        c.error(jumpInDefer(), jumpSpan.start, jumpSpan.end, message)?;
+    }
+    return c.hir.addStmt(HirStmt.Defer(checked), span.start, span.end);
+}
+
+/// The first `return`, `break`, `continue` or `defer` inside a statement, or none (FindJump).
+fn findJump(c: borrow Checker, stmt: u32) -> u32 {
+    match (c.front.ast.stmts[stmt as usize]) {
+        StmtNode.Return(_) => { return stmt; }
+        StmtNode.Break => { return stmt; }
+        StmtNode.Continue => { return stmt; }
+        StmtNode.Defer(_) => { return stmt; }
+        StmtNode.Block(statements) => {
+            for (k in 0..statements.count) {
+                let found = findJump(c, c.front.ast.at(statements, k));
+                if (found != none()) {
+                    return found;
+                }
+            }
+            return none();
+        }
+        StmtNode.If(_, then, otherwise) => {
+            let found = findJump(c, then);
+            if (found != none() || otherwise == none()) {
+                return found;
+            }
+            return findJump(c, otherwise);
+        }
+        StmtNode.While(_, body) => { return findJump(c, body); }
+        StmtNode.Loop(body) => { return findJump(c, body); }
+        _ => { return none(); }
+    }
+}

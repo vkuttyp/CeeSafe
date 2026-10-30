@@ -119,7 +119,31 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
         }
         ExprNode.Unary(op, operand) => { return synthUnary(c, op, operand, expected, span); }
         ExprNode.Binary(left, op, right) => { return synthBinary(c, left, op, right, expected, span); }
-        ExprNode.Call(callee, arguments) => { return synthCall(c, callee, arguments, expected, span); }
+        ExprNode.Call(callee, arguments) => {
+            match (c.front.ast.exprs[callee as usize]) {
+                ExprNode.Name(name, typeArguments) => {
+                    let symbol = c.front.ast.idents[name as usize].symbol;
+                    let undeclared = match (c.lookup(symbol)) {
+                        Entity.None => true,
+                        _ => false,
+                    };
+                    if (typeArguments.count == 0 && undeclared) {
+                        let text = c.name(symbol);
+                        if (sameText(text, "Ok") || sameText(text, "Err")) {
+                            return checkResultValue(c, symbol, arguments, expected, span);
+                        }
+                        if (sameText(text, "Some")) {
+                            return checkSomeValue(c, arguments, expected, span);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return synthCall(c, callee, arguments, expected, span);
+        }
+        ExprNode.NullLiteral => { return checkNull(c, expected, span); }
+        ExprNode.Try(operand) => { return checkTry(c, operand, span); }
+        ExprNode.Unwrap(operand) => { return checkUnwrap(c, operand, span); }
         ExprNode.If(_, _, _) => { return checkBranching(c, e, none()); }
         ExprNode.Match(_, _) => { return checkBranching(c, e, none()); }
         ExprNode.This => {
@@ -337,8 +361,7 @@ fn synthBinary(
         _ => false,
     };
     if ((index == 2 || index == 3) && (isNullLeft || isNullRight)) {
-        c.notPorted(span.start, span.end, "a null test", "S2")?;
-        return c.errorResult(span.start, span.end);
+        return synthNullTest(c, leftSyntax, rightSyntax, index == 2, isNullLeft, span);
     }
     let boolType = c.types.boolType;
     if (index == 0 || index == 1) {
@@ -520,9 +543,16 @@ fn coerce(c: borrow mut Checker, e: u32, expected: u32, span: Span) -> Result<u3
             return Ok(read);
         }
     }
-    if (c.types.optionType(expected) != none()) {
-        c.notPorted(span.start, span.end, "a value where an optional is expected", "S2")?;
-        return c.errorResult(span.start, span.end);
+    let wrapped = c.types.optionType(expected);
+    if (wrapped != none()) {
+        // A `T` where a `T?` is expected is `Some(value)` (§22.1), tried quietly.
+        let saved = c.front.diagnostics.items.length;
+        let inner = coerce(c, e, wrapped, span)?;
+        c.front.diagnostics.items.truncate(saved);
+        if (!c.isBottom(inner)) {
+            let some = variantAt(c, expected, 1);
+            return enumValue(c, some, inner, expected, span);
+        }
     }
     var message = Vector<u8>.create();
     appendText(mut message, "expected ")?;
@@ -834,8 +864,14 @@ fn checkBuiltinMemberCall(
         return c.expr(HirExpr.BuiltinCall(function, emptyRange()), usize, span.start, span.end);
     }
     if (function == bfArgument()) {
-        c.notPorted(span.start, span.end, "Process.argument (an optional result)", "S2")?;
-        return c.errorResult(span.start, span.end);
+        let usize = c.types.usize;
+        let indexSyntax = c.front.ast.at(arguments, 0);
+        let index = checkExpr(c, indexSyntax, usize)?;
+        let values = [index];
+        let list = c.hir.list(values[..])?;
+        let view = c.types.stringView;
+        let option = optionOf(c, view)?;
+        return c.expr(HirExpr.BuiltinCall(function, list), option, span.start, span.end);
     }
     var values = Vector<u32>.create();
     for (k in 0..count) {

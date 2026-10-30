@@ -1,0 +1,45 @@
+enum E { A }
+
+fn f() -> i32 {
+    let a = half(3)?;
+    let b = parse()?;
+    return 0;
+}
+
+fn g() -> Result<i32, i32> {
+    let b = parse()?;
+    let c = 5?;
+    let d = 5!;
+    return Ok(1, 2);
+}
+
+fn h() -> Result<void, E> {
+    let x = null;
+    let y: i32 = null;
+    let z = Ok(1);
+    let w: i32 = Err(E.A);
+    let s = Some(1, 2);
+    let t = Some(main());
+    if (null == null) {}
+    if (3 == null) {}
+    return Ok(5);
+}
+
+fn half(n: i32) -> i32? => null;
+fn parse() -> Result<u8, E> => Err(E.A);
+
+fn k() -> i32? {
+    defer {
+        let q = half(1)?;
+        return null;
+    }
+    while (true) {
+        defer break;
+    }
+    let r: Result<i32> = Ok(1);
+    let v: Vecky<i32> = 1;
+    let p: Result<i32, E, E> = Ok(1);
+    return 1;
+}
+
+fn main() {}

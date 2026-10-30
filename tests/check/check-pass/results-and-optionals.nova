@@ -1,0 +1,63 @@
+enum Shape { Dot, Circle(i32) }
+
+fn half(n: i32) -> i32? {
+    if (n % 2 != 0) {
+        return null;
+    }
+    return n / 2;
+}
+
+fn quarter(n: i32) -> i32? {
+    let h = half(n)?;
+    return half(h);
+}
+
+fn parse(n: i32) -> Result<u8, Shape> {
+    if (n < 0) {
+        return Err(Shape.Circle(n));
+    }
+    if (n > 255) {
+        return Err(Shape.Dot);
+    }
+    return Ok(truncate<u8>(n));
+}
+
+fn twice(n: i32) -> Result<u8, Shape> {
+    let v = parse(n)?;
+    let w: Result<void, Shape> = Ok();
+    let x: u8? = Some(v);
+    let y = Some(7);
+    let z: u8?? = Some(x);
+    if (x == null || null != y) {
+        return Ok(0);
+    }
+    match (x) {
+        Some(k) => { return Ok(k); }
+        null => {}
+    }
+    let r = match (parse(n)) {
+        Ok(b) => b,
+        Err(Shape.Dot) => 1,
+        Err(Shape.Circle(_)) => 2,
+    };
+    let s = match (z) {
+        Some(Some(q)) => q,
+        Some(null) => 1,
+        null => 0,
+    };
+    return Ok(v + r + s);
+}
+
+fn main() {
+    defer Console.writeLine("bye");
+    let q = quarter(8)!;
+    let t = twice(4)!;
+    let a = Process.argument(0);
+    if (a != null) {
+        defer {
+            Console.writeLine("x");
+        }
+    }
+    let o = if (q > 1) null else Some(q);
+    let u = if (q > 1) Some(q) else null;
+}
