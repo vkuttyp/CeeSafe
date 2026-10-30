@@ -91,8 +91,16 @@ python3 tools/run_corpus.py --compiler ~/.nova/bin/novac                 # Nova'
 python3 tools/run_corpus.py --compiler out/ceesafe --reference ~/.nova/bin/novac --family parse-pass
 python3 tools/run_corpus.py --compiler ~/.nova/bin/novac --corpus probes --family run-pass --family check-fail \
     --family parse-fail                                                  # the P1 probes
+W=""; for f in src/support/*.nova; do W="$W --with $f"; done                # zsh: then ${=W}
+python3 tools/run_corpus.py --compiler ~/.nova/bin/novac --corpus tests/support --family run-pass $W --check-leaks
+python3 tools/fault_sweep.py --compiler ~/.nova/bin/novac tests/support/fault/alloc-sweep.nova src/support/*.nova
+python3 tools/oracles/support_models.py                                  # oracle summaries for tests/support
 python3 tools/inventory.py                                               # regenerate docs/reference-inventory.md
 ```
+
+Generated files say so in their first line (`tools/oracles/gen_*.py` writes them); edit the generator, never the
+output. Expected values in `tests/support` come from oracles outside the code under test (Python, .NET, novac).
+Use `--check-leaks` for anything new: novac 0.3.1 can skip drops (`probes/upstream/`).
 
 `run_corpus.py` checks the corpus's own expectations (annotations, snapshots, expected output); `--reference`
 also requires identical observable outcomes. Its normalisations are listed in the script: never widen one to make a
@@ -113,7 +121,9 @@ docs/decisions/                         CeeSafe decisions
 bootstrap/                              stage-0 pin and reference manifest
 tools/                                  run_corpus.py (corpus runner), inventory.py (reference inventory)
 probes/                                 P1 capability probes in corpus format; upstream/ holds novac bug reproducers
-tests/                                  CeeSafe's own fixtures (planned)
+src/support/ src/host/                  the support library (P1) and host services
+tests/support/                          support-library tests (run-pass, fault/)
+tools/oracles/                          independent oracles and generators for tests
 out/                                    build output, never committed
 ```
 

@@ -47,6 +47,12 @@ expectation was rechecked and the cause recorded; none of the disagreements was 
 | N0245 is reported twice at one position for `-> borrow V?` in a method of a generic struct. It happens only in the full probe; every reduction tried reports it once. | `probes/run-pass/generic-map.nova` with `borrow(this)` removed from `get` | low (cosmetic) |
 | When a `match` scrutinee fails to check (N0248, `let` where `var` is needed), the arm bindings are also reported as undefined (N0200), as cascading errors. | the first draft of `lexer.nova`'s `readFile` | low (diagnostic quality) |
 | `type-system.md:702` still says "N0258 otherwise", but N0258 was retired in M3c (§18.4). | — | doc nit |
+| **Missing drop.** A temporary that needs drop, made in an `if` or `while` condition, is never destroyed. The `while` condition below runs twice but destroys one temporary. `let` and `match` are correct. Native code and `--interp` behave the same, so this is lowering, not the C backend. lifetimes.md: a temporary lives to the end of its statement. Nova's corpus does not cover it: `run_corpus.py --check-leaks` finds no leak in its 199 programs. | `probes/upstream/condition-temporary-not-dropped.nova` | **high**: destructors and frees are skipped (a resource leak, against the drop semantics the port must reproduce). Found by LeakSanitizer in the P1 gate. Workaround: bind to a local. |
+| **Spec and checker disagree.** §23.1 makes `truncate`'s arguments two-phase, like `push`, but `v.truncate(v.length - 1)` is rejected (N0242), while `v.push(…v.length…)` is accepted. | `probes/upstream/truncate-two-phase.nova` | medium: a valid program is rejected. Workaround: a local. |
+| **Imprecision.** `-> borrow(this) T?` is ignored when the other reference parameter has a type-parameter type (`key: borrow K`): a temporary key is then rejected with N0243. With a concrete key type it is accepted. | `probes/upstream/generic-param-borrow-annotation.nova` | medium: a valid program is rejected. Workaround: a local. |
+| **Crash on deep nesting.** 100,000 nested parentheses crash novac with SIGSEGV (exit 139), with no message. 10,000 are accepted. There is no nesting limit or diagnostic. | `docs/limits.md` §1 | medium (robustness). CeeSafe needs a specified limit, as an N-track spec item. |
+| The formatter wraps chained `if` expressions inside `match` arms unreadably, with operands split across lines. | the first `phaseOf` in `src/main.nova` | low (formatter quality) |
+| There is no explicit panic or abort for internal-error assertions. | `src/support/bits.nova` | low (a missing feature: an assertion needs a deliberate index fault) |
 
 ## 4. Revised N-track list
 
@@ -55,6 +61,9 @@ Priorities are by what blocks a phase. "Workaround" means the port can proceed w
 | Item | Needed by | Blocking? | Evidence |
 |---|---|---|---|
 | **N0. Fix the `T = void` crash** | P1 (support library), P3 | yes: a crash, not a missing feature | §3 |
+| **N0b. Fix the condition-temporary drop bug**, with a corpus regression and a leak check in Nova's run corpus | P4–P5 (drop parity) | yes: the port must reproduce correct drops, and the oracle drops wrongly | §3 |
+| N0c. Fix the `truncate` two-phase disagreement and the `borrow(this)` imprecision | — | no: workarounds exist | §3 |
+| N0d. Specify a nesting limit and its diagnostic | P2 | yes, for P2's robustness gate | `docs/limits.md` |
 | **N1a. Bytes to text**: `StringView.fromUtf8(Slice<u8>) -> StringView?` (validating) and appending checked bytes to a `String` | P2 diagnostics that quote source; P8 tools | partly. Without it, messages are printed piece by piece and nothing that contains a source name can be built as a `String`, so JSON output, fixes and LSP/MCP replies (P8) cannot be built. | `text-gaps`, `lexer` |
 | N1b. `Vector` bulk append from a slice | P2 onward (performance) | no: push in a loop | `lexer`, `error-layers` |
 | N1c. Text ordering, `clone`, `find`/`startsWith`, number parsing | — | no: byte-wise functions in CeeSafe's support library | `text-gaps` |
@@ -65,7 +74,8 @@ Priorities are by what blocks a phase. "Workaround" means the port can proceed w
 | N3. `impl<T>`, `Self`, `From` | — | **no**: per-instantiation impls, `K: Key<K>`, lift functions | `generic-impls`, `error-layers` |
 | N5. More borrow precision | — | **no** | `aliasing-workarounds` |
 
-So the upstream work before P2 is **N0** and **N1a**; N4 is needed before P5. The rest is optional ergonomics.
+So the upstream work before P2 is **N0** (and N0b, N0d) and **N1a**; N4 is needed before P5. The rest is optional
+ergonomics.
 
 ## 5. Patterns the port adopts
 
@@ -81,3 +91,43 @@ So the upstream work before P2 is **N0** and **N1a**; N4 is needed before P5. Th
   is fixed.
 - **Tables of names** (keywords, operators) are `match` expressions.
 - Probe binaries and their outputs stay out of the repository. Build output goes to `out/` or a temporary directory.
+
+## 6. Measurements of the reference's text handling
+
+These were run on 2026-10-30 against novac 0.3.1. They fixed `src/support/source.nova`'s rules.
+
+- **Ill-formed UTF-8.** Twelve inputs went in a comment before an error token:
+  - valid 2-, 3- and 4-byte sequences;
+  - a lone continuation byte;
+  - truncated 3- and 4-byte sequences;
+  - an overlong form;
+  - a surrogate;
+  - a code point above U+10FFFF;
+  - `FF FE`;
+  - a mixed run.
+
+  novac's reported column equalled Python's `bytes.decode("utf-8", "replace")` counted in UTF-16 code units in all 12
+  cases. So .NET replaces each maximal subpart with one U+FFFD, and Python is a valid oracle for it.
+- **BOMs.** A file starting with two UTF-8 BOMs reports the same positions as one starting with one: `File.ReadAllText`
+  strips the first and `SourceText` the second. A BOM inside a line is N0001.
+- **JSON escaping.** File names with special characters showed that `"` and control characters are escaped, with DEL
+  as `\u007F` and uppercase hex. Some BMP characters stay raw (é, U+200B); NBSP, U+2028 and U+FEFF are escaped, and
+  astral characters are escaped surrogate pairs. The full table (345 BMP ranges) was extracted from .NET 10.0.12
+  (`tools/oracles/JsonEscapes.cs`, `tools/oracles/data/json-escaped-bmp.txt`). `\b \f \n \r \t` use short forms,
+  and U+FFFD is raw.
+
+## 7. Support library results (P1, 2026-10-30)
+
+| Module | Test | Oracle | Result |
+|---|---|---|---|
+| `map.nova` | `tests/support/run-pass/map-model.nova`: 20,000 seeded operations | an in-program linear model at every step; summary from `tools/oracles/support_models.py` | match |
+| `interner.nova` | `interner-model.nova`: 5,000 seeded interns | in-program list model; Python summary | match |
+| `bits.nova`, `bytes.nova` | `bits-model.nova`: 30,000 seeded set/clear, then union, intersection and difference; ordinal order | boolean-vector model; Python | match |
+| `source.nova` | `source-positions.nova`: 11 inputs (BOMs, line endings, ill-formed UTF-8, astral) | Python model of SourceText (`gen_source_positions.py`) | match |
+| `bigint.nova` | `bigint-cases.nova`: 329 operand pairs (edges and random values up to 400 bits) and 17 wrap/fits values | Python integers (`gen_bigint_cases.py`) | match |
+| `json.nova` | `json-writer.nova`: every BMP scalar, every 997th astral one, and ill-formed input (418,506 bytes); two novac documents | .NET 10.0.12's Utf8JsonWriter (`JsonSweep.cs`), novac 0.3.1 | byte-identical |
+| all | `tests/support/fault/alloc-sweep.nova` through `tools/fault_sweep.py`: each of 573 allocations failed in turn | the program's own consistency check, and the runtime's `live=0` | 573/573; a planted rollback bug was caught |
+
+The modules were run on macOS (Apple clang, with and without ASan+UBSan) and on the Ryzen box (GCC 12, and clang 18
+with ASan+UBSan+LeakSanitizer), all with `--check-leaks`.
+

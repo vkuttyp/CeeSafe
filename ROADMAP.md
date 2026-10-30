@@ -1,7 +1,7 @@
 # CeeSafe roadmap: port the Nova compiler to Nova, as CeeSafe
 
-Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0 complete; P1 next**. The package scaffold, the stage-0 pin,
-decision 0001, the inventory, the parity ledger and the corpus runner exist. No compiler code has been ported.
+Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0 and P1 complete; next: the upstream N0/N1a work (owner's go-ahead), then P2**.
+The probes, `src/support/`, the limits, the fault sweep and the skeleton exist (`docs/p1-probes.md`). No compiler code has been ported.
 Repository: `~/dev/CeeSafe`. Reference: `vkuttyp/Nova` (C#/.NET 10), pinned in `bootstrap/reference.md`.
 
 **Identity** (decision 0001):
@@ -261,6 +261,14 @@ Each item is a Nova change approved by the owner and made under Nova's rules: sp
 - [ ] **N0. Fix the compiler crash** on a generic `Result` rebuild instantiated with `T = void`
   (`probes/upstream/void-result-rebuild-crash.nova`). This is a bug fix with a corpus regression, not a language
   change. Until it lands, `void` results use non-generic lifts.
+- [ ] **N0b. Fix the missing drop** of a temporary made in an `if` or `while` condition
+  (`probes/upstream/condition-temporary-not-dropped.nova`). Its regression test needs a leak check, which Nova's run
+  corpus lacks. **Before P4**, since drops are part of parity.
+- [ ] N0c. Fix two false rejections, each with a workaround:
+  - `truncate` is not two-phase, against §23.1;
+  - `borrow(this)` is ignored when the other parameter has a type-parameter type.
+- [ ] **N0d. Specify a nesting limit and its diagnostic.** novac crashes at 100,000 nested parentheses (SIGSEGV;
+  `docs/limits.md`). **Before P2's robustness gate.**
 - [ ] **N1a. Bytes to text.** Add `StringView.fromUtf8(Slice<u8>) -> StringView?` (validating), and a way to append
   checked bytes to a `String`. Needed by P2 so that diagnostics can quote source names, and by P8 so that JSON, fixes
   and LSP/MCP replies can be built. **Before P2.**
@@ -285,7 +293,7 @@ Each item is a Nova change approved by the owner and made under Nova's rules: sp
   (`generic-impls`, `error-layers` probes).
 - [x] ~~N5 borrow precision~~: not needed. `splitAtMut`, copy-out and separate tables are accepted
   (`aliasing-workarounds` probe).
-- [ ] N6. Draft `~/Nova/docs/milestone-15.md` citing OD-33, with N0, N1a, N4a and N4b. This is the **next Nova-side
+- [ ] N6. Draft `~/Nova/docs/milestone-15.md` citing OD-33, with N0–N0d, N1a, N4a and N4b. This is the **next Nova-side
   task** and waits for the owner's go-ahead.
 
 Gate per item: the novac release passes Nova's full suite, and CeeSafe's affected probes pass after the re-pin.
@@ -308,20 +316,28 @@ Dependencies: P0. Runs alongside the N track.
   crash (N0) and decided the N list.
 - [x] Host probe (2026-10-30). Writing a file, running `cc` with an argument vector, exit statuses, stderr and file
   existence all work. Capturing output and the environment are missing (N4a).
-- [ ] `src/support/`:
-  - typed ID tables;
-  - an interner with first-seen IDs (`SymbolTable.cs:3`);
-  - bitsets and worklists;
-  - an exact integer;
-  - UTF-8↔UTF-16 offsets and line index;
-  - a JSON reader and writer.
+- [x] `src/support/` (2026-10-30), each module tested against an independent model (`docs/p1-probes.md` §7):
+  - `bytes`;
+  - `map`, an insertion-ordered `Map<K: Key<K>, V>`;
+  - `interner`, with first-seen IDs;
+  - `bits`;
+  - `source`, giving the reference's line/UTF-16 positions, ill-formed UTF-8 as U+FFFD per maximal subpart, and up to
+    two BOMs;
+  - `bigint`, arbitrary precision for constants and float formatting;
+  - `json` (the writer), byte-identical to .NET's relaxed escaping. The reader moves to P8.
 
-  Each one is tested against an independent model.
-- [ ] Specify the maximum supported sizes and IDs, and the allocation-failure behaviour.
-- [ ] Grow the skeleton: input loading, structured errors, clean teardown.
+  The first worklist is a `Vector` plus `Bits`, as in the dataflow probe.
+- [x] Limits and allocation failure (`docs/limits.md`). Each limit is recorded with the phase that enforces it.
+  `tools/fault_sweep.py` fails each of 573 allocations in turn: every failure comes back as an error, with the
+  structures intact and nothing leaked.
+- [x] Grow the skeleton (2026-10-30). `ceesafec` knows novac's 15 commands, loads the files they name into
+  `SourceText` (`src/host/files.nova`), reports unreadable files, and names the phase that implements each command.
 
 Gate: probes and the support library pass under ASan and UBSan with the pinned novac. Every compiler bug found has a
 reduced reproducer filed upstream. Missing features block; they are never worked around by weakening checks.
+**Passed 2026-10-30 (§10).** The four reproducers in `probes/upstream/` and the nesting crash (`docs/limits.md`) are ready to file, but not yet
+filed: that is
+an action on Nova, and waits for the owner.
 
 ### P2 — Source frontend
 
@@ -545,15 +561,16 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
 
 ## 9. Immediate work queue
 
-1. P1: `src/support/`, promoted from the probes and tested against independent models:
-   - ID tables, the interner, bitsets and worklists, and the map;
-   - then exact integers, UTF-16 offsets and JSON.
-2. N6 (with the owner's go-ahead): draft Nova `docs/milestone-15.md` with N0 (the crash), N1a (bytes to text) and N4
-   (host services). Fix N0 first: it is a bug, not a language change.
-3. Alongside: the rest of the runner's C configuration matrix, and the package fixtures (`docs/parity.md` §3).
-4. P2 starts once N1a is released and re-pinned (or with an accepted decision to print names piece by piece until
-   then). Begin with `SourceText`, the line index and the interner, then tokens and the lexer. Do not begin by
-   translating `TypeChecker.cs`.
+1. **Owner decision:** file the four upstream reproducers (`probes/upstream/`) and the nesting crash and start Nova M15 (N6). Its order:
+   - N0 (the crash) and N0b (the missing drop) first, since they are bugs;
+   - then N1a (bytes to text) and N0d (the nesting limit), which P2 needs;
+   - N4 (host services) later, before P5.
+2. Alongside: the rest of the runner's C matrix (`-O0`, the overflow fallback, `--split`, TSan) and the package
+   fixtures (`docs/parity.md` §3).
+3. P2, once N1a is released and re-pinned, or with an accepted decision to quote source names byte by byte until
+   then. Begin with tokens and the lexer over `src/support/source.nova` and `interner.nova`, compared through
+   `run_corpus.py --compiler out/ceesafe --family parse-pass --family parse-fail`. Do not begin by translating
+   `TypeChecker.cs`.
 
 Progress is measured in completed contracts and gates. There is no calendar estimate before P1 produces evidence.
 
@@ -567,6 +584,7 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 | 2026-10-30 | P0 inventory, ledger and runner: `tools/inventory.py`, `docs/reference-inventory.md`, `docs/parity.md`, `tools/run_corpus.py`; novac built from `07d561f` into a scratch directory for comparison | done; findings in `docs/parity.md` §3 |
 | 2026-10-30 | P0 gate on the Ryzen box | passed; P0 complete |
 | 2026-10-30 | P1 probes (`probes/`), the report (`docs/p1-probes.md`), and an upstream crash reproducer (`probes/upstream/`) | 12/12 pass; N list revised |
+| 2026-10-30 | P1 support library, oracles (`tools/oracles/`), fault sweep, limits, skeleton loading; `run_corpus.py --with` and `--check-leaks`; 4 more upstream reproducers | all pass; P1 gate passed |
 
 **Tests run for the skeleton** (2026-10-30, novac 0.3.1, Apple clang 21.0.0):
 - `novac check` and `novac fmt --check`: clean.
@@ -597,4 +615,18 @@ clang 18.1.8.
 
 **P1 probes** (2026-10-30): the 12 probes and the lexer's 525-file run, on macOS and on the Ryzen box (Debian 12),
 under GCC 12, clang 18 and Apple clang, with and without ASan+UBSan. All passed. The commands and results are in
-`docs/p1-probes.md` §1. Not yet run: anything in `src/support/`, and P2 or later.
+`docs/p1-probes.md` §1.
+
+**P1 support library and gate** (2026-10-30; `docs/p1-probes.md` §7):
+- macOS:
+  - 6 support tests, all matching their oracles, with and without ASan+UBSan;
+  - the fault sweep, 573/573;
+  - a planted rollback bug and a planted leak were both caught.
+- Ryzen box (Debian 12, CeeSafe `28fdb5b`), all with `--check-leaks`:
+  - the support tests under GCC 12 and under clang 18 with ASan+UBSan+LSan: 6/6 each;
+  - the probes under both: 8/8 each;
+  - Nova's run-pass, run-fail and ffi corpus: 199/199 with no leak;
+  - the fault sweep under clang ASan+LSan: 573/573.
+- The earlier gate run found the missing-drop bug as a LeakSanitizer report.
+
+Not yet run: P2 or later.

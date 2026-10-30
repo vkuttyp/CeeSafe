@@ -13,7 +13,7 @@ Lines are C# lines from the inventory. A file shared between phases counts under
 
 | Phase | C# scope (lines) | Black-box evidence | Other evidence still to build | Status |
 |---|---|---|---|---|
-| P1 support | `IntegerSemantics`, `FloatSemantics` (297), `NovaVersion` | — | support-library models; `FloatFormatTests`, `RuntimeSemanticsTests` edge values as fixtures | not started |
+| P1 support | `IntegerSemantics`, `FloatSemantics` (297), `NovaVersion` | `tests/support` (6 programs, oracles in `tools/oracles/`), fault sweep | `FloatFormatTests`, `RuntimeSemanticsTests` edge values as fixtures (with P3/P5) | **done** (support library; the semantics files themselves port in P3) |
 | P2 frontend | `Syntax/`, `Diagnostics/` (3,959) | parse-pass 40 (`.ast`), parse-fail 27 | `LexerTests`, `ParserTests` cases as fixtures; token dump decision | not started |
 | P3 types/HIR | `Semantics/`, `Hir/` (12,133, plus `Compilation.cs` 131 shared with P4) | check-pass 27 (`.hir`), check-fail 128 (type-focused part) | `PackageTests`, `PrivateFieldTests`: two-package fixtures for N0310–N0315 | not started |
 | P4 NIR/safety | `Nir/` (not `ClosureSpecialisation`), `Analysis/` safety passes (4,346) | check-fail 128 (all) | `MutationTests` (411 lines), `UnsafeTests`; NIR dumps (`--dump-nir`) as a reference export | not started |
@@ -73,6 +73,11 @@ difference in `--reference` mode.
   `CollectionPropertyTests` (461) and `MutationTests` (411).
 - **No token or NIR snapshots exist.** AST and HIR snapshots cover P2 and P3. Whether P4 compares NIR dumps byte for
   byte, or through a mapping, is a P4 decision; `--dump-nir` works today.
+
+- **Leaks are not checked by Nova's run corpus.** `run_corpus.py --check-leaks` requires the runtime's `live=0` on a
+  normal exit. Nova's 199 run-pass, run-fail and ffi programs pass it (2026-10-30), yet novac 0.3.1 skips drops of
+  `if`/`while` condition temporaries (`probes/upstream/condition-temporary-not-dropped.nova`). CeeSafe's runs use
+  `--check-leaks`.
 
 ## 4. Reference test suite
 
