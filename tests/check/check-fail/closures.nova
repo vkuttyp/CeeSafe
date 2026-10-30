@@ -1,0 +1,20 @@
+fn apply(f: borrow fn(i32) -> i32, x: i32) -> i32 => f(x);
+fn plainOnly(f: fn(i32) -> i32) -> i32 => f(1);
+fn shared(f: borrow fn(i32)) {}
+
+fn main() {
+    let limit = 1;
+    var total = 0;
+    let a = (x) => x;
+    let b = apply((x, y) => x, 1);
+    let c = plainOnly((x) => x + limit);
+    shared((x) => { total += x; });
+    let d = (x: i32) => { return x; };
+    let limit2 = (limit: i32) => limit;
+    let e = apply(5, 1);
+    let g: i32 = (x: i32) => x;
+    let m = move (x: i32) => x;
+    let k = apply((x) => true, 1);
+    let r = (x: i32) => x;
+    r = (x: i32) => x + 1;
+}

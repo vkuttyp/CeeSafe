@@ -219,7 +219,7 @@ fn checkLocalDecl(
         c.error(referenceNotAllowed(), id.start, id.end, message)?;
         localType = c.types.error;
     }
-    if (c.lookupLocal(id.symbol) != none()) {
+    if (c.lookupLocal(id.symbol)? != none()) {
         var message = Vector<u8>.create();
         appendQuotedName(mut message, c, id.symbol)?;
         appendText(mut message, " is already declared in this function; locals cannot be shadowed")?;
@@ -308,7 +308,7 @@ fn resolveAssignmentTarget(c: borrow mut Checker, target: u32) -> Result<u32, Al
     match (c.front.ast.exprs[target as usize]) {
         ExprNode.Name(name, _) => {
             let symbol = c.front.ast.idents[name as usize].symbol;
-            match (c.lookup(symbol)) {
+            match (c.lookup(symbol)?) {
                 Entity.Local(_) => {}
                 Entity.None => {
                     var message = Vector<u8>.create();
@@ -372,6 +372,7 @@ fn resolveAssignmentTarget(c: borrow mut Checker, target: u32) -> Result<u32, Al
         c.error(assignToImmutable(), span.start, span.end, message)?;
         return Ok(none());
     }
+    noteMutableUse(c, p.root);
     // Assigning to a reference local writes through it (§13.3); assigning to a reference-typed field or element
     // replaces the reference stored there (§25.4).
     if (c.types.is(p.typ, TypeKind.Reference) && isLocal) {
@@ -470,7 +471,7 @@ fn checkFor(
         }
     }
     let id = c.front.ast.idents[variable as usize];
-    if (c.lookupLocal(id.symbol) != none()) {
+    if (c.lookupLocal(id.symbol)? != none()) {
         var message = Vector<u8>.create();
         appendQuotedName(mut message, c, id.symbol)?;
         appendText(mut message, " is already declared in this function; locals cannot be shadowed")?;

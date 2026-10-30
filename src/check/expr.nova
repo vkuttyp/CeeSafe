@@ -71,9 +71,12 @@ fn checkExpr(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocE
     match (c.front.ast.exprs[e as usize]) {
         ExprNode.If(_, _, _) => { return checkBranching(c, e, expected); }
         ExprNode.Match(_, _) => { return checkBranching(c, e, expected); }
-        ExprNode.Closure(_) => {
-            c.notPorted(span.start, span.end, "a closure", "S6")?;
-            return c.errorResult(span.start, span.end);
+        ExprNode.Closure(closure) => {
+            if (c.front.ast.closures[closure as usize].isMove) {
+                return misplacedMoveLiteral(c, span);
+            }
+            let value = checkClosure(c, closure, expected, span)?;
+            return coerce(c, value, expected, span);
         }
         _ => {}
     }
@@ -123,7 +126,7 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
             match (c.front.ast.exprs[callee as usize]) {
                 ExprNode.Name(name, typeArguments) => {
                     let symbol = c.front.ast.idents[name as usize].symbol;
-                    let undeclared = match (c.lookup(symbol)) {
+                    let undeclared = match (c.lookup(symbol)?) {
                         Entity.None => true,
                         _ => false,
                     };
@@ -142,6 +145,12 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
             return synthCall(c, callee, arguments, expected, span);
         }
         ExprNode.NullLiteral => { return checkNull(c, expected, span); }
+        ExprNode.Closure(closure) => {
+            if (c.front.ast.closures[closure as usize].isMove) {
+                return misplacedMoveLiteral(c, span);
+            }
+            return checkClosure(c, closure, none(), span);
+        }
         ExprNode.Borrow(mutable, operand) => { return synthBorrow(c, mutable, operand, span); }
         ExprNode.Move(operand) => { return synthMove(c, operand, span); }
         ExprNode.ArrayLiteral(elements) => { return synthArrayLiteral(c, elements, expected, span); }
@@ -154,7 +163,8 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
         ExprNode.If(_, _, _) => { return checkBranching(c, e, none()); }
         ExprNode.Match(_, _) => { return checkBranching(c, e, none()); }
         ExprNode.This => {
-            let receiver = c.lookupLocal(c.thisSymbol);
+            let thisSymbol = c.thisSymbol;
+            let receiver = c.lookupLocal(thisSymbol)?;
             if (receiver != none()) {
                 let t = c.hir.locals[receiver as usize].typ;
                 return c.expr(HirExpr.LocalRef(receiver), t, span.start, span.end);
@@ -238,7 +248,7 @@ fn appendTypeBound(out: borrow mut Vector<u8>, t: TypeInfo, max: bool) -> Result
 
 fn synthName(c: borrow mut Checker, name: u32, span: Span) -> Result<u32, AllocError> {
     let symbol = c.front.ast.idents[name as usize].symbol;
-    match (c.lookup(symbol)) {
+    match (c.lookup(symbol)?) {
         Entity.Local(local) => {
             let t = c.hir.locals[local as usize].typ;
             return c.expr(HirExpr.LocalRef(local), t, span.start, span.end);
@@ -533,16 +543,54 @@ fn coerce(c: borrow mut Checker, e: u32, expected: u32, span: Span) -> Result<u3
             HirExpr.LocalRef(_) => true,
             _ => false,
         };
+        let isField = match (c.hir.exprs[e as usize]) {
+            HirExpr.FieldAccess(_, _) => true,
+            _ => false,
+        };
+        if (x.mutableReference && isField) {
+            let field = toPlace(c, e)?;
+            if (field != none()) {
+                // A `borrow mut` or `SliceMut` field is reborrowed like a variable (§13.3, §16): a mutable use of the
+                // field's root, so a closure captures that mutably. Its referent must be mutable from here (§13.2).
+                let referent = project(c, field, derefProjection())?;
+                var reason = Vector<u8>.create();
+                mutabilityError(c, referent, mut reason)?;
+                if (reason.length > 0) {
+                    var message = Vector<u8>.create();
+                    appendText(mut message, "cannot use ")?;
+                    describePlace(c, field, mut message)?;
+                    appendText(mut message, " as a 'borrow mut': ")?;
+                    appendBytes(mut message, reason.view())?;
+                    c.error(borrowMutOfImmutable(), span.start, span.end, message)?;
+                    return c.errorResult(span.start, span.end);
+                }
+                let fieldRoot = c.hir.places[field as usize].root;
+                noteMutableUse(c, fieldRoot);
+                return c.expr(HirExpr.Reborrow(true, e), expected, span.start, span.end);
+            }
+        }
         if (x.mutableReference && isLocalRef) {
             return c.expr(HirExpr.Reborrow(true, e), expected, span.start, span.end);
         }
         return Ok(e);
+    }
+    if (c.types.isClosure(expected)) {
+        return coerceToClosure(c, e, expected, span);
     }
     if (c.types.isDynReference(expected) || c.types.isDynBox(expected)) {
         let converted = coerceToDyn(c, e, expected, span)?;
         if (converted != none()) {
             return Ok(converted);
         }
+    }
+    if (c.types.isClosure(t)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "expected ")?;
+        appendQuotedType(mut message, c, expected)?;
+        appendText(mut message, ", found the closure type ")?;
+        appendQuotedType(mut message, c, t)?;
+        c.error(typeMismatch(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
     }
     let h = c.types.info(t);
     if (c.types.is(
@@ -598,6 +646,18 @@ fn coerce(c: borrow mut Checker, e: u32, expected: u32, span: Span) -> Result<u3
 fn checkArgumentsLoosely(c: borrow mut Checker, arguments: Range) -> Result<void, AllocError> {
     for (k in 0..arguments.count) {
         var argument = c.front.ast.at(arguments, k);
+        // The call is already rejected. A closure whose parameter types would have come from it is checked quietly:
+        // without an expected type it could only add N0236 (§36.2).
+        let quiet = match (c.front.ast.exprs[argument as usize]) {
+            ExprNode.Closure(closure) => closureNeedsTypes(c, closure),
+            _ => false,
+        };
+        if (quiet) {
+            let mark = diagnosticsMark(c);
+            synth(c, argument, none())?;
+            dropDiagnosticsSince(c, mark);
+            continue;
+        }
         match (c.front.ast.exprs[argument as usize]) {
             ExprNode.MutArg(operand) => { argument = operand; }
             _ => {}
@@ -618,7 +678,7 @@ fn synthCall(
     match (c.front.ast.exprs[callee as usize]) {
         ExprNode.Name(name, typeArguments) => {
             let id = c.front.ast.idents[name as usize];
-            match (c.lookup(id.symbol)) {
+            match (c.lookup(id.symbol)?) {
                 Entity.Function(function) => {
                     if (typeArguments.count == 0) {
                         return checkUserCall(c, function, arguments, span);
@@ -643,11 +703,16 @@ fn synthCall(
                         let value = c.expr(HirExpr.LocalRef(local), t, calleeSpan.start, calleeSpan.end)?;
                         return checkFunctionValueCall(c, value, arguments, span);
                     }
-                    if (c.types.is(
-                        t,
-                        TypeKind.FunctionPointer,
-                    ) || c.types.isClosure(t) || c.types.is(t, TypeKind.Box)) {
-                        c.notPorted(span.start, span.end, "calling a function value", "S6")?;
+                    if (c.types.isClosure(t)) {
+                        let value = c.expr(HirExpr.LocalRef(local), t, calleeSpan.start, calleeSpan.end)?;
+                        return checkClosureCall(c, value, arguments, span);
+                    }
+                    if (c.types.is(t, TypeKind.FunctionPointer)) {
+                        c.notPorted(span.start, span.end, "a call through a C function pointer", "S7")?;
+                        return c.errorResult(span.start, span.end);
+                    }
+                    if (dynFunctionBehind(c, t) != none()) {
+                        c.notPorted(span.start, span.end, "a call through a 'dyn fn'", "S6c")?;
                         return c.errorResult(span.start, span.end);
                     }
                 }
@@ -674,7 +739,8 @@ fn synthCall(
         ExprNode.Member(target, member) => {
             match (c.front.ast.exprs[target as usize]) {
                 ExprNode.Name(targetName, typeArguments) => {
-                    match (c.lookup(c.front.ast.idents[targetName as usize].symbol)) {
+                    let targetSymbol = c.front.ast.idents[targetName as usize].symbol;
+                    match (c.lookup(targetSymbol)?) {
                         Entity.Builtin(b) => {
                             if (b == builtinVector() || b == builtinString()) {
                                 let isString = b == builtinString();
@@ -732,7 +798,7 @@ fn synthCall(
                     }
                     if (typeArguments.count == 0) {
                         let symbol = c.front.ast.idents[targetName as usize].symbol;
-                        let entity = c.lookup(symbol);
+                        let entity = c.lookup(symbol)?;
                         let floatType = c.types.lookup(c.name(symbol));
                         let isNone = match (entity) {
                             Entity.None => true,
@@ -1230,7 +1296,7 @@ fn synthMember(c: borrow mut Checker, target: u32, member: u32, span: Span, expe
     match (c.front.ast.exprs[target as usize]) {
         ExprNode.Name(name, typeArguments) => {
             let symbol = c.front.ast.idents[name as usize].symbol;
-            match (c.lookup(symbol)) {
+            match (c.lookup(symbol)?) {
                 Entity.Enum(index) => {
                     // `Shape.Empty`: a variant without payload.
                     let targetSpan = c.front.ast.exprSpans[target as usize];
@@ -1239,7 +1305,7 @@ fn synthMember(c: borrow mut Checker, target: u32, member: u32, span: Span, expe
                 _ => {}
             }
             if (typeArguments.count == 0) {
-                match (c.lookup(symbol)) {
+                match (c.lookup(symbol)?) {
                     Entity.Builtin(_) => {
                         return notAValue(c, symbol, member, span);
                     }

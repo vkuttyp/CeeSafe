@@ -92,6 +92,8 @@ struct Checker {
     registerNext: bool; // false while declaring a signature only
     dynAllowed: bool;   // set by resolvePointee for the next type resolved (the reference's _dynAllowed)
     dynTables: Vector<DynTable>;
+    closureContexts: Vector<ClosureContext>; // the closures being checked, outermost first
+    environments: Vector<EnvironmentRecord>;
     implementations: Vector<Implementation>;
     implMethods: Vector<ImplMethod>;
     boundMethods: Vector<BoundMethod>;
@@ -173,7 +175,8 @@ struct Checker {
 
     // ---- Names ----
 
-    fn lookupLocal(borrow this, symbol: u32) -> u32 {
+    /// A local in scope, without recording a capture (FindLocal).
+    fn findLocal(borrow this, symbol: u32) -> u32 {
         var i = this.scopes.length;
         while (i > 0) {
             i -= 1;
@@ -182,6 +185,20 @@ struct Checker {
             }
         }
         return none();
+    }
+
+    /// A local in scope (LookupLocal): one outside a closure being checked is captured by it (§36.2).
+    fn lookupLocal(borrow mut this, symbol: u32) -> Result<u32, AllocError> {
+        var i = this.scopes.length;
+        while (i > 0) {
+            i -= 1;
+            if (this.scopes[i].symbol == symbol) {
+                let local = this.scopes[i].local;
+                recordCaptures(this, i, local)?;
+                return Ok(local);
+            }
+        }
+        return Ok(none());
     }
 
     fn item(borrow this, symbol: u32) -> Entity {
@@ -200,19 +217,19 @@ struct Checker {
     }
 
     /// Locals (innermost first), then package items, then built-ins (Lookup).
-    fn lookup(borrow this, symbol: u32) -> Entity {
-        let local = this.lookupLocal(symbol);
+    fn lookup(borrow mut this, symbol: u32) -> Result<Entity, AllocError> {
+        let local = this.lookupLocal(symbol)?;
         if (local != none()) {
-            return Entity.Local(local);
+            return Ok(Entity.Local(local));
         }
         let found = this.item(symbol);
         match (found) {
             Entity.None => {}
-            _ => { return found; }
+            _ => { return Ok(found); }
         }
         match (this.builtins.get(Word { value: symbol as u64 })) {
-            Some(b) => { return Entity.Builtin(b); }
-            null => { return Entity.None; }
+            Some(b) => { return Ok(Entity.Builtin(b)); }
+            null => { return Ok(Entity.None); }
         }
     }
 

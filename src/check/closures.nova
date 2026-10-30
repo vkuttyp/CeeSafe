@@ -1,0 +1,1073 @@
+// Closures (the reference's ClosureContext, LookupLocal's captures, NoteMutableUse, NamesOuterLocal, CheckClosure,
+// NewClosureFunction, FinishEnvironment, FieldPrecise, CoerceToClosure, AdapterClosure, EffectsAllowed,
+// CheckClosureCall and the closure cases of SynthCall): P3 S6a (type-system.md §36.2). Effect lists come with S6b,
+// move literals and `dyn fn` with S6c, threads with S6d.
+
+fn closureKind() -> u32 => 299;
+fn closureTypeUnknown() -> u32 => 236;
+
+/// One closure being checked (ClosureContext): the scopes outside it, and what it captures, in order of first use.
+struct ClosureContext {
+    baseDepth: u32; // the number of scopes when it began
+    captures: Vector<HirCapture>;
+}
+
+/// Records that the local bound at scope entry `entry` is captured by every closure being checked whose scopes it is
+/// outside, shared until used mutably (LookupLocal's loop).
+fn recordCaptures(c: borrow mut Checker, entry: usize, local: u32) -> Result<void, AllocError> {
+    if (c.closureContexts.length == 0) {
+        return Ok();
+    }
+    // The scope the entry is in: the last scope that starts at or before it.
+    var scope: u32 = 0;
+    for (k in 0..c.scopeStarts.length) {
+        if (c.scopeStarts[k] <= entry) {
+            scope = truncate<u32>(k);
+        }
+    }
+    for (k in 0..c.closureContexts.length) {
+        if (scope < c.closureContexts[k].baseDepth && captureIndex(c, k, local) == none()) {
+            c.closureContexts[k].captures.push(
+                HirCapture {
+                    local: local,
+                    mode: CaptureMode.Shared,
+                    value: none(),
+                    field: none(),
+                    throughReference: false,
+                },
+            )?;
+        }
+    }
+    return Ok();
+}
+
+fn captureIndex(c: borrow Checker, context: usize, local: u32) -> u32 {
+    let captures = borrow c.closureContexts[context].captures;
+    for (k in 0..captures.length) {
+        if (captures[k].local == local) {
+            return truncate<u32>(k);
+        }
+    }
+    return none();
+}
+
+/// A place rooted at `root` is written or borrowed mutably: its captures become mutable (NoteMutableUse).
+fn noteMutableUse(c: borrow mut Checker, root: u32) {
+    for (k in 0..c.closureContexts.length) {
+        let index = captureIndex(c, k, root);
+        if (index != none()) {
+            c.closureContexts[k].captures[index as usize].mode = CaptureMode.Mutable;
+        }
+    }
+}
+
+// ---- NamesOuterLocal ----
+
+/// Does a closure literal name a local outside it (NamesOuterLocal)? Its parameters do not count; nested closures'
+/// bodies are scanned too, with these parameters (the reference's reflection walk).
+fn namesOuterLocal(c: borrow Checker, closure: u32) -> bool {
+    let literal = c.front.ast.closures[closure as usize];
+    var parameters = Vector<u32>.create();
+    for (k in 0..literal.parameters.count) {
+        let p = c.front.ast.closureParameters[c.front.ast.at(literal.parameters, k) as usize];
+        parameters.push(c.front.ast.idents[p.name as usize].symbol)!;
+    }
+    return (literal.block != none() && namesInStmt(c, literal.block, parameters)) ||
+        (literal.body != none() && namesInExpr(c, literal.body, parameters));
+}
+
+fn namesInList(c: borrow Checker, list: Range, parameters: borrow Vector<u32>) -> bool {
+    for (k in 0..list.count) {
+        if (namesInExpr(c, c.front.ast.at(list, k), parameters)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn namesIn(c: borrow Checker, e: u32, parameters: borrow Vector<u32>) -> bool =>
+    e != none() && namesInExpr(c, e, parameters);
+
+fn namesInExpr(c: borrow Checker, e: u32, parameters: borrow Vector<u32>) -> bool {
+    match (c.front.ast.exprs[e as usize]) {
+        ExprNode.Name(name, _) => {
+            let symbol = c.front.ast.idents[name as usize].symbol;
+            return !containsU32(parameters, symbol) && c.findLocal(symbol) != none();
+        }
+        ExprNode.This => { return c.findLocal(c.thisSymbol) != none(); }
+        ExprNode.Paren(inner) => { return namesInExpr(c, inner, parameters); }
+        ExprNode.Unary(_, operand) => { return namesInExpr(c, operand, parameters); }
+        ExprNode.Binary(left, _, right) => {
+            return namesInExpr(c, left, parameters) || namesInExpr(c, right, parameters);
+        }
+        ExprNode.Cast(operand, _) => { return namesInExpr(c, operand, parameters); }
+        ExprNode.Call(callee, arguments) => {
+            return namesInExpr(c, callee, parameters) || namesInList(c, arguments, parameters);
+        }
+        ExprNode.Member(target, _) => { return namesInExpr(c, target, parameters); }
+        ExprNode.Unsafe(block) => { return namesInStmt(c, block, parameters); }
+        ExprNode.If(condition, then, otherwise) => {
+            return namesInExpr(c, condition, parameters) || namesInExpr(c, then, parameters) ||
+                namesIn(c, otherwise, parameters);
+        }
+        ExprNode.Match(scrutinee, arms) => {
+            if (namesInExpr(c, scrutinee, parameters)) {
+                return true;
+            }
+            for (k in 0..arms.count) {
+                let arm = c.front.ast.valueArms[c.front.ast.at(arms, k) as usize];
+                if (namesInPattern(c, arm.pattern, parameters) || namesInExpr(c, arm.value, parameters)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        ExprNode.Closure(nested) => {
+            let literal = c.front.ast.closures[nested as usize];
+            return (literal.block != none() && namesInStmt(c, literal.block, parameters)) ||
+                (literal.body != none() && namesInExpr(c, literal.body, parameters));
+        }
+        ExprNode.Block(block) => { return namesInStmt(c, block, parameters); }
+        ExprNode.Borrow(_, operand) => { return namesInExpr(c, operand, parameters); }
+        ExprNode.Move(operand) => { return namesInExpr(c, operand, parameters); }
+        ExprNode.MutArg(operand) => { return namesInExpr(c, operand, parameters); }
+        ExprNode.StructLiteral(_, fields, _) => {
+            for (k in 0..fields.count) {
+                if (namesInExpr(c, c.front.ast.fieldInits[c.front.ast.at(fields, k) as usize].value, parameters)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        ExprNode.ArrayLiteral(elements) => { return namesInList(c, elements, parameters); }
+        ExprNode.ArrayRepeat(value, count) => {
+            return namesInExpr(c, value, parameters) || namesInExpr(c, count, parameters);
+        }
+        ExprNode.Index(target, index) => {
+            return namesInExpr(c, target, parameters) || namesInExpr(c, index, parameters);
+        }
+        ExprNode.Slice(target, low, high) => {
+            return namesInExpr(c, target, parameters) || namesIn(c, low, parameters) || namesIn(c, high, parameters);
+        }
+        ExprNode.Try(operand) => { return namesInExpr(c, operand, parameters); }
+        ExprNode.Unwrap(operand) => { return namesInExpr(c, operand, parameters); }
+        _ => { return false; }
+    }
+}
+
+fn namesInPattern(c: borrow Checker, p: u32, parameters: borrow Vector<u32>) -> bool {
+    match (c.front.ast.patterns[p as usize]) {
+        PatternNode.Literal(e) => { return namesInExpr(c, e, parameters); }
+        PatternNode.Variant(_, _, bindings) => {
+            for (k in 0..bindings.count) {
+                let b = c.front.ast.bindings[c.front.ast.at(bindings, k) as usize];
+                if (b.nested != none() && namesInPattern(c, b.nested, parameters)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        _ => { return false; }
+    }
+}
+
+fn namesInStmt(c: borrow Checker, s: u32, parameters: borrow Vector<u32>) -> bool {
+    match (c.front.ast.stmts[s as usize]) {
+        StmtNode.Block(statements) => {
+            for (k in 0..statements.count) {
+                if (namesInStmt(c, c.front.ast.at(statements, k), parameters)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        StmtNode.Local(_, _, _, initializer) => { return namesIn(c, initializer, parameters); }
+        StmtNode.Defer(body) => { return namesInStmt(c, body, parameters); }
+        StmtNode.Match(scrutinee, arms) => {
+            if (namesInExpr(c, scrutinee, parameters)) {
+                return true;
+            }
+            for (k in 0..arms.count) {
+                let arm = c.front.ast.matchArms[c.front.ast.at(arms, k) as usize];
+                if (namesInPattern(c, arm.pattern, parameters) || namesInStmt(c, arm.body, parameters)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        StmtNode.If(condition, then, otherwise) => {
+            return namesInExpr(c, condition, parameters) || namesInStmt(c, then, parameters) ||
+                (otherwise != none() && namesInStmt(c, otherwise, parameters));
+        }
+        StmtNode.While(condition, body) => {
+            return namesInExpr(c, condition, parameters) || namesInStmt(c, body, parameters);
+        }
+        StmtNode.For(_, start, end, body) => {
+            return namesInExpr(c, start, parameters) || namesIn(c, end, parameters) || namesInStmt(c, body, parameters);
+        }
+        StmtNode.Loop(body) => { return namesInStmt(c, body, parameters); }
+        StmtNode.Return(value) => { return namesIn(c, value, parameters); }
+        StmtNode.Assign(target, _, value) => {
+            return namesInExpr(c, target, parameters) || namesInExpr(c, value, parameters);
+        }
+        StmtNode.Expression(e) => { return namesInExpr(c, e, parameters); }
+        StmtNode.Unsafe(block) => { return namesInStmt(c, block, parameters); }
+        _ => { return false; }
+    }
+}
+
+// ---- CheckClosure ----
+
+/// A closure literal (CheckClosure, §36.2). Parameter types are written or expected; the body is checked here, with the
+/// enclosing scopes visible, as a function of its own; every outer local it names is captured, mutably if it is written
+/// or borrowed mutably. With captures (or a closure type expected) it gets an environment and is a closure; without,
+/// it is a plain function value.
+fn checkClosure(c: borrow mut Checker, closure: u32, expected: u32, span: Span) -> Result<u32, AllocError> {
+    let literal = c.front.ast.closures[closure as usize];
+    let expectsClosure = expected != none() && c.types.isClosure(expected);
+    let expectsFunction = expected != none() && c.types.is(expected, TypeKind.Function);
+    let callable = if (expectsClosure) c.types.info(expected).pointee else if (expectsFunction) expected else none();
+    let parameterCount = literal.parameters.count;
+    if (callable != none() && c.types.info(callable).parameters.count != parameterCount) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "this closure takes ")?;
+        appendDecimal(mut message, parameterCount as u64)?;
+        appendText(mut message, " parameter(s), but ")?;
+        appendQuotedType(mut message, c, expected)?;
+        appendText(mut message, " takes ")?;
+        appendDecimal(mut message, c.types.info(callable).parameters.count as u64)?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var parameterTypes = Vector<u32>.create();
+    var bottom = false;
+    for (k in 0..parameterCount) {
+        let p = c.front.ast.closureParameters[c.front.ast.at(literal.parameters, k) as usize];
+        var t = none();
+        if (p.typ != none()) {
+            t = c.resolveType(p.typ, false)?;
+        } else if (callable != none()) {
+            t = c.types.listAt(c.types.info(callable).parameters, k);
+        } else {
+            let id = c.front.ast.idents[p.name as usize];
+            var message = Vector<u8>.create();
+            appendText(mut message, "parameter ")?;
+            appendQuotedName(mut message, c, id.symbol)?;
+            appendText(mut message, " needs a type: write '")?;
+            appendBytes(mut message, c.name(id.symbol))?;
+            appendText(
+                mut message,
+                ": T', or use the closure where a function or closure type is expected (type-system.md §36.2)",
+            )?;
+            c.error(closureTypeUnknown(), p.start, p.end, message)?;
+            t = c.types.error;
+        }
+        if (c.types.isBottom(t)) {
+            bottom = true;
+        }
+        parameterTypes.push(t)?;
+    }
+    if (bottom) {
+        return c.errorResult(span.start, span.end);
+    }
+    if (literal.isMove) {
+        c.notPorted(span.start, span.end, "a 'move' closure", "S6c")?;
+        return c.errorResult(span.start, span.end);
+    }
+    let asClosure = expectsClosure || namesOuterLocal(c, closure);
+    // A block's result is unknown without an expected type: the error type until the body is checked, so a
+    // `return value` there is not also reported as returning from a void function.
+    let initialReturn = if (callable != none()) c.types.info(
+        callable,
+    ).result else if (literal.block != none()) c.types.error else c.types.voidType;
+    var names = Vector<u32>.create();
+    var spans = Vector<Span>.create();
+    for (k in 0..parameterCount) {
+        let p = c.front.ast.closureParameters[c.front.ast.at(literal.parameters, k) as usize];
+        let id = c.front.ast.idents[p.name as usize];
+        names.push(id.symbol)?;
+        spans.push(Span { start: id.start, end: id.end })?;
+    }
+    let function = newClosureFunction(
+        c,
+        span,
+        names.view(),
+        parameterTypes.view(),
+        spans.view(),
+        initialReturn,
+        asClosure,
+    )?;
+    let environment = c.hir.functions[function as usize].closureEnvironment;
+
+    // The body, as the closure's own function: its locals are its own, `return` is its, loops do not reach out.
+    let savedFunction = c.function;
+    let savedLoop = c.loopDepth;
+    c.closureContexts.push(
+        ClosureContext { baseDepth: truncate<u32>(c.scopeStarts.length), captures: Vector<HirCapture>.create() },
+    )?;
+    c.function = function;
+    c.loopDepth = 0;
+    c.pushScope()?;
+    let firstParameter: usize = if (asClosure) 1 else 0;
+    let parameterLocals = c.hir.functions[function as usize].parameters.length;
+    for (k in firstParameter..parameterLocals) {
+        let local = c.hir.functions[function as usize].parameters[k];
+        let name = c.hir.locals[local as usize].name;
+        if (c.findLocal(name) != none()) {
+            let l = c.hir.locals[local as usize];
+            var message = Vector<u8>.create();
+            appendQuotedName(mut message, c, name)?;
+            appendText(mut message, " is already a local in this scope; closure parameters cannot shadow it")?;
+            c.error(localRedeclared(), l.start, l.end, message)?;
+        }
+        if (!boundInCurrentScope(c, name)) {
+            c.bind(name, local)?; // TryAdd: a repeated parameter name keeps the first
+        }
+    }
+    var body = none();
+    if (literal.block != none()) {
+        body = checkBlock(c, literal.block)?;
+    } else {
+        let expression = literal.body;
+        let expressionSpan = c.front.ast.exprSpans[expression as usize];
+        var statement = none();
+        if (callable != none()) {
+            let result = c.types.info(callable).result;
+            if (c.types.is(result, TypeKind.Void)) {
+                let value = checkExpressionStatement(c, expression)?;
+                statement = c.hir.addStmt(HirStmt.Expression(value), expressionSpan.start, expressionSpan.end)?;
+            } else {
+                let value = checkExpr(c, expression, result)?;
+                statement = c.hir.addStmt(HirStmt.Return(value), expressionSpan.start, expressionSpan.end)?;
+            }
+        } else {
+            let value = checkExpr(c, expression, none())?;
+            let t = c.typeOf(value);
+            c.hir.functions[function as usize].returnType = if (c.types.isBottom(t)) c.types.error else t;
+            statement = c.hir.addStmt(
+                if (c.types.is(t, TypeKind.Void)) HirStmt.Expression(value) else HirStmt.Return(value),
+                expressionSpan.start,
+                expressionSpan.end,
+            )?;
+        }
+        let statements = [statement];
+        let list = c.hir.list(statements[..])?;
+        body = c.hir.addStmt(HirStmt.Block(list), expressionSpan.start, expressionSpan.end)?;
+    }
+    c.hir.functions[function as usize].body = body;
+    c.popScope();
+    var captures = Vector<HirCapture>.create();
+    let last = c.closureContexts.length - 1;
+    for (capture in c.closureContexts[last].captures.view()) {
+        captures.push(capture)?;
+    }
+    c.closureContexts.truncate(last);
+    c.function = savedFunction;
+    c.loopDepth = savedLoop;
+    if (callable == none() && literal.block != none()) {
+        if (returnsValue(c, body)) {
+            var message = Vector<u8>.create();
+            appendText(
+                mut message,
+                "this closure's block returns a value, but its result type is unknown: use it where a function or closure type is expected (type-system.md §36.2)",
+            )?;
+            c.error(closureTypeUnknown(), span.start, span.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+        c.hir.functions[function as usize].returnType = c.types.voidType;
+    }
+    analyzeFlow(c, function)?;
+    let returnType = c.hir.functions[function as usize].returnType;
+    // An expected effect list bounds the body, as `@effects` bounds a function's (§36.3): S6b.
+    let effects = if (callable != none()) c.types.info(callable).effects else allEffects();
+    let callableType = c.types.functionTo(parameterTypes.view(), returnType, effects)?;
+    if (c.types.isBottom(returnType)) {
+        return c.errorResult(span.start, span.end);
+    }
+    if (!asClosure) {
+        return c.expr(HirExpr.Closure(function, emptyRange()), callableType, span.start, span.end);
+    }
+    if (expectsFunction) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "expected the plain function type ")?;
+        appendQuotedType(mut message, c, expected)?;
+        appendText(mut message, ", but this closure captures ")?;
+        appendQuotedName(mut message, c, c.hir.locals[captures[0].local as usize].name)?;
+        appendText(mut message, ", so it is a 'borrow fn' (type-system.md §36.2)")?;
+        c.error(closureKind(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var mutable = false;
+    var changed = none();
+    for (capture in captures.view()) {
+        if (isMutableCapture(capture.mode)) {
+            if (!mutable) {
+                changed = capture.local;
+            }
+            mutable = true;
+        }
+    }
+    if (expectsClosure && !c.types.info(expected).mutableReference && mutable) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "expected ")?;
+        appendQuotedType(mut message, c, expected)?;
+        appendText(mut message, ", but this closure changes ")?;
+        appendQuotedName(mut message, c, c.hir.locals[changed as usize].name)?;
+        appendText(mut message, ", so it is a 'borrow mut fn' (type-system.md §36.2)")?;
+        c.error(closureKind(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var refined = Vector<HirCapture>.create();
+    fieldPrecise(c, body, captures.view(), mut refined)?;
+    let captureRange = finishEnvironment(c, function, environment, refined.view(), effects, span)?;
+    let closureType = c.types.closureTo(parameterTypes.view(), returnType, effects)?;
+    let typ = c.types.referenceTo(closureType, mutable || (expectsClosure && c.types.info(expected).mutableReference))?;
+    return c.expr(HirExpr.Closure(function, captureRange), typ, span.start, span.end);
+}
+
+fn isMutableCapture(mode: CaptureMode) -> bool => match (mode) {
+    CaptureMode.Mutable => true,
+    _ => false,
+};
+
+fn boundInCurrentScope(c: borrow Checker, symbol: u32) -> bool {
+    let start = c.scopeStarts[c.scopeStarts.length - 1];
+    for (k in start..c.scopes.length) {
+        if (c.scopes[k].symbol == symbol) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Does a statement return a value (ReturnsValue), outside nested closures?
+fn returnsValue(c: borrow Checker, stmt: u32) -> bool {
+    match (c.hir.stmts[stmt as usize]) {
+        HirStmt.Return(value) => { return value != none(); }
+        HirStmt.Block(statements) => {
+            for (k in 0..statements.count) {
+                if (returnsValue(c, c.hir.at(statements, k))) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        HirStmt.If(_, then, otherwise) => {
+            return returnsValue(c, then) || (otherwise != none() && returnsValue(c, otherwise));
+        }
+        HirStmt.While(_, body) => { return returnsValue(c, body); }
+        HirStmt.Loop(body) => { return returnsValue(c, body); }
+        HirStmt.For(_, _, _, body) => { return returnsValue(c, body); }
+        HirStmt.Match(_, arms, _, _) => {
+            for (k in 0..arms.count) {
+                if (returnsValue(c, c.hir.arms[c.hir.at(arms, k) as usize].body)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        HirStmt.Defer(body) => { return returnsValue(c, body); }
+        _ => { return false; }
+    }
+}
+
+/// A closure's function, registered with the program (NewClosureFunction): parameter 0 is its environment (a `borrow
+/// mut` of a new environment struct, whose fields finishEnvironment adds) when it has one.
+fn newClosureFunction(
+    c: borrow mut Checker,
+    span: Span,
+    names: Slice<u32>,
+    types: Slice<u32>,
+    spans: Slice<Span>,
+    returnType: u32,
+    withEnvironment: bool,
+) -> Result<u32, AllocError> {
+    let id = c.hir.registeredFunctions;
+    let closureName = c.intern("closure")?;
+    let nameIdent = c.front.ast.addIdent(
+        Ident { symbol: closureName, start: span.start, end: span.end, missing: false },
+    )?;
+    c.front.ast.functions.push(Function {
+        visibility: Visibility.Default,
+        name: nameIdent,
+        receiver: ReceiverKind.None,
+        receiverStart: span.start,
+        receiverEnd: span.end,
+        parameters: emptyRange(),
+        returnType: none(),
+        body: none(),
+        expressionBody: none(),
+        typeParameters: emptyRange(),
+        regionParameters: emptyRange(),
+        isUnsafe: false,
+        hasDoc: false,
+        doc: emptyRange(),
+        isExtern: false,
+        attributes: emptyRange(),
+        start: span.start,
+        end: span.end,
+    })?;
+    let syntax = truncate<u32>(c.front.ast.functions.length - 1);
+    let library = isLibraryFile(c);
+    let function = c.hir.addFunction(closureName, none(), returnType, c.file, syntax, library, true)?;
+    var pairs = Vector<EnvPair>.create();
+    for (pair in c.typeEnvironment.view()) {
+        pairs.push(pair)?;
+    }
+    let environment = storeEnvironment(c, pairs.view())?;
+    c.hir.functions[function as usize].environment = environment;
+    c.hir.functions[function as usize].isClosure = true;
+    if (withEnvironment) {
+        var text = Vector<u8>.create();
+        appendText(mut text, "{closure environment ")?;
+        appendDecimal(mut text, id as u64)?;
+        appendText(mut text, "}")?;
+        let environmentType = c.types.createStruct(text.view(), none(), c.file, false)?;
+        let definition = c.types.info(environmentType).structDef;
+        c.types.structs[definition as usize].isClosureEnvironment = true;
+        c.types.structs[definition as usize].closureId = id;
+        c.hir.functions[function as usize].closureEnvironment = environmentType;
+        // Named `env`, but in no scope: the body cannot name it (its captures lower to places in it).
+        let envName = c.intern("env")?;
+        let envType = c.types.referenceTo(environmentType, true)?;
+        let local = c.hir.addLocal(function, envName, envType, false, true, span.start, span.end)?;
+        c.hir.functions[function as usize].parameters.push(local)?;
+    }
+    for (k in 0..names.length) {
+        let local = c.hir.addLocal(function, names[k], types[k], false, true, spans[k].start, spans[k].end)?;
+        c.hir.functions[function as usize].parameters.push(local)?;
+    }
+    return Ok(function);
+}
+
+/// The environment's fields (FinishEnvironment): the code pointer, then each capture (a reference, or the copied
+/// value). Returns the captures' range in Hir.captures.
+fn finishEnvironment(
+    c: borrow mut Checker,
+    function: u32,
+    environment: u32,
+    captures: Slice<HirCapture>,
+    effects: u32,
+    span: Span,
+) -> Result<Range, AllocError> {
+    let definition = c.types.info(environment).structDef;
+    var parameters = Vector<u32>.create();
+    for (k in 1..c.hir.functions[function as usize].parameters.length) {
+        parameters.push(c.hir.locals[c.hir.functions[function as usize].parameters[k] as usize].typ)?;
+    }
+    let returnType = c.hir.functions[function as usize].returnType;
+    let codeName = c.intern("code")?;
+    let codeType = c.types.closureTo(parameters.view(), returnType, effects)?;
+    addField(c, definition, codeName, codeType, span.start, span.end)?;
+    for (capture in captures) {
+        let local = c.hir.locals[capture.local as usize];
+        if (capture.field != none()) {
+            // A field-precise capture (§36.2): a reference to that field, named after the local and the field.
+            let field = c.types.fields[capture.field as usize];
+            var text = Vector<u8>.create();
+            appendBytes(mut text, c.name(local.name))?;
+            appendText(mut text, "__")?;
+            appendBytes(mut text, c.name(field.name))?;
+            let name = c.front.symbols.intern(text.view())?.id;
+            let t = c.types.referenceTo(field.typ, isMutableCapture(capture.mode))?;
+            addField(c, definition, name, t, span.start, span.end)?;
+            continue;
+        }
+        let byValue = match (capture.mode) {
+            CaptureMode.Copy => true,
+            CaptureMode.Move => true,
+            _ => false,
+        };
+        let t = if (byValue) local.typ else c.types.referenceTo(local.typ, isMutableCapture(capture.mode))?;
+        addField(c, definition, local.name, t, span.start, span.end)?;
+    }
+    let start = truncate<u32>(c.hir.captures.length);
+    for (capture in captures) {
+        c.hir.captures.push(capture)?;
+    }
+    let range = Range { start: start, count: truncate<u32>(captures.length) };
+    c.hir.functions[function as usize].closureCaptures = range;
+    c.environments.push(EnvironmentRecord { typ: environment, closure: function })?;
+    return Ok(range);
+}
+
+/// A closure environment and its function (the reference's _environments), for the C backend.
+struct EnvironmentRecord {
+    typ: u32;
+    closure: u32;
+}
+
+// ---- FieldPrecise ----
+
+/// Field-precise captures (FieldPrecise, M13 G5, §36.2): a captured struct local that the body reaches only as `s.f`
+/// (never whole, and not from a nested closure) is captured as one reference per field it names. The walk visits the
+/// HIR in the reference's property order; like its reflection walk, it does not look into struct literals' fields,
+/// match bindings or the projections of places not rooted at the local.
+fn fieldPrecise(
+    c: borrow mut Checker,
+    body: u32,
+    captures: Slice<HirCapture>,
+    out: borrow mut Vector<HirCapture>,
+) -> Result<void, AllocError> {
+    for (capture in captures) {
+        let t = c.hir.locals[capture.local as usize].typ;
+        let throughReference = c.types.is(t, TypeKind.Reference) && c.types.is(
+            c.types.info(t).pointee,
+            TypeKind.Struct,
+        );
+        let sharedOrMutable = match (capture.mode) {
+            CaptureMode.Shared => true,
+            CaptureMode.Mutable => true,
+            _ => false,
+        };
+        if (!sharedOrMutable || (!c.types.is(t, TypeKind.Struct) && !throughReference)) {
+            out.push(capture)?;
+            continue;
+        }
+        var walk = FieldWalk {
+            local: capture.local,
+            throughReference: throughReference,
+            fields: Vector<u32>.create(),
+            whole: false,
+        };
+        walkStmt(c, body, mut walk)?;
+        if (walk.whole || walk.fields.length == 0) {
+            out.push(capture)?;
+            continue;
+        }
+        for (f in walk.fields.view()) {
+            out.push(
+                HirCapture {
+                    local: capture.local,
+                    mode: capture.mode,
+                    value: capture.value,
+                    field: f,
+                    throughReference: throughReference,
+                },
+            )?;
+        }
+    }
+    return Ok();
+}
+
+struct FieldWalk {
+    local: u32;
+    throughReference: bool;
+    fields: Vector<u32>;
+    whole: bool;
+}
+
+fn note(walk: borrow mut FieldWalk, field: u32) -> Result<void, AllocError> {
+    if (!containsU32(walk.fields, field)) {
+        walk.fields.push(field)?;
+    }
+    return Ok();
+}
+
+fn walkStmt(c: borrow Checker, s: u32, walk: borrow mut FieldWalk) -> Result<void, AllocError> {
+    match (c.hir.stmts[s as usize]) {
+        HirStmt.Block(statements) => {
+            for (k in 0..statements.count) {
+                walkStmt(c, c.hir.at(statements, k), walk)?;
+            }
+        }
+        HirStmt.LocalDecl(_, initializer) => {
+            if (initializer != none()) {
+                walkExpr(c, initializer, none(), none(), walk)?;
+            }
+        }
+        HirStmt.Assign(place, _, value) => {
+            walkPlace(c, place, walk)?;
+            walkExpr(c, value, none(), none(), walk)?;
+        }
+        HirStmt.If(condition, then, otherwise) => {
+            walkExpr(c, condition, none(), none(), walk)?;
+            walkStmt(c, then, walk)?;
+            if (otherwise != none()) {
+                walkStmt(c, otherwise, walk)?;
+            }
+        }
+        HirStmt.While(condition, body) => {
+            walkExpr(c, condition, none(), none(), walk)?;
+            walkStmt(c, body, walk)?;
+        }
+        HirStmt.Loop(body) => { walkStmt(c, body, walk)?; }
+        HirStmt.For(_, start, end, body) => {
+            walkExpr(c, start, none(), none(), walk)?;
+            if (end != none()) {
+                walkExpr(c, end, none(), none(), walk)?;
+            }
+            walkStmt(c, body, walk)?;
+        }
+        HirStmt.Return(value) => {
+            if (value != none()) {
+                walkExpr(c, value, none(), none(), walk)?;
+            }
+        }
+        HirStmt.Expression(e) => { walkExpr(c, e, none(), none(), walk)?; }
+        HirStmt.Yield(value) => { walkExpr(c, value, none(), none(), walk)?; }
+        HirStmt.Defer(body) => { walkStmt(c, body, walk)?; }
+        HirStmt.Match(scrutinee, arms, _, _) => {
+            walkExpr(c, scrutinee, none(), none(), walk)?;
+            for (k in 0..arms.count) {
+                // HirArm: Kind, Variant, Value, Bindings (value tuples: skipped), Body, ListsPayloads, Pattern.
+                let arm = c.hir.arms[c.hir.at(arms, k) as usize];
+                walkStmt(c, arm.body, walk)?;
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+/// A place (HirPlace): rooted at the local, it is noted through its first field; any other place is skipped whole
+/// (its projections are value types to the reference's walk).
+fn walkPlace(c: borrow Checker, place: u32, walk: borrow mut FieldWalk) -> Result<void, AllocError> {
+    let p = c.hir.places[place as usize];
+    if (p.root != walk.local) {
+        return Ok();
+    }
+    let first = if (p.projections.count > 0) c.hir.projections[p.projections.start as usize] else derefProjection();
+    let second =
+        if (p.projections.count > 1) c.hir.projections[(p.projections.start + 1) as usize] else derefProjection();
+    if (!walk.throughReference && p.projections.count > 0 && isFieldProjection(first)) {
+        note(walk, first.field)?;
+    } else if (walk.throughReference && p.projections.count > 1 && isDerefProjection(
+        first,
+    ) && isFieldProjection(second)) {
+        note(walk, second.field)?;
+    } else {
+        walk.whole = true;
+    }
+    for (k in 0..p.projections.count) {
+        let projection = c.hir.projections[(p.projections.start + k) as usize];
+        if (isIndexProjection(projection) && projection.index != none()) {
+            walkExpr(c, projection.index, none(), none(), walk)?; // `s.items[s.next]` names the local in an index too
+        }
+    }
+    return Ok();
+}
+
+fn walkList(c: borrow Checker, list: Range, parent: u32, walk: borrow mut FieldWalk) -> Result<void, AllocError> {
+    for (k in 0..list.count) {
+        walkExpr(c, c.hir.at(list, k), parent, none(), walk)?;
+    }
+    return Ok();
+}
+
+/// An expression, with its parent and grandparent (Visit's `parent` and `grandparent`).
+fn walkExpr(
+    c: borrow Checker,
+    e: u32,
+    parent: u32,
+    grandparent: u32,
+    walk: borrow mut FieldWalk,
+) -> Result<void, AllocError> {
+    match (c.hir.exprs[e as usize]) {
+        HirExpr.LocalRef(local) => {
+            if (local != walk.local) {
+                return Ok();
+            }
+            if (!walk.throughReference && parent != none()) {
+                match (c.hir.exprs[parent as usize]) {
+                    HirExpr.FieldAccess(target, field) => {
+                        if (target == e) {
+                            return note(walk, field);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if (walk.throughReference && parent != none() && grandparent != none()) {
+                let derefOfThis = match (c.hir.exprs[parent as usize]) {
+                    HirExpr.Deref(reference) => reference == e,
+                    _ => false,
+                };
+                if (derefOfThis) {
+                    match (c.hir.exprs[grandparent as usize]) {
+                        HirExpr.FieldAccess(target, field) => {
+                            if (target == parent) {
+                                return note(walk, field);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            walk.whole = true;
+        }
+        HirExpr.Closure(_, captures) => {
+            for (k in 0..captures.count) {
+                if (c.hir.captures[(captures.start + k) as usize].local == walk.local) {
+                    walk.whole = true; // passed on whole to an inner closure
+                }
+            }
+        }
+        HirExpr.Unary(_, operand) => { walkExpr(c, operand, e, parent, walk)?; }
+        HirExpr.Binary(_, left, right) => {
+            walkExpr(c, left, e, parent, walk)?;
+            walkExpr(c, right, e, parent, walk)?;
+        }
+        HirExpr.Cast(operand) => { walkExpr(c, operand, e, parent, walk)?; }
+        HirExpr.Truncate(operand) => { walkExpr(c, operand, e, parent, walk)?; }
+        HirExpr.Call(_, arguments) => { walkList(c, arguments, e, walk)?; }
+        HirExpr.BuiltinCall(_, arguments) => { walkList(c, arguments, e, walk)?; }
+        HirExpr.FieldAccess(target, _) => { walkExpr(c, target, e, parent, walk)?; }
+        HirExpr.EnumValue(_, payload) => { walkList(c, payload, e, walk)?; }
+        HirExpr.Borrow(_, place) => { walkPlace(c, place, walk)?; }
+        HirExpr.BorrowTemp(_, value) => { walkExpr(c, value, e, parent, walk)?; }
+        HirExpr.BorrowPath(_, path) => { walkExpr(c, path, e, parent, walk)?; }
+        HirExpr.Reborrow(_, reference) => { walkExpr(c, reference, e, parent, walk)?; }
+        HirExpr.Move(place) => { walkPlace(c, place, walk)?; }
+        HirExpr.Deref(reference) => { walkExpr(c, reference, e, parent, walk)?; }
+        HirExpr.ArrayLiteral(elements) => { walkList(c, elements, e, walk)?; }
+        HirExpr.ArrayRepeat(value) => { walkExpr(c, value, e, parent, walk)?; }
+        HirExpr.Index(target, index) => {
+            walkExpr(c, target, e, parent, walk)?;
+            walkExpr(c, index, e, parent, walk)?;
+        }
+        HirExpr.Slice(_, place, low, high) => {
+            walkPlace(c, place, walk)?;
+            if (low != none()) {
+                walkExpr(c, low, e, parent, walk)?;
+            }
+            if (high != none()) {
+                walkExpr(c, high, e, parent, walk)?;
+            }
+        }
+        HirExpr.SliceLength(slice) => { walkExpr(c, slice, e, parent, walk)?; }
+        HirExpr.Try(operand) => { walkExpr(c, operand, e, parent, walk)?; }
+        HirExpr.Unwrap(operand) => { walkExpr(c, operand, e, parent, walk)?; }
+        HirExpr.IsNull(reference, _) => { walkExpr(c, reference, e, parent, walk)?; }
+        HirExpr.StmtValue(statement) => { walkStmt(c, statement, walk)?; }
+        HirExpr.FloatToInt(operand, _) => { walkExpr(c, operand, e, parent, walk)?; }
+        _ => {} // constants, struct literals (their fields are value tuples to the reference's walk), addresses
+    }
+    return Ok();
+}
+
+// ---- coercions and calls ----
+
+/// Do two function or closure types have the same parameter and result types (SameSignature)?
+fn sameSignature(c: borrow Checker, a: u32, b: u32) -> bool =>
+    sameLists(
+        c,
+        c.types.info(a).parameters,
+        c.types.info(b).parameters,
+    ) && c.types.info(a).result == c.types.info(b).result;
+
+/// Are the effects of a value's type among an expected type's effect list (EffectsAllowed, §36.3)? N0299 if not.
+fn effectsAllowed(
+    c: borrow mut Checker,
+    actual: u32,
+    allowed: u32,
+    expected: u32,
+    found: u32,
+    span: Span,
+) -> Result<bool, AllocError> {
+    let extra = c.types.info(actual).effects & (0xFFFFFFFF ^ c.types.info(allowed).effects);
+    if (extra == 0) {
+        return Ok(true);
+    }
+    var message = Vector<u8>.create();
+    appendText(mut message, "expected ")?;
+    appendQuotedType(mut message, c, expected)?;
+    appendText(mut message, ", found ")?;
+    appendQuotedType(mut message, c, found)?;
+    appendText(mut message, if ((extra & sleepEffect()) != 0) ", which may sleep" else ", which may allocate")?;
+    appendText(
+        mut message,
+        ": only a named function or a closure literal can be checked against an effect list (type-system.md §36.3)",
+    )?;
+    c.error(closureKind(), span.start, span.end, message)?;
+    return Ok(false);
+}
+
+/// A value where a closure type is expected (CoerceToClosure, §36.2).
+fn coerceToClosure(c: borrow mut Checker, e: u32, expected: u32, span: Span) -> Result<u32, AllocError> {
+    let callable = c.types.info(expected).pointee;
+    let t = c.typeOf(e);
+    if (c.types.isClosure(t) && sameSignature(c, c.types.info(t).pointee, callable)) {
+        if (c.types.info(t).mutableReference && !c.types.info(expected).mutableReference) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "expected ")?;
+            appendQuotedType(mut message, c, expected)?;
+            appendText(mut message, ", found ")?;
+            appendQuotedType(mut message, c, t)?;
+            appendText(
+                mut message,
+                ": a closure that changes what it captures cannot be shared (type-system.md §36.2)",
+            )?;
+            c.error(closureKind(), span.start, span.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+        let actualCallable = c.types.info(t).pointee;
+        if (!effectsAllowed(c, actualCallable, callable, expected, t, span)?) {
+            return c.errorResult(span.start, span.end);
+        }
+        return c.expr(HirExpr.Cast(e), expected, span.start, span.end);
+    }
+    if (c.types.is(t, TypeKind.Function) && sameSignature(c, t, callable)) {
+        var value = e;
+        let named = match (c.hir.exprs[e as usize]) {
+            HirExpr.FunctionAddress(_) => true,
+            _ => false,
+        };
+        if (named) {
+            // A named function takes the expected effect list; the effect checker holds it to it (§36.3).
+            var parameters = Vector<u32>.create();
+            listTypes(c, c.types.info(callable).parameters, mut parameters)?;
+            let callableResult = c.types.info(callable).result;
+            let callableEffects = c.types.info(callable).effects;
+            let retyped = c.types.functionTo(parameters.view(), callableResult, callableEffects)?;
+            c.hir.exprTypes[e as usize] = retyped;
+        } else if (!effectsAllowed(c, t, callable, expected, t, span)?) {
+            return c.errorResult(span.start, span.end);
+        }
+        return adapterClosure(c, value, expected, span);
+    }
+    var message = Vector<u8>.create();
+    appendText(mut message, "expected ")?;
+    appendQuotedType(mut message, c, expected)?;
+    appendText(mut message, ", found ")?;
+    appendQuotedType(mut message, c, t)?;
+    c.error(typeMismatch(), span.start, span.end, message)?;
+    return c.errorResult(span.start, span.end);
+}
+
+/// A plain function value as a closure (AdapterClosure, §36.2): an environment holding a copy of it, and a body
+/// calling it. A named function needs no copy: the body calls it directly.
+fn adapterClosure(c: borrow mut Checker, value: u32, expected: u32, span: Span) -> Result<u32, AllocError> {
+    let callable = c.types.info(expected).pointee;
+    let parameterList = c.types.info(callable).parameters;
+    let result = c.types.info(callable).result;
+    let effects = c.types.info(callable).effects;
+    var names = Vector<u32>.create();
+    var types = Vector<u32>.create();
+    var spans = Vector<Span>.create();
+    for (k in 0..parameterList.count) {
+        var text = Vector<u8>.create();
+        text.push('a')?;
+        appendDecimal(mut text, k as u64)?;
+        names.push(c.front.symbols.intern(text.view())?.id)?;
+        types.push(c.types.listAt(parameterList, k))?;
+        spans.push(span)?;
+    }
+    let function = newClosureFunction(c, span, names.view(), types.view(), spans.view(), result, true)?;
+    let environment = c.hir.functions[function as usize].closureEnvironment;
+    let isVoid = c.types.is(result, TypeKind.Void);
+    let named = match (c.hir.exprs[value as usize]) {
+        HirExpr.FunctionAddress(f) => f,
+        _ => none(),
+    };
+    var arguments = Vector<u32>.create();
+    var captures = Vector<HirCapture>.create();
+    if (named == none()) {
+        let functionName = c.intern("function")?;
+        let valueType = c.typeOf(value);
+        let held = c.hir.addDetachedLocal(functionName, valueType, span.start, span.end)?;
+        arguments.push(c.expr(HirExpr.LocalRef(held), valueType, span.start, span.end)?)?;
+        captures.push(
+            HirCapture { local: held, mode: CaptureMode.Copy, value: value, field: none(), throughReference: false },
+        )?;
+    }
+    for (k in 1..c.hir.functions[function as usize].parameters.length) {
+        let p = c.hir.functions[function as usize].parameters[k];
+        let parameterType = c.hir.locals[p as usize].typ;
+        arguments.push(c.expr(HirExpr.LocalRef(p), parameterType, span.start, span.end)?)?;
+    }
+    let list = c.hir.list(arguments.view())?;
+    let call = if (named != none()) c.expr(HirExpr.Call(named, list), result, span.start, span.end)? else c.expr(
+        HirExpr.BuiltinCall(bfCallFunction(), list),
+        result,
+        span.start,
+        span.end,
+    )?;
+    let statement = c.hir.addStmt(
+        if (isVoid) HirStmt.Expression(call) else HirStmt.Return(call),
+        span.start,
+        span.end,
+    )?;
+    let statements = [statement];
+    let block = c.hir.list(statements[..])?;
+    c.hir.functions[function as usize].body = c.hir.addStmt(HirStmt.Block(block), span.start, span.end)?;
+    let range = finishEnvironment(c, function, environment, captures.view(), effects, span)?;
+    return c.expr(HirExpr.Closure(function, range), expected, span.start, span.end);
+}
+
+/// A call through a closure (CheckClosureCall, §36.2): a `borrow mut fn` is reborrowed, so it can be called again.
+fn checkClosureCall(c: borrow mut Checker, callee: u32, arguments: Range, span: Span) -> Result<u32, AllocError> {
+    let t = c.typeOf(callee);
+    let callable = c.types.info(t).pointee;
+    let parameters = c.types.info(callable).parameters;
+    if (arguments.count != parameters.count) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, t)?;
+        appendText(mut message, " takes ")?;
+        appendDecimal(mut message, parameters.count as u64)?;
+        appendText(mut message, " argument(s) but ")?;
+        appendDecimal(mut message, arguments.count as u64)?;
+        appendText(mut message, " were supplied")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var values = Vector<u32>.create();
+    if (c.types.info(t).mutableReference) {
+        let s = c.spanOf(callee);
+        values.push(c.expr(HirExpr.Reborrow(true, callee), t, s.start, s.end)?)?;
+    } else {
+        values.push(callee)?;
+    }
+    var bottom = false;
+    for (k in 0..arguments.count) {
+        let argument = c.front.ast.at(arguments, k);
+        let parameterType = c.types.listAt(parameters, k);
+        let value = checkArgument(c, argument, parameterType)?;
+        if (c.isBottom(value)) {
+            bottom = true;
+        }
+        values.push(value)?;
+    }
+    if (bottom) {
+        return c.errorResult(span.start, span.end);
+    }
+    let list = c.hir.list(values.view())?;
+    return c.expr(HirExpr.BuiltinCall(bfCallClosure(), list), c.types.info(callable).result, span.start, span.end);
+}
+
+fn moveLiteralPlace() -> u32 => 333;
+
+/// A move literal anywhere but as `Box.create`'s value for an expected `Box<dyn fn…>` (MisplacedMoveLiteral, §36.5).
+fn misplacedMoveLiteral(c: borrow mut Checker, span: Span) -> Result<u32, AllocError> {
+    var message = Vector<u8>.create();
+    appendText(
+        mut message,
+        "a 'move' closure must be boxed where its type is known: 'Box.create(move (…) => …)' where a 'Box<dyn fn(…) -> R>' is expected (type-system.md §36.5)",
+    )?;
+    c.error(moveLiteralPlace(), span.start, span.end, message)?;
+    return c.errorResult(span.start, span.end);
+}
+
+/// The `dyn fn` type a value of `typ` reaches through references and boxes, or none (DynFunctionBehind).
+fn dynFunctionBehind(c: borrow Checker, typ: u32) -> u32 {
+    var t = typ;
+    while (c.types.is(t, TypeKind.Reference) || c.types.is(t, TypeKind.Box)) {
+        t = c.types.info(t).pointee;
+    }
+    return if (c.types.isDyn(t) && c.types.info(t).dynInterface == none()) t else none();
+}
+
+/// A move literal, or a closure with a parameter written without a type.
+fn closureNeedsTypes(c: borrow Checker, closure: u32) -> bool {
+    let literal = c.front.ast.closures[closure as usize];
+    if (literal.isMove) {
+        return true;
+    }
+    for (k in 0..literal.parameters.count) {
+        if (c.front.ast.closureParameters[c.front.ast.at(literal.parameters, k) as usize].typ == none()) {
+            return true;
+        }
+    }
+    return false;
+}

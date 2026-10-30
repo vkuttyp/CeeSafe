@@ -107,6 +107,9 @@ struct HirPrinter {
         let l = hir.locals[local as usize];
         this.bytes(symbols.name(Symbol { id: l.name }))?;
         this.text("#")?;
+        if (l.id == 0xFFFFFFFF) {
+            return this.text("-1"); // a local of no function's list (the reference's HirLocal id -1)
+        }
         return appendDecimal(mut this.out, l.id as u64);
     }
 

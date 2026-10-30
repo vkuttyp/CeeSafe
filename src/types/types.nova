@@ -87,6 +87,8 @@ enum ResourceKind {
 
 /// The effect flags of a function or closure type (Hir.cs `Effects`): sleep is 1, alloc 2.
 fn allEffects() -> u32 => 3;
+fn sleepEffect() -> u32 => 1;
+fn allocEffect() -> u32 => 2;
 
 /// One type. Which fields mean something depends on `kind`, as for the reference's NovaType properties; an unused
 /// index is none().

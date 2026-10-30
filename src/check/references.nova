@@ -45,9 +45,26 @@ fn resolveReferenceType(
         _ => false,
     };
     if (isFunction) {
-        // `borrow fn(…) -> R` is a closure type (§36.2).
-        c.notPorted(span.start, span.end, "a closure type", "S6")?;
-        return Ok(c.types.error);
+        // `borrow fn(…) -> R` is a closure type (§36.2): a reference to a callable object, not to a function value.
+        let pointeeSpan = c.front.ast.typeSpans[pointeeSyntax as usize];
+        let callable = match (c.front.ast.types[pointeeSyntax as usize]) {
+            TypeNode.Function(attributes, parameters, result) => c.resolveFunctionType(
+                attributes,
+                parameters,
+                result,
+                pointeeSpan,
+            )?,
+            _ => c.types.error,
+        };
+        if (!c.types.is(callable, TypeKind.Function)) {
+            return Ok(c.types.error);
+        }
+        var parameterTypes = Vector<u32>.create();
+        listTypes(c, c.types.info(callable).parameters, mut parameterTypes)?;
+        let result = c.types.info(callable).result;
+        let effects = c.types.info(callable).effects;
+        let closure = c.types.closureTo(parameterTypes.view(), result, effects)?;
+        return c.types.referenceTo(closure, mutable);
     }
     let pointee = resolvePointee(c, pointeeSyntax)?;
     if (c.types.is(pointee, TypeKind.Reference)) {

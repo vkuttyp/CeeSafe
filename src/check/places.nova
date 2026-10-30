@@ -278,6 +278,10 @@ fn borrowPlace(c: borrow mut Checker, value: u32, mutable: bool, span: Span) -> 
         return c.errorResult(span.start, span.end);
     }
     if (mutable) {
+        let placeRoot = c.hir.places[place as usize].root;
+        noteMutableUse(c, placeRoot);
+    }
+    if (mutable) {
         var reason = Vector<u8>.create();
         mutabilityError(c, place, mut reason)?;
         if (reason.length > 0) {

@@ -699,7 +699,7 @@ fn declareBinding(
         c.error(referenceNotAllowed(), ident.start, ident.end, message)?;
         isMutable = false;
     }
-    if (c.lookupLocal(ident.symbol) != none()) {
+    if (c.lookupLocal(ident.symbol)? != none()) {
         var message = Vector<u8>.create();
         appendQuotedName(mut message, c, ident.symbol)?;
         appendText(mut message, " is already declared in this function; locals cannot be shadowed")?;

@@ -202,7 +202,8 @@ struct HirFunction {
     siteFile: u32; // where an instance was made, or none
     siteStart: u32;
     siteEnd: u32;
-    registered: bool; // false for a signature only (an interface method's): not in the reference's _functions
+    registered: bool;       // false for a signature only (an interface method's): not in the reference's _functions
+    closureCaptures: Range; // a closure's captures (Hir.captures), once its environment is finished
 }
 
 struct HirConstant {
@@ -332,6 +333,22 @@ struct HirProgram {
         return Ok(local);
     }
 
+    /// A local belonging to no function's list (the reference's `new HirLocal(-1, …)`): an adapter closure's held
+    /// function value.
+    fn addDetachedLocal(borrow mut this, name: u32, typ: u32, start: u32, end: u32) -> Result<u32, AllocError> {
+        this.locals.push(HirLocal {
+            id: 0xFFFFFFFF,
+            name: name,
+            typ: typ,
+            mutable: false,
+            parameter: false,
+            isUsing: false,
+            start: start,
+            end: end,
+        })?;
+        return Ok(truncate<u32>(this.locals.length - 1));
+    }
+
     /// A new function; its id is the number of functions so far (the reference's `_functions.Count`).
     fn addFunction(
         borrow mut this,
@@ -378,6 +395,7 @@ struct HirProgram {
             siteStart: 0,
             siteEnd: 0,
             registered: registered,
+            closureCaptures: Range { start: 0, count: 0 },
         })?;
         return Ok(truncate<u32>(this.functions.length - 1));
     }

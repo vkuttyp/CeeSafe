@@ -1,0 +1,43 @@
+struct Counter { hits: i32; misses: i32; name: i32; }
+struct Holder<region r> { check: borrow(r) fn(i32) -> bool; f: fn(i32) -> i32; }
+
+fn apply(f: borrow fn(i32) -> i32, x: i32) -> i32 => f(x);
+fn each(xs: Slice<i32>, visit: borrow mut fn(i32)) {
+    for (x in xs) {
+        visit(x);
+    }
+}
+fn double(x: i32) -> i32 => x * 2;
+fn pick(f: fn(i32) -> i32) -> i32 => f(3);
+
+fn main() {
+    let limit = 3;
+    var total = 0;
+    var counter = Counter { hits: 0, misses: 0, name: 1 };
+    let xs = [1, 2, 3, 4];
+    let a = apply((x) => x + limit, 1);
+    let b = apply(double, 2);
+    let f: fn(i32) -> i32 = double;
+    let c = apply(f, 3);
+    each(xs[..], (x) => {
+        total += x;
+        if (x > limit) {
+            counter.hits += 1;
+        } else {
+            counter.misses += 1;
+        }
+    });
+    let plain = (x: i32) => x + 1;
+    let d = pick(plain);
+    let e = pick((x) => x * x);
+    let h = Holder { check: (x) => x > limit, f: double };
+    let ok = h.check(5);
+    let g = h.f(2);
+    let nested = (x: i32) => {
+        let inner = (y: i32) => y + limit;
+        let z = apply(inner, x);
+    };
+    nested(1);
+    let names = (x: i32) => counter.name + x;
+    let n = names(2);
+}

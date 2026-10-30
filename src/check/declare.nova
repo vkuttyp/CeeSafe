@@ -132,6 +132,8 @@ fn checkProgram(
         registerNext: true,
         dynAllowed: false,
         dynTables: Vector<DynTable>.create(),
+        closureContexts: Vector<ClosureContext>.create(),
+        environments: Vector<EnvironmentRecord>.create(),
         implementations: Vector<Implementation>.create(),
         implMethods: Vector<ImplMethod>.create(),
         boundMethods: Vector<BoundMethod>.create(),
@@ -212,7 +214,8 @@ fn checkProgram(
     // The body pass: every function in creation order, the libraries' included.
     var f: usize = 0;
     while (f < c.hir.functions.length) {
-        if (c.hir.functions[f].registered) {
+        // A closure's body is checked where its literal is (§36.2).
+        if (c.hir.functions[f].registered && !c.hir.functions[f].isClosure) {
             let function = truncate<u32>(f);
             if (functionIsInstantiation(c, function)) {
                 // Its generic version reports (§20.3); a scoped type argument the body cannot take is N0274.

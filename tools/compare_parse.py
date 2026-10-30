@@ -11,6 +11,7 @@ usage: tools/compare_parse.py --ceesafec out/ceesafe --novac ~/.nova/0.5.0/bin/n
 """
 
 import argparse
+import re
 import os
 import subprocess
 import sys
@@ -38,6 +39,15 @@ def outcome(compiler, argv, root):
         return "timeout", b"", b""
 
 
+CLOSURE_IDS = re.compile(rb"(closure environment |\(closure )[0-9]+")
+
+
+def normalized(result):
+    """Closure ids blanked: they count every function before them, the libraries' included (docs/p3-plan.md S6)."""
+    status, out, err = result
+    return status, CLOSURE_IDS.sub(rb"\1N", out), CLOSURE_IDS.sub(rb"\1N", err)
+
+
 def options_of(root, path):
     """The corpus's per-file options for `check` (run_corpus.compile_options, CorpusTests.ProfileOf and the like)."""
     with open(os.path.join(root, path), encoding="utf-8", errors="replace") as f:
@@ -59,6 +69,8 @@ def compare(args, root, path):
     for argv in ([args.command, dump, "--diagnostics-format=json"] + extra + [path], [args.command] + extra + [path]):
         mine = outcome(args.ceesafec, argv, root)
         ref = outcome(args.novac, argv, root)
+        if args.normalize_closure_ids:
+            mine, ref = normalized(mine), normalized(ref)
         if mine != ref:
             what = [n for n, a, b in zip(("status", "stdout", "stderr"), mine, ref) if a != b]
             detail = ""
@@ -85,6 +97,8 @@ def main():
     parser.add_argument("--command", choices=("parse", "check"), default="parse")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     parser.add_argument("--list", metavar="FILE", help="write every differing file's path to FILE, sorted, one per line")
+    parser.add_argument("--normalize-closure-ids", action="store_true",
+                        help="blank closure ids, which match only once every library function is declared (S7)")
     parser.add_argument("paths", nargs="+")
     args = parser.parse_args()
     args.ceesafec = os.path.abspath(os.path.expanduser(args.ceesafec))
