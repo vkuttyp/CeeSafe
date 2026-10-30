@@ -1,7 +1,7 @@
-// The C emitter (the reference's Backend.C/CEmitter.cs) in its flat form: one label per NIR block, terminators as
-// goto, switch and return, and every operation that can be undefined in C a call of a checked helper from nova/rt.h
-// (c-backend.md). P7 adds closure variants (S0), placement (S1) and check elimination (S2); the structured form is
-// still to come, so the C is novac's with --flat-c.
+// The C emitter (the reference's Backend.C/CEmitter.cs): every operation that can be undefined in C a call of a
+// checked helper from nova/rt.h (c-backend.md), function bodies structured by c_structurer.cee or, with --flat-c or an
+// irreducible graph, flat (one label per NIR block, terminators as goto, switch and return). Closure variants,
+// placement and check elimination are on by default, as in novac.
 //
 // The program is emitted twice, as by the reference: the first (trial) emission collects the helpers' location
 // constants and the boxes built in place, which the second writes before the code that uses them.
@@ -63,6 +63,9 @@ struct CEmitter {
     paths: Vector<Vector<u8>>;     // by source: its path, as #line names it
     unitNames: Vector<Vector<u8>>; // split mode: by source, its unit's name, or empty
     hasPendingLabel: bool;
+    structured: bool; // c-backend.md §3 (off: --flat-c)
+    capturing: bool;  // structured form: statement lines are collected for the tree
+    capture: Vector<Vector<u8>>;
 
     fn create(trial: bool) -> CEmitter => CEmitter {
         split: false,
@@ -106,6 +109,9 @@ struct CEmitter {
         paths: Vector<Vector<u8>>.create(),
         unitNames: Vector<Vector<u8>>.create(),
         hasPendingLabel: false,
+        structured: false,
+        capturing: false,
+        capture: Vector<Vector<u8>>.create(),
     };
 
     /// Starts writing the named file (Into, split mode); a file named twice is continued.
@@ -166,6 +172,9 @@ struct CEmitter {
     fn line(borrow mut this, text: StringView) -> Result<void, AllocError> => this.writeLine(text.bytes(), true);
 
     fn writeLine(borrow mut this, text: Slice<u8>, code: bool) -> Result<void, AllocError> {
+        if (this.capturing) {
+            return this.capture.push(copyBytes(text)?);
+        }
         if (this.files.length == 0) {
             this.files.push(CFile { name: copyBytes("main.c".bytes())?, text: Vector<u8>.create() })?;
         }

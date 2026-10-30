@@ -188,7 +188,14 @@ fn emitFunction(
             e.emit()?;
         }
     }
-    emitFlatBody(e, c, n, sources, f)?;
+    var tree: Structurer? = null;
+    if (e.structured) {
+        tree = structureFunction(e, c, n, sources, f)?;
+    }
+    match (tree) {
+        Some(s) => { printTree(e, c, n, sources, s, s.root, 1)?; }
+        null => { emitFlatBody(e, c, n, sources, f)?; }
+    }
     e.line("}")?;
     endMapping(e)?;
     e.function = none();

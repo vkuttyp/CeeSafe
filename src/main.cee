@@ -57,6 +57,7 @@ struct Options {
     explainBoundsChecks: bool;   // --explain-bounds-checks
     oce: bool;                   // on unless --no-oce (optimisations.md §3)
     explainOverflowChecks: bool; // --explain-overflow-checks
+    structured: bool;            // on unless --flat-c (c-backend.md §3)
     emit: Vector<u8>;            // --emit c|exe|obj (build)
     output: Vector<u8>;          // -o (build), or empty
     exportsHeader: Vector<u8>;   // --exports-header (build)
@@ -175,7 +176,7 @@ fn readOptions(options: borrow mut Options) -> i32 {
         } else if (options.building && arg == "--explain-overflow-checks") {
             options.explainOverflowChecks = true;
         } else if (options.building && arg == "--flat-c") {
-            // Not ported yet (docs/p7-plan.md): ceesafec emits as novac does with these.
+            options.structured = false;
         } else if (arg == "--no-float") {
             options.noFloat = true;
         } else if (arg == "--library-diagnostics") {
@@ -373,6 +374,7 @@ fn parseCommand() -> i32 {
         explainBoundsChecks: false,
         oce: true,
         explainOverflowChecks: false,
+        structured: true,
         emit: copyBytes("exe".bytes())!,
         output: Vector<u8>.create(),
         exportsHeader: copyBytes("nova_exports.h".bytes())!,
@@ -597,6 +599,7 @@ fn fileCommand(building: bool) -> i32 {
         explainBoundsChecks: false,
         oce: true,
         explainOverflowChecks: false,
+        structured: true,
         emit: copyBytes("exe".bytes())!,
         output: Vector<u8>.create(),
         exportsHeader: copyBytes("nova_exports.h".bytes())!,
@@ -779,6 +782,7 @@ fn fileCommand(building: bool) -> i32 {
             placement: options.placement,
             bce: options.bce,
             oce: options.oce,
+            structured: options.structured,
         };
         if (!generateC(mut checker, mut nir, sources, build, mut files)!) {
             return report(options.json, checker.front.diagnostics, sources);

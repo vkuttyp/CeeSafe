@@ -1,0 +1,868 @@
+// Structured C (the reference's Backend.C/CStructurer.cs; c-backend.md §3): a statement tree built from the NIR graph.
+// Every block's code ends in an explicit transfer, so placement only affects readability; transfers are removed or
+// turned into break/continue only where falling through provably reaches the same label.
+//
+// The tree lives in arenas: nodes, the lists of node ids they hold (a list is named by its index, so swapping an if's
+// arms swaps two numbers), the condition and label texts, and the captured C lines of statements.
+
+fn nodeCode() -> u32 => 0;
+fn nodeLabel() -> u32 => 1;
+fn nodeGoto() -> u32 => 2;
+fn nodeBreak() -> u32 => 3;
+fn nodeContinue() -> u32 => 4;
+fn nodeIf() -> u32 => 5;
+fn nodeLoop() -> u32 => 6;
+fn nodeSwitch() -> u32 => 7;
+fn nodeCase() -> u32 => 8;
+
+/// A node of the tree (CNode): code lines, a label or goto of a block (by id), break, continue, an if (its condition
+/// text, then and else lists), a loop (its header's id, its body), a switch (its value text, a list of case nodes) or
+/// a case (a list of label texts, its body).
+struct SNode {
+    kind: u32;
+    start: u32; // span
+    end: u32;
+    block: u32;     // a label's, goto's or loop's block id
+    text: u32;      // an if's condition, a switch's value: a text
+    lineStart: u32; // code: its lines
+    lineCount: u32;
+    completes: bool; // code: false for return, exit, panic
+    first: u32;      // a list: an if's then, a loop's body, a switch's cases, a case's labels (texts)
+    second: u32;     // a list: an if's else, a case's body
+}
+
+struct Structurer {
+    flow: ControlFlow;
+    function: u32;
+    nodes: Vector<SNode>;
+    lists: Vector<Vector<u32>>;
+    texts: Vector<Vector<u8>>;
+    lines: Vector<Vector<u8>>;
+    follows: Vector<Vector<u32>>;     // by block index: the blocks emitted after its code (Follow)
+    exitFollows: Vector<Vector<u32>>; // by loop header index: the blocks emitted after its loop (ExitFollow)
+    root: u32;                        // the tree's list
+}
+
+fn newList(s: borrow mut Structurer) -> Result<u32, AllocError> {
+    s.lists.push(Vector<u32>.create())?;
+    return Ok(truncate<u32>(s.lists.length - 1));
+}
+
+fn newText(s: borrow mut Structurer, text: Slice<u8>) -> Result<u32, AllocError> {
+    s.texts.push(copyBytes(text)?)?;
+    return Ok(truncate<u32>(s.texts.length - 1));
+}
+
+fn newNode(s: borrow mut Structurer, kind: u32, start: u32, end: u32) -> Result<u32, AllocError> {
+    s.nodes.push(SNode {
+        kind: kind,
+        start: start,
+        end: end,
+        block: none(),
+        text: none(),
+        lineStart: 0,
+        lineCount: 0,
+        completes: true,
+        first: none(),
+        second: none(),
+    })?;
+    return Ok(truncate<u32>(s.nodes.length - 1));
+}
+
+fn pushNode(s: borrow mut Structurer, list: u32, node: u32) -> Result<void, AllocError> =>
+    s.lists[list as usize].push(node);
+
+/// Appends the nodes of one list to another (AddRange).
+fn appendList(s: borrow mut Structurer, list: u32, other: u32) -> Result<void, AllocError> {
+    for (k in 0..s.lists[other as usize].length) {
+        let node = s.lists[other as usize][k];
+        s.lists[list as usize].push(node)?;
+    }
+    return Ok();
+}
+
+fn removeAt(s: borrow mut Structurer, list: u32, i: usize) {
+    let l = list as usize;
+    var k = i;
+    while (k + 1 < s.lists[l].length) {
+        s.lists[l].swap(k, k + 1);
+        k += 1;
+    }
+    s.lists[l].pop();
+}
+
+fn structuredBlockId(n: borrow NirProgram, s: borrow Structurer, block: u32) -> u32 =>
+    n.functions[s.function as usize].blocks[block as usize].id;
+
+// ---- Placement (§3 step 2) ----
+
+fn placeInline() -> u32 => 0;
+fn placeFollow() -> u32 => 1;
+fn placeExitFollow() -> u32 => 2;
+
+struct BlockPlacement {
+    kind: u32;
+    owner: u32; // a block index
+}
+
+/// Where a block (not the entry) is emitted, and next to which block (PlacementOf).
+fn placementOf(n: borrow NirProgram, s: borrow Structurer, block: u32) -> Result<BlockPlacement, AllocError> {
+    let flow = borrow s.flow;
+    let d = flow.idom[block as usize];
+    var exited = none(); // a loop's index
+    for (l in 0..flow.loopHeaders.length) {
+        // The outermost such loop is the largest one: loops are nested or disjoint.
+        let members = borrow flow.loopMembers[l];
+        if (members[d as usize] && !members[block as usize] &&
+            (exited == none() || flow.loopSizes[exited as usize] < flow.loopSizes[l])) {
+            exited = truncate<u32>(l);
+        }
+    }
+    let single = flow.forwardPredecessors[block as usize] == 1;
+    if (exited != none()) {
+        let header = flow.loopHeaders[exited as usize];
+        if (single && d != header && isSmallClosedSubtree(n, s, block)?) {
+            return Ok(BlockPlacement { kind: placeInline(), owner: d });
+        }
+        return Ok(BlockPlacement { kind: placeExitFollow(), owner: header });
+    }
+    return Ok(BlockPlacement { kind: if (single) placeInline() else placeFollow(), owner: d });
+}
+
+fn isSmallClosedSubtree(n: borrow NirProgram, s: borrow Structurer, root: u32) -> Result<bool, AllocError> {
+    let function = borrow n.functions[s.function as usize];
+    var inSubtree = Vector<bool>.create();
+    for (k in 0..function.blocks.length) {
+        inSubtree.push(false)?;
+    }
+    var subtree = Vector<u32>.create();
+    var stack = Vector<u32>.create();
+    stack.push(root)?;
+    while (stack.length > 0) {
+        let block = stack.pop()!;
+        inSubtree[block as usize] = true;
+        subtree.push(block)?;
+        for (child in s.flow.children[block as usize].view()) {
+            stack.push(child)?;
+        }
+    }
+    if (subtree.length > 2) {
+        return Ok(false); // InlineExitBlocks
+    }
+    var statements: usize = 0;
+    for (block in subtree.view()) {
+        statements += function.blocks[block as usize].statements.length;
+        for (id in function.blocks[block as usize].successors.view()) {
+            if (!inSubtree[blockIndexIn(s.flow, id) as usize]) {
+                return Ok(false);
+            }
+        }
+    }
+    return Ok(statements <= 8); // InlineExitStatements
+}
+
+// ---- Building (steps 2 and 3) ----
+
+/// The function body as a statement tree (Structure), or none if its graph is irreducible (emit it flat).
+fn structureFunction(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+) -> Result<Structurer?, AllocError> {
+    let flow = controlFlowOf(n.functions[f as usize])?;
+    if (!flow.isReducible) {
+        return Ok(null);
+    }
+    var s = Structurer {
+        flow: flow,
+        function: f,
+        nodes: Vector<SNode>.create(),
+        lists: Vector<Vector<u32>>.create(),
+        texts: Vector<Vector<u8>>.create(),
+        lines: Vector<Vector<u8>>.create(),
+        follows: Vector<Vector<u32>>.create(),
+        exitFollows: Vector<Vector<u32>>.create(),
+        root: 0,
+    };
+    for (k in 0..n.functions[f as usize].blocks.length) {
+        s.follows.push(Vector<u32>.create())?;
+        s.exitFollows.push(Vector<u32>.create())?;
+    }
+    for (i in 1..s.flow.reversePostorder.length) {
+        let block = s.flow.reversePostorder[i];
+        let placement = placementOf(n, s, block)?;
+        if (placement.kind == placeFollow()) {
+            s.follows[placement.owner as usize].push(block)?;
+        } else if (placement.kind == placeExitFollow()) {
+            s.exitFollows[placement.owner as usize].push(block)?;
+        }
+    }
+    let tree = treeOf(e, c, n, sources, mut s, 0)?;
+    // To a fixpoint: removing a goto can extend what falls through before it (an empty exit block).
+    let nothing = Vector<u32>.create();
+    let root = EliminationContext {
+        header: none(),
+        afterLoop: Vector<u32>.create(),
+        inSwitch: false,
+        afterSwitch: Vector<u32>.create(),
+    };
+    while (eliminate(mut s, tree, nothing, root)?) {}
+    var targets = Vector<bool>.create();
+    collectGotos(s, tree, mut targets)?;
+    removeLabels(mut s, tree, targets)?; // before hoisting: an arm holding only a dead label is empty
+    hoist(mut s, tree)?;
+    s.root = tree;
+    return Ok(Some(s));
+}
+
+/// A block's statements that print something, captured as code nodes (StatementNodes): a label before nothing would
+/// end its block, a C23 extension.
+fn statementNodes(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    s: borrow mut Structurer,
+    block: u32,
+) -> Result<u32, AllocError> {
+    let list = newList(s)?;
+    let f = s.function;
+    let count = n.functions[f as usize].blocks[block as usize].statements.length;
+    for (k in 0..count) {
+        let statement = n.functions[f as usize].blocks[block as usize].statements[k];
+        e.capturing = true;
+        emitStatement(e, c, n, sources, f, statement)?;
+        e.capturing = false;
+        if (e.capture.length > 0) {
+            let span = n.statementSpans[statement as usize];
+            let node = capturedNode(e, s, span.start, span.end, true)?;
+            pushNode(s, list, node)?;
+        }
+    }
+    return Ok(list);
+}
+
+/// The lines captured, as a code node (Captured).
+fn capturedNode(
+    e: borrow mut CEmitter,
+    s: borrow mut Structurer,
+    start: u32,
+    end: u32,
+    completes: bool,
+) -> Result<u32, AllocError> {
+    let node = newNode(s, nodeCode(), start, end)?;
+    s.nodes[node as usize].lineStart = truncate<u32>(s.lines.length);
+    s.nodes[node as usize].lineCount = truncate<u32>(e.capture.length);
+    s.nodes[node as usize].completes = completes;
+    for (k in 0..e.capture.length) {
+        s.lines.push(copyBytes(e.capture[k].view())?)?;
+    }
+    e.capture.clear();
+    return Ok(node);
+}
+
+fn treeOf(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    s: borrow mut Structurer,
+    block: u32,
+) -> Result<u32, AllocError> {
+    let list = newList(s)?;
+    let label = newNode(s, nodeLabel(), 0, 0)?;
+    s.nodes[label as usize].block = structuredBlockId(n, s, block);
+    pushNode(s, list, label)?;
+    if (isLoopHeader(s.flow, block)) {
+        let body = bodyOf(e, c, n, sources, s, block)?;
+        let loopNode = newNode(s, nodeLoop(), 0, 0)?;
+        s.nodes[loopNode as usize].block = structuredBlockId(n, s, block);
+        s.nodes[loopNode as usize].first = body;
+        pushNode(s, list, loopNode)?;
+        for (k in 0..s.exitFollows[block as usize].length) {
+            let exit = s.exitFollows[block as usize][k];
+            let tree = treeOf(e, c, n, sources, s, exit)?;
+            appendList(s, list, tree)?;
+        }
+    } else {
+        let body = bodyOf(e, c, n, sources, s, block)?;
+        appendList(s, list, body)?;
+    }
+    return Ok(list);
+}
+
+fn bodyOf(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    s: borrow mut Structurer,
+    block: u32,
+) -> Result<u32, AllocError> {
+    let f = s.function;
+    let list = statementNodes(e, c, n, sources, s, block)?;
+    let terminator = n.functions[f as usize].blocks[block as usize].terminator;
+    let span = n.terminatorSpans[terminator as usize];
+    match (n.terminators[terminator as usize]) {
+        NirTerminator.Goto(target) => {
+            let branchIndex = blockIndexIn(s.flow, target);
+            let branch = branchTo(e, c, n, sources, s, block, branchIndex, span.start, span.end)?;
+            appendList(s, list, branch)?;
+        }
+        NirTerminator.Branch(condition, then, otherwise) => {
+            let operand = operandText(e, c, n, sources, f, condition)?;
+            let text = newText(s, operand.view())?;
+            let thenListIndex = blockIndexIn(s.flow, then);
+            let thenList = branchTo(e, c, n, sources, s, block, thenListIndex, span.start, span.end)?;
+            let elseListIndex = blockIndexIn(s.flow, otherwise);
+            let elseList = branchTo(e, c, n, sources, s, block, elseListIndex, span.start, span.end)?;
+            let node = newNode(s, nodeIf(), span.start, span.end)?;
+            s.nodes[node as usize].text = text;
+            s.nodes[node as usize].first = thenList;
+            s.nodes[node as usize].second = elseList;
+            pushNode(s, list, node)?;
+        }
+        NirTerminator.Switch(value, cases, otherwise) => {
+            // C rejects switching on a bool (-Wswitch-bool): switch on its int value instead (SwitchCases).
+            let t = n.operandTypes[value as usize];
+            let isBool = c.types.is(t, TypeKind.Bool);
+            var valueText = Vector<u8>.create();
+            if (isBool) {
+                appendText(mut valueText, "(int)")?;
+            }
+            let operand = operandText(e, c, n, sources, f, value)?;
+            appendBytes(mut valueText, operand.view())?;
+            var labels = Vector<u32>.create();  // texts
+            var targets = Vector<u32>.create(); // block ids
+            for (k in 0..cases.count) {
+                let case = n.cases[(cases.start + k) as usize];
+                var label = Vector<u8>.create();
+                if (isBool) {
+                    appendIntValue(mut label, case.value)?;
+                } else {
+                    appendConstant(c, mut label, case.value, t)?;
+                }
+                labels.push(newText(s, label.view())?)?;
+                targets.push(case.target)?;
+            }
+            labels.push(newText(s, "default".bytes())?)?;
+            targets.push(otherwise)?;
+            // Cases with one target share a body, in the order targets first appear; the default's case comes last,
+            // with `default` its last label.
+            var groups = Vector<u32>.create(); // targets, first-appearance order
+            for (target in targets.view()) {
+                if (!containsU32(groups, target)) {
+                    groups.push(target)?;
+                }
+            }
+            let caseList = newList(s)?;
+            var defaultCase = none();
+            for (target in groups.view()) {
+                let labelList = newList(s)?;
+                for (k in 0..targets.length) {
+                    if (targets[k] == target && k + 1 < targets.length) {
+                        pushNode(s, labelList, labels[k])?;
+                    }
+                }
+                let bodyIndex = blockIndexIn(s.flow, target);
+                let body = branchTo(e, c, n, sources, s, block, bodyIndex, span.start, span.end)?;
+                let node = newNode(s, nodeCase(), 0, 0)?;
+                s.nodes[node as usize].first = labelList;
+                s.nodes[node as usize].second = body;
+                if (target == otherwise) {
+                    pushNode(s, labelList, labels[labels.length - 1])?;
+                    defaultCase = node;
+                } else {
+                    pushNode(s, caseList, node)?;
+                }
+            }
+            pushNode(s, caseList, defaultCase)?;
+            let node = newNode(s, nodeSwitch(), span.start, span.end)?;
+            s.nodes[node as usize].text = newText(s, valueText.view())?;
+            s.nodes[node as usize].first = caseList;
+            pushNode(s, list, node)?;
+        }
+        _ => {
+            e.capturing = true;
+            emitTerminator(e, c, n, sources, f, terminator)?;
+            e.capturing = false;
+            let node = capturedNode(e, s, span.start, span.end, false)?;
+            pushNode(s, list, node)?;
+        }
+    }
+    for (k in 0..s.follows[block as usize].length) {
+        let follow = s.follows[block as usize][k];
+        let tree = treeOf(e, c, n, sources, s, follow)?;
+        appendList(s, list, tree)?;
+    }
+    return Ok(list);
+}
+
+/// The code of a transfer (Branch): the target's tree, if it is placed inline here, else a goto.
+fn branchTo(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    s: borrow mut Structurer,
+    from: u32,
+    to: u32,
+    start: u32,
+    end: u32,
+) -> Result<u32, AllocError> {
+    if (!dominates(s.flow, to, from) && to != 0) {
+        let placement = placementOf(n, s, to)?;
+        if (placement.kind == placeInline() && placement.owner == from) {
+            return treeOf(e, c, n, sources, s, to);
+        }
+    }
+    let list = newList(s)?;
+    let node = newNode(s, nodeGoto(), start, end)?;
+    s.nodes[node as usize].block = structuredBlockId(n, s, to);
+    pushNode(s, list, node)?;
+    return Ok(list);
+}
+
+// ---- Transfer elimination (step 4) ----
+
+/// Where a statement list sits (Context): the innermost loop's header (a block id, or none), what falls through after
+/// that loop, whether a switch lies between here and it, and what falls through after the innermost switch.
+struct EliminationContext {
+    header: u32;
+    afterLoop: Vector<u32>;
+    inSwitch: bool;
+    afterSwitch: Vector<u32>;
+}
+
+/// What falling off the end of the list after node `index` reaches (FallAfter): labels passed over without code.
+fn fallAfter(
+    s: borrow Structurer,
+    list: u32,
+    index: usize,
+    end: borrow Vector<u32>,
+) -> Result<Vector<u32>, AllocError> {
+    var labels = Vector<u32>.create();
+    for (i in (index + 1)..s.lists[list as usize].length) {
+        let node = s.nodes[s.lists[list as usize][i] as usize];
+        if (node.kind != nodeLabel()) {
+            return Ok(labels);
+        }
+        labels.push(node.block)?;
+    }
+    for (label in end.view()) {
+        labels.push(label)?;
+    }
+    return Ok(labels);
+}
+
+/// Removes transfers to where control falls anyway, and makes the others break or continue where they can
+/// (Eliminate); whether anything changed.
+fn eliminate(
+    s: borrow mut Structurer,
+    list: u32,
+    end: borrow Vector<u32>,
+    context: borrow EliminationContext,
+) -> Result<bool, AllocError> {
+    var changed = false;
+    var i: usize = 0;
+    while (i < s.lists[list as usize].length) {
+        let next = fallAfter(s, list, i, end)?;
+        let id = s.lists[list as usize][i];
+        let node = s.nodes[id as usize];
+        if (node.kind == nodeGoto()) {
+            if (containsU32(next, node.block)) {
+                removeAt(s, list, i);
+                changed = true;
+                continue;
+            }
+            if (node.block == context.header) {
+                s.nodes[id as usize].kind = nodeContinue();
+                changed = true;
+            } else if (!context.inSwitch && context.header != none() && containsU32(context.afterLoop, node.block)) {
+                s.nodes[id as usize].kind = nodeBreak();
+                changed = true;
+            } else if (context.inSwitch && containsU32(context.afterSwitch, node.block)) {
+                s.nodes[id as usize].kind = nodeBreak();
+                changed = true;
+            }
+        } else if (node.kind == nodeIf()) {
+            if (eliminate(s, node.first, next, context)?) {
+                changed = true;
+            }
+            if (eliminate(s, node.second, next, context)?) {
+                changed = true;
+            }
+        } else if (node.kind == nodeLoop()) {
+            // Falling off a loop body goes back to its header.
+            var fall = Vector<u32>.create();
+            fall.push(node.block)?;
+            let inner = EliminationContext {
+                header: node.block,
+                afterLoop: next,
+                inSwitch: false,
+                afterSwitch: Vector<u32>.create(),
+            };
+            if (eliminate(s, node.first, fall, inner)?) {
+                changed = true;
+            }
+        } else if (node.kind == nodeSwitch()) {
+            for (k in 0..s.lists[node.first as usize].length) {
+                let body = s.nodes[s.lists[node.first as usize][k] as usize].second;
+                // A case body never falls into the next case (-Wimplicit-fallthrough).
+                let nothing = Vector<u32>.create();
+                let inner = EliminationContext {
+                    header: context.header,
+                    afterLoop: copyU32s(context.afterLoop.view())?,
+                    inSwitch: true,
+                    afterSwitch: copyU32s(next.view())?,
+                };
+                if (eliminate(s, body, nothing, inner)?) {
+                    changed = true;
+                }
+            }
+        }
+        i += 1;
+    }
+    return Ok(changed);
+}
+
+// ---- Guard clauses (step 5) ----
+
+fn swapArms(s: borrow mut Structurer, node: u32) -> Result<void, AllocError> {
+    let k = node as usize;
+    let then = s.nodes[k].first;
+    s.nodes[k].first = s.nodes[k].second;
+    s.nodes[k].second = then;
+    var negated = Vector<u8>.create();
+    negateCondition(s.texts[s.nodes[k].text as usize].view(), mut negated)?;
+    s.nodes[k].text = newText(s, negated.view())?;
+    return Ok();
+}
+
+fn hoist(s: borrow mut Structurer, list: u32) -> Result<void, AllocError> {
+    var i: usize = 0;
+    while (i < s.lists[list as usize].length) {
+        let id = s.lists[list as usize][i];
+        let node = s.nodes[id as usize];
+        if (node.kind == nodeIf()) {
+            hoist(s, node.first)?;
+            hoist(s, node.second)?;
+            if (s.lists[node.first as usize].length == 0 && s.lists[node.second as usize].length == 0) {
+                removeAt(s, list, i); // conditions are operands: no side effects
+                continue;
+            }
+            if (s.lists[s.nodes[id as usize].first as usize].length == 0) {
+                swapArms(s, id)?;
+            }
+            let then = s.nodes[id as usize].first;
+            let otherwise = s.nodes[id as usize].second;
+            if (s.lists[otherwise as usize].length > 0) {
+                var thenEnds = !completesList(s, then);
+                let elseEnds = !completesList(s, otherwise);
+                if (elseEnds && (!thenEnds || sizeOf(s, otherwise) < sizeOf(s, then))) {
+                    swapArms(s, id)?;
+                    thenEnds = true;
+                }
+                if (thenEnds) {
+                    // The else arm follows the if.
+                    let moved = s.nodes[id as usize].second;
+                    var rebuilt = Vector<u32>.create();
+                    for (k in 0..(i + 1)) {
+                        rebuilt.push(s.lists[list as usize][k])?;
+                    }
+                    for (k in 0..s.lists[moved as usize].length) {
+                        rebuilt.push(s.lists[moved as usize][k])?;
+                    }
+                    for (k in (i + 1)..s.lists[list as usize].length) {
+                        rebuilt.push(s.lists[list as usize][k])?;
+                    }
+                    s.lists[list as usize] = rebuilt;
+                    s.lists[moved as usize].clear();
+                }
+            }
+        } else if (node.kind == nodeLoop()) {
+            hoist(s, node.first)?;
+        } else if (node.kind == nodeSwitch()) {
+            for (k in 0..s.lists[node.first as usize].length) {
+                let body = s.nodes[s.lists[node.first as usize][k] as usize].second;
+                hoist(s, body)?;
+            }
+        }
+        i += 1;
+    }
+    return Ok();
+}
+
+fn isCIdentifier(text: Slice<u8>) -> bool {
+    if (text.length == 0 || (text[0] >= '0' && text[0] <= '9')) {
+        return false;
+    }
+    for (ch in text) {
+        let letter = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_';
+        if (!letter) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The negated condition (Negate): `!x` for an identifier, `x` for `!x`, else `!(…)`.
+fn negateCondition(condition: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    if (condition.length > 0 && condition[0] == '!' && isCIdentifier(condition[1..])) {
+        return appendBytes(out, condition[1..]);
+    }
+    if (isCIdentifier(condition)) {
+        out.push('!')?;
+        return appendBytes(out, condition);
+    }
+    appendText(out, "!(")?;
+    appendBytes(out, condition)?;
+    return out.push(')');
+}
+
+fn sizeOf(s: borrow Structurer, list: u32) -> usize {
+    var size: usize = 0;
+    for (id in s.lists[list as usize].view()) {
+        let node = s.nodes[id as usize];
+        if (node.kind == nodeIf()) {
+            size += 1 + sizeOf(s, node.first) + sizeOf(s, node.second);
+        } else if (node.kind == nodeLoop()) {
+            size += 1 + sizeOf(s, node.first);
+        } else if (node.kind == nodeSwitch()) {
+            size += 1;
+            for (k in s.lists[node.first as usize].view()) {
+                size += sizeOf(s, s.nodes[k as usize].second);
+            }
+        } else if (node.kind == nodeCode()) {
+            size += node.lineCount as usize;
+        } else if (node.kind != nodeLabel()) {
+            size += 1;
+        }
+    }
+    return size;
+}
+
+/// Whether control can reach the end of the list (Completes).
+fn completesList(s: borrow Structurer, list: u32) -> bool {
+    let l = borrow s.lists[list as usize];
+    if (l.length == 0) {
+        return true;
+    }
+    let node = s.nodes[l[l.length - 1] as usize];
+    if (node.kind == nodeGoto() || node.kind == nodeBreak() || node.kind == nodeContinue()) {
+        return false;
+    }
+    if (node.kind == nodeCode()) {
+        return node.completes;
+    }
+    if (node.kind == nodeIf()) {
+        return completesList(s, node.first) || completesList(s, node.second);
+    }
+    if (node.kind == nodeLoop()) {
+        return breaksList(s, node.first);
+    }
+    return true; // labels, switches (conservative)
+}
+
+/// Whether the list contains a break of the loop it is the body of (Breaks).
+fn breaksList(s: borrow Structurer, list: u32) -> bool {
+    for (id in s.lists[list as usize].view()) {
+        let node = s.nodes[id as usize];
+        if (node.kind == nodeBreak()) {
+            return true;
+        }
+        if (node.kind == nodeIf() && (breaksList(s, node.first) || breaksList(s, node.second))) {
+            return true;
+        }
+    }
+    return false; // a nested loop's or switch's break is its own
+}
+
+// ---- Labels (step 6) ----
+
+fn collectGotos(s: borrow Structurer, list: u32, targets: borrow mut Vector<bool>) -> Result<void, AllocError> {
+    for (id in s.lists[list as usize].view()) {
+        let node = s.nodes[id as usize];
+        if (node.kind == nodeGoto()) {
+            markType(targets, node.block)?;
+        } else if (node.kind == nodeIf()) {
+            collectGotos(s, node.first, targets)?;
+            collectGotos(s, node.second, targets)?;
+        } else if (node.kind == nodeLoop()) {
+            collectGotos(s, node.first, targets)?;
+        } else if (node.kind == nodeSwitch()) {
+            for (k in s.lists[node.first as usize].view()) {
+                collectGotos(s, s.nodes[k as usize].second, targets)?;
+            }
+        }
+    }
+    return Ok();
+}
+
+fn removeLabels(s: borrow mut Structurer, list: u32, targets: borrow Vector<bool>) -> Result<void, AllocError> {
+    var kept = Vector<u32>.create();
+    for (id in s.lists[list as usize].view()) {
+        let node = s.nodes[id as usize];
+        if (node.kind != nodeLabel() || inSet(targets, node.block)) {
+            kept.push(id)?;
+        }
+    }
+    s.lists[list as usize] = kept;
+    for (k in 0..s.lists[list as usize].length) {
+        let node = s.nodes[s.lists[list as usize][k] as usize];
+        if (node.kind == nodeIf()) {
+            removeLabels(s, node.first, targets)?;
+            removeLabels(s, node.second, targets)?;
+        } else if (node.kind == nodeLoop()) {
+            removeLabels(s, node.first, targets)?;
+        } else if (node.kind == nodeSwitch()) {
+            for (j in 0..s.lists[node.first as usize].length) {
+                let body = s.nodes[s.lists[node.first as usize][j] as usize].second;
+                removeLabels(s, body, targets)?;
+            }
+        }
+    }
+    return Ok();
+}
+
+// ---- Printing ----
+
+fn appendIndent(out: borrow mut Vector<u8>, depth: u32) -> Result<void, AllocError> {
+    for (k in 0..(4 * depth)) {
+        out.push(' ')?;
+    }
+    return Ok();
+}
+
+/// Prints a statement tree at the given depth (Print).
+fn printTree(
+    e: borrow mut CEmitter,
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    s: borrow Structurer,
+    list: u32,
+    depth: u32,
+) -> Result<void, AllocError> {
+    let count = s.lists[list as usize].length;
+    for (i in 0..count) {
+        let node = s.nodes[s.lists[list as usize][i] as usize];
+        if (node.kind == nodeLabel()) {
+            if (i + 1 < count && e.lineDirectives) {
+                if (!e.hasPendingLabel) {
+                    e.pendingLabel.clear();
+                }
+                appendText(mut e.pendingLabel, "bb")?;
+                appendDecimal(mut e.pendingLabel, node.block as u64)?;
+                appendText(mut e.pendingLabel, ": ")?;
+                e.hasPendingLabel = true;
+            } else {
+                e.t("bb")?;
+                e.d(node.block as u64)?;
+                e.t(if (i + 1 < count) ":" else ": ;")?;
+                e.emitNoCode()?;
+            }
+        } else if (node.kind == nodeCode()) {
+            mapTo(e, c, n, sources, node.start, node.end);
+            for (k in 0..node.lineCount) {
+                // Statements are written at one level ("    "); deeper lines (a block built in place) keep their extra
+                // indent.
+                let line = s.lines[(node.lineStart + k) as usize].view();
+                appendIndent(mut e.buf, depth)?;
+                if (line.length >= 4 && line[0] == ' ' && line[1] == ' ' && line[2] == ' ' && line[3] == ' ') {
+                    e.b(line[4..])?;
+                } else {
+                    var start: usize = 0;
+                    while (start < line.length && (line[start] == ' ' || line[start] == '\t' || line[start] == '\n' ||
+                        line[start] == '\r')) {
+                        start += 1;
+                    }
+                    e.b(line[start..])?;
+                }
+                e.emit()?;
+            }
+        } else if (node.kind == nodeGoto()) {
+            mapTo(e, c, n, sources, node.start, node.end);
+            appendIndent(mut e.buf, depth)?;
+            e.t("goto bb")?;
+            e.d(node.block as u64)?;
+            e.t(";")?;
+            e.emit()?;
+        } else if (node.kind == nodeBreak() || node.kind == nodeContinue()) {
+            mapTo(e, c, n, sources, node.start, node.end);
+            appendIndent(mut e.buf, depth)?;
+            e.t(if (node.kind == nodeBreak()) "break;" else "continue;")?;
+            e.emit()?;
+        } else if (node.kind == nodeIf()) {
+            mapTo(e, c, n, sources, node.start, node.end);
+            appendIndent(mut e.buf, depth)?;
+            e.t("if (")?;
+            e.b(s.texts[node.text as usize].view())?;
+            e.t(") {")?;
+            e.emit()?;
+            var current = node;
+            loop {
+                printTree(e, c, n, sources, s, current.first, depth + 1)?;
+                let otherwise = borrow s.lists[current.second as usize];
+                if (otherwise.length == 1 && s.nodes[otherwise[0] as usize].kind == nodeIf()) {
+                    let nested = s.nodes[otherwise[0] as usize];
+                    mapTo(e, c, n, sources, nested.start, nested.end);
+                    appendIndent(mut e.buf, depth)?;
+                    e.t("} else if (")?;
+                    e.b(s.texts[nested.text as usize].view())?;
+                    e.t(") {")?;
+                    e.emit()?;
+                    current = nested;
+                    continue;
+                }
+                if (otherwise.length > 0) {
+                    appendIndent(mut e.buf, depth)?;
+                    e.t("} else {")?;
+                    e.emitNoCode()?;
+                    printTree(e, c, n, sources, s, current.second, depth + 1)?;
+                }
+                break;
+            }
+            appendIndent(mut e.buf, depth)?;
+            e.t("}")?;
+            e.emitNoCode()?;
+        } else if (node.kind == nodeLoop()) {
+            appendIndent(mut e.buf, depth)?;
+            e.t("for (;;) {")?;
+            e.emitNoCode()?;
+            printTree(e, c, n, sources, s, node.first, depth + 1)?;
+            appendIndent(mut e.buf, depth)?;
+            e.t("}")?;
+            e.emitNoCode()?;
+        } else if (node.kind == nodeSwitch()) {
+            mapTo(e, c, n, sources, node.start, node.end);
+            appendIndent(mut e.buf, depth)?;
+            e.t("switch (")?;
+            e.b(s.texts[node.text as usize].view())?;
+            e.t(") {")?;
+            e.emit()?;
+            for (k in s.lists[node.first as usize].view()) {
+                let case = s.nodes[k as usize];
+                for (label in s.lists[case.first as usize].view()) {
+                    let text = s.texts[label as usize].view();
+                    appendIndent(mut e.buf, depth)?;
+                    if (sameText(text, "default")) {
+                        e.t("default:")?;
+                    } else {
+                        e.t("case ")?;
+                        e.b(text)?;
+                        e.t(":")?;
+                    }
+                    e.emitNoCode()?;
+                }
+                printTree(e, c, n, sources, s, case.second, depth + 1)?;
+            }
+            appendIndent(mut e.buf, depth)?;
+            e.t("}")?;
+            e.emitNoCode()?;
+        }
+    }
+    return Ok();
+}

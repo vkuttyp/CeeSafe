@@ -43,6 +43,7 @@ struct CBuildOptions {
     placement: bool;             // memory-model.md §5 (off: --no-placement)
     bce: bool;                   // optimisations.md §2 (off: --no-bce)
     oce: bool;                   // optimisations.md §3 (off: --no-oce)
+    structured: bool;            // c-backend.md §3 (off: --flat-c)
 }
 
 fn generateC(
@@ -93,6 +94,7 @@ fn generateC(
         trial.checks = analyzeChecks(c, n)?;
     }
     trial.bce = o.bce;
+    trial.structured = o.structured;
     trial.oce = o.oce;
     setUpEmitter(mut trial, c, n)?;
     emitProgram(mut trial, c, n, sources)?;
@@ -113,6 +115,7 @@ fn generateC(
     }
     emitter.checks = trial.checks;
     emitter.bce = o.bce;
+    emitter.structured = o.structured;
     emitter.oce = o.oce;
     emitter.usedTypes = trial.usedTypes;
     setUpEmitter(mut emitter, c, n)?;
