@@ -10,13 +10,14 @@
 /// What a name denotes (the reference's `object` items and builtins).
 enum Entity {
     None,
-    Local(u32),       // HirProgram.locals
-    Function(u32),    // HirProgram.functions
-    Constant(u32),    // Checker.constants
-    LibraryItem(u32), // a library item not yet ported (S5): its AST item
-    Struct(u32),      // Checker.structs
-    Enum(u32),        // Checker.enums
-    Builtin(u32),     // Console, Process, ... (the reference's Builtin enum, by declaration index)
+    Local(u32),           // HirProgram.locals
+    Function(u32),        // HirProgram.functions
+    Constant(u32),        // Checker.constants
+    LibraryItem(u32),     // a library item not yet ported (S5): its AST item
+    Struct(u32),          // Checker.structs
+    Enum(u32),            // Checker.enums
+    Builtin(u32),         // Console, Process, ... (the reference's Builtin enum, by declaration index)
+    GenericFunction(u32), // Checker.genericFunctions
 }
 
 /// The reference's Builtin enum members S1 uses, by declaration index.
@@ -76,7 +77,14 @@ struct Checker {
     regions: Vector<u32>; // the region names in scope (the reference's _regions)
     frameMemory: u32;     // a scratch frame's region parts, as fields
     frameAllocation: u32;
-    flowNames: Vector<Vector<u64>>; // ResolveFlows' per-parameter names, while it runs
+    flowNames: Vector<Vector<u64>>;   // ResolveFlows' per-parameter names, while it runs
+    typeEnvironment: Vector<EnvPair>; // the type parameters in scope (the reference's _typeEnvironment)
+    envPairs: Vector<EnvPair>;        // stored environments, by range
+    genericFunctions: Vector<GenericFunctionEntry>;
+    scopedInstanceReports: Vector<SpanIn>;
+    instantiating: u32;
+    recursionState: Vector<u8>; // by type id: 0 new, 1 on the stack, 2 done (kept across runs)
+    copyDone: Vector<bool>;     // by type id (kept across runs)
     pendingElements: Vector<PendingElement>;
     letKeywords: Vector<LetKeyword>;
 
@@ -287,6 +295,10 @@ struct Checker {
                     return Ok(this.types.error);
                 }
                 let ident = this.front.ast.idents[this.front.ast.at(q.parts, 0) as usize];
+                let parameter = environmentType(this, ident.symbol);
+                if (parameter != none()) {
+                    return Ok(parameter); // a type parameter in scope, or what it is instantiated with (§20)
+                }
                 var text = Vector<u8>.create();
                 appendBytes(mut text, this.name(ident.symbol))?;
                 let undeclared = match (this.item(ident.symbol)) {
@@ -295,6 +307,21 @@ struct Checker {
                 };
                 if (isBareContainerName(text.view()) && undeclared) {
                     return resolveBareContainer(this, text.view(), span);
+                }
+                let genericItem = match (this.item(ident.symbol)) {
+                    Entity.Struct(s) => isGenericItem(this, this.structs[s as usize].item),
+                    Entity.Enum(e) => isGenericItem(this, this.enums[e as usize].item),
+                    _ => false,
+                };
+                if (genericItem) {
+                    var message = Vector<u8>.create();
+                    appendText(mut message, "'")?;
+                    appendBytes(mut message, text.view())?;
+                    appendText(mut message, "' is generic: give its type arguments, e.g. '")?;
+                    appendBytes(mut message, text.view())?;
+                    appendText(mut message, "<i32>'")?;
+                    this.error(unknownType(), span.start, span.end, message)?;
+                    return Ok(this.types.error);
                 }
                 var found = this.types.lookup(text.view());
                 if (found == none()) {

@@ -116,8 +116,8 @@ fn checkRegionArgument(c: borrow mut Checker, typ: u32) -> Result<bool, AllocErr
     return Ok(false);
 }
 
-/// `S<a>` or `E<a>` for a struct or enum with region parameters and no type parameters (ResolveGenericItemType's
-/// region part); generic items are S4's.
+/// `S<a, T>` or `E<a, T>` for a user struct or enum (ResolveGenericItemType, §20.2, §25.2): region arguments are
+/// checked and erased, type arguments resolved and the item instantiated.
 fn resolveRegionItemType(
     c: borrow mut Checker,
     typ: u32,
@@ -125,6 +125,8 @@ fn resolveRegionItemType(
     text: Slice<u8>,
     arguments: Range,
     span: Span,
+    isStruct: bool,
+    index: u32,
 ) -> Result<u32, AllocError> {
     var regions = emptyRange();
     var parameters = emptyRange();
@@ -180,8 +182,27 @@ fn resolveRegionItemType(
         c.error(unknownType(), span.start, span.end, message)?;
         return Ok(c.types.error);
     }
-    c.notPorted(span.start, span.end, "a generic struct or enum", "S4")?;
-    return Ok(c.types.error);
+    var resolved = Vector<u32>.create();
+    for (k in (arguments.count - typeArguments)..arguments.count) {
+        let argumentSyntax = c.front.ast.at(arguments, k);
+        let t = c.resolveType(argumentSyntax, false)?;
+        if (c.types.isBottom(t)) {
+            return Ok(c.types.error);
+        }
+        if (c.types.holdsRegionValue(t)) {
+            let argumentSpan = c.front.ast.typeSpans[argumentSyntax as usize];
+            var message = Vector<u8>.create();
+            appendQuotedType(mut message, c, t)?;
+            appendText(
+                mut message,
+                " cannot be a type argument of a user type: region values and pool boxes stay in locals (type-system.md §25.4)",
+            )?;
+            c.error(referenceNotAllowed(), argumentSpan.start, argumentSpan.end, message)?;
+            return Ok(c.types.error);
+        }
+        resolved.push(t)?; // scoped arguments make a scoped instance (§25.3)
+    }
+    return instantiateItemType(c, isStruct, index, resolved.view(), span);
 }
 
 // ---- pools ----

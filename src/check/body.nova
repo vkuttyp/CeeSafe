@@ -8,6 +8,8 @@ fn checkFunctionBody(c: borrow mut Checker, function: u32) -> Result<void, Alloc
     var scope = Vector<u32>.create();
     regionScope(c, c.hir.functions[function as usize].syntax, c.hir.functions[function as usize].owner, mut scope)?;
     c.regions = scope;
+    let environment = c.hir.functions[function as usize].environment;
+    enterEnvironment(c, environment)?;
     c.loopDepth = 0;
     c.scopes.truncate(0);
     c.scopeStarts.truncate(0);
@@ -53,6 +55,7 @@ fn checkFunctionBody(c: borrow mut Checker, function: u32) -> Result<void, Alloc
     analyzeFlow(c, function)?;
     c.function = none();
     c.regions = Vector<u32>.create();
+    c.typeEnvironment.truncate(0);
     return Ok();
 }
 

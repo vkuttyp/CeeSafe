@@ -1,0 +1,41 @@
+struct Pair<T> { first: T; second: T; fn flip(this) -> Pair<T> => Pair { first: this.second, second: this.first }; fn make(a: T, b: T) -> Pair<T> => Pair { first: a, second: b }; }
+struct Wrap<T, U> { a: T; b: U; }
+enum Tree<T> { Leaf(T), Node(Box<Tree<T>>, Box<Tree<T>>) }
+enum Maybe<T> { Nothing, Just(T) }
+struct Holder<region r, T> { view: StringView<r>; value: T; }
+
+fn id<T>(x: T) -> T => x;
+fn swap<A, B>(w: Wrap<A, B>) -> Wrap<B, A> => Wrap { a: w.b, b: w.a };
+fn firstOf<T: Copy>(p: borrow Pair<T>) -> T => p.first;
+fn wrapOpt<T>(x: T) -> T? => x;
+fn unwrapOr<T>(m: Maybe<T>, fallback: T) -> T => match (m) {
+    Maybe.Just(v) => v,
+    Maybe.Nothing => fallback,
+};
+fn depth<T>(t: borrow Tree<T>) -> u32 {
+    match (t) {
+        Tree.Leaf(_) => { return 1; }
+        Tree.Node(l, r) => { return depth(l) + depth(r); }
+    }
+}
+fn boxed<T>(x: T) -> Result<Box<T>, AllocError> => Box.create(x);
+fn push<T>(v: borrow mut Vector<T>, x: T) -> Result<void, AllocError> => v.push(x);
+
+fn main() {
+    let p = Pair { first: 1u8, second: 2u8 };
+    let q = id(p).flip();
+    let f = firstOf(q);
+    let m = Pair<i64>.make(4, 5);
+    let w = swap(Wrap { a: 1, b: true });
+    let n: Maybe<u16> = Maybe.Just(3);
+    let o = Maybe<bool>.Nothing;
+    let v = unwrapOr(n, 0);
+    let t = Tree.Leaf(5);
+    let d = depth(t);
+    let opt = wrapOpt(7);
+    let e = id<Maybe<u16>>(n);
+    let h = Holder { view: "x", value: 2 };
+    let b = boxed(Pair { first: 'a', second: 'b' })!;
+    var xs = Vector<i32>.create();
+    push(mut xs, 3)!;
+}

@@ -1,0 +1,856 @@
+// Generics (the reference's DeclareTypeParameters, GenericFunctionEntry, InstantiateStruct, InstantiateEnum,
+// InstantiateFunction, FinishLateTypes, CheckInstance, Quietly, Unify, TypeArgumentsFor, ResolveGenericItemType,
+// CheckGenericCall, StaticOwner and CheckBounds' marker bounds): P3 S4a/S4b (type-system.md §20). Interface bounds,
+// impls and methods through bounds are S4c; `dyn` is S4d.
+
+fn cannotInferTypeArguments() -> u32 => 265;
+fn instantiationTooDeep() -> u32 => 266;
+fn boundNotSatisfied() -> u32 => 268;
+fn scopedTypeArgument() -> u32 => 274;
+fn notSend() -> u32 => 334;
+
+/// A type parameter's name and what it stands for: itself in a generic version, a type in an instance.
+struct EnvPair {
+    symbol: u32;
+    typ: u32;
+}
+
+/// A generic function (GenericFunctionEntry): checked once with opaque type parameters, instantiated on use.
+struct GenericFunctionEntry {
+    syntax: u32; // Ast.functions
+    file: u32;
+    generic: u32;      // the generic version (a HIR function)
+    parameters: Range; // its type parameters, in TypeTable.lists
+}
+
+/// A diagnostics mark for CheckInstance and Quietly: diagnostics after it are dropped when the trial ends.
+fn diagnosticsMark(c: borrow Checker) -> usize => c.front.diagnostics.items.length;
+
+/// Quietly's end: the trial's diagnostics are dropped.
+fn dropDiagnosticsSince(c: borrow mut Checker, mark: usize) {
+    c.front.diagnostics.items.truncate(mark);
+}
+
+/// The type a name stands for in the current type environment, or none.
+fn environmentType(c: borrow Checker, symbol: u32) -> u32 {
+    var k = c.typeEnvironment.length;
+    while (k > 0) {
+        k -= 1;
+        if (c.typeEnvironment[k].symbol == symbol) {
+            return c.typeEnvironment[k].typ;
+        }
+    }
+    return none();
+}
+
+/// Stores an environment, returning its range in Checker.envPairs.
+fn storeEnvironment(c: borrow mut Checker, pairs: Slice<EnvPair>) -> Result<Range, AllocError> {
+    let start = truncate<u32>(c.envPairs.length);
+    for (p in pairs) {
+        c.envPairs.push(p)?;
+    }
+    return Ok(Range { start: start, count: truncate<u32>(pairs.length) });
+}
+
+/// Makes a stored environment the current one, returning the previous.
+fn enterEnvironment(c: borrow mut Checker, env: Range) -> Result<Vector<EnvPair>, AllocError> {
+    var old = Vector<EnvPair>.create();
+    for (p in c.typeEnvironment.view()) {
+        old.push(p)?;
+    }
+    c.typeEnvironment.truncate(0);
+    for (k in 0..env.count) {
+        c.typeEnvironment.push(c.envPairs[(env.start + k) as usize])?;
+    }
+    return Ok(old);
+}
+
+fn restoreEnvironment(c: borrow mut Checker, old: Vector<EnvPair>) {
+    c.typeEnvironment = old;
+}
+
+/// Does a stored environment hold a generic type (HirFunction.IsGeneric's first half)?
+fn environmentIsGeneric(c: borrow Checker, env: Range) -> bool {
+    for (k in 0..env.count) {
+        if (c.types.isGeneric(c.envPairs[(env.start + k) as usize].typ)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// HirFunction.IsGeneric: its environment holds a generic type, or its owner is generic.
+fn functionIsGeneric(c: borrow Checker, function: u32) -> bool {
+    let f = borrow c.hir.functions[function as usize];
+    return environmentIsGeneric(c, f.environment) || (f.owner != none() && c.types.isGeneric(f.owner));
+}
+
+/// HirFunction.IsInstantiation: a monomorphised copy of generic code.
+fn functionIsInstantiation(c: borrow Checker, function: u32) -> bool =>
+    c.hir.functions[function as usize].environment.count > 0 && !functionIsGeneric(c, function);
+
+/// The type parameters of a declaration (DeclareTypeParameters): each a new type, with its marker bounds; interface
+/// bounds are S4c's. `env` gets the outer environment's pairs and then these.
+fn declareTypeParameters(
+    c: borrow mut Checker,
+    syntax: Range,
+    parameters: borrow mut Vector<u32>,
+    env: borrow mut Vector<EnvPair>,
+) -> Result<void, AllocError> {
+    for (k in 0..syntax.count) {
+        let p = c.front.ast.typeParameters[c.front.ast.at(syntax, k) as usize];
+        let ident = c.front.ast.idents[p.name as usize];
+        var text = Vector<u8>.create();
+        appendBytes(mut text, c.name(ident.symbol))?;
+        var inEnvironment = false;
+        for (e in env.view()) {
+            if (e.symbol == ident.symbol) {
+                inEnvironment = true;
+            }
+        }
+        let isItem = match (c.item(ident.symbol)) {
+            Entity.None => false,
+            _ => true,
+        };
+        if (inEnvironment || c.types.lookup(text.view()) != none() || isItem) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "type parameter '")?;
+            appendBytes(mut message, text.view())?;
+            appendText(mut message, if (inEnvironment) "' is declared twice" else "' would shadow the type or item '")?;
+            if (!inEnvironment) {
+                appendBytes(mut message, text.view())?;
+                appendText(mut message, "'")?;
+            }
+            c.error(duplicateItem(), ident.start, ident.end, message)?;
+        }
+        let typ = c.types.createTypeParameter(text.view())?;
+        env.push(EnvPair { symbol: ident.symbol, typ: typ })?;
+        parameters.push(typ)?;
+    }
+    // Bounds may mention any of the parameters (`T: Comparable<T>`), so they are resolved last.
+    let saved = enterEnvironmentPairs(c, env.view())?;
+    for (k in 0..syntax.count) {
+        let p = c.front.ast.typeParameters[c.front.ast.at(syntax, k) as usize];
+        let parameterInfo = c.types.info(parameters[k as usize]).typeParameter;
+        for (b in 0..p.bounds.count) {
+            let bound = c.front.ast.at(p.bounds, b);
+            let marker = singleName(c, bound);
+            let undeclared = marker != none() && match (c.item(marker)) {
+                Entity.None => true,
+                _ => false,
+            };
+            if (undeclared && sameText(c.name(marker), "Copy")) {
+                c.types.typeParameters[parameterInfo as usize].copyBound = true;
+            } else if (undeclared && sameText(c.name(marker), "Send")) {
+                c.types.typeParameters[parameterInfo as usize].sendBound = true; // inferred properties as bounds (§38.1)
+            } else if (undeclared && sameText(c.name(marker), "Share")) {
+                c.types.typeParameters[parameterInfo as usize].shareBound = true;
+            } else {
+                let span = c.front.ast.typeSpans[bound as usize];
+                c.notPorted(span.start, span.end, "an interface bound", "S4c")?;
+            }
+        }
+    }
+    restoreEnvironment(c, saved);
+    return Ok();
+}
+
+fn enterEnvironmentPairs(c: borrow mut Checker, pairs: Slice<EnvPair>) -> Result<Vector<EnvPair>, AllocError> {
+    var old = Vector<EnvPair>.create();
+    for (p in c.typeEnvironment.view()) {
+        old.push(p)?;
+    }
+    c.typeEnvironment.truncate(0);
+    for (p in pairs) {
+        c.typeEnvironment.push(p)?;
+    }
+    return Ok(old);
+}
+
+/// `Name<A, B>` with the type names of `arguments` (the reference's `$"{text}<{string.Join(", ", arguments)}>"`).
+fn appendInstanceName(
+    out: borrow mut Vector<u8>,
+    c: borrow Checker,
+    text: Slice<u8>,
+    arguments: Slice<u32>,
+) -> Result<void, AllocError> {
+    appendBytes(out, text)?;
+    out.push('<')?;
+    for (k in 0..arguments.length) {
+        if (k > 0) {
+            appendText(out, ", ")?;
+        }
+        appendBytes(out, c.typeName(arguments[k]))?;
+    }
+    return out.push('>');
+}
+
+fn sameTypes(c: borrow Checker, list: Range, arguments: Slice<u32>) -> bool {
+    if (list.count as usize != arguments.length) {
+        return false;
+    }
+    for (k in 0..arguments.length) {
+        if (c.types.listAt(list, truncate<u32>(k)) != arguments[k]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn listTypes(c: borrow Checker, list: Range, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    for (k in 0..list.count) {
+        out.push(c.types.listAt(list, k))?;
+    }
+    return Ok();
+}
+
+/// The declaration's type parameters as EnvPairs with `arguments`.
+fn zipEnvironment(
+    c: borrow Checker,
+    typeParameters: Range,
+    arguments: Slice<u32>,
+    out: borrow mut Vector<EnvPair>,
+) -> Result<void, AllocError> {
+    for (k in 0..typeParameters.count) {
+        let p = c.front.ast.typeParameters[c.front.ast.at(typeParameters, k) as usize];
+        out.push(EnvPair { symbol: c.front.ast.idents[p.name as usize].symbol, typ: arguments[k as usize] })?;
+    }
+    return Ok();
+}
+
+fn itemTypeParameters(c: borrow Checker, item: u32) -> Range => match (c.front.ast.items[item as usize].kind) {
+    ItemKind.Struct(k) => c.front.ast.structs[k as usize].typeParameters,
+    ItemKind.Enum(_, typeParameters, _) => typeParameters,
+    _ => emptyRange(),
+};
+
+// ---- CheckInstance ----
+
+/// CheckInstance's end (§20.3): the trial's diagnostics are dropped. If it failed for an instance with a scoped type
+/// argument, the generic needs an unscoped type there, reported where the instance is written (N0274); else a failed
+/// function instance records why, for N0222 after the ownership checks.
+fn endInstance(
+    c: borrow mut Checker,
+    mark: usize,
+    arguments: Slice<u32>,
+    generic: Slice<u8>,
+    file: u32,
+    span: Span,
+    instance: u32,
+) -> Result<void, AllocError> {
+    var first = none();
+    for (k in mark..c.front.diagnostics.items.length) {
+        if (first == none() && c.front.diagnostics.items[k].isError) {
+            first = truncate<u32>(k);
+        }
+    }
+    let failed = first != none();
+    var firstMessage = Vector<u8>.create();
+    if (failed) {
+        appendBytes(mut firstMessage, c.front.diagnostics.items[first as usize].message.view())?;
+    }
+    dropDiagnosticsSince(c, mark);
+    var scoped = none();
+    for (a in arguments) {
+        if (scoped == none() && c.types.isScoped(a)) {
+            scoped = a;
+        }
+    }
+    if (failed && scoped != none()) {
+        for (r in c.scopedInstanceReports.view()) {
+            if (r.file == file && r.start == span.start && r.end == span.end) {
+                return Ok();
+            }
+        }
+        c.scopedInstanceReports.push(SpanIn { file: file, start: span.start, end: span.end })?;
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, generic)?;
+        appendText(mut message, "' cannot be used with the scoped type ")?;
+        appendQuotedType(mut message, c, scoped)?;
+        appendText(
+            mut message,
+            ": it needs an unscoped type there (for example, it puts the value in a 'Box' or an array; type-system.md §25.4)",
+        )?;
+        return c.front.diagnostics.error(scopedTypeArgument(), file, span.start, span.end, message);
+    }
+    if (failed && instance != none()) {
+        var text = Vector<u8>.create();
+        appendText(mut text, "'")?;
+        appendBytes(mut text, generic)?;
+        appendText(mut text, "' cannot be used with ")?;
+        for (k in 0..arguments.length) {
+            if (k > 0) {
+                appendText(mut text, ", ")?;
+            }
+            appendQuotedType(mut text, c, arguments[k])?;
+        }
+        appendText(mut text, ": for these type arguments its body has an error: ")?;
+        appendBytes(mut text, firstMessage.view())?;
+        appendText(mut text, " (type-system.md §20.4)")?;
+        c.hir.functions[instance as usize].hasInstanceError = true;
+        c.hir.functions[instance as usize].instanceError = text;
+    }
+    return Ok();
+}
+
+/// A span in a file.
+struct SpanIn {
+    file: u32;
+    start: u32;
+    end: u32;
+}
+
+// ---- bounds ----
+
+/// CheckBounds' marker bounds (Copy, Send, Share); interface bounds are S4c's.
+fn checkBounds(
+    c: borrow mut Checker,
+    parameters: Slice<u32>,
+    arguments: Slice<u32>,
+    span: Span,
+) -> Result<void, AllocError> {
+    for (k in 0..parameters.length) {
+        let parameter = parameters[k];
+        let argument = arguments[k];
+        if (c.types.isBottom(argument)) {
+            continue;
+        }
+        let info = borrow c.types.typeParameters[c.types.info(parameter).typeParameter as usize];
+        let copyBound = info.copyBound;
+        let sendBound = info.sendBound;
+        let shareBound = info.shareBound;
+        if (copyBound && !c.types.isCopy(argument)) {
+            var message = Vector<u8>.create();
+            appendQuotedType(mut message, c, argument)?;
+            appendText(mut message, " is not Copy, but ")?;
+            appendQuotedType(mut message, c, parameter)?;
+            appendText(mut message, " must be ('")?;
+            appendBytes(mut message, c.typeName(parameter))?;
+            appendText(mut message, ": Copy')")?;
+            c.error(boundNotSatisfied(), span.start, span.end, message)?;
+        }
+        if (sendBound && !c.types.isSendType(argument)?) {
+            var message = Vector<u8>.create();
+            appendQuotedType(mut message, c, argument)?;
+            appendText(mut message, " is not Send, but ")?;
+            appendQuotedType(mut message, c, parameter)?;
+            appendText(mut message, " must be ('")?;
+            appendBytes(mut message, c.typeName(parameter))?;
+            appendText(
+                mut message,
+                ": Send'): it holds a loan, a raw pointer or another value tied to one thread (type-system.md §38.1)",
+            )?;
+            c.error(notSend(), span.start, span.end, message)?;
+        }
+        if (shareBound && !c.types.isShare(argument)?) {
+            var message = Vector<u8>.create();
+            appendQuotedType(mut message, c, argument)?;
+            appendText(mut message, " is not Share, but ")?;
+            appendQuotedType(mut message, c, parameter)?;
+            appendText(mut message, " must be ('")?;
+            appendBytes(mut message, c.typeName(parameter))?;
+            appendText(mut message, ": Share'; type-system.md §38.1)")?;
+            c.error(notSend(), span.start, span.end, message)?;
+        }
+    }
+    return Ok();
+}
+
+// ---- instantiation ----
+
+/// The instantiation of a generic struct template with `arguments` (InstantiateStruct, §20.4).
+fn instantiateStruct(
+    c: borrow mut Checker,
+    template: u32,
+    arguments: Slice<u32>,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let entry = c.structs[template as usize];
+    let definition = c.types.info(entry.typ).structDef;
+    let parameters = c.types.structs[definition as usize].typeArguments;
+    if (sameTypes(c, parameters, arguments)) {
+        return Ok(template);
+    }
+    var parameterTypes = Vector<u32>.create();
+    listTypes(c, parameters, mut parameterTypes)?;
+    checkBounds(c, parameterTypes.view(), arguments, span)?;
+    for (k in 0..c.structs.length) {
+        let s = c.structs[k];
+        if (s.template == template && sameTypes(
+            c,
+            c.types.structs[c.types.info(s.typ).structDef as usize].typeArguments,
+            arguments,
+        )) {
+            return Ok(truncate<u32>(k));
+        }
+    }
+    let item = c.front.ast.items[entry.item as usize];
+    let symbol = c.front.ast.idents[item.name as usize].symbol;
+    var text = Vector<u8>.create();
+    appendBytes(mut text, c.name(symbol))?;
+    var name = Vector<u8>.create();
+    appendInstanceName(mut name, c, text.view(), arguments)?;
+    let hasRegions = c.types.structs[definition as usize].hasRegionParameters;
+    let typ = c.types.createStruct(name.view(), entry.item, entry.file, hasRegions)?;
+    let instanceDefinition = c.types.info(typ).structDef;
+    let list = c.types.addList(arguments)?;
+    c.types.structs[instanceDefinition as usize].typeArguments = list;
+    c.types.structs[instanceDefinition as usize].isThreadSafe = c.types.structs[definition as usize].isThreadSafe;
+    var pairs = Vector<EnvPair>.create();
+    zipEnvironment(c, itemTypeParameters(c, entry.item), arguments, mut pairs)?;
+    let env = storeEnvironment(c, pairs.view())?;
+    c.structs.push(StructEntry { item: entry.item, file: entry.file, typ: typ, environment: env, template: template })?;
+    let index = truncate<u32>(c.structs.length - 1);
+    if (c.membersResolved) {
+        c.instantiating += 1;
+        let mark = diagnosticsMark(c);
+        resolveStructMembers(c, index)?; // checked in the generic version
+        let file = c.file;
+        endInstance(c, mark, arguments, text.view(), file, span, none())?;
+        c.instantiating -= 1;
+        finishLateTypes(c)?;
+    }
+    return Ok(index);
+}
+
+/// As instantiateStruct, for enums (InstantiateEnum).
+fn instantiateEnum(c: borrow mut Checker, template: u32, arguments: Slice<u32>, span: Span) -> Result<u32, AllocError> {
+    let entry = c.enums[template as usize];
+    let definition = c.types.info(entry.typ).enumDef;
+    let parameters = c.types.enums[definition as usize].typeArguments;
+    if (sameTypes(c, parameters, arguments)) {
+        return Ok(template);
+    }
+    var parameterTypes = Vector<u32>.create();
+    listTypes(c, parameters, mut parameterTypes)?;
+    checkBounds(c, parameterTypes.view(), arguments, span)?;
+    for (k in 0..c.enums.length) {
+        let e = c.enums[k];
+        if (e.template == template && sameTypes(
+            c,
+            c.types.enums[c.types.info(e.typ).enumDef as usize].typeArguments,
+            arguments,
+        )) {
+            return Ok(truncate<u32>(k));
+        }
+    }
+    let item = c.front.ast.items[entry.item as usize];
+    let symbol = c.front.ast.idents[item.name as usize].symbol;
+    var text = Vector<u8>.create();
+    appendBytes(mut text, c.name(symbol))?;
+    var name = Vector<u8>.create();
+    appendInstanceName(mut name, c, text.view(), arguments)?;
+    let hasRegions = c.types.enums[definition as usize].hasRegionParameters;
+    let typ = c.types.createEnum(name.view(), entry.item, entry.file, hasRegions)?;
+    let instanceDefinition = c.types.info(typ).enumDef;
+    let list = c.types.addList(arguments)?;
+    c.types.enums[instanceDefinition as usize].typeArguments = list;
+    var pairs = Vector<EnvPair>.create();
+    zipEnvironment(c, itemTypeParameters(c, entry.item), arguments, mut pairs)?;
+    let env = storeEnvironment(c, pairs.view())?;
+    c.enums.push(
+        EnumEntry {
+            item: entry.item,
+            file: entry.file,
+            typ: typ,
+            builtin: none(),
+            environment: env,
+            template: template,
+        },
+    )?;
+    let index = truncate<u32>(c.enums.length - 1);
+    if (c.membersResolved) {
+        c.instantiating += 1;
+        let mark = diagnosticsMark(c);
+        resolveEnumVariants(c, index)?;
+        let file = c.file;
+        endInstance(c, mark, arguments, text.view(), file, span, none())?;
+        c.instantiating -= 1;
+        finishLateTypes(c)?;
+    }
+    return Ok(index);
+}
+
+/// Recursion, Copy and drop for types instantiated after the declaration phase, once the outermost instantiation is
+/// complete (FinishLateTypes).
+fn finishLateTypes(c: borrow mut Checker) -> Result<void, AllocError> {
+    if (c.copyKnown && c.instantiating == 0) {
+        checkStructRecursion(c)?;
+        computeCopyAndDrop(c)?;
+    }
+    return Ok();
+}
+
+/// The instantiation of a generic function with `arguments` (InstantiateFunction, §20.4); none after N0266.
+fn instantiateFunction(c: borrow mut Checker, g: u32, arguments: Slice<u32>, span: Span) -> Result<u32, AllocError> {
+    let entry = c.genericFunctions[g as usize];
+    if (sameTypes(c, entry.parameters, arguments)) {
+        return Ok(entry.generic);
+    }
+    var parameterTypes = Vector<u32>.create();
+    listTypes(c, entry.parameters, mut parameterTypes)?;
+    checkBounds(c, parameterTypes.view(), arguments, span)?;
+    for (k in 0..c.hir.functions.length) {
+        let f = borrow c.hir.functions[k];
+        if (f.genericEntry == g && sameTypes(c, f.typeArguments, arguments)) {
+            return Ok(truncate<u32>(k));
+        }
+    }
+    let decl = c.front.ast.functions[entry.syntax as usize];
+    let symbol = c.front.ast.idents[decl.name as usize].symbol;
+    let depth = (if (c.function == none()) 0u32 else c.hir.functions[c.function as usize].instantiationDepth) + 1;
+    if (depth > 64) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "instantiating ")?;
+        appendQuotedName(mut message, c, symbol)?;
+        appendText(mut message, " here makes more than 64 nested instantiations (polymorphic recursion?)")?;
+        c.error(instantiationTooDeep(), span.start, span.end, message)?;
+        return Ok(none());
+    }
+    var pairs = Vector<EnvPair>.create();
+    zipEnvironment(c, decl.typeParameters, arguments, mut pairs)?;
+    let env = storeEnvironment(c, pairs.view())?;
+    let savedFile = c.file;
+    c.file = entry.file;
+    // The generic version's signature was checked; the instantiation's would only repeat it (§20.3).
+    var text = Vector<u8>.create();
+    appendBytes(mut text, c.name(symbol))?;
+    let mark = diagnosticsMark(c);
+    let instance = declareFunctionIn(c, entry.syntax, none(), env)?;
+    endInstance(c, mark, arguments, text.view(), savedFile, span, none())?;
+    c.file = savedFile;
+    let list = c.types.addList(arguments)?;
+    c.hir.functions[instance as usize].typeArguments = list;
+    c.hir.functions[instance as usize].instantiationDepth = depth;
+    c.hir.functions[instance as usize].siteFile = savedFile;
+    c.hir.functions[instance as usize].siteStart = span.start;
+    c.hir.functions[instance as usize].siteEnd = span.end;
+    c.hir.functions[instance as usize].genericEntry = g;
+    return Ok(instance);
+}
+
+// ---- inference ----
+
+struct Found {
+    parameter: u32;
+    typ: u32;
+}
+
+fn foundFor(found: borrow Vector<Found>, parameter: u32) -> u32 {
+    for (f in found.view()) {
+        if (f.parameter == parameter) {
+            return f.typ;
+        }
+    }
+    return none();
+}
+
+/// Matches a declared type that mentions `parameters` against an actual type, recording what each parameter must be
+/// (Unify, §20.2). Mismatches are not reported here: the real check follows.
+fn unify(
+    c: borrow Checker,
+    declared: u32,
+    actual: u32,
+    parameters: Slice<u32>,
+    found: borrow mut Vector<Found>,
+) -> Result<void, AllocError> {
+    if (c.types.isBottom(actual)) {
+        return Ok();
+    }
+    for (p in parameters) {
+        if (p == declared) {
+            if (foundFor(found, declared) == none()) {
+                found.push(Found { parameter: declared, typ: actual })?;
+            }
+            return Ok();
+        }
+    }
+    let d = c.types.info(declared);
+    let a = c.types.info(actual);
+    if (c.types.is(declared, TypeKind.Reference)) {
+        // An argument for a `borrow T` parameter is borrowed implicitly.
+        let inner = if (c.types.is(actual, TypeKind.Reference)) a.pointee else actual;
+        return unify(c, d.pointee, inner, parameters, found);
+    }
+    if (c.types.is(actual, TypeKind.Box) && !c.types.is(declared, TypeKind.Box)) {
+        return unify(c, declared, a.pointee, parameters, found); // a box converts to its contents (§18.2)
+    }
+    if (typeKindIndex(d.kind) != typeKindIndex(a.kind)) {
+        return Ok();
+    }
+    if (c.types.is(declared, TypeKind.Struct)) {
+        let ds = borrow c.types.structs[d.structDef as usize];
+        let actualStruct = borrow c.types.structs[a.structDef as usize];
+        if (ds.item != none() && ds.item == actualStruct.item) {
+            for (k in 0..ds.typeArguments.count) {
+                if (k < actualStruct.typeArguments.count) {
+                    unify(
+                        c,
+                        c.types.listAt(ds.typeArguments, k),
+                        c.types.listAt(actualStruct.typeArguments, k),
+                        parameters,
+                        found,
+                    )?;
+                }
+            }
+        }
+        return Ok();
+    }
+    if (c.types.is(declared, TypeKind.Enum)) {
+        let de = borrow c.types.enums[d.enumDef as usize];
+        let ae = borrow c.types.enums[a.enumDef as usize];
+        if (de.resultOk != none() && ae.resultOk != none()) {
+            unify(c, de.resultOk, ae.resultOk, parameters, found)?;
+            return unify(c, de.resultErr, ae.resultErr, parameters, found);
+        }
+        if (de.optionType != none() && ae.optionType != none()) {
+            return unify(c, de.optionType, ae.optionType, parameters, found);
+        }
+        if (de.item != none() && de.item == ae.item) {
+            for (k in 0..de.typeArguments.count) {
+                if (k < ae.typeArguments.count) {
+                    unify(
+                        c,
+                        c.types.listAt(de.typeArguments, k),
+                        c.types.listAt(ae.typeArguments, k),
+                        parameters,
+                        found,
+                    )?;
+                }
+            }
+        }
+        return Ok();
+    }
+    if (c.types.is(declared, TypeKind.Vector)) {
+        if (c.types.isString(declared) == c.types.isString(actual)) {
+            return unify(c, c.types.info(d.pointee).element, c.types.info(a.pointee).element, parameters, found);
+        }
+        return Ok();
+    }
+    if (c.types.is(declared, TypeKind.StableVector)) {
+        return unify(c, c.types.info(d.pointee).element, c.types.info(a.pointee).element, parameters, found);
+    }
+    if (c.types.is(declared, TypeKind.SlotMap) || c.types.is(declared, TypeKind.Handle)) {
+        return unify(c, d.element, a.element, parameters, found);
+    }
+    if (c.types.is(declared, TypeKind.Array) || c.types.is(declared, TypeKind.Box)) {
+        let de = if (d.element != none()) d.element else d.pointee;
+        let ae = if (a.element != none()) a.element else a.pointee;
+        return unify(c, de, ae, parameters, found);
+    }
+    return Ok();
+}
+
+/// One (declared type, expression) pair for inference.
+struct InferencePair {
+    declared: u32;
+    value: u32; // an expression
+}
+
+/// Type arguments for `parameters` (TypeArgumentsFor): from the explicit list, else from the expected instance, else
+/// inferred from `pairs`. False after an error (reported).
+fn typeArgumentsFor(
+    c: borrow mut Checker,
+    what: Slice<u8>,
+    parameters: Slice<u32>,
+    explicit: Range,
+    expected: Range,
+    hasExpected: bool,
+    pairs: Slice<InferencePair>,
+    span: Span,
+    out: borrow mut Vector<u32>,
+) -> Result<bool, AllocError> {
+    if (explicit.count > 0) {
+        if (explicit.count as usize != parameters.length) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "'")?;
+            appendBytes(mut message, what)?;
+            appendText(mut message, "' takes ")?;
+            appendDecimal(mut message, parameters.length as u64)?;
+            appendText(mut message, " type argument(s), but ")?;
+            appendDecimal(mut message, explicit.count as u64)?;
+            appendText(mut message, " were given")?;
+            c.error(argumentCount(), span.start, span.end, message)?;
+            return Ok(false);
+        }
+        var bottom = false;
+        for (k in 0..explicit.count) {
+            let argumentSyntax = c.front.ast.at(explicit, k);
+            let t = c.resolveType(argumentSyntax, false)?;
+            if (c.types.isBottom(t)) {
+                bottom = true;
+            }
+            out.push(t)?;
+        }
+        return Ok(!bottom);
+    }
+    if (hasExpected) {
+        listTypes(c, expected, out)?;
+        return Ok(true);
+    }
+    var found = Vector<Found>.create();
+    for (p in pairs) {
+        let value = match (c.front.ast.exprs[p.value as usize]) {
+            ExprNode.MutArg(operand) => operand,
+            _ => p.value,
+        };
+        let mark = diagnosticsMark(c);
+        let actual = synth(c, value, none())?;
+        dropDiagnosticsSince(c, mark);
+        unify(c, p.declared, c.typeOf(actual), parameters, mut found)?;
+    }
+    var missing = Vector<u32>.create();
+    for (p in parameters) {
+        if (foundFor(found, p) == none()) {
+            missing.push(p)?;
+        }
+    }
+    if (missing.length > 0) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "cannot infer ")?;
+        for (k in 0..missing.length) {
+            if (k > 0) {
+                appendText(mut message, ", ")?;
+            }
+            appendQuotedType(mut message, c, missing[k])?;
+        }
+        appendText(mut message, " for '")?;
+        appendBytes(mut message, what)?;
+        appendText(mut message, "' here; write the type arguments: '")?;
+        appendBytes(mut message, what)?;
+        appendText(mut message, "<…>'")?;
+        c.error(cannotInferTypeArguments(), span.start, span.end, message)?;
+        return Ok(false);
+    }
+    for (p in parameters) {
+        out.push(foundFor(found, p))?;
+    }
+    return Ok(true);
+}
+
+/// `f(args)` or `f<T>(args)` for a generic function (CheckGenericCall, §20.2): infer, instantiate, check.
+fn checkGenericCall(
+    c: borrow mut Checker,
+    g: u32,
+    nameSymbol: u32,
+    typeArguments: Range,
+    arguments: Range,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let entry = c.genericFunctions[g as usize];
+    var parameterTypes = Vector<u32>.create();
+    listTypes(c, entry.parameters, mut parameterTypes)?;
+    var pairs = Vector<InferencePair>.create();
+    let genericParameters = c.hir.functions[entry.generic as usize].parameters.length;
+    for (k in 0..arguments.count) {
+        if ((k as usize) < genericParameters) {
+            let local = c.hir.functions[entry.generic as usize].parameters[k as usize];
+            pairs.push(
+                InferencePair { declared: c.hir.locals[local as usize].typ, value: c.front.ast.at(arguments, k) },
+            )?;
+        }
+    }
+    var text = Vector<u8>.create();
+    appendBytes(mut text, c.name(nameSymbol))?;
+    var found = Vector<u32>.create();
+    let ok = typeArgumentsFor(
+        c,
+        text.view(),
+        parameterTypes.view(),
+        typeArguments,
+        emptyRange(),
+        false,
+        pairs.view(),
+        span,
+        mut found,
+    )?;
+    let instance = if (ok) instantiateFunction(c, g, found.view(), span)? else none();
+    if (instance == none()) {
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    return checkUserCall(c, instance, arguments, span);
+}
+
+/// `S<A>` or `E<A>` for a user generic struct or enum (ResolveGenericItemType's instantiation, after the regions).
+fn instantiateItemType(
+    c: borrow mut Checker,
+    isStruct: bool,
+    index: u32,
+    arguments: Slice<u32>,
+    span: Span,
+) -> Result<u32, AllocError> {
+    if (isStruct) {
+        let entry = instantiateStruct(c, index, arguments, span)?;
+        return Ok(c.structs[entry as usize].typ);
+    }
+    let entry = instantiateEnum(c, index, arguments, span)?;
+    return Ok(c.enums[entry as usize].typ);
+}
+
+/// The struct entry of an instantiation (or the template itself) of `template` (StructEntryFor).
+fn structEntryFor(c: borrow Checker, template: u32, typ: u32) -> u32 {
+    if (c.structs[template as usize].typ == typ) {
+        return template;
+    }
+    for (k in 0..c.structs.length) {
+        if (c.structs[k].template == template && c.structs[k].typ == typ) {
+            return truncate<u32>(k);
+        }
+    }
+    return none();
+}
+
+fn enumEntryFor(c: borrow Checker, template: u32, typ: u32) -> u32 {
+    if (c.enums[template as usize].typ == typ) {
+        return template;
+    }
+    for (k in 0..c.enums.length) {
+        if (c.enums[k].template == template && c.enums[k].typ == typ) {
+            return truncate<u32>(k);
+        }
+    }
+    return none();
+}
+
+/// Is the struct or enum entry a generic declaration (its syntax has type parameters)?
+fn isGenericItem(c: borrow Checker, item: u32) -> bool => item != none() && itemTypeParameters(c, item).count > 0;
+
+/// The struct whose static function `S.f(…)` or `S<T>.f(…)` names (StaticOwner, §20.2); none after an error.
+fn staticOwner(
+    c: borrow mut Checker,
+    index: u32,
+    target: u32,
+    nameSymbol: u32,
+    typeArguments: Range,
+) -> Result<u32, AllocError> {
+    let entry = c.structs[index as usize];
+    let targetSpan = c.front.ast.exprSpans[target as usize];
+    if (!isGenericItem(c, entry.item)) {
+        if (typeArguments.count > 0) {
+            var message = Vector<u8>.create();
+            appendQuotedType(mut message, c, entry.typ)?;
+            appendText(mut message, " is not generic; write it without type arguments")?;
+            c.error(unknownType(), targetSpan.start, targetSpan.end, message)?;
+            return Ok(none());
+        }
+        return Ok(index);
+    }
+    if (typeArguments.count == 0) {
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, nameSymbol)?;
+        appendText(mut message, " is generic: write its type arguments, e.g. '")?;
+        appendBytes(mut message, c.name(nameSymbol))?;
+        appendText(mut message, "<i32>.…'")?;
+        c.error(cannotInferTypeArguments(), targetSpan.start, targetSpan.end, message)?;
+        return Ok(none());
+    }
+    var itemName = Vector<u8>.create();
+    appendBytes(mut itemName, c.name(nameSymbol))?;
+    let typ = resolveRegionItemType(c, entry.typ, entry.item, itemName.view(), typeArguments, targetSpan, true, index)?;
+    if (c.types.isBottom(typ)) {
+        return Ok(none());
+    }
+    return Ok(structEntryFor(c, index, typ));
+}

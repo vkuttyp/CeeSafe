@@ -42,20 +42,74 @@ fn payloadCount(c: borrow Checker, variant: u32) -> usize => c.types.variants[va
 /// `E.V` or `E.V(a, b)` (CheckEnumValue) for a non-generic enum.
 fn checkEnumValue(
     c: borrow mut Checker,
-    index: u32,
+    template: u32,
     member: u32,
     arguments: Range,
-    typeArgumentCount: u32,
+    typeArguments: Range,
     targetSpan: Span,
     span: Span,
+    expected: u32,
 ) -> Result<u32, AllocError> {
-    let typ = c.enums[index as usize].typ;
-    if (typeArgumentCount > 0) {
+    var index = template;
+    let entryItem = c.enums[template as usize].item;
+    if (isGenericItem(c, entryItem)) {
+        // `Maybe.Just(7)`, `Maybe<u8>.Nothing`, or a variant of the expected instance (§20.2).
+        let templateType = c.enums[template as usize].typ;
+        let templateDefinition = c.types.info(templateType).enumDef;
+        let memberSymbol = c.front.ast.idents[member as usize].symbol;
+        let templateVariant = findVariant(c, templateDefinition, memberSymbol);
+        var pairs = Vector<InferencePair>.create();
+        if (templateVariant != none()) {
+            let count = payloadCount(c, templateVariant);
+            for (k in 0..arguments.count) {
+                if ((k as usize) < count) {
+                    pairs.push(
+                        InferencePair {
+                            declared: payloadType(c, templateVariant, k as usize),
+                            value: c.front.ast.at(arguments, k),
+                        },
+                    )?;
+                }
+            }
+        }
+        var expectedArguments = emptyRange();
+        var hasExpected = false;
+        if (expected != none() && c.types.is(expected, TypeKind.Enum)) {
+            let expectedDefinition = c.types.info(expected).enumDef;
+            if (c.types.enums[expectedDefinition as usize].item == entryItem) {
+                expectedArguments = c.types.enums[expectedDefinition as usize].typeArguments;
+                hasExpected = true;
+            }
+        }
+        var parameters = Vector<u32>.create();
+        listTypes(c, c.types.enums[templateDefinition as usize].typeArguments, mut parameters)?;
+        let nameSymbol = c.front.ast.idents[c.front.ast.items[entryItem as usize].name as usize].symbol;
+        var text = Vector<u8>.create();
+        appendBytes(mut text, c.name(nameSymbol))?;
+        var found = Vector<u32>.create();
+        if (!typeArgumentsFor(
+            c,
+            text.view(),
+            parameters.view(),
+            typeArguments,
+            expectedArguments,
+            hasExpected,
+            pairs.view(),
+            span,
+            mut found,
+        )?) {
+            synthAll(c, arguments)?;
+            return c.errorResult(span.start, span.end);
+        }
+        index = instantiateEnum(c, template, found.view(), span)?;
+    } else if (typeArguments.count > 0) {
+        let typ = c.enums[index as usize].typ;
         var message = Vector<u8>.create();
         appendQuotedType(mut message, c, typ)?;
         appendText(mut message, " is not generic; write it without type arguments")?;
         c.error(unknownType(), targetSpan.start, targetSpan.end, message)?;
     }
+    let typ = c.enums[index as usize].typ;
     let definition = c.types.info(typ).enumDef;
     let ident = c.front.ast.idents[member as usize];
     let variant = findVariant(c, definition, ident.symbol);
@@ -718,11 +772,16 @@ fn resolvePatternVariant(c: borrow mut Checker, path: QualifiedName, span: Span,
 
 /// Does `symbol` name the enum: its own name, or an item that is that enum (`geometry.Shape`, §2)?
 fn namesEnum(c: borrow Checker, symbol: u32, typ: u32) -> bool {
-    if (sameBytes(c.name(symbol), c.typeName(typ))) {
+    let item = c.types.enums[c.types.info(typ).enumDef as usize].item;
+    if (item == none()) {
+        // AllocError and IoError: declared from built-in source, named as written.
+        return sameBytes(c.name(symbol), c.typeName(typ));
+    }
+    if (c.front.ast.idents[c.front.ast.items[item as usize].name as usize].symbol == symbol) {
         return true;
     }
     match (c.item(symbol)) {
-        Entity.Enum(index) => { return c.enums[index as usize].typ == typ; }
+        Entity.Enum(index) => { return c.enums[index as usize].item == item; }
         _ => { return false; }
     }
 }

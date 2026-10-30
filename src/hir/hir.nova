@@ -196,6 +196,12 @@ struct HirFunction {
     instanceError: Vector<u8>;
     returnSources: Vector<u32>; // the parameters (by index) a scoped result may borrow from
     mutableFlows: Vector<u64>;  // (i << 32) | j: parameter j's loans may be stored through `borrow mut` parameter i
+    environment: Range;         // its type environment (the checker's envPairs)
+    genericEntry: u32;          // for an instance of a generic function: the checker's GenericFunctionEntry, else none
+    instantiationDepth: u32;
+    siteFile: u32; // where an instance was made, or none
+    siteStart: u32;
+    siteEnd: u32;
 }
 
 struct HirConstant {
@@ -358,6 +364,12 @@ struct HirProgram {
             instanceError: Vector<u8>.create(),
             returnSources: Vector<u32>.create(),
             mutableFlows: Vector<u64>.create(),
+            environment: Range { start: 0, count: 0 },
+            genericEntry: 0xFFFFFFFF,
+            instantiationDepth: 0,
+            siteFile: 0xFFFFFFFF,
+            siteStart: 0,
+            siteEnd: 0,
         })?;
         return Ok(id);
     }

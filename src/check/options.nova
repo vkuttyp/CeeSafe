@@ -50,13 +50,13 @@ fn resolveGenericType(
                 let entry = c.structs[index as usize];
                 var itemName = Vector<u8>.create();
                 appendBytes(mut itemName, c.name(first.symbol))?;
-                return resolveRegionItemType(c, entry.typ, entry.item, itemName.view(), arguments, span);
+                return resolveRegionItemType(c, entry.typ, entry.item, itemName.view(), arguments, span, true, index);
             }
             Entity.Enum(index) => {
                 let entry = c.enums[index as usize];
                 var itemName = Vector<u8>.create();
                 appendBytes(mut itemName, c.name(first.symbol))?;
-                return resolveRegionItemType(c, entry.typ, entry.item, itemName.view(), arguments, span);
+                return resolveRegionItemType(c, entry.typ, entry.item, itemName.view(), arguments, span, false, index);
             }
             Entity.LibraryItem(_) => {
                 c.notPorted(span.start, span.end, "a generic struct or enum", "S4/S5")?;

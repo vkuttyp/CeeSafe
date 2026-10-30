@@ -73,6 +73,7 @@ fn synthStructLiteral(
     fields: Range,
     typeArguments: Range,
     span: Span,
+    expected: u32,
 ) -> Result<u32, AllocError> {
     let nameIdent = c.front.ast.idents[typeName as usize];
     let nameSpan = Span { start: nameIdent.start, end: nameIdent.end };
@@ -102,13 +103,58 @@ fn synthStructLiteral(
         }
         return c.errorResult(span.start, span.end);
     }
-    if (typeArguments.count > 0) {
+    var entry = index;
+    let templateItem = c.structs[index as usize].item;
+    if (isGenericItem(c, templateItem)) {
+        // `Pair { first: 1, … }` infers T from the fields; `Pair<u8> { … }` gives it (§20.2).
+        let template = c.types.info(c.structs[index as usize].typ).structDef;
+        var pairs = Vector<InferencePair>.create();
+        for (k in 0..fields.count) {
+            let init = c.front.ast.fieldInits[c.front.ast.at(fields, k) as usize];
+            let field = findField(c, template, c.front.ast.idents[init.name as usize].symbol);
+            if (field != none()) {
+                pairs.push(InferencePair { declared: c.types.fields[field as usize].typ, value: init.value })?;
+            }
+        }
+        var expectedArguments = emptyRange();
+        var hasExpected = false;
+        if (expected != none() && c.types.is(expected, TypeKind.Struct)) {
+            let expectedDefinition = c.types.info(expected).structDef;
+            if (c.types.structs[expectedDefinition as usize].item == templateItem) {
+                expectedArguments = c.types.structs[expectedDefinition as usize].typeArguments;
+                hasExpected = true;
+            }
+        }
+        var parameters = Vector<u32>.create();
+        listTypes(c, c.types.structs[template as usize].typeArguments, mut parameters)?;
+        var text = Vector<u8>.create();
+        appendBytes(mut text, c.name(nameIdent.symbol))?;
+        var found = Vector<u32>.create();
+        if (!typeArgumentsFor(
+            c,
+            text.view(),
+            parameters.view(),
+            typeArguments,
+            expectedArguments,
+            hasExpected,
+            pairs.view(),
+            span,
+            mut found,
+        )?) {
+            for (k in 0..fields.count) {
+                let init = c.front.ast.fieldInits[c.front.ast.at(fields, k) as usize];
+                synth(c, init.value, none())?;
+            }
+            return c.errorResult(span.start, span.end);
+        }
+        entry = instantiateStruct(c, index, found.view(), span)?;
+    } else if (typeArguments.count > 0) {
         var message = Vector<u8>.create();
         appendQuotedName(mut message, c, nameIdent.symbol)?;
         appendText(mut message, " is not generic; write it without type arguments")?;
         c.error(unknownType(), nameSpan.start, nameSpan.end, message)?;
     }
-    let typ = c.structs[index as usize].typ;
+    let typ = c.structs[entry as usize].typ;
     let definition = c.types.info(typ).structDef;
     var values = Vector<HirFieldValue>.create();
     var seen = Vector<u32>.create();
@@ -454,17 +500,25 @@ fn checkNonStructMethod(
         c.notPorted(span.start, span.end, "this built-in method", "S3")?;
         return c.errorResult(span.start, span.end);
     }
-    if (c.types.is(structType, TypeKind.TypeParameter) || c.types.is(structType, TypeKind.Dyn) ||
-        c.types.is(structType, TypeKind.Enum)) {
-        c.notPorted(span.start, span.end, "this kind of method", "S4")?;
+    let isParameter = c.types.is(structType, TypeKind.TypeParameter);
+    if (c.types.is(structType, TypeKind.Dyn) || (isParameter &&
+        c.types.typeParameters[c.types.info(structType).typeParameter as usize].bounds.length > 0)) {
+        c.notPorted(span.start, span.end, "a method through a bound or 'dyn'", "S4c/S4d")?;
         return c.errorResult(span.start, span.end);
     }
+    // An enum's methods come only from `impl` blocks (S4c), which are not ported: none yet.
     var message = Vector<u8>.create();
     appendText(mut message, "type ")?;
     appendQuotedType(mut message, c, structType)?;
     appendText(mut message, " has no methods; ")?;
     appendQuotedName(mut message, c, memberIdent.symbol)?;
-    appendText(mut message, " cannot be called on it")?;
+    if (isParameter) {
+        appendText(mut message, " needs a bound that declares it ('")?;
+        appendBytes(mut message, c.typeName(structType))?;
+        appendText(mut message, ": Interface')")?;
+    } else {
+        appendText(mut message, " cannot be called on it")?;
+    }
     c.error(notAStruct(), memberIdent.start, memberIdent.end, message)?;
     checkArgumentsLoosely(c, arguments)?;
     return c.errorResult(span.start, span.end);

@@ -165,9 +165,9 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
             return c.errorResult(span.start, span.end);
         }
         ExprNode.Error => { return c.errorResult(span.start, span.end); }
-        ExprNode.Member(target, member) => { return synthMember(c, target, member, span); }
+        ExprNode.Member(target, member) => { return synthMember(c, target, member, span, expected); }
         ExprNode.StructLiteral(typeName, fields, typeArguments) => {
-            return synthStructLiteral(c, typeName, fields, typeArguments, span);
+            return synthStructLiteral(c, typeName, fields, typeArguments, span, expected);
         }
         ExprNode.FloatLiteral(digits, suffix) => { return checkFloatLiteral(c, digits, suffix, expected, span); }
         ExprNode.CharLiteral(value) => { return checkCharLiteral(c, value, expected, span); }
@@ -262,6 +262,15 @@ fn synthName(c: borrow mut Checker, name: u32, span: Span) -> Result<u32, AllocE
             }
         }
         Entity.Function(function) => { return functionValue(c, function, span); }
+        Entity.GenericFunction(_) => {
+            var message = Vector<u8>.create();
+            appendText(mut message, "generic function ")?;
+            appendQuotedName(mut message, c, symbol)?;
+            appendText(mut message, " is a value only with its type arguments: '")?;
+            appendBytes(mut message, c.name(symbol))?;
+            appendText(mut message, "<T>' (type-system.md §36.1)")?;
+            c.error(notCallable(), span.start, span.end, message)?;
+        }
         Entity.LibraryItem(_) => { c.notPorted(span.start, span.end, "a library or not-yet-ported item", "S2-S7")?; }
         Entity.Struct(_) => {
             var message = Vector<u8>.create();
@@ -655,6 +664,9 @@ fn synthCall(
                     c.notPorted(span.start, span.end, "calling this item", "S2-S5")?;
                     return c.errorResult(span.start, span.end);
                 }
+                Entity.GenericFunction(g) => {
+                    return checkGenericCall(c, g, id.symbol, typeArguments, arguments, span);
+                }
                 _ => {}
             }
         }
@@ -693,6 +705,28 @@ fn synthCall(
                                 return checkStringViewFunction(c, member, arguments, span);
                             }
                         }
+                        Entity.Struct(index) => {
+                            let nameSymbol = c.front.ast.idents[targetName as usize].symbol;
+                            let owner = staticOwner(c, index, target, nameSymbol, typeArguments)?;
+                            if (owner == none()) {
+                                checkArgumentsLoosely(c, arguments)?;
+                                return c.errorResult(span.start, span.end);
+                            }
+                            return checkStaticCall(c, owner, member, arguments, calleeSpan, span);
+                        }
+                        Entity.Enum(index) => {
+                            let targetSpan = c.front.ast.exprSpans[target as usize];
+                            return checkEnumValue(
+                                c,
+                                index,
+                                member,
+                                arguments,
+                                typeArguments,
+                                targetSpan,
+                                span,
+                                expected,
+                            );
+                        }
                         _ => {}
                     }
                     if (typeArguments.count == 0) {
@@ -729,13 +763,6 @@ fn synthCall(
                                 }
                                 c.notPorted(span.start, span.end, "this built-in's functions", "S3")?;
                                 return c.errorResult(span.start, span.end);
-                            }
-                            Entity.Struct(index) => {
-                                return checkStaticCall(c, index, member, arguments, calleeSpan, span);
-                            }
-                            Entity.Enum(index) => {
-                                let targetSpan = c.front.ast.exprSpans[target as usize];
-                                return checkEnumValue(c, index, member, arguments, 0, targetSpan, span);
                             }
                             Entity.LibraryItem(_) => {
                                 c.notPorted(span.start, span.end, "calling this item", "S2-S5")?;
@@ -1199,16 +1226,20 @@ fn checkTruncate(
 fn invalidCast() -> u32 => 208;
 
 /// SynthMember: so far only `Console.writeLine` without a call (N0210); field access and enum variants come with S2.
-fn synthMember(c: borrow mut Checker, target: u32, member: u32, span: Span) -> Result<u32, AllocError> {
+fn synthMember(c: borrow mut Checker, target: u32, member: u32, span: Span, expected: u32) -> Result<u32, AllocError> {
     match (c.front.ast.exprs[target as usize]) {
         ExprNode.Name(name, typeArguments) => {
+            let symbol = c.front.ast.idents[name as usize].symbol;
+            match (c.lookup(symbol)) {
+                Entity.Enum(index) => {
+                    // `Shape.Empty`: a variant without payload.
+                    let targetSpan = c.front.ast.exprSpans[target as usize];
+                    return checkEnumValue(c, index, member, emptyRange(), typeArguments, targetSpan, span, expected);
+                }
+                _ => {}
+            }
             if (typeArguments.count == 0) {
-                let symbol = c.front.ast.idents[name as usize].symbol;
                 match (c.lookup(symbol)) {
-                    Entity.Enum(index) => {
-                        let targetSpan = c.front.ast.exprSpans[target as usize];
-                        return checkEnumValue(c, index, member, emptyRange(), 0, targetSpan, span);
-                    }
                     Entity.Builtin(_) => {
                         return notAValue(c, symbol, member, span);
                     }

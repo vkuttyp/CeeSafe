@@ -10,6 +10,8 @@ struct StructEntry {
     item: u32; // Ast.items, or none for a built-in
     file: u32; // none for a built-in
     typ: u32;
+    environment: Range; // its type parameters' types (Checker.envPairs): themselves for a template, arguments for an instance
+    template: u32;      // the generic template an instance was made from, or none
 }
 
 /// An enum: a declaration in the AST, or a built-in one (AllocError, IoError).
@@ -18,6 +20,8 @@ struct EnumEntry {
     file: u32;
     typ: u32;
     builtin: u32; // 0 AllocError, 1 IoError, none for a declared enum
+    environment: Range;
+    template: u32;
 }
 
 /// The built-in items, as the reference declares them first (DeclareAllocError, DeclareIoError,
@@ -26,16 +30,29 @@ struct EnumEntry {
 fn declareBuiltinTypes(c: borrow mut Checker) -> Result<void, AllocError> {
     let allocName = c.builtinNames[0];
     let allocError = c.types.createEnum(c.front.symbols.name(Symbol { id: allocName }), none(), none(), false)?;
-    c.enums.push(EnumEntry { item: none(), file: none(), typ: allocError, builtin: 0 })?;
+    c.enums.push(
+        EnumEntry {
+            item: none(),
+            file: none(),
+            typ: allocError,
+            builtin: 0,
+            environment: emptyRange(),
+            template: none(),
+        },
+    )?;
     c.coreItems.put(Word { value: allocName as u64 }, Entity.Enum(0))?;
     let ioName = c.builtinNames[1];
     let ioError = c.types.createEnum(c.front.symbols.name(Symbol { id: ioName }), none(), none(), false)?;
-    c.enums.push(EnumEntry { item: none(), file: none(), typ: ioError, builtin: 1 })?;
+    c.enums.push(
+        EnumEntry { item: none(), file: none(), typ: ioError, builtin: 1, environment: emptyRange(), template: none() },
+    )?;
     c.coreItems.put(Word { value: ioName as u64 }, Entity.Enum(1))?;
     for (k in 2..4usize) {
         let name = c.builtinNames[k];
         let t = c.types.createStruct(c.front.symbols.name(Symbol { id: name }), none(), none(), false)?;
-        c.structs.push(StructEntry { item: none(), file: none(), typ: t })?;
+        c.structs.push(
+            StructEntry { item: none(), file: none(), typ: t, environment: emptyRange(), template: none() },
+        )?;
         let index = truncate<u32>(c.structs.length - 1);
         c.coreItems.put(Word { value: name as u64 }, Entity.Struct(index))?;
     }
@@ -68,7 +85,7 @@ fn checkTypeItemName(c: borrow mut Checker, ident: Ident) -> Result<bool, AllocE
     return Ok(true);
 }
 
-/// DeclareStruct for a user struct without type parameters.
+/// DeclareStruct for a user struct; a generic one is its generic version (§20.3).
 fn declareStruct(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
     let entry = c.front.ast.items[item as usize];
     let ident = c.front.ast.idents[entry.name as usize];
@@ -83,27 +100,33 @@ fn declareStruct(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
     if (!checkTypeItemName(c, ident)?) {
         return Ok();
     }
-    if (s.typeParameters.count > 0) {
-        c.notPorted(ident.start, ident.end, "a generic struct", "S4")?;
-        ownItem(c, ident.symbol, Entity.LibraryItem(item))?;
-        return Ok();
-    }
     if (entry.attributes.count > 0) {
         c.notPorted(entry.start, entry.end, "attributes on a struct", "S7")?;
     }
-    let t = c.types.createStruct(
-        c.front.symbols.name(Symbol { id: ident.symbol }),
-        item,
-        c.file,
-        s.regionParameters.count > 0,
-    )?;
-    c.structs.push(StructEntry { item: item, file: c.file, typ: t })?;
+    var name = Vector<u8>.create();
+    appendBytes(mut name, c.name(ident.symbol))?;
+    var parameters = Vector<u32>.create();
+    var pairs = Vector<EnvPair>.create();
+    if (s.typeParameters.count > 0) {
+        // The generic version: its own type parameters as arguments (§20.3).
+        declareTypeParameters(c, s.typeParameters, mut parameters, mut pairs)?;
+        var generic = Vector<u8>.create();
+        appendInstanceName(mut generic, c, name.view(), parameters.view())?;
+        name = generic;
+    }
+    let t = c.types.createStruct(name.view(), item, c.file, s.regionParameters.count > 0)?;
+    let env = storeEnvironment(c, pairs.view())?;
+    if (parameters.length > 0) {
+        let list = c.types.addList(parameters.view())?;
+        c.types.structs[c.types.info(t).structDef as usize].typeArguments = list;
+    }
+    c.structs.push(StructEntry { item: item, file: c.file, typ: t, environment: env, template: none() })?;
     let index = truncate<u32>(c.structs.length - 1);
     ownItem(c, ident.symbol, Entity.Struct(index))?;
     return Ok();
 }
 
-/// DeclareEnum for a user enum without type parameters.
+/// DeclareEnum for a user enum; a generic one is its generic version.
 fn declareEnum(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
     let entry = c.front.ast.items[item as usize];
     let ident = c.front.ast.idents[entry.name as usize];
@@ -122,16 +145,26 @@ fn declareEnum(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
     if (!checkTypeItemName(c, ident)?) {
         return Ok();
     }
-    if (parameters.count > 0) {
-        c.notPorted(ident.start, ident.end, "a generic enum", "S4")?;
-        ownItem(c, ident.symbol, Entity.LibraryItem(item))?;
-        return Ok();
-    }
     if (entry.attributes.count > 0) {
         c.notPorted(entry.start, entry.end, "attributes on an enum", "S7")?;
     }
-    let t = c.types.createEnum(c.front.symbols.name(Symbol { id: ident.symbol }), item, c.file, regions.count > 0)?;
-    c.enums.push(EnumEntry { item: item, file: c.file, typ: t, builtin: none() })?;
+    var name = Vector<u8>.create();
+    appendBytes(mut name, c.name(ident.symbol))?;
+    var typeParameters = Vector<u32>.create();
+    var pairs = Vector<EnvPair>.create();
+    if (parameters.count > 0) {
+        declareTypeParameters(c, parameters, mut typeParameters, mut pairs)?;
+        var generic = Vector<u8>.create();
+        appendInstanceName(mut generic, c, name.view(), typeParameters.view())?;
+        name = generic;
+    }
+    let t = c.types.createEnum(name.view(), item, c.file, regions.count > 0)?;
+    let env = storeEnvironment(c, pairs.view())?;
+    if (typeParameters.length > 0) {
+        let list = c.types.addList(typeParameters.view())?;
+        c.types.enums[c.types.info(t).enumDef as usize].typeArguments = list;
+    }
+    c.enums.push(EnumEntry { item: item, file: c.file, typ: t, builtin: none(), environment: env, template: none() })?;
     let index = truncate<u32>(c.enums.length - 1);
     ownItem(c, ident.symbol, Entity.Enum(index))?;
     return Ok();
@@ -261,7 +294,8 @@ fn resolveStructMembers(c: borrow mut Checker, index: u32) -> Result<void, Alloc
     var scope = Vector<u32>.create();
     pushRegionNames(c, s.regionParameters, mut scope)?;
     let savedRegions = swapRegions(c, scope)?;
-    let hasRegions = s.regionParameters.count > 0;
+    let savedEnvironment = enterEnvironment(c, entry.environment)?;
+    let hasRegions = s.regionParameters.count > 0 || entry.template != none();
     var memberNames = Vector<u32>.create();
     for (k in 0..s.fields.count) {
         let field = c.front.ast.fields[c.front.ast.at(s.fields, k) as usize];
@@ -310,7 +344,7 @@ fn resolveStructMembers(c: borrow mut Checker, index: u32) -> Result<void, Alloc
             end: dropSpan.end,
         })?;
         let syntax = truncate<u32>(c.front.ast.functions.length - 1);
-        let dropFunction = declareFunction(c, syntax, entry.typ)?;
+        let dropFunction = declareFunctionIn(c, syntax, entry.typ, entry.environment)?;
         c.types.structs[definition as usize].dropFunction = dropFunction;
     }
     for (k in 0..s.functions.count) {
@@ -325,11 +359,12 @@ fn resolveStructMembers(c: borrow mut Checker, index: u32) -> Result<void, Alloc
             continue;
         }
         memberNames.push(id.symbol)?;
-        let function = declareFunction(c, f, entry.typ)?;
+        let function = declareFunctionIn(c, f, entry.typ, entry.environment)?;
         c.types.structs[definition as usize].functions.push(function)?;
         c.types.structs[definition as usize].functionNames.push(id.symbol)?;
     }
     swapRegions(c, savedRegions)?;
+    restoreEnvironment(c, savedEnvironment);
     c.file = savedFile;
     return Ok();
 }
@@ -444,6 +479,7 @@ fn resolveEnumVariants(c: borrow mut Checker, index: u32) -> Result<void, AllocE
     var scope = Vector<u32>.create();
     pushRegionNames(c, regionParameters, mut scope)?;
     let savedRegions = swapRegions(c, scope)?;
+    let savedEnvironment = enterEnvironment(c, entry.environment)?;
     for (k in 0..variants.count) {
         let v = c.front.ast.variants[c.front.ast.at(variants, k) as usize];
         let id = c.front.ast.idents[v.name as usize];
@@ -467,12 +503,13 @@ fn resolveEnumVariants(c: borrow mut Checker, index: u32) -> Result<void, AllocE
                 "an enum payload",
                 "enum",
                 declarationName,
-                regionParameters.count > 0,
+                regionParameters.count > 0 || entry.template != none(),
             )?;
             addPayload(c, variant, p, typ, typeSpan.start, typeSpan.end)?;
         }
     }
     swapRegions(c, savedRegions)?;
+    restoreEnvironment(c, savedEnvironment);
     c.file = savedFile;
     return Ok();
 }
@@ -534,7 +571,11 @@ fn isAggregate(c: borrow Checker, typ: u32) -> bool =>
 
 /// N0227: an aggregate may not contain itself by value (CheckStructRecursion, a depth-first search).
 fn checkStructRecursion(c: borrow mut Checker) -> Result<void, AllocError> {
+    // Kept across calls: instantiations made later are checked incrementally (§20.4).
     var state = Vector<u8>.create(); // by type id: 0 new, 1 on the stack, 2 done
+    for (v in c.recursionState.view()) {
+        state.push(v)?;
+    }
     while (state.length < c.types.types.length) {
         state.push(0)?;
     }
@@ -550,6 +591,10 @@ fn checkStructRecursion(c: borrow mut Checker) -> Result<void, AllocError> {
         if (state[t as usize] == 0) {
             visitRecursion(c, t, mut state, mut stack)?;
         }
+    }
+    c.recursionState.truncate(0);
+    for (v in state.view()) {
+        c.recursionState.push(v)?;
     }
     return Ok();
 }
@@ -622,7 +667,10 @@ fn sourceOfAggregate(c: borrow Checker, typ: u32) -> u32 {
 
 /// Copy and needs-drop for every struct and enum, contained types first (ComputeCopyAndDrop, §14.1, §15.1).
 fn computeCopyAndDrop(c: borrow mut Checker) -> Result<void, AllocError> {
-    var done = Vector<bool>.create();
+    var done = Vector<bool>.create(); // kept across calls (the reference's _copyDone)
+    for (v in c.copyDone.view()) {
+        done.push(v)?;
+    }
     var order = Vector<u32>.create();
     for (s in c.structs.view()) {
         order.push(s.typ)?;
@@ -632,6 +680,10 @@ fn computeCopyAndDrop(c: borrow mut Checker) -> Result<void, AllocError> {
     }
     for (t in order.view()) {
         visitCopy(c, t, mut done)?;
+    }
+    c.copyDone.truncate(0);
+    for (v in done.view()) {
+        c.copyDone.push(v)?;
     }
     return Ok();
 }

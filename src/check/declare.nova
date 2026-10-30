@@ -119,6 +119,13 @@ fn checkProgram(
         frameMemory: none(),
         frameAllocation: none(),
         flowNames: Vector<Vector<u64>>.create(),
+        typeEnvironment: Vector<EnvPair>.create(),
+        envPairs: Vector<EnvPair>.create(),
+        genericFunctions: Vector<GenericFunctionEntry>.create(),
+        scopedInstanceReports: Vector<SpanIn>.create(),
+        instantiating: 0,
+        recursionState: Vector<u8>.create(),
+        copyDone: Vector<bool>.create(),
         pendingElements: Vector<PendingElement>.create(),
         letKeywords: Vector<LetKeyword>.create(),
     };
@@ -206,7 +213,28 @@ fn checkProgram(
     var f: usize = 0;
     while (f < c.hir.functions.length) {
         if (!c.hir.functions[f].library) {
-            checkFunctionBody(mut c, truncate<u32>(f))?;
+            let function = truncate<u32>(f);
+            if (functionIsInstantiation(c, function)) {
+                // Its generic version reports (§20.3); a scoped type argument the body cannot take is N0274.
+                var arguments = Vector<u32>.create();
+                listTypes(c, c.hir.functions[f].typeArguments, mut arguments)?;
+                var name = Vector<u8>.create();
+                appendBytes(mut name, c.name(c.hir.functions[f].name))?;
+                var siteFile = c.hir.functions[f].siteFile;
+                var siteSpan = Span { start: c.hir.functions[f].siteStart, end: c.hir.functions[f].siteEnd };
+                if (siteFile == none()) {
+                    // A method of a struct instance: its declaration's name (the reference's Syntax.Name.Span).
+                    siteFile = c.hir.functions[f].file;
+                    let syntax = c.front.ast.functions[c.hir.functions[f].syntax as usize];
+                    let id = c.front.ast.idents[syntax.name as usize];
+                    siteSpan = Span { start: id.start, end: id.end };
+                }
+                let mark = diagnosticsMark(c);
+                checkFunctionBody(mut c, function)?;
+                endInstance(mut c, mark, arguments.view(), name.view(), siteFile, siteSpan, function)?;
+            } else {
+                checkFunctionBody(mut c, function)?;
+            }
         }
         f += 1;
     }
@@ -352,8 +380,18 @@ fn declare(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
                 c.error(thisOutsideMethod(), decl.receiverStart, decl.receiverEnd, message)?;
             }
             if (decl.typeParameters.count > 0) {
-                c.notPorted(id.start, id.end, "a generic function", "S4")?;
-                ownItem(c, id.symbol, Entity.LibraryItem(item))?;
+                // Checked once with opaque type parameters; instantiated on use (§20).
+                var parameters = Vector<u32>.create();
+                var pairs = Vector<EnvPair>.create();
+                declareTypeParameters(c, decl.typeParameters, mut parameters, mut pairs)?;
+                let env = storeEnvironment(c, pairs.view())?;
+                let list = c.types.addList(parameters.view())?;
+                let generic = declareFunctionIn(c, f, none(), env)?;
+                c.genericFunctions.push(
+                    GenericFunctionEntry { syntax: f, file: c.file, generic: generic, parameters: list },
+                )?;
+                let index = truncate<u32>(c.genericFunctions.length - 1);
+                ownItem(c, id.symbol, Entity.GenericFunction(index))?;
                 return Ok();
             }
             let function = declareFunction(c, f, none())?;
@@ -421,16 +459,22 @@ fn receiverIndex(kind: ReceiverKind) -> u32 => match (kind) {
 };
 
 /// DeclareFunction for a top-level function without type parameters: its signature, and its parameters as locals.
-fn declareFunction(c: borrow mut Checker, f: u32, owner: u32) -> Result<u32, AllocError> {
+fn declareFunction(c: borrow mut Checker, f: u32, owner: u32) -> Result<u32, AllocError> =>
+    declareFunctionIn(c, f, owner, emptyRange());
+
+/// DeclareFunction with a type environment (Checker.envPairs): a generic version's or an instance's.
+fn declareFunctionIn(c: borrow mut Checker, f: u32, owner: u32, environment: Range) -> Result<u32, AllocError> {
     var scope = Vector<u32>.create();
     regionScope(c, f, owner, mut scope)?;
     let saved = swapRegions(c, scope)?;
-    let function = declareFunctionCore(c, f, owner)?;
+    let savedEnvironment = enterEnvironment(c, environment)?;
+    let function = declareFunctionCore(c, f, owner, environment)?;
+    restoreEnvironment(c, savedEnvironment);
     swapRegions(c, saved)?;
     return Ok(function);
 }
 
-fn declareFunctionCore(c: borrow mut Checker, f: u32, owner: u32) -> Result<u32, AllocError> {
+fn declareFunctionCore(c: borrow mut Checker, f: u32, owner: u32, environment: Range) -> Result<u32, AllocError> {
     let decl = c.front.ast.functions[f as usize];
     if (owner != none() && decl.regionParameters.count > 0) {
         let first = c.front.ast.typeParameters[c.front.ast.at(decl.regionParameters, 0) as usize];
@@ -442,6 +486,25 @@ fn declareFunctionCore(c: borrow mut Checker, f: u32, owner: u32) -> Result<u32,
         c.error(unsupported(), first.start, first.end, message)?;
     }
     checkRegionParameters(c, decl.regionParameters, decl.typeParameters)?;
+    var env = environment;
+    if (owner != none() && decl.typeParameters.count > 0) {
+        let tp = c.front.ast.typeParameters[c.front.ast.at(decl.typeParameters, 0) as usize];
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            "methods cannot declare type parameters of their own in v0; use the struct's, or a top-level generic function",
+        )?;
+        c.error(unsupported(), tp.start, tp.end, message)?;
+        // Declared anyway, so their names resolve (no cascade of unknown types).
+        var parameters = Vector<u32>.create();
+        var pairs = Vector<EnvPair>.create();
+        for (p in c.typeEnvironment.view()) {
+            pairs.push(p)?;
+        }
+        declareTypeParameters(c, decl.typeParameters, mut parameters, mut pairs)?;
+        enterEnvironmentPairs(c, pairs.view())?;
+        env = storeEnvironment(c, pairs.view())?;
+    }
     let returnType = if (decl.returnType == none()) c.types.voidType else c.resolveTypeWith(
         decl.returnType,
         true,
@@ -450,10 +513,7 @@ fn declareFunctionCore(c: borrow mut Checker, f: u32, owner: u32) -> Result<u32,
     let name = c.front.ast.idents[decl.name as usize].symbol;
     let library = isLibraryFile(c);
     let function = c.hir.addFunction(name, owner, returnType, c.file, f, library)?;
-    if (owner != none() && decl.typeParameters.count > 0) {
-        let tp = c.front.ast.typeParameters[c.front.ast.at(decl.typeParameters, 0) as usize];
-        c.notPorted(tp.start, tp.end, "a method with type parameters", "S4")?;
-    }
+    c.hir.functions[function as usize].environment = env;
     if (owner != none() && receiverIndex(decl.receiver) != 0) {
         // `this` is an immutable binding: the struct by value, or a reference to it (§12, §13.2).
         let thisType = match (decl.receiver) {
@@ -500,6 +560,17 @@ fn checkMain(c: borrow mut Checker) -> Result<void, AllocError> {
         null => { return Ok(); }
     };
     let entity = foundEntity(c.rootItems, Word { value: mainSymbol as u64 });
+    match (entity) {
+        Entity.GenericFunction(g) => {
+            let entry = c.genericFunctions[g as usize];
+            c.file = entry.file;
+            let id = c.front.ast.idents[c.front.ast.functions[entry.syntax as usize].name as usize];
+            var message = Vector<u8>.create();
+            appendText(mut message, "'main' cannot be generic")?;
+            return c.error(invalidMain(), id.start, id.end, message);
+        }
+        _ => {}
+    }
     let function = match (entity) {
         Entity.Function(f) => f,
         _ => { return Ok(); }

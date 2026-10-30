@@ -1,0 +1,30 @@
+struct Pair<T> { first: T; second: T; }
+struct Res { n: i32; drop {} }
+enum Maybe<T> { Nothing, Just(T) }
+
+fn id<T>(x: T) -> T => x;
+fn two<A, B>(a: A) -> B => a;
+fn copyOnly<T: Copy>(x: T) -> T => x;
+fn dup<T, T>(x: T) {}
+fn shadow<i32>(x: i32) {}
+fn shadow2<Pair>(x: Pair) {}
+fn calls<T>(x: T) { x.run(); }
+
+fn main() {
+    let a: Pair = Pair { first: 1, second: 2 };
+    let b: Pair<i32, i32> = Pair { first: 1, second: 2 };
+    let c: Maybe = Maybe.Nothing;
+    let d = Maybe.Nothing;
+    let e = two(1);
+    let f = id<i32, i32>(1);
+    let g = id<i32>(true);
+    let h = copyOnly(Res { n: 1 });
+    let i = Pair.make(1);
+    let j = Pair<u8> { first: 1, second: 300 };
+    let k = Pair { first: 1, second: true };
+    let l = Pair { };
+    let m = id;
+    let n: i32<u8> = 1;
+    let o = Maybe<u8, u8>.Nothing;
+}
+fn main2<T>() {}
