@@ -1,0 +1,3 @@
+public fn common() -> u32 => 2;
+public fn only2() -> u32 => 2;
+public struct Thing { public a: u32; }

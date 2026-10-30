@@ -1,0 +1,19 @@
+interface Shape { fn area(borrow this) -> u32; }
+const K: u32 = 1;
+fn f() {}
+fn main() {
+    let a: f = 1;
+    let b: Shape = 1;
+    let c: K = 1;
+    let d = f<i32>();
+    let x = 1;
+    let e = x<u32>;
+    let g = Box(1);
+    let h = Console(1);
+    let i = truncate.x();
+    let j = round.y(1);
+    var arr = [1, 2];
+    let k = arr.frob();
+    let m = Process(1);
+    let n = layoutOf.z();
+}

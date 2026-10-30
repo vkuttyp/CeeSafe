@@ -1,0 +1,9 @@
+public struct Point {
+    public x: i32;
+    y: i32;
+
+    public fn make(x: i32, y: i32) -> Point => Point { x: x, y: y };
+    fn secret(borrow this) -> i32 => this.y;
+}
+struct Hidden { v: u32; }
+public fn origin() -> Point => Point.make(0, 0);

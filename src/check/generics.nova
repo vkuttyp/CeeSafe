@@ -442,7 +442,7 @@ fn instantiateStruct(
     let item = c.front.ast.items[entry.item as usize];
     let symbol = c.front.ast.idents[item.name as usize].symbol;
     var text = Vector<u8>.create();
-    appendBytes(mut text, c.name(symbol))?;
+    qualifiedName(c, entry.file, c.name(symbol), mut text)?; // QualifiedIn(template.Source, …)
     var name = Vector<u8>.create();
     appendInstanceName(mut name, c, text.view(), arguments)?;
     let hasRegions = c.types.structs[definition as usize].hasRegionParameters;
@@ -492,7 +492,7 @@ fn instantiateEnum(c: borrow mut Checker, template: u32, arguments: Slice<u32>, 
     let item = c.front.ast.items[entry.item as usize];
     let symbol = c.front.ast.idents[item.name as usize].symbol;
     var text = Vector<u8>.create();
-    appendBytes(mut text, c.name(symbol))?;
+    qualifiedName(c, entry.file, c.name(symbol), mut text)?; // QualifiedIn(template.Source, …)
     var name = Vector<u8>.create();
     appendInstanceName(mut name, c, text.view(), arguments)?;
     let hasRegions = c.types.enums[definition as usize].hasRegionParameters;

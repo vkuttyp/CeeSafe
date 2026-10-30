@@ -1,0 +1,14 @@
+import base;
+import base.Area;
+
+public struct Square {
+    public side: u32;
+    unit: base.Unit;
+}
+public fn square(side: u32) -> Square => Square { side: side, unit: unit() };
+public fn kind(s: Square) -> base.Kind => if (s.side > 10) base.Kind.Large(s.side) else base.Kind.Small;
+public fn name() -> u32 => 1;
+public fn shared() -> u32 => 2;
+impl Area for Square {
+    fn area(borrow this) -> u32 => this.side * this.side;
+}

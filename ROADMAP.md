@@ -1,6 +1,6 @@
 # CeeSafe roadmap: port the Nova compiler to Nova, as CeeSafe
 
-Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0 and P1 complete; next: the upstream N0/N1a work (owner's go-ahead), then P2**.
+Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P3 complete (P3 gate passed 2026-10-30 against novac 0.5.0); next: re-pin to 0.6.0 when it is released, then P4**.
 The probes, `src/support/`, the limits, the fault sweep and the skeleton exist (`docs/p1-probes.md`). No compiler code has been ported.
 Repository: `~/dev/CeeSafe`. Reference: `vkuttyp/Nova` (C#/.NET 10), pinned in `bootstrap/reference.md`.
 
@@ -367,19 +367,20 @@ file in Nova's repository and CeeSafe's own sources parse. Fuzzed malformed inpu
 
 Dependencies: P2, N2–N3, P1's exact integers.
 
-- [ ] Port `PackageNames` (ADR 0013, N0310–N0315), scopes and visibility, builtins, `TargetInfo`, type interning,
+- [x] Port `PackageNames` (ADR 0013, N0310–N0315), scopes and visibility, builtins, `TargetInfo`, type interning,
   layouts and type properties.
-- [ ] Port declarations, expressions, coercions and reborrows, patterns and usefulness (`PatternUsefulness.cs`),
+- [x] Port declarations, expressions, coercions and reborrows, patterns and usefulness (`PatternUsefulness.cs`),
   constant evaluation, HIR construction and `--dump-hir`.
-- [ ] Port the generics: body checking, bounds, regions, instantiation, closure captures, `dyn`, owning closures,
+- [x] Port the generics: body checking, bounds, regions, instantiation, closure captures, `dyn`, owning closures,
   `Send`/`Share`, `@effectsOf`.
-- [ ] Port the M14 and K semantics: statics (ADR 0024), `here`, `layoutOf`, raw `read`/`write` (ADR 0027), inline
+- [x] Port the M14 and K semantics: statics (ADR 0024), `here`, `layoutOf`, raw `read`/`write` (ADR 0027), inline
   atomics (ADR 0026), `lib/kernel` contracts (ADR 0025), profiles, `unsafe`/FFI, and embedded C state.
-- [ ] Split `TypeChecker.cs` (9,100 lines) into reviewable files using a source-to-port checklist that preserves
+- [x] Split `TypeChecker.cs` (9,100 lines) into reviewable files using a source-to-port checklist that preserves
   diagnostic order.
 
 Gate: check-pass and type-focused check-fail fixtures and HIR snapshots match exactly. Ownership negatives are tracked
-as pending P4. This is not yet a full `check`.
+as pending P4. This is not yet a full `check`. **Passed (2026-10-30, novac 0.5.0)**: `docs/p3-plan.md` (slices S0–S8,
+`src/check/` as the split of `TypeChecker.cs`).
 
 ### P4 — NIR and every safety pass
 
@@ -576,9 +577,9 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
    track has no open blocking item.
 2. Alongside: the rest of the runner's C matrix (`-O0`, the overflow fallback, `--split`, TSan) and the package
    fixtures (`docs/parity.md` §3).
-3. P2 is done (`docs/p2-frontend.md`). Next is P3, names, types, generics and the HIR, starting with
-   `PackageNames.cs` and the type checker's declarations pass rather than translating `TypeChecker.cs` top to bottom.
-   Plan it from the inventory's P3 rows first.
+3. P2 and P3 are done (`docs/p2-frontend.md`, `docs/p3-plan.md`). Next: re-pin to novac 0.6.0 once it is tagged and
+   released (port its checker changes, rerun the P3 gate), then P4, NIR and the safety passes, whose diagnostics are
+   all that the remaining check-fail differences need.
 4. Owner's call: propose upstream that N0110 count `else if` links and `?` suffixes. novac's `--dump-ast` aborts on a
    20,000-link `else if` chain (`docs/p2-frontend.md` §6).
 
@@ -602,6 +603,7 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 | 2026-10-30 | Re-pinned to novac 0.4.0, then 0.4.1 (`80d8d8c`). 0.4.0 reserved its lib/std helper names (N7), fixed in Nova `24106b0` and released as the point release 0.4.1. All P1 workarounds removed; the four upstream reproducers became regression probes. Gates rerun with 0.4.1: macOS (Apple clang 21) and the Ryzen box (GCC 12; clang 18.1.8 -O2; clang 18.1.8 ASan+UBSan+LSan) | reference corpus at `v0.4.1` 467 pass, 3 partial, no leaks, on both; probes 16/16; support 6/6; fault sweep 573/573; skeleton builds; inventory regenerated, 0 unmapped |
 | 2026-10-30 | Re-pinned to novac 0.5.0 (`af071d4`, ADR 0029) at P3 S2b, before any S2b code. lib/ unchanged, the checker change is S7's (FFI). Gates rerun on macOS (Apple clang 21) only; the Ryzen box keeps 0.4.1 until its next gate run | probes 16/16; support 8/8; type table 1/1 with no leaks; reference corpus at `v0.5.0` 468 pass, 3 partial; parse 483/483 identical; check 99/320 identical (as with 0.4.1); fault sweep 573/573 |
 | 2026-10-30 | P2: lexer, diagnostics and JSON, AST tables, parser and `--dump-ast` (`src/syntax/`, `src/diagnostics/`); token-dump oracle from the reference's `Lexer`; `compare_tokens.py`, `compare_parse.py`, `lexer_fuzz.py`, `parser_fuzz.py`, `gen_catalog.py` | gate passed on macOS and Linux (`docs/p2-frontend.md` §4): parse families 68/68 with no reference difference, 540/540 reference files identical, 5,000 mutated and 3,000 random inputs identical, sanitizers clean, `live=0` |
+| 2026-10-30 | P3: the type checker (`src/check/`, `src/hir/`), slices S0–S8 (`docs/p3-plan.md`), and package mode for `check` (`src/host/packages.nova`, path dependencies) | P3 gate passed: check-pass 27/27 and the 27 HIR snapshots identical; check programs 265/320, the other 55 differ only by P4's diagnostics or novac's printer crashes; `ffi`, `freestanding`, `emit-c`, `placement`, `bounds-checks`, `overflow-checks`, `closure-calls`, `run-fail` 83/83; package fixtures 7/7; `ceesafec check` of CeeSafe itself identical to novac (HIR dump, 35,150 lines); ASan+UBSan clean |
 
 **Tests run for the skeleton** (2026-10-30, novac 0.3.1, Apple clang 21.0.0):
 - `novac check` and `novac fmt --check`: clean.
@@ -646,4 +648,4 @@ under GCC 12, clang 18 and Apple clang, with and without ASan+UBSan. All passed.
   - the fault sweep under clang ASan+LSan: 573/573.
 - The earlier gate run found the missing-drop bug as a LeakSanitizer report.
 
-Not yet run: P2 or later.
+Not yet run: P4 or later.

@@ -1,0 +1,3 @@
+@export
+fn entry() -> u32 => mid.mid() + leaf.leaf();
+fn f(x: f64) {}

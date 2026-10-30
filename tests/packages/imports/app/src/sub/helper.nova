@@ -1,0 +1,1 @@
+public fn helper() -> u32 => shapes.name() + colors.shared();

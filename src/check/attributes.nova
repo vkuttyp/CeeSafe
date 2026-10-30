@@ -56,7 +56,9 @@ fn processStructAttributes(c: borrow mut Checker, item: u32, s: u32) -> Result<v
             continue;
         }
         // The library's thread-safe types (type-system.md §38.3); user code cannot claim it (ownership.md T3).
-        if (!isLibraryFile(c) || c.front.ast.attributes[attribute as usize].hasParentheses) {
+        let package = currentPackage(c);
+        let trusted = package != none() && c.packages[package as usize].trusted;
+        if (!(isLibraryFile(c) || trusted) || c.front.ast.attributes[attribute as usize].hasParentheses) {
             attributeError(
                 c,
                 attribute,

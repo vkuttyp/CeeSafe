@@ -1,0 +1,19 @@
+import shapes;
+import colors;
+import base.Pair;
+
+fn describe(k: base.Kind) -> u32 => match (k) {
+    base.Kind.Small => 0,
+    base.Kind.Large(n) => n,
+};
+
+fn main() {
+    let s = shapes.square(3);
+    let a = s.area();
+    let p: Pair<u32> = base.pair(1, 2);
+    let q = p.swap();
+    let c = colors.red();
+    let d = describe(shapes.kind(s));
+    let l = base.LIMIT + base.COUNT;
+    Console.writeLine(a + q.first + d + l + helper());
+}

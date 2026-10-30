@@ -1,0 +1,17 @@
+public struct Unit { public v: u32; }
+public fn unit() -> Unit => Unit { v: 1 };
+@threadSafe
+public struct Safe { public v: u32; }
+public enum Kind { Small, Large(u32) }
+public struct Pair<T> {
+    public first: T;
+    public second: T;
+    public fn swap(this) -> Pair<T> => Pair { first: this.second, second: this.first };
+}
+public fn pair<T>(a: T, b: T) -> Pair<T> => Pair { first: a, second: b };
+public const LIMIT: u32 = 7;
+public static COUNT: u32 = 3;
+fn hidden() -> u32 => 1;
+public interface Area {
+    fn area(borrow this) -> u32;
+}

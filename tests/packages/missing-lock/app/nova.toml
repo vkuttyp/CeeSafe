@@ -1,0 +1,10 @@
+# an app with its own source directory, freestanding, without floats
+[package]
+name = "app"
+version = "0.1.0"
+profile = "freestanding"
+float = false
+sources = ["code"]
+
+[dependencies]
+mid = { path = "../mid" }   # one dependency

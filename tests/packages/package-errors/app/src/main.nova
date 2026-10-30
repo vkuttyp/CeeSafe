@@ -1,0 +1,18 @@
+import lib1;
+import lib2;
+import lib1.notPublic;
+import lib1.missing;
+
+fn main() {
+    let t = lib1.Thing.make();
+    let h = t.hidden();
+    let b = t.b;
+    let s = lib1.Thing.helper();
+    let p = lib1.Private { x: 1 };
+    let n = lib1.nope();
+    let c = common();
+    let o = only1() + only2();
+    let x = Thing.make();
+    let q = lib2.Thing { a: 1 };
+    let k = lib1.Claimed { x: 1 };
+}

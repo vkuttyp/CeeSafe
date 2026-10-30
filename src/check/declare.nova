@@ -87,6 +87,8 @@ fn checkProgram(
     filePaths: Vector<Vector<u8>>,
     noFloat: bool,
     freestanding: bool,
+    packages: Vector<PackageInfo>,
+    filePackage: Vector<u32>,
 ) -> Result<Checker, AllocError> {
     var c = Checker {
         front: front,
@@ -96,7 +98,7 @@ fn checkProgram(
         fileTexts: fileTexts,
         filePaths: filePaths,
         noFloat: noFloat,
-        rootItems: Map<Word, Entity>.create(),
+        packageItems: Map<Word, Entity>.create(),
         coreItems: Map<Word, Entity>.create(),
         builtins: Map<Word, u32>.create(),
         builtinNames: Vector<u32>.create(),
@@ -162,6 +164,11 @@ fn checkProgram(
         freestanding: freestanding,
         profileReports: Vector<LayoutUse>.create(),
         reportedQualified: Vector<LayoutUse>.create(),
+        packages: packages,
+        filePackage: filePackage,
+        packageDeclared: Map<Word, Word>.create(),
+        declaredOrder: Vector<DeclaredEntry>.create(),
+        fileImports: Vector<FileImport>.create(),
     };
     // The constructor: the builtins' names, `this`, and a scratch frame's two parts.
     for (k in 0..26u32) {
@@ -175,6 +182,7 @@ fn checkProgram(
         let symbol = c.intern(reservedName(k))?;
         c.reserved.push(symbol)?;
     }
+    declarePackageNames(mut c)?;
     declareFrameFields(mut c)?;
     declareBuiltinItems(mut c)?;
     checkQualifiedNames(mut c)?;
@@ -330,7 +338,7 @@ fn isDeclared(c: borrow Checker, symbol: u32) -> bool {
     if (isLibraryFile(c)) {
         return c.coreItems.find(key) != null;
     }
-    return c.rootItems.find(key) != null || c.coreItems.find(key) != null;
+    return c.packageItems.find(packageKey(currentPackage(c), symbol)) != null || c.coreItems.find(key) != null;
 }
 
 fn ownItem(c: borrow mut Checker, symbol: u32, entity: Entity) -> Result<void, AllocError> {
@@ -338,7 +346,7 @@ fn ownItem(c: borrow mut Checker, symbol: u32, entity: Entity) -> Result<void, A
     if (isLibraryFile(c)) {
         c.coreItems.put(key, entity)?;
     } else {
-        c.rootItems.put(key, entity)?;
+        c.packageItems.put(packageKey(currentPackage(c), symbol), entity)?;
     }
     return Ok();
 }
@@ -413,7 +421,7 @@ fn declare(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
                 t = c.types.error;
             }
             c.hir.constants.push(HirConstant {
-                name: id.symbol,
+                name: qualifiedSymbol(c, id.symbol)?,
                 typ: t,
                 file: c.file,
                 start: entry.start,
@@ -514,7 +522,9 @@ fn declareFunctionCore(c: borrow mut Checker, f: u32, owner: u32, environment: R
         c.allowImported = hasAttributeNamed(c, decl.attributes, "constant");
         returnType = c.resolveTypeWith(decl.returnType, true, true)?;
     }
-    let name = c.front.ast.idents[decl.name as usize].symbol;
+    // A dependency's top-level function is named with its package (c-backend.md §2.1); a C function keeps its own name.
+    let declaredName = c.front.ast.idents[decl.name as usize].symbol;
+    let name = if (owner == none() && !decl.isExtern) qualifiedSymbol(c, declaredName)? else declaredName;
     let library = isLibraryFile(c);
     let function = c.hir.addFunction(name, owner, returnType, c.file, f, library, c.registerNext)?;
     c.hir.functions[function as usize].environment = env;
@@ -563,7 +573,7 @@ fn checkMain(c: borrow mut Checker) -> Result<void, AllocError> {
         Some(s) => s.id,
         null => { return Ok(); }
     };
-    let entity = foundEntity(c.rootItems, Word { value: mainSymbol as u64 });
+    let entity = foundEntity(c.packageItems, packageKey(0, mainSymbol));
     match (entity) {
         Entity.GenericFunction(g) => {
             let entry = c.genericFunctions[g as usize];

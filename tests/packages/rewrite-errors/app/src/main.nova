@@ -1,0 +1,15 @@
+import lib1;
+import lib2;
+import other;
+
+struct lib1 { x: u32; }
+
+fn use(lib2: u32) -> u32 {
+    let lib1 = 3;
+    for (lib2 in 0..3) {}
+    return lib2;
+}
+
+fn main() {
+    let f = (lib1: u32) => lib1;
+}

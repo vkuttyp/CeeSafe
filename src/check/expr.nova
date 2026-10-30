@@ -184,7 +184,12 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
                     }
                     _ => {}
                 }
-                c.notPorted(span.start, span.end, "a name with type arguments", "S4")?;
+                var message = Vector<u8>.create();
+                appendText(
+                    mut message,
+                    "type arguments go on a call ('f<T>(…)'), a type or a static function ('S<T>.f(…)')",
+                )?;
+                c.error(unsupported(), span.start, span.end, message)?;
                 return c.errorResult(span.start, span.end);
             }
             return synthName(c, name, span);
@@ -265,7 +270,6 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
             c.hir.exprSpans[value as usize] = span;
             return Ok(value);
         }
-        _ => { c.notPorted(span.start, span.end, "this expression", "S2-S7")?; }
     }
     return c.errorResult(span.start, span.end);
 }
@@ -365,7 +369,6 @@ fn synthName(c: borrow mut Checker, name: u32, span: Span) -> Result<u32, AllocE
             c.error(notCallable(), span.start, span.end, message)?;
         }
         Entity.Static(entry) => { return staticUse(c, entry, span); }
-        Entity.LibraryItem(_) => { c.notPorted(span.start, span.end, "a library or not-yet-ported item", "S2-S7")?; }
         Entity.Struct(_) => {
             var message = Vector<u8>.create();
             appendQuotedName(mut message, c, symbol)?;
@@ -841,11 +844,11 @@ fn synthCall(
                     if (b == 3) {
                         return checkLayoutOf(c, typeArguments, arguments, span);
                     }
-                    c.notPorted(span.start, span.end, "this built-in function", "S1b")?;
-                    return c.errorResult(span.start, span.end);
-                }
-                Entity.LibraryItem(_) => {
-                    c.notPorted(span.start, span.end, "calling this item", "S2-S5")?;
+                    // Other built-in names are not functions (SynthCall's last case).
+                    var message = Vector<u8>.create();
+                    appendText(mut message, "this expression cannot be called")?;
+                    c.error(notCallable(), calleeSpan.start, calleeSpan.end, message)?;
+                    checkArgumentsLoosely(c, arguments)?;
                     return c.errorResult(span.start, span.end);
                 }
                 Entity.GenericFunction(g) => {
@@ -953,12 +956,7 @@ fn synthCall(
                                 if (b == builtinConsole() || b == builtinProcess() || b == 23 || b == 24) {
                                     return checkBuiltinMemberCall(c, b, targetName, member, arguments, span);
                                 }
-                                c.notPorted(span.start, span.end, "this built-in's functions", "S3")?;
-                                return c.errorResult(span.start, span.end);
-                            }
-                            Entity.LibraryItem(_) => {
-                                c.notPorted(span.start, span.end, "calling this item", "S2-S5")?;
-                                return c.errorResult(span.start, span.end);
+                                // Any other built-in is a receiver like any value (CheckMethodCall).
                             }
                             _ => {}
                         }

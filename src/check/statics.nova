@@ -34,9 +34,10 @@ fn declareStatic(c: borrow mut Checker, item: u32, mutable: bool, typeSyntax: u3
     c.allowImported = true;
     let typ = c.resolveType(typeSyntax, false)?;
     let file = c.file;
+    let qualified = qualifiedSymbol(c, id.symbol)?;
     c.hir.statics.push(
         HirStatic {
-            name: id.symbol,
+            name: qualified,
             typ: typ,
             mutable: mutable,
             file: file,
@@ -56,8 +57,10 @@ fn declareStatic(c: borrow mut Checker, item: u32, mutable: bool, typeSyntax: u3
 fn staticUse(c: borrow mut Checker, entry: u32, span: Span) -> Result<u32, AllocError> {
     let hir = c.statics[entry as usize].hir;
     let s = c.hir.statics[hir as usize];
+    // The declared name (entry.Decl.Name), not the package-qualified one.
+    let declaredIdent = c.front.ast.items[c.statics[entry as usize].item as usize].name;
     var name = Vector<u8>.create();
-    appendBytes(mut name, c.name(s.name))?;
+    appendBytes(mut name, c.name(c.front.ast.idents[declaredIdent as usize].symbol))?;
     let function = c.function;
     if (function == none()) {
         var message = Vector<u8>.create();

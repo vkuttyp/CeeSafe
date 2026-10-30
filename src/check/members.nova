@@ -23,6 +23,15 @@ fn checkPrivate(c: borrow mut Checker, definition: u32, field: u32, span: Span) 
         appendBytes(mut message, c.filePaths[d.file as usize].view())?;
         appendText(mut message, ": only code there can reach it (type-system.md §12)")?;
         c.error(privateField(), span.start, span.end, message)?;
+    } else if (!c.types.fields[field as usize].isPublic && isOtherPackage(c, d.file)) {
+        let item = c.front.ast.items[d.item as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "field ")?;
+        appendQuotedName(mut message, c, c.types.fields[field as usize].name)?;
+        appendText(mut message, " of '")?;
+        qualifiedName(c, d.file, c.name(c.front.ast.idents[item.name as usize].symbol), mut message)?;
+        appendText(mut message, "' is not public: only its own package can reach it (type-system.md §2)")?;
+        c.error(notPublic(), span.start, span.end, message)?;
     }
     return Ok();
 }
@@ -82,14 +91,6 @@ fn synthStructLiteral(
         _ => none(),
     };
     if (index == none()) {
-        let isLibrary = match (c.item(nameIdent.symbol)) {
-            Entity.LibraryItem(_) => true,
-            _ => false,
-        };
-        if (isLibrary) {
-            c.notPorted(span.start, span.end, "a literal of a generic or library struct", "S4/S5")?;
-            return c.errorResult(span.start, span.end);
-        }
         var text = Vector<u8>.create();
         appendBytes(mut text, c.name(nameIdent.symbol))?;
         let unknown = c.types.lookup(text.view()) == none() && isNone(c.lookup(nameIdent.symbol)?);
@@ -297,6 +298,7 @@ fn checkStaticCall(
         checkArgumentsLoosely(c, arguments)?;
         return c.errorResult(span.start, span.end);
     }
+    checkMethodVisible(c, function, Span { start: memberIdent.start, end: memberIdent.end })?;
     if (isMethod(c, function)) {
         var message = Vector<u8>.create();
         appendText(mut message, "'")?;
@@ -581,18 +583,6 @@ fn checkNonStructMethod(
         receiverType,
         TypeKind.Reference,
     )) c.types.info(receiverType).pointee else receiverType;
-    let builtinReceiver = c.types.is(readType, TypeKind.Array) || c.types.is(readType, TypeKind.Vector) ||
-        c.types.is(readType, TypeKind.SlotMap) || c.types.is(readType, TypeKind.StableVector) ||
-        c.types.is(readType, TypeKind.Resource) || c.types.is(readType, TypeKind.Thread) ||
-        c.types.is(readType, TypeKind.Region) || c.types.is(readType, TypeKind.RawPointer) ||
-        c.types.is(readType, TypeKind.FunctionPointer) || readType == c.ioErrorType ||
-        c.types.is(structType, TypeKind.Region) || c.types.is(receiverType, TypeKind.Box) ||
-        (c.types.is(structType, TypeKind.Integer) && isIntegerMethodName(name.view())) ||
-        (c.types.is(structType, TypeKind.Float) && isFloatMethodName(name.view()));
-    if (builtinReceiver) {
-        c.notPorted(span.start, span.end, "this built-in method", "S3")?;
-        return c.errorResult(span.start, span.end);
-    }
     let isParameter = c.types.is(structType, TypeKind.TypeParameter);
     // A `dyn fn` has no methods (§36.5): the general message below. The reference crashes here (novac 0.5.0's
     // DynMethod dereferences the absent interface); docs/p3-plan.md records the divergence.

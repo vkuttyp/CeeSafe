@@ -1,0 +1,15 @@
+public struct Thing {
+    public a: u32;
+    b: u32;
+    public fn make() -> Thing => Thing { a: 1, b: 2 };
+    fn hidden(borrow this) -> u32 => this.b;
+    fn helper() -> u32 => 1;
+}
+struct Private { x: u32; }
+public fn leaks(p: Private) -> u32 => p.x;
+public fn common() -> u32 => 1;
+public fn only1() -> u32 => 1;
+fn notPublic() -> u32 => 1;
+@threadSafe
+public struct Claimed { x: u32; }
+public fn broken() -> u32 => true;

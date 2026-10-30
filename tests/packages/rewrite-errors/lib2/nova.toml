@@ -1,0 +1,4 @@
+[package]
+name = "lib2"
+version = "0.1.0"
+kind = "library"

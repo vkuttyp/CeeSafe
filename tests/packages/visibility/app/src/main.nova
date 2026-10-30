@@ -1,0 +1,11 @@
+import geo;
+
+fn main() {
+    let p = geo.Point.make(1, 2);
+    let o = origin();
+    let h = geo.Hidden { v: 1 };
+    let n = geo.Nothing;
+    let y = p.y;
+    let s = p.secret();
+    Console.writeLine(p.x + o.x);
+}

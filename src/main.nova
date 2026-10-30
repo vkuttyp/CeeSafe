@@ -46,6 +46,7 @@ struct Options {
     libraryDiagnostics: bool; // report diagnostics in the libraries' files too (porting gaps there; novac has none)
     freestanding: bool;       // --profile freestanding (cosmoos/profiles.md §4)
     kernel: bool;             // --kernel cosmoos: lib/kernel, in the freestanding profile (ADR 0025)
+    profileGiven: bool;       // --profile was given: package mode keeps it over the manifest's
     files: Vector<String>;
 }
 
@@ -116,8 +117,10 @@ fn readOptions(options: borrow mut Options) -> i32 {
                 options.kernel = true;
             } else if (value == "hosted") {
                 options.freestanding = false;
+                options.profileGiven = true;
             } else if (value == "freestanding") {
                 options.freestanding = true;
+                options.profileGiven = true;
             } else {
                 var message = String.create();
                 message.append("--profile must be 'hosted' or 'freestanding', not '")!;
@@ -259,6 +262,7 @@ fn parseCommand() -> i32 {
         libraryDiagnostics: false,
         freestanding: false,
         kernel: false,
+        profileGiven: false,
         files: Vector<String>.create(),
     };
     let status = readOptions(mut options);
@@ -329,6 +333,88 @@ fn report(json: bool, diagnostics: borrow Diagnostics, sources: borrow Vector<So
 }
 
 /// `check`: the hosted libraries and the files, parsed; then checked if they parse (Compilation.Create, P3).
+/// Package mode's loading (Program.LoadPackage): the packages, root first, and their files; the root manifest's
+/// profile, float and kernel where the command line does not say otherwise. Returns the exit status of a failure.
+fn loadPackage(
+    options: borrow mut Options,
+    packages: borrow mut Vector<PackageInfo>,
+    files: borrow mut Vector<Vector<Vector<u8>>>,
+) -> i32 {
+    let cwd = match (Directory.current()) {
+        Ok(d) => d,
+        Err(_) => { return fail("cannot read the current directory"); }
+    };
+    let directory = match (findManifestDirectory(cwd.view().bytes())!) {
+        Some(d) => d,
+        null => { return fail("no Nova input files, and no nova.toml here or above"); }
+    };
+    var problem = Vector<u8>.create();
+    var loaded = Vector<LoadedPackage>.create();
+    let manifestPath = joinPath(directory.view(), "nova.toml".bytes())!;
+    match (readManifest(directory.view(), mut problem)!) {
+        Some(root) => {
+            let lock = joinPath(directory.view(), "nova.lock".bytes())!;
+            if (root.dependencies.length > 0 && !fileExists(lock.view())) {
+                // The manifest is the file the error names (Workspace.Resolve, N0324).
+                let text = readFile(StringView.fromUtf8(manifestPath.view())!)!;
+                let name = sourcePath(StringView.fromUtf8(manifestPath.view())!);
+                var sources = Vector<SourceText>.create();
+                sources.push(SourceText.create(name.view(), text.view())!)!;
+                var diagnostics = Diagnostics.create();
+                var message = Vector<u8>.create();
+                appendText(mut message, "there is no nova.lock: run 'novac fetch'")!;
+                diagnostics.error(324, 0, 0, 0, message)!;
+                return report(options.json, diagnostics, sources);
+            }
+        }
+        null => { return fail(StringView.fromUtf8(problem.view())!); }
+    }
+    if (!resolvePackages(directory.view(), mut loaded, mut problem)!) {
+        return fail(StringView.fromUtf8(problem.view())!);
+    }
+    if (loaded[0].files.length == 0) {
+        var message = String.create();
+        message.append("package '")!;
+        message.append(StringView.fromUtf8(loaded[0].manifest.name.view())!)!;
+        message.append("' has no .nova files under ")!;
+        for (k in 0..loaded[0].manifest.sources.length) {
+            if (k > 0) {
+                message.append(", ")!;
+            }
+            message.append(StringView.fromUtf8(loaded[0].manifest.sources[k].view())!)!;
+        }
+        return fail(message.view());
+    }
+    if (!options.profileGiven) {
+        options.freestanding = loaded[0].manifest.freestanding;
+    }
+    if (!loaded[0].manifest.floatAllowed) {
+        options.noFloat = true;
+    }
+    if (loaded[0].manifest.kernel) {
+        options.kernel = true;
+    }
+    for (p in loaded.view()) {
+        var dependencies = Vector<Vector<u8>>.create();
+        for (d in p.manifest.dependencies.view()) {
+            dependencies.push(copyBytes(d.name.view())!)!;
+        }
+        packages.push(
+            PackageInfo {
+                name: copyBytes(p.manifest.name.view())!,
+                dependencies: dependencies,
+                trusted: p.manifest.trusted,
+            },
+        )!;
+        var paths = Vector<Vector<u8>>.create();
+        for (f in p.files.view()) {
+            paths.push(copyBytes(f.view())!)!;
+        }
+        files.push(paths)!;
+    }
+    return 0;
+}
+
 fn checkCommand() -> i32 {
     var options = Options {
         json: false,
@@ -339,17 +425,28 @@ fn checkCommand() -> i32 {
         libraryDiagnostics: false,
         freestanding: false,
         kernel: false,
+        profileGiven: false,
         files: Vector<String>.create(),
     };
     let status = readOptions(mut options);
     if (status != 0) {
         return status;
     }
-    if (options.files.length == 0) {
-        return fail("package mode is not implemented yet (ROADMAP P8); name the files");
-    }
     var sources = Vector<SourceText>.create();
     var fileIsLibrary = Vector<bool>.create();
+    var packages = Vector<PackageInfo>.create();
+    var packageFiles = Vector<Vector<Vector<u8>>>.create();
+    if (options.files.length == 0) {
+        // Package mode (tooling.md §4.4): the nearest manifest's package and its path dependencies.
+        let loaded = loadPackage(mut options, mut packages, mut packageFiles);
+        if (loaded != 0) {
+            return loaded;
+        }
+    } else {
+        packages.push(
+            PackageInfo { name: Vector<u8>.create(), dependencies: Vector<Vector<u8>>.create(), trusted: false },
+        )!;
+    }
     // lib/core, then lib/std (hosted) or lib/kernel (freestanding with --kernel): library files come first
     // (CoreLibrary.SourcesFor).
     for (k in 0..libraryFileCount()) {
@@ -361,9 +458,37 @@ fn checkCommand() -> i32 {
             fileIsLibrary.push(true)!;
         }
     }
-    let loaded = loadFiles(options.files, mut sources);
-    if (loaded != 0) {
-        return loaded;
+    var filePackage = Vector<u32>.create();
+    while (filePackage.length < sources.length) {
+        filePackage.push(0xFFFFFFFF)!;
+    }
+    if (options.files.length > 0) {
+        let loaded = loadFiles(options.files, mut sources);
+        if (loaded != 0) {
+            return loaded;
+        }
+        while (filePackage.length < sources.length) {
+            filePackage.push(0)!;
+        }
+    } else {
+        for (p in 0..packageFiles.length) {
+            for (f in packageFiles[p].view()) {
+                let path = StringView.fromUtf8(f.view())!;
+                let bytes = match (readFile(path)) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        var message = String.create();
+                        message.append("cannot read '")!;
+                        message.append(path)!;
+                        message.append("'")!;
+                        return fail(message.view());
+                    }
+                };
+                let name = sourcePath(path);
+                sources.push(SourceText.create(name.view(), bytes.view())!)!;
+                filePackage.push(truncate<u32>(p))!;
+            }
+        }
     }
     while (fileIsLibrary.length < sources.length) {
         fileIsLibrary.push(false)!;
@@ -373,11 +498,12 @@ fn checkCommand() -> i32 {
         let source = borrow sources[i];
         let file = truncate<u32>(i);
         let lexed = lex(source.text.view(), file, mut front.symbols, mut front.diagnostics)!;
+        let marks = astMarks(front);
         front = parseFile(file, lexed, front)!;
         // PackageNames.Rewrite: a package file, rewritten while nothing has failed yet.
         if (!fileIsLibrary[i] && !front.diagnostics.hasErrors()) {
             let unit = truncate<u32>(front.ast.units.length - 1);
-            checkImports(mut front, unit)!;
+            rewritePackageNames(mut front, unit, packages[filePackage[i] as usize].dependencies, marks)!;
         }
     }
     if (front.diagnostics.hasErrors()) {
@@ -389,7 +515,16 @@ fn checkCommand() -> i32 {
         texts.push(copyBytes(sources[i].text.view())!)!;
         paths.push(copyBytes(sources[i].path.view())!)!;
     }
-    var checker = checkProgram(front, fileIsLibrary, texts, paths, options.noFloat, options.freestanding)!;
+    var checker = checkProgram(
+        front,
+        fileIsLibrary,
+        texts,
+        paths,
+        options.noFloat,
+        options.freestanding,
+        packages,
+        filePackage,
+    )!;
     if (!options.libraryDiagnostics) {
         // The reference's libraries check cleanly: what is reported in them here is a porting gap (docs/p3-plan.md S5).
         checker.front.diagnostics.removeFiles(checker.fileIsLibrary.view());

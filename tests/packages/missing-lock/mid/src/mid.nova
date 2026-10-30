@@ -1,0 +1,1 @@
+public fn mid() -> u32 => leaf.leaf();

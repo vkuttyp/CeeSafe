@@ -14,9 +14,10 @@ fn reportedQualified(c: borrow Checker, start: u32) -> bool {
     return false;
 }
 
-/// N0310–N0313 before anything is declared (CheckQualifiedNames): every dotted name must name a public item of a
-/// dependency. A file's identifiers are visited in source order, which the reference's reflection walk follows for the
-/// names that can be dotted (a struct literal's type name).
+/// N0310–N0313 before anything is declared (CheckQualifiedNames): every named import and dotted name must name a
+/// public item of a dependency, and a simple name that two imports provide is ambiguous where it is used. A file's
+/// identifiers are visited in source order (the reference's reflection walk follows the tree, which is source order
+/// for the names that matter here), leaving out those PackageNames replaced.
 fn checkQualifiedNames(c: borrow mut Checker) -> Result<void, AllocError> {
     let saved = c.file;
     for (u in 0..c.front.ast.units.length) {
@@ -25,9 +26,31 @@ fn checkQualifiedNames(c: borrow mut Checker) -> Result<void, AllocError> {
             continue;
         }
         c.file = file;
-        let identStart = c.front.ast.units[u].identStart;
-        let identEnd = c.front.ast.units[u].identEnd;
-        for (k in identStart..identEnd) {
+        let importCount = c.front.ast.units[u].imports.length;
+        for (k in 0..importCount) {
+            let imported = c.front.ast.units[u].imports[k];
+            if (imported.parts.count > 1) {
+                var packageName = Vector<u8>.create();
+                appendBytes(
+                    mut packageName,
+                    c.name(c.front.ast.idents[c.front.ast.at(imported.parts, 0) as usize].symbol),
+                )?;
+                var itemName = Vector<u8>.create();
+                appendBytes(
+                    mut itemName,
+                    c.name(c.front.ast.idents[c.front.ast.at(imported.parts, 1) as usize].symbol),
+                )?;
+                checkQualified(
+                    c,
+                    packageName.view(),
+                    itemName.view(),
+                    Span { start: imported.start, end: imported.end },
+                )?;
+            }
+        }
+        var identifiers = Vector<u32>.create();
+        unitIdentifiers(c, truncate<u32>(u), mut identifiers)?;
+        for (k in identifiers.view()) {
             let id = c.front.ast.idents[k as usize];
             var text = Vector<u8>.create();
             appendBytes(mut text, c.name(id.symbol))?;
@@ -39,23 +62,164 @@ fn checkQualifiedNames(c: borrow mut Checker) -> Result<void, AllocError> {
             }
             if (dot != none() && dot > 0) {
                 let bytes = text.view();
-                checkQualified(c, bytes[..(dot as usize)], Span { start: id.start, end: id.end })?;
+                checkQualified(
+                    c,
+                    bytes[..(dot as usize)],
+                    bytes[((dot as usize) + 1)..],
+                    Span { start: id.start, end: id.end },
+                )?;
             }
         }
+        checkAmbiguousImports(c, truncate<u32>(u), identifiers.view())?;
     }
     c.file = saved;
     return Ok();
 }
 
-/// One qualified name `package.item` (CheckQualified). A single package has no dependencies: N0310.
-fn checkQualified(c: borrow mut Checker, packageName: Slice<u8>, span: Span) -> Result<void, AllocError> {
-    var message = Vector<u8>.create();
-    appendText(mut message, "'")?;
-    appendBytes(mut message, packageName)?;
-    appendText(mut message, "' is not a dependency of this package")?;
-    c.error(unknownPackage(), span.start, span.end, message)?;
+/// A file's identifiers in source order, without those PackageNames replaced (Identifiers).
+fn unitIdentifiers(c: borrow Checker, unit: u32, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    let identStart = c.front.ast.units[unit as usize].identStart;
+    let identEnd = c.front.ast.units[unit as usize].identEnd;
+    for (k in identStart..identEnd) {
+        if (!containsU32(c.front.ast.replacedIdents, k) && !c.front.ast.idents[k as usize].missing) {
+            out.push(k)?;
+        }
+    }
+    for (i in 1..out.length) {
+        var j = i;
+        while (j > 0 && c.front.ast.idents[out[j] as usize].start < c.front.ast.idents[out[j - 1] as usize].start) {
+            out.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+    return Ok();
+}
+
+/// One qualified name `package.item` (CheckQualified): N0310 if the package is not a dependency, N0311 if it has no
+/// such item, N0312 if the item is not public.
+fn checkQualified(
+    c: borrow mut Checker,
+    packageName: Slice<u8>,
+    itemName: Slice<u8>,
+    span: Span,
+) -> Result<void, AllocError> {
+    let package = currentPackage(c);
+    let dependency = dependencyNamed(c, package, packageName);
     let file = c.file;
-    return c.reportedQualified.push(LayoutUse { typ: 0, start: span.start, end: span.end, file: file });
+    if (dependency == none()) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, packageName)?;
+        appendText(mut message, "' is not a dependency of this package")?;
+        c.error(unknownPackage(), span.start, span.end, message)?;
+        return c.reportedQualified.push(LayoutUse { typ: 0, start: span.start, end: span.end, file: file });
+    }
+    let symbol = c.front.symbols.intern(itemName)?.id;
+    let declared = declaredIn(c, dependency, symbol);
+    if (declared == 0) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "package '")?;
+        appendBytes(mut message, packageName)?;
+        appendText(mut message, "' has no item '")?;
+        appendBytes(mut message, itemName)?;
+        appendText(mut message, "'")?;
+        c.error(unknownPackageItem(), span.start, span.end, message)?;
+        return c.reportedQualified.push(LayoutUse { typ: 0, start: span.start, end: span.end, file: file });
+    }
+    if (declared == 1) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, packageName)?;
+        appendText(mut message, ".")?;
+        appendBytes(mut message, itemName)?;
+        appendText(mut message, "' is not public: only its own package can use it (type-system.md §2)")?;
+        c.error(notPublic(), span.start, span.end, message)?;
+    }
+    return Ok();
+}
+
+/// One name two imports provide (CheckAmbiguousImports' providers).
+struct Provider {
+    symbol: u32;
+    packages: Vector<u32>;
+}
+
+/// N0313 (CheckAmbiguousImports): a simple name that two of the file's imports provide, not declared by its package
+/// or lib/core, at its first use.
+fn checkAmbiguousImports(c: borrow mut Checker, unit: u32, identifiers: Slice<u32>) -> Result<void, AllocError> {
+    let file = c.front.ast.units[unit as usize].file;
+    var count: u32 = 0;
+    for (imported in c.fileImports.view()) {
+        if (imported.file == file) {
+            count += 1;
+        }
+    }
+    if (count < 2) {
+        return Ok();
+    }
+    var providers = Vector<Provider>.create();
+    for (k in 0..c.fileImports.length) {
+        let imported = c.fileImports[k];
+        if (imported.file != file) {
+            continue;
+        }
+        var names = Vector<u32>.create();
+        if (imported.item != none()) {
+            names.push(imported.item)?;
+        } else {
+            for (d in c.declaredOrder.view()) {
+                if (d.package == imported.package && d.isPublic) {
+                    names.push(d.symbol)?;
+                }
+            }
+        }
+        for (name in names.view()) {
+            var found = none();
+            for (p in 0..providers.length) {
+                if (providers[p].symbol == name) {
+                    found = truncate<u32>(p);
+                }
+            }
+            if (found == none()) {
+                providers.push(Provider { symbol: name, packages: Vector<u32>.create() })?;
+                found = truncate<u32>(providers.length - 1);
+            }
+            if (!containsU32(providers[found as usize].packages, imported.package)) {
+                providers[found as usize].packages.push(imported.package)?;
+            }
+        }
+    }
+    let package = packageOfFile(c, file);
+    var reported = Vector<u32>.create();
+    for (k in identifiers) {
+        let symbol = c.front.ast.idents[k as usize].symbol;
+        if (containsU32(reported, symbol)) {
+            continue;
+        }
+        for (p in providers.view()) {
+            if (p.symbol != symbol || p.packages.length < 2 || declaredIn(c, package, symbol) != 0 ||
+                declaredIn(c, none(), symbol) != 0) {
+                continue;
+            }
+            reported.push(symbol)?;
+            let id = c.front.ast.idents[k as usize];
+            let first = c.packages[p.packages[0] as usize].name.view();
+            let second = c.packages[p.packages[1] as usize].name.view();
+            var message = Vector<u8>.create();
+            appendQuotedName(mut message, c, symbol)?;
+            appendText(mut message, " is imported from both '")?;
+            appendBytes(mut message, first)?;
+            appendText(mut message, "' and '")?;
+            appendBytes(mut message, second)?;
+            appendText(mut message, "': write '")?;
+            appendBytes(mut message, first)?;
+            appendText(mut message, ".")?;
+            appendBytes(mut message, c.name(symbol))?;
+            appendText(mut message, "' or import only one")?;
+            c.error(ambiguousImport(), id.start, id.end, message)?;
+        }
+    }
+    return Ok();
 }
 
 fn isPublicVisibility(v: Visibility) -> bool => match (v) {
@@ -129,9 +293,8 @@ fn hiddenType(c: borrow Checker, typ: u32, seen: borrow mut Vector<u32>) -> Resu
     return Ok(none());
 }
 
-/// Is `file` in the package being checked (PackageOf(source) == PackageOf(_source))? One package until S8b.
-fn samePackage(c: borrow Checker, file: u32) -> bool =>
-    file != none() && c.fileIsLibrary[file as usize] == c.fileIsLibrary[c.file as usize];
+/// Is `file` in the package being checked (PackageOf(source) == PackageOf(_source))?
+fn samePackage(c: borrow Checker, file: u32) -> bool => file != none() && packageOfFile(c, file) == currentPackage(c);
 
 /// N0314 for `name` if one of `types` hides a type (CheckSignature).
 fn checkSignature(c: borrow mut Checker, name: u32, types: Slice<u32>) -> Result<void, AllocError> {
@@ -249,9 +412,128 @@ fn checkPublicSignatures(c: borrow mut Checker) -> Result<void, AllocError> {
     return Ok();
 }
 
-/// The imports of a file (PackageNames.Rewrite's check, before type checking): each names a dependency of its
-/// package, N0310 otherwise. A single package has none.
-fn checkImports(front: borrow mut Frontend, unit: u32) -> Result<void, AllocError> {
+fn packageNameReused() -> u32 => 315;
+
+/// A package of the build as the checker takes it (PackageInfo): its name, its dependencies' names, `trusted`.
+struct PackageInfo {
+    name: Vector<u8>;
+    dependencies: Vector<Vector<u8>>;
+    trusted: bool;
+}
+
+/// Where each AST arena stood before a file was parsed: the file's nodes are the ones after (PackageNames.Rewrite
+/// walks them).
+struct AstMarks {
+    types: usize;
+    exprs: usize;
+    patterns: usize;
+    stmts: usize;
+    parameters: usize;
+    typeParameters: usize;
+    closureParameters: usize;
+    bindings: usize;
+    items: usize;
+}
+
+fn astMarks(front: borrow Frontend) -> AstMarks =>
+    AstMarks {
+        types: front.ast.types.length,
+        exprs: front.ast.exprs.length,
+        patterns: front.ast.patterns.length,
+        stmts: front.ast.stmts.length,
+        parameters: front.ast.parameters.length,
+        typeParameters: front.ast.typeParameters.length,
+        closureParameters: front.ast.closureParameters.length,
+        bindings: front.ast.bindings.length,
+        items: front.ast.items.length,
+    };
+
+fn isDependencyName(front: borrow Frontend, dependencies: borrow Vector<Vector<u8>>, symbol: u32) -> bool {
+    let name = front.symbols.name(Symbol { id: symbol });
+    for (d in dependencies.view()) {
+        if (sameBytes(d.view(), name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The identifier `package.item` spanning both (Join).
+fn joinIdents(front: borrow mut Frontend, package: u32, item: u32) -> Result<u32, AllocError> {
+    let p = front.ast.idents[package as usize];
+    let i = front.ast.idents[item as usize];
+    var text = Vector<u8>.create();
+    appendBytes(mut text, front.symbols.name(Symbol { id: p.symbol }))?;
+    text.push('.')?;
+    appendBytes(mut text, front.symbols.name(Symbol { id: i.symbol }))?;
+    let symbol = front.symbols.intern(text.view())?.id;
+    return front.ast.addIdent(Ident { symbol: symbol, start: p.start, end: i.end, missing: false });
+}
+
+/// `dep.X.rest` with `dep` a dependency as the single name `dep.X` followed by the rest (Name); unchanged otherwise.
+fn joinQualified(
+    front: borrow mut Frontend,
+    dependencies: borrow Vector<Vector<u8>>,
+    name: QualifiedName,
+) -> Result<QualifiedName, AllocError> {
+    if (name.parts.count < 2) {
+        return Ok(name);
+    }
+    let first = front.ast.at(name.parts, 0);
+    if (!isDependencyName(front, dependencies, front.ast.idents[first as usize].symbol)) {
+        return Ok(name);
+    }
+    let second = front.ast.at(name.parts, 1);
+    front.ast.replacedIdents.push(first)?;
+    front.ast.replacedIdents.push(second)?;
+    var parts = Vector<u32>.create();
+    parts.push(joinIdents(front, first, second)?)?;
+    for (k in 2..name.parts.count) {
+        parts.push(front.ast.at(name.parts, k))?;
+    }
+    let range = front.ast.list(parts)?;
+    return Ok(QualifiedName { parts: range, start: name.start, end: name.end });
+}
+
+/// N0315: a dependency's name names something else here (Declared).
+fn declaredName(
+    front: borrow mut Frontend,
+    dependencies: borrow Vector<Vector<u8>>,
+    file: u32,
+    ident: u32,
+    what: StringView,
+) -> Result<void, AllocError> {
+    if (ident == 0xFFFFFFFF) {
+        return Ok();
+    }
+    let id = front.ast.idents[ident as usize];
+    if (!isDependencyName(front, dependencies, id.symbol)) {
+        return Ok();
+    }
+    var message = Vector<u8>.create();
+    appendText(mut message, "'")?;
+    appendBytes(mut message, front.symbols.name(Symbol { id: id.symbol }))?;
+    appendText(mut message, "' is the name of a dependency and cannot also name ")?;
+    appendText(mut message, what)?;
+    return front.diagnostics.error(packageNameReused(), file, id.start, id.end, message);
+}
+
+/// One declaration of a dependency's name, for N0315 in source order.
+struct DeclaredName {
+    ident: u32;
+    what: u32; // 0 item, 1 type parameter, 2 parameter, 3 local, 4 loop variable, 5 binding
+}
+
+/// PackageNames.Rewrite (type-system.md §2, ADR 0013): each import names a dependency (N0310); with dependencies, a
+/// dependency's name names nothing else (N0315), and `dep.X` becomes the single name `dep.X` in types, expressions and
+/// patterns. The file's nodes are those parsed after `marks`; the joined identifiers extend the file's identifier
+/// range, and the identifiers they replace are recorded so CheckQualifiedNames skips them.
+fn rewritePackageNames(
+    front: borrow mut Frontend,
+    unit: u32,
+    dependencies: borrow Vector<Vector<u8>>,
+    marks: AstMarks,
+) -> Result<void, AllocError> {
     let file = front.ast.units[unit as usize].file;
     let count = front.ast.units[unit as usize].imports.length;
     for (k in 0..count) {
@@ -260,11 +542,357 @@ fn checkImports(front: borrow mut Frontend, unit: u32) -> Result<void, AllocErro
             continue;
         }
         let package = front.ast.idents[front.ast.at(imported.parts, 0) as usize];
+        if (isDependencyName(front, dependencies, package.symbol)) {
+            continue;
+        }
         var message = Vector<u8>.create();
         appendText(mut message, "'")?;
         appendBytes(mut message, front.symbols.name(Symbol { id: package.symbol }))?;
         appendText(mut message, "' is not a dependency of this package")?;
         front.diagnostics.error(unknownPackage(), file, package.start, package.end, message)?;
     }
+    if (dependencies.length == 0) {
+        return Ok();
+    }
+    // N0315, in source order (the reference visits a function's type parameters after its body; ceesafec reports in
+    // source order, which differs only when one function has several such names).
+    var declared = Vector<DeclaredName>.create();
+    for (k in marks.items..front.ast.items.length) {
+        let item = front.ast.items[k];
+        // An impl is named by its interface's first identifier, so `impl dep.I for T` is N0315 as in the reference.
+        let isExtern = match (item.kind) {
+            ItemKind.Extern(_, _, _) => true,
+            _ => false,
+        };
+        if (!isExtern) {
+            declared.push(DeclaredName { ident: item.name, what: 0 })?;
+        }
+    }
+    for (k in marks.typeParameters..front.ast.typeParameters.length) {
+        declared.push(DeclaredName { ident: front.ast.typeParameters[k].name, what: 1 })?;
+    }
+    for (k in marks.parameters..front.ast.parameters.length) {
+        declared.push(DeclaredName { ident: front.ast.parameters[k].name, what: 2 })?;
+    }
+    for (k in marks.closureParameters..front.ast.closureParameters.length) {
+        declared.push(DeclaredName { ident: front.ast.closureParameters[k].name, what: 2 })?;
+    }
+    for (k in marks.stmts..front.ast.stmts.length) {
+        match (front.ast.stmts[k]) {
+            StmtNode.Local(_, name, _, _) => { declared.push(DeclaredName { ident: name, what: 3 })?; }
+            StmtNode.For(variable, _, _, _) => { declared.push(DeclaredName { ident: variable, what: 4 })?; }
+            _ => {}
+        }
+    }
+    for (k in marks.bindings..front.ast.bindings.length) {
+        let b = front.ast.bindings[k];
+        if (b.nested == 0xFFFFFFFF) {
+            declared.push(DeclaredName { ident: b.name, what: 5 })?;
+        }
+    }
+    for (i in 1..declared.length) {
+        var j = i;
+        while (j > 0 && declaredStart(front, declared[j].ident) < declaredStart(front, declared[j - 1].ident)) {
+            declared.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+    for (d in declared.view()) {
+        let what = match (d.what) {
+            0 => "an item",
+            1 => "a type parameter",
+            2 => "a parameter",
+            3 => "a local",
+            4 => "a loop variable",
+            _ => "a binding",
+        };
+        declaredName(front, dependencies, file, d.ident, what)?;
+    }
+    // Types and patterns: qualified names.
+    for (k in marks.types..front.ast.types.length) {
+        match (front.ast.types[k]) {
+            TypeNode.Named(q) => {
+                let joined = joinQualified(front, dependencies, q)?;
+                front.ast.types[k] = TypeNode.Named(joined);
+            }
+            TypeNode.Generic(q, arguments) => {
+                let joined = joinQualified(front, dependencies, q)?;
+                front.ast.types[k] = TypeNode.Generic(joined, arguments);
+            }
+            _ => {}
+        }
+    }
+    for (k in marks.patterns..front.ast.patterns.length) {
+        match (front.ast.patterns[k]) {
+            PatternNode.Variant(q, parenthesised, bindings) => {
+                let joined = joinQualified(front, dependencies, q)?;
+                front.ast.patterns[k] = PatternNode.Variant(joined, parenthesised, bindings);
+            }
+            _ => {}
+        }
+    }
+    // Expressions: `dep.X` (a member of the dependency's name) becomes the name `dep.X`.
+    for (k in marks.exprs..front.ast.exprs.length) {
+        match (front.ast.exprs[k]) {
+            ExprNode.Member(target, member) => {
+                match (front.ast.exprs[target as usize]) {
+                    ExprNode.Name(package, typeArguments) => {
+                        if (typeArguments.count == 0 &&
+                            isDependencyName(front, dependencies, front.ast.idents[package as usize].symbol)) {
+                            let joined = joinIdents(front, package, member)?;
+                            front.ast.exprs[k] = ExprNode.Name(joined, emptyRange());
+                            front.ast.replacedIdents.push(package)?;
+                            front.ast.replacedIdents.push(member)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    front.ast.units[unit as usize].identEnd = truncate<u32>(front.ast.idents.length);
     return Ok();
 }
+
+fn declaredStart(front: borrow Frontend, ident: u32) -> u32 =>
+    if (ident == 0xFFFFFFFF) 0 else front.ast.idents[ident as usize].start;
+
+// ---- The package model (PackageScope, PackageOf, Own, Item, IsPublic) ----
+
+/// One import of a file (the reference's _imports): a dependency, and one of its items by name or none for all.
+struct FileImport {
+    file: u32;
+    package: u32;
+    item: u32; // a symbol, or none
+}
+
+/// The key of a package's item in Checker.packageItems: the package (0 the root) and the name.
+fn packageKey(package: u32, symbol: u32) -> Word => Word { value: ((package as u64) << 32) | (symbol as u64) };
+
+/// The package of a file (PackageOf): none for the libraries (lib/core's scope).
+fn packageOfFile(c: borrow Checker, file: u32) -> u32 => if (file == none()) none() else c.filePackage[file as usize];
+
+fn currentPackage(c: borrow Checker) -> u32 => packageOfFile(c, c.file);
+
+/// The index of the package named `name`, or none.
+fn packageNamed(c: borrow Checker, name: Slice<u8>) -> u32 {
+    for (k in 0..c.packages.length) {
+        if (sameBytes(c.packages[k].name.view(), name)) {
+            return truncate<u32>(k);
+        }
+    }
+    return none();
+}
+
+/// Is `name` a dependency of package `package`, and a package of the build? Its index, or none.
+fn dependencyNamed(c: borrow Checker, package: u32, name: Slice<u8>) -> u32 {
+    if (package == none()) {
+        return none();
+    }
+    for (d in c.packages[package as usize].dependencies.view()) {
+        if (sameBytes(d.view(), name)) {
+            let index = packageNamed(c, name);
+            return if (index == 0) none() else index;
+        }
+    }
+    return none();
+}
+
+/// The package model's start (the constructor): each file's declared names, and its imports of dependencies.
+fn declarePackageNames(c: borrow mut Checker) -> Result<void, AllocError> {
+    for (u in 0..c.front.ast.units.length) {
+        let file = c.front.ast.units[u].file;
+        let package = packageOfFile(c, file);
+        let items = c.front.ast.units[u].items;
+        for (k in 0..items.count) {
+            let item = c.front.ast.at(items, k);
+            match (c.front.ast.items[item as usize].kind) {
+                ItemKind.Extern(_, functions, _) => {
+                    for (j in 0..functions.count) {
+                        let f = c.front.ast.at(functions, j);
+                        let symbol = c.front.ast.idents[c.front.ast.functions[f as usize].name as usize].symbol;
+                        let visibility = c.front.ast.functions[f as usize].visibility;
+                        declarePackageName(c, package, symbol, isPublicVisibility(visibility))?;
+                    }
+                }
+                ItemKind.Impl(_, _, _) => {}
+                _ => {
+                    let entry = c.front.ast.items[item as usize];
+                    let symbol = c.front.ast.idents[entry.name as usize].symbol;
+                    declarePackageName(c, package, symbol, isPublicVisibility(entry.visibility))?;
+                }
+            }
+        }
+        let importCount = c.front.ast.units[u].imports.length;
+        for (k in 0..importCount) {
+            let imported = c.front.ast.units[u].imports[k];
+            let first = c.front.ast.idents[c.front.ast.at(imported.parts, 0) as usize].symbol;
+            var name = Vector<u8>.create();
+            appendBytes(mut name, c.name(first))?;
+            // An import of a package that is not a dependency was reported by PackageNames (N0310).
+            let dependency = dependencyNamed(c, package, name.view());
+            if (dependency != none()) {
+                let item = if (imported.parts.count > 1) c.front.ast.idents[c.front.ast.at(
+                    imported.parts,
+                    1,
+                ) as usize].symbol else none();
+                c.fileImports.push(FileImport { file: file, package: dependency, item: item })?;
+            }
+        }
+    }
+    return Ok();
+}
+
+/// Declared.TryAdd: the first declaration of a name in a package, and whether it is public. The core scope is
+/// package none, kept apart by its own key.
+fn declarePackageName(c: borrow mut Checker, package: u32, symbol: u32, isPublic: bool) -> Result<void, AllocError> {
+    let key = packageKey(if (package == none()) 0xFFFFFFFE else package, symbol);
+    if (c.packageDeclared.find(key) != null) {
+        return Ok();
+    }
+    c.packageDeclared.put(key, Word { value: if (isPublic) 1 else 0 })?;
+    return c.declaredOrder.push(DeclaredEntry { package: package, symbol: symbol, isPublic: isPublic });
+}
+
+struct DeclaredEntry {
+    package: u32;
+    symbol: u32;
+    isPublic: bool;
+}
+
+/// Does package `package` declare `symbol` (Declared.TryGetValue)? 0 no, 1 not public, 2 public.
+fn declaredIn(c: borrow Checker, package: u32, symbol: u32) -> u32 {
+    let key = packageKey(if (package == none()) 0xFFFFFFFE else package, symbol);
+    return match (c.packageDeclared.get(key)) {
+        Some(w) => if (w.value == 1) 2u32 else 1u32,
+        null => 0u32,
+    };
+}
+
+/// Is an item public (IsPublic)?
+fn isPublicEntity(c: borrow Checker, entity: Entity) -> bool {
+    match (entity) {
+        Entity.Function(f) => {
+            return isPublicVisibility(c.front.ast.functions[c.hir.functions[f as usize].syntax as usize].visibility);
+        }
+        Entity.GenericFunction(g) => {
+            return isPublicVisibility(c.front.ast.functions[c.genericFunctions[g as usize].syntax as usize].visibility);
+        }
+        Entity.Struct(s) => { return itemIsPublic(c, c.structs[s as usize].item); }
+        Entity.Enum(e) => { return itemIsPublic(c, c.enums[e as usize].item); }
+        Entity.Interface(i) => { return itemIsPublic(c, c.interfaces[i as usize].item); }
+        Entity.Constant(k) => { return itemIsPublic(c, c.constants[k as usize].item); }
+        Entity.Static(s) => { return itemIsPublic(c, c.statics[s as usize].item); }
+        _ => { return false; }
+    }
+}
+
+fn itemIsPublic(c: borrow Checker, item: u32) -> bool =>
+    item != none() && isPublicVisibility(c.front.ast.items[item as usize].visibility);
+
+/// The item a name means in the current file (Item, §2): the package's own; for a dotted name `dep.X`, the
+/// dependency's item; then the file's imports; then lib/core's.
+fn packageItem(c: borrow Checker, symbol: u32) -> Entity {
+    let package = currentPackage(c);
+    if (package == none()) {
+        return foundEntity(c.coreItems, Word { value: symbol as u64 });
+    }
+    let mine = foundEntity(c.packageItems, packageKey(package, symbol));
+    match (mine) {
+        Entity.None => {}
+        _ => { return mine; }
+    }
+    let text = c.name(symbol);
+    var dot = none();
+    for (k in 0..text.length) {
+        if (dot == none() && text[k] == '.') {
+            dot = truncate<u32>(k);
+        }
+    }
+    if (dot != none() && dot > 0) {
+        let dependency = dependencyNamed(c, package, text[..(dot as usize)]);
+        if (dependency == none()) {
+            return Entity.None;
+        }
+        let rest = c.front.symbols.find(text[((dot as usize) + 1)..]);
+        return match (rest) {
+            Some(s) => foundEntity(c.packageItems, packageKey(dependency, s.id)),
+            null => Entity.None,
+        };
+    }
+    for (imported in c.fileImports.view()) {
+        if (imported.file != c.file || (imported.item != none() && imported.item != symbol)) {
+            continue;
+        }
+        let found = foundEntity(c.packageItems, packageKey(imported.package, symbol));
+        let isNone = match (found) {
+            Entity.None => true,
+            _ => false,
+        };
+        if (!isNone && (imported.item != none() || isPublicEntity(c, found))) {
+            return found;
+        }
+    }
+    return foundEntity(c.coreItems, Word { value: symbol as u64 });
+}
+
+/// An item's name as messages and the C backend write it (Qualified): with its package's name for a dependency's.
+fn qualifiedName(
+    c: borrow Checker,
+    file: u32,
+    text: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    let package = packageOfFile(c, file);
+    if (package != none() && package != 0) {
+        appendBytes(out, c.packages[package as usize].name.view())?;
+        out.push('.')?;
+    }
+    return appendBytes(out, text);
+}
+
+/// The symbol of a declared name, qualified for a dependency's item.
+fn qualifiedSymbol(c: borrow mut Checker, symbol: u32) -> Result<u32, AllocError> {
+    let package = currentPackage(c);
+    if (package == none() || package == 0) {
+        return Ok(symbol);
+    }
+    var text = Vector<u8>.create();
+    let file = c.file;
+    qualifiedName(c, file, c.name(symbol), mut text)?;
+    return Ok(c.front.symbols.intern(text.view())?.id);
+}
+
+/// Is `file` in a package other than the current one, and not a library (IsOtherPackage)?
+fn isOtherPackage(c: borrow Checker, file: u32) -> bool {
+    let owner = packageOfFile(c, file);
+    return owner != none() && owner != currentPackage(c);
+}
+
+/// N0312 for a method or static function of another package's struct that is not public (CheckMethodVisible).
+fn checkMethodVisible(c: borrow mut Checker, function: u32, span: Span) -> Result<void, AllocError> {
+    let owner = c.hir.functions[function as usize].owner;
+    if (owner == none()) {
+        return Ok();
+    }
+    let definition = c.types.info(owner).structDef;
+    if (definition == none()) {
+        return Ok();
+    }
+    let syntax = c.front.ast.functions[c.hir.functions[function as usize].syntax as usize];
+    if (isPublicVisibility(syntax.visibility) || !isOtherPackage(c, c.types.structs[definition as usize].file)) {
+        return Ok();
+    }
+    var message = Vector<u8>.create();
+    appendQuotedType(mut message, c, owner)?;
+    message.truncate(message.length - 1);
+    appendText(mut message, ".")?;
+    appendBytes(mut message, c.name(c.hir.functions[function as usize].name))?;
+    appendText(mut message, "' is not public: only its own package can call it (type-system.md §2)")?;
+    return c.error(notPublic(), span.start, span.end, message);
+}
+
+fn notPublic() -> u32 => 312;
+fn unknownPackageItem() -> u32 => 311;
+fn ambiguousImport() -> u32 => 313;

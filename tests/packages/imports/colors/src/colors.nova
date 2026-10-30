@@ -1,0 +1,4 @@
+public enum Color { Red, Green }
+public fn name() -> u32 => 3;
+public fn shared() -> u32 => 4;
+public fn red() -> Color => Color.Red;

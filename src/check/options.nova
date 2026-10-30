@@ -58,10 +58,6 @@ fn resolveGenericType(
                 appendBytes(mut itemName, c.name(first.symbol))?;
                 return resolveRegionItemType(c, entry.typ, entry.item, itemName.view(), arguments, span, false, index);
             }
-            Entity.LibraryItem(_) => {
-                c.notPorted(span.start, span.end, "a generic struct or enum", "S4/S5")?;
-                return Ok(c.types.error);
-            }
             _ => {}
         }
     }

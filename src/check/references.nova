@@ -526,7 +526,6 @@ fn collectFlowNames(
             match (c.item(symbol)) {
                 Entity.Struct(index) => { regions = itemRegionCount(c, c.structs[index as usize].item); }
                 Entity.Enum(index) => { regions = itemRegionCount(c, c.enums[index as usize].item); }
-                Entity.LibraryItem(item) => { regions = itemRegionCount(c, item); }
                 _ => {
                     if (sameText(text, "StringView") || ((sameText(text, "Slice") || sameText(text, "SliceMut")) &&
                         arguments.count == 2)) {

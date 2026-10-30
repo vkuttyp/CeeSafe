@@ -494,6 +494,7 @@ fn findMethod(c: borrow mut Checker, typ: u32, name: u32, span: Span) -> Result<
     if (definition != none()) {
         let ownBound = findStructFunction(c, definition, name);
         if (ownBound != none()) {
+            checkMethodVisible(c, ownBound, span)?;
             return Ok(ownBound);
         }
     }

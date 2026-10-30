@@ -404,7 +404,10 @@ fn processFunctionAttributesOf(c: borrow mut Checker, f: u32) -> Result<void, Al
 /// The current package's own item `symbol` (the reference's Own): lib/core's in a library file, else the program's.
 fn ownEntity(c: borrow Checker, symbol: u32) -> Entity {
     let key = Word { value: symbol as u64 };
-    return if (isLibraryFile(c)) foundEntity(c.coreItems, key) else foundEntity(c.rootItems, key);
+    return if (isLibraryFile(c)) foundEntity(c.coreItems, key) else foundEntity(
+        c.packageItems,
+        packageKey(currentPackage(c), symbol),
+    );
 }
 
 /// The C symbol `@export` gives: the item's name, or the string argument; count 0xFFFFFFFF when invalid.

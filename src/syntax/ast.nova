@@ -343,6 +343,7 @@ struct Ast {
     patterns: Vector<PatternNode>;
     patternSpans: Vector<Span>;
     bindings: Vector<Binding>;
+    replacedIdents: Vector<u32>; // identifiers PackageNames joined into a `dep.X` name: no longer in the tree
     stmts: Vector<StmtNode>;
     stmtSpans: Vector<Span>;
     closures: Vector<Closure>;
@@ -371,6 +372,7 @@ struct Ast {
         patterns: Vector<PatternNode>.create(),
         patternSpans: Vector<Span>.create(),
         bindings: Vector<Binding>.create(),
+        replacedIdents: Vector<u32>.create(),
         stmts: Vector<StmtNode>.create(),
         stmtSpans: Vector<Span>.create(),
         closures: Vector<Closure>.create(),

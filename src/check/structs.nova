@@ -101,7 +101,12 @@ fn declareStruct(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
         return Ok();
     }
     var name = Vector<u8>.create();
-    appendBytes(mut name, c.name(ident.symbol))?;
+    if (s.isImported) {
+        appendBytes(mut name, c.name(ident.symbol))?; // an imported C type keeps its C name
+    } else {
+        let file = c.file;
+        qualifiedName(c, file, c.name(ident.symbol), mut name)?;
+    }
     var parameters = Vector<u32>.create();
     var pairs = Vector<EnvPair>.create();
     if (s.typeParameters.count > 0) {
@@ -143,7 +148,8 @@ fn declareEnum(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
         return Ok();
     }
     var name = Vector<u8>.create();
-    appendBytes(mut name, c.name(ident.symbol))?;
+    let file = c.file;
+    qualifiedName(c, file, c.name(ident.symbol), mut name)?;
     var typeParameters = Vector<u32>.create();
     var pairs = Vector<EnvPair>.create();
     if (parameters.count > 0) {
