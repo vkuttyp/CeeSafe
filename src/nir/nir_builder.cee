@@ -189,7 +189,14 @@ fn finishFunction(f: u32, b: Lowering, parameterCount: u32) -> Result<NirFunctio
     for (i in 0..(count / 2)) {
         blocks.swap(i, count - 1 - i);
     }
-    return Ok(NirFunction { source: f, locals: locals, parameterCount: parameterCount, blocks: blocks });
+    return Ok(NirFunction {
+        source: f,
+        locals: locals,
+        parameterCount: parameterCount,
+        blocks: blocks,
+        variant: 0,
+        bindings: Vector<u64>.create(),
+    });
 }
 
 fn newBlock(b: borrow mut Lowering) -> Result<u32, AllocError> {

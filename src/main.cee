@@ -43,15 +43,17 @@ struct Options {
     dumpAst: bool;
     dumpHir: bool;
     noFloat: bool;
-    libraryDiagnostics: bool;  // report diagnostics in the libraries' files too (porting gaps there; novac has none)
-    freestanding: bool;        // --profile freestanding (cosmoos/profiles.md §4)
-    kernel: bool;              // --kernel cosmoos: lib/kernel, in the freestanding profile (ADR 0025)
-    profileGiven: bool;        // --profile was given: package mode keeps it over the manifest's
-    building: bool;            // `build`: until P5, only `--dump-nir`, which prints the NIR and stops
-    dumpNir: bool;             // --dump-nir (build)
-    emit: Vector<u8>;          // --emit c|exe|obj (build)
-    output: Vector<u8>;        // -o (build), or empty
-    exportsHeader: Vector<u8>; // --exports-header (build)
+    libraryDiagnostics: bool;    // report diagnostics in the libraries' files too (porting gaps there; novac has none)
+    freestanding: bool;          // --profile freestanding (cosmoos/profiles.md §4)
+    kernel: bool;                // --kernel cosmoos: lib/kernel, in the freestanding profile (ADR 0025)
+    profileGiven: bool;          // --profile was given: package mode keeps it over the manifest's
+    building: bool;              // `build`: until P5, only `--dump-nir`, which prints the NIR and stops
+    dumpNir: bool;               // --dump-nir (build)
+    closureSpecialisation: bool; // on unless --no-closure-specialisation (optimisations.md §5)
+    explainClosureCalls: bool;   // --explain-closure-calls
+    emit: Vector<u8>;            // --emit c|exe|obj (build)
+    output: Vector<u8>;          // -o (build), or empty
+    exportsHeader: Vector<u8>;   // --exports-header (build)
     emitGiven: bool;
     lineDirectives: bool;       // --line-directives or -g (build)
     debug: bool;                // -g (build)
@@ -150,9 +152,13 @@ fn readOptions(options: borrow mut Options) -> i32 {
             } else {
                 options.exportsHeader = copyBytes(value.bytes())!;
             }
-        } else if (options.building && (arg == "--no-closure-specialisation" || arg == "--no-placement" ||
-            arg == "--no-bce" || arg == "--no-oce" || arg == "--flat-c")) {
-            // The optimisations and the structured form are P7's: ceesafec always emits as novac does with these.
+        } else if (options.building && arg == "--no-closure-specialisation") {
+            options.closureSpecialisation = false;
+        } else if (options.building && arg == "--explain-closure-calls") {
+            options.explainClosureCalls = true;
+        } else if (options.building && (arg == "--no-placement" || arg == "--no-bce" || arg == "--no-oce" ||
+            arg == "--flat-c")) {
+            // Not ported yet (docs/p7-plan.md): ceesafec emits as novac does with these.
         } else if (arg == "--no-float") {
             options.noFloat = true;
         } else if (arg == "--library-diagnostics") {
@@ -342,6 +348,8 @@ fn parseCommand() -> i32 {
         profileGiven: false,
         building: false,
         dumpNir: false,
+        closureSpecialisation: true,
+        explainClosureCalls: false,
         emit: copyBytes("exe".bytes())!,
         output: Vector<u8>.create(),
         exportsHeader: copyBytes("nova_exports.h".bytes())!,
@@ -558,6 +566,8 @@ fn fileCommand(building: bool) -> i32 {
         profileGiven: false,
         building: building,
         dumpNir: false,
+        closureSpecialisation: true,
+        explainClosureCalls: false,
         emit: copyBytes("exe".bytes())!,
         output: Vector<u8>.create(),
         exportsHeader: copyBytes("nova_exports.h".bytes())!,
@@ -709,10 +719,13 @@ fn fileCommand(building: bool) -> i32 {
         if (checker.front.diagnostics.hasErrors()) {
             return report(options.json, checker.front.diagnostics, sources);
         }
-        if (options.dumpNir) {
-            var out = Vector<u8>.create();
-            printNir(checker, nir, mut out)!;
-            Console.writeBytes(out.view());
+        // The report is of a fresh specialisation of the checked NIR, made whether or not the C uses it (§5.3).
+        var closureReport = ClosureReport {
+            calls: Vector<ClosureCall>.create(),
+            variants: Vector<PendingVariant>.create(),
+        };
+        if (options.explainClosureCalls) {
+            closureReport = specialiseClosures(checker, mut nir, false)!;
         }
         // The name split mode's external C names carry: --program, the package's, or the first file's.
         var programName = copyBytes(options.programName.view())!;
@@ -726,20 +739,26 @@ fn fileCommand(building: bool) -> i32 {
         // With C files, `main` may be in C (type-system.md §28.6).
         let requireMain = sameText(options.emit.view(), "exe") && options.cNames.length == 0 && !options.freestanding;
         var files = Vector<CFile>.create();
-        if (!generateC(
-            mut checker,
-            nir,
-            sources,
-            requireMain,
-            options.freestanding,
-            options.lineDirectives,
-            options.split,
-            programName.view(),
-            options.exportsHeader.view(),
-            mut files,
-        )!) {
+        let build = CBuildOptions {
+            requireMain: requireMain,
+            freestanding: options.freestanding,
+            lineDirectives: options.lineDirectives,
+            split: options.split,
+            programName: programName,
+            exportsHeader: copyBytes(options.exportsHeader.view())!,
+            closureSpecialisation: options.closureSpecialisation,
+        };
+        if (!generateC(mut checker, mut nir, sources, build, mut files)!) {
             return report(options.json, checker.front.diagnostics, sources);
         }
+        var printed = Vector<u8>.create();
+        if (options.dumpNir) {
+            printNir(checker, nir, mut printed)!; // the NIR the C was made from (closure variants included)
+        }
+        if (options.explainClosureCalls) {
+            explainClosureCalls(checker, nir, sources, closureReport, mut printed)!;
+        }
+        Console.writeBytes(printed.view());
         for (k in 0..options.cNames.length) {
             var name = copyBytes("c/".bytes())!;
             appendBytes(mut name, options.cNames[k].view())!;

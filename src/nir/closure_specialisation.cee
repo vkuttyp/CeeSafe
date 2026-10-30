@@ -1,0 +1,504 @@
+// Closure-call specialisation (the reference's Nir/ClosureSpecialisation.cs; optimisations.md §5, ADR 0019): a call
+// through a closure whose body is known becomes a direct call to that body, and a call passing a known closure to a
+// closure-typed parameter goes to a variant of the callee with that parameter bound, so the calls inside are direct
+// too. Every function is rewritten into new blocks (statements that change are new; the rest are shared), and the
+// variants come after the program's own functions, in the order a worklist makes them.
+
+/// One call through a closure (ClosureCall): where it is, and the body it now calls directly (none: indirect).
+struct ClosureCall {
+    source: u32;  // the HIR function the call is in
+    variant: u32; // and its variant
+    start: u32;   // the statement's span
+    body: u32;    // the closure's HIR function, or none
+}
+
+/// A variant made (or to be rewritten): its callee, bindings and number.
+struct PendingVariant {
+    callee: u32;
+    bindings: Vector<u64>; // (index << 32) | body, by index
+    variant: u32;
+}
+
+/// What specialisation did (the reference's report): the calls through closures and the variants made, in order.
+struct ClosureReport {
+    calls: Vector<ClosureCall>;
+    variants: Vector<PendingVariant>; // in the order made
+}
+
+struct Specialiser {
+    originals: Vector<u32>;           // by HIR function: its NIR function, or none
+    variants: Vector<PendingVariant>; // every variant made, in the order made
+    work: usize;                      // the next variant to rewrite
+    counts: Vector<u32>;              // by HIR function: its variants so far
+    calls: Vector<ClosureCall>;
+}
+
+fn sameBindings(a: borrow Vector<u64>, b: borrow Vector<u64>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (k in 0..a.length) {
+        if (a[k] != b[k]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Functions with a body in NIR that is compiled: not generic versions (§20.3).
+fn isSpecialisable(c: borrow Checker, source: u32) -> bool =>
+    !functionIsGeneric(c, source) && !isExternFunction(c, source);
+
+/// The variant of `callee` for these bindings (VariantOf): queued now if new, rewritten later.
+fn variantOf(s: borrow mut Specialiser, callee: u32, bindings: Vector<u64>) -> Result<u32, AllocError> {
+    for (v in s.variants.view()) {
+        if (v.callee == callee && sameBindings(v.bindings, bindings)) {
+            return Ok(v.variant);
+        }
+    }
+    let number = s.counts[callee as usize] + 1;
+    s.counts[callee as usize] = number;
+    s.variants.push(PendingVariant { callee: callee, bindings: bindings, variant: number })?;
+    return Ok(number);
+}
+
+/// A local's closure, as known so far (`known[local]`), or none.
+fn knownOf(known: borrow Vector<u32>, local: u32) -> u32 =>
+    if ((local as usize) < known.length) known[local as usize] else none();
+
+fn localOperand(n: borrow NirProgram, operand: u32) -> u32 => match (n.operands[operand as usize]) {
+    NirOperand.Place(place, _) =>
+        if (n.places[place as usize].projections.count == 0) n.places[place as usize].local else none(),
+    _ => none(),
+};
+
+/// The value every assignment gives (Agree), if they all give the same one that is not none.
+fn agreeOn(values: borrow Vector<u32>, results: borrow Vector<u32>) -> u32 {
+    var agreed = none();
+    for (k in 0..values.length) {
+        let one = results[k];
+        if (one == none() || (agreed != none() && agreed != one)) {
+            return none();
+        }
+        agreed = one;
+    }
+    return agreed;
+}
+
+/// The locals holding a known closure, and its body (KnownClosures, optimisations.md §5.1): every assignment to the
+/// local makes that closure, or copies, casts or reborrows a local holding it; a variant's bound parameters are seeds.
+fn specialisedClosures(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    function: borrow NirFunction,
+    bindings: borrow Vector<u64>,
+) -> Result<Vector<u32>, AllocError> {
+    let count = function.locals.length;
+    // Each local's assignments, in order: an rvalue, or none for a write that is not followed.
+    var order = Vector<u32>.create(); // locals in the order of their first assignment
+    var assignments = Vector<Vector<u32>>.create();
+    for (k in 0..count) {
+        assignments.push(Vector<u32>.create())?;
+    }
+    for (block in function.blocks.view()) {
+        for (s in block.statements.view()) {
+            match (n.statements[s as usize]) {
+                NirStatement.Assign(target, r) => {
+                    let local = n.places[target as usize].local;
+                    let value = if (n.places[target as usize].projections.count == 0) r else none();
+                    if (assignments[local as usize].length == 0) {
+                        order.push(local)?;
+                    }
+                    assignments[local as usize].push(value)?;
+                }
+                NirStatement.Unpack(_, _, targets) => {
+                    for (k in 0..targets.count) {
+                        let target = n.at(targets, k);
+                        if (target != none()) {
+                            if (assignments[target as usize].length == 0) {
+                                order.push(target)?;
+                            }
+                            assignments[target as usize].push(none())?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    var known = Vector<u32>.create();
+    var codes = Vector<u32>.create();
+    for (k in 0..count) {
+        known.push(none())?;
+        codes.push(none())?;
+    }
+    for (b in bindings.view()) {
+        known[(b >> 32) as usize] = truncate<u32>(b & 0xFFFFFFFF);
+    }
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (local in order.view()) {
+            let values = borrow assignments[local as usize];
+            if (codes[local as usize] == none()) {
+                var results = Vector<u32>.create();
+                for (v in values.view()) {
+                    var code = none();
+                    if (v != none()) {
+                        match (n.rvalues[v as usize]) {
+                            NirRvalue.FunctionAddress(f) => {
+                                if (c.hir.functions[f as usize].isClosure) {
+                                    code = f;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    results.push(code)?;
+                }
+                let code = agreeOn(values, results);
+                if (code != none()) {
+                    codes[local as usize] = code;
+                    changed = true;
+                }
+            }
+            if (known[local as usize] == none() && c.types.isClosure(function.locals[local as usize].typ)) {
+                var results = Vector<u32>.create();
+                for (v in values.view()) {
+                    results.push(specialisedClosureOf(c, n, function, v, known, codes, assignments)?)?;
+                }
+                let body = agreeOn(values, results);
+                if (body != none()) {
+                    known[local as usize] = body;
+                    changed = true;
+                }
+            }
+        }
+    }
+    return Ok(known);
+}
+
+/// The body of the closure a value makes or carries, if known (Closure).
+fn specialisedClosureOf(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    function: borrow NirFunction,
+    value: u32,
+    known: borrow Vector<u32>,
+    codes: borrow Vector<u32>,
+    assignments: borrow Vector<Vector<u32>>,
+) -> Result<u32, AllocError> {
+    if (value == none()) {
+        return Ok(none());
+    }
+    match (n.rvalues[value as usize]) {
+        NirRvalue.Ref(_, place) => {
+            let p = n.places[place as usize];
+            if (p.projections.count != 1) {
+                return Ok(none());
+            }
+            let projection = n.projections[p.projections.start as usize];
+            match (projection.kind) {
+                ProjectionKind.Field => {
+                    // A closure made here: a reference to field 0 of its environment, whose field 0 is the body's address.
+                    let s = c.types.info(function.locals[p.local as usize].typ).structDef;
+                    if (s == none() || c.types.structs[s as usize].fields.length == 0 ||
+                        projection.field != c.types.structs[s as usize].fields[0] ||
+                        assignments[p.local as usize].length == 0) {
+                        return Ok(none());
+                    }
+                    let environments = borrow assignments[p.local as usize];
+                    var results = Vector<u32>.create();
+                    for (e in environments.view()) {
+                        var code = none();
+                        if (e != none()) {
+                            match (n.rvalues[e as usize]) {
+                                NirRvalue.Aggregate(fields) => {
+                                    if (fields.count > 0) {
+                                        let first = localOperand(n, n.at(fields, 0));
+                                        if (first != none()) {
+                                            code = codes[first as usize];
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        results.push(code)?;
+                    }
+                    return Ok(agreeOn(environments, results));
+                }
+                ProjectionKind.Deref => { return Ok(knownOf(known, p.local)); } // a reborrow of a closure in a local
+                _ => { return Ok(none()); }
+            }
+        }
+        NirRvalue.Use(o) => {
+            let local = localOperand(n, o);
+            return Ok(if (local == none()) none() else knownOf(known, local));
+        }
+        NirRvalue.Cast(o) => {
+            let local = localOperand(n, o);
+            return Ok(if (local == none()) none() else knownOf(known, local));
+        }
+        _ => { return Ok(none()); }
+    }
+}
+
+/// A call through a known closure as a direct call, a call passing known closures as a variant's call (Specialise):
+/// the new rvalue, or none to keep the statement.
+fn specialiseRvalue(
+    c: borrow Checker,
+    n: borrow mut NirProgram,
+    s: borrow mut Specialiser,
+    original: borrow Vector<NirFunction>,
+    known: borrow Vector<u32>,
+    r: u32,
+    source: u32,
+    variant: u32,
+    start: u32,
+) -> Result<u32, AllocError> {
+    let t = n.rvalueTypes[r as usize];
+    let span = n.rvalueSpans[r as usize];
+    match (n.rvalues[r as usize]) {
+        NirRvalue.Builtin(b, arguments) => {
+            if (b != bfCallClosure()) {
+                return Ok(none());
+            }
+            let local = localOperand(n, n.at(arguments, 0));
+            let body = if (local == none()) none() else knownOf(known, local);
+            s.calls.push(ClosureCall { source: source, variant: variant, start: start, body: body })?;
+            if (body == none()) {
+                return Ok(none());
+            }
+            return n.rvalue(NirRvalue.Call(body, arguments), t, span);
+        }
+        NirRvalue.Call(callee, arguments) => {
+            if (n.rvalueVariants[r as usize] != 0 || s.originals[callee as usize] == none() ||
+                c.hir.functions[callee as usize].isDynMethod) {
+                return Ok(none());
+            }
+            let parameters = borrow original[s.originals[callee as usize] as usize].locals;
+            var bindings = Vector<u64>.create();
+            for (k in 0..arguments.count) {
+                let local = localOperand(n, n.at(arguments, k));
+                if ((k as usize) < parameters.length && c.types.isClosure(
+                    parameters[k as usize].typ,
+                ) && local != none() &&
+                    knownOf(known, local) != none()) {
+                    bindings.push(((k as u64) << 32) | knownOf(known, local) as u64)?;
+                }
+            }
+            if (bindings.length == 0) {
+                return Ok(none());
+            }
+            let number = variantOf(s, callee, bindings)?;
+            let call = n.rvalue(NirRvalue.Call(callee, arguments), t, span)?;
+            n.rvalueVariants[call as usize] = number;
+            return Ok(call);
+        }
+        _ => { return Ok(none()); }
+    }
+}
+
+/// A function's copy with its calls specialised (Rewrite).
+fn rewriteFunction(
+    c: borrow Checker,
+    n: borrow mut NirProgram,
+    s: borrow mut Specialiser,
+    original: borrow Vector<NirFunction>,
+    index: u32,
+    bindings: borrow Vector<u64>,
+    variant: u32,
+    specialise: bool,
+) -> Result<NirFunction, AllocError> {
+    let function = borrow original[index as usize];
+    let known = if (specialise) specialisedClosures(c, n, function, bindings)? else Vector<u32>.create();
+    var locals = Vector<NirLocal>.create();
+    for (l in function.locals.view()) {
+        locals.push(l)?;
+    }
+    var blocks = Vector<NirBlock>.create();
+    for (block in function.blocks.view()) {
+        var statements = Vector<u32>.create();
+        for (statement in block.statements.view()) {
+            let start = n.statementSpans[statement as usize].start;
+            var replaced = none();
+            let kind = if (specialise) n.statements[statement as usize] else NirStatement.StorageDead(0);
+            match (kind) {
+                NirStatement.Assign(target, r) => {
+                    let value = specialiseRvalue(c, n, s, original, known, r, function.source, variant, start)?;
+                    if (value != none()) {
+                        n.statements.push(NirStatement.Assign(target, value))?;
+                        replaced = truncate<u32>(n.statements.length - 1);
+                    }
+                }
+                NirStatement.Eval(r) => {
+                    let value = specialiseRvalue(c, n, s, original, known, r, function.source, variant, start)?;
+                    if (value != none()) {
+                        n.statements.push(NirStatement.Eval(value))?;
+                        replaced = truncate<u32>(n.statements.length - 1);
+                    }
+                }
+                _ => {}
+            }
+            if (replaced != none()) {
+                let span = n.statementSpans[statement as usize];
+                n.statementSpans.push(span)?;
+                statements.push(replaced)?;
+            } else {
+                statements.push(statement)?;
+            }
+        }
+        var successors = Vector<u32>.create();
+        for (target in block.successors.view()) {
+            successors.push(target)?;
+        }
+        blocks.push(
+            NirBlock { id: block.id, statements: statements, terminator: block.terminator, successors: successors },
+        )?;
+    }
+    var bound = Vector<u64>.create();
+    for (b in bindings.view()) {
+        bound.push(b)?;
+    }
+    return Ok(NirFunction {
+        source: function.source,
+        locals: locals,
+        parameterCount: function.parameterCount,
+        blocks: blocks,
+        variant: variant,
+        bindings: bound,
+    });
+}
+
+/// The specialised program (Apply): `n.functions` is replaced when `apply`, and the report says what was done.
+fn specialiseClosures(c: borrow Checker, n: borrow mut NirProgram, apply: bool) -> Result<ClosureReport, AllocError> {
+    var original = Vector<NirFunction>.create();
+    while (n.functions.length > 0) {
+        original.push(n.functions.pop()!)?;
+    }
+    let total = original.length;
+    for (k in 0..(total / 2)) {
+        original.swap(k, total - 1 - k);
+    }
+    var s = Specialiser {
+        originals: Vector<u32>.create(),
+        variants: Vector<PendingVariant>.create(),
+        work: 0,
+        counts: Vector<u32>.create(),
+        calls: Vector<ClosureCall>.create(),
+    };
+    for (k in 0..c.hir.functions.length) {
+        s.originals.push(none())?;
+        s.counts.push(0)?;
+    }
+    for (k in 0..original.length) {
+        if (isSpecialisable(c, original[k].source)) {
+            s.originals[original[k].source as usize] = truncate<u32>(k);
+        }
+    }
+    var rewritten = Vector<NirFunction>.create();
+    let empty = Vector<u64>.create();
+    for (k in 0..original.length) {
+        // A generic version is copied unchanged.
+        let specialise = isSpecialisable(c, original[k].source);
+        rewritten.push(rewriteFunction(c, n, mut s, original, truncate<u32>(k), empty, 0, specialise)?)?;
+    }
+    while (s.work < s.variants.length) {
+        let callee = s.variants[s.work].callee;
+        let number = s.variants[s.work].variant;
+        var bindings = Vector<u64>.create();
+        for (b in s.variants[s.work].bindings.view()) {
+            bindings.push(b)?;
+        }
+        s.work += 1;
+        let index = s.originals[callee as usize];
+        rewritten.push(rewriteFunction(c, n, mut s, original, index, bindings, number, true)?)?;
+    }
+    if (apply) {
+        n.functions = rewritten;
+    } else {
+        n.functions = original;
+    }
+    return Ok(ClosureReport { calls: s.calls, variants: s.variants });
+}
+
+/// The report `--explain-closure-calls` prints (optimisations.md §5.3).
+fn explainClosureCalls(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    report: borrow ClosureReport,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    for (call in report.calls.view()) {
+        if (c.hir.functions[call.source as usize].library && call.variant == 0) {
+            continue;
+        }
+        let file = c.hir.functions[call.source as usize].file;
+        appendBytes(out, sources[file as usize].path.view())?;
+        out.push(':')?;
+        appendDecimal(out, sources[file as usize].position(call.start as usize).line as u64)?;
+        appendText(out, ": in ")?;
+        appendVariantFunction(c, out, call.source, call.variant)?;
+        appendText(out, ": ")?;
+        if (call.body == none()) {
+            appendText(out, "indirect: the closure is not known here\n")?;
+        } else {
+            appendText(out, "direct call to ")?;
+            appendClosureBody(c, sources, out, call.body)?;
+            out.push('\n')?;
+        }
+    }
+    for (variant in report.variants.view()) {
+        appendText(out, "variant ")?;
+        appendVariantFunction(c, out, variant.callee, variant.variant)?;
+        appendText(out, ": ")?;
+        for (j in 0..variant.bindings.length) {
+            if (j > 0) {
+                appendText(out, ", ")?;
+            }
+            let b = variant.bindings[j];
+            appendText(out, "parameter ")?;
+            appendDecimal(out, b >> 32)?;
+            appendText(out, " = ")?;
+            appendClosureBody(c, sources, out, truncate<u32>(b & 0xFFFFFFFF))?;
+        }
+        out.push('\n')?;
+    }
+    return Ok();
+}
+
+fn appendClosureBody(
+    c: borrow Checker,
+    sources: borrow Vector<SourceText>,
+    out: borrow mut Vector<u8>,
+    body: u32,
+) -> Result<void, AllocError> {
+    let f = borrow c.hir.functions[body as usize];
+    let start = c.front.ast.functions[f.syntax as usize].start;
+    appendText(out, "the closure at ")?;
+    appendBytes(out, sources[f.file as usize].path.view())?;
+    out.push(':')?;
+    return appendDecimal(out, sources[f.file as usize].position(start as usize).line as u64);
+}
+
+/// `Owner.name#variant` (Describe).
+fn appendVariantFunction(
+    c: borrow Checker,
+    out: borrow mut Vector<u8>,
+    source: u32,
+    variant: u32,
+) -> Result<void, AllocError> {
+    let f = borrow c.hir.functions[source as usize];
+    if (f.owner != none()) {
+        appendBytes(out, c.types.name(f.owner))?;
+        out.push('.')?;
+    }
+    appendBytes(out, c.name(f.name))?;
+    if (variant > 0) {
+        out.push('#')?;
+        appendDecimal(out, variant as u64)?;
+    }
+    return Ok();
+}

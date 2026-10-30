@@ -76,8 +76,16 @@ def main():
     parser.add_argument("--extra", action="append", default=[],
                         help="another switch for both compilers, e.g. --extra=--split or --extra=-g (repeatable)")
     parser.add_argument("--show", type=int, default=0, help="print the first lines of N differing files' diffs")
+    parser.add_argument("--on", action="append", default=[],
+                        choices=("closure-specialisation", "placement", "bce", "oce", "structured"),
+                        help="leave this part on (its novac default) for both compilers (repeatable)")
     parser.add_argument("paths", nargs="+")
     args = parser.parse_args()
+    off = {"closure-specialisation": "--no-closure-specialisation", "placement": "--no-placement", "bce": "--no-bce",
+           "oce": "--no-oce", "structured": "--flat-c"}
+    for part in args.on:
+        if off[part] in SWITCHES:
+            SWITCHES.remove(off[part])
     ceesafec = os.path.abspath(args.ceesafec)
     novac = os.path.expanduser(args.novac)
     work = [(args.root, ceesafec, novac, path, args.extra) for path in files(args.root, args.paths)]

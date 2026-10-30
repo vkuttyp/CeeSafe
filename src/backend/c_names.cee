@@ -609,3 +609,13 @@ fn appendCMessageLiteral(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result
     }
     return out.push('"');
 }
+
+/// A variant's prefix (VariantName, c-backend §2.1): `nvXS<n>_` before its original's name; none for the original.
+fn appendVariantPrefix(out: borrow mut Vector<u8>, variant: u32) -> Result<void, AllocError> {
+    if (variant == 0) {
+        return Ok();
+    }
+    appendText(out, "nvXS")?;
+    appendDecimal(out, variant as u64)?;
+    return out.push('_');
+}

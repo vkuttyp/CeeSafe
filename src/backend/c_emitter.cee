@@ -39,6 +39,7 @@ struct CEmitter {
     sites: Map<PairKey, u32>;          // (file << 32 | line, column) → id
     siteList: Vector<CSite>;           // by id
     usedLibrary: Vector<bool>;         // by HIR function: library code that compiled code reaches (§29.2)
+    usedVariants: Vector<u64>;         // the library (function, variant) pairs reached (variantKey)
     usedTypes: Vector<bool>;           // by type: mentioned by emitted code
     inPlaceResults: Vector<bool>;      // by type: Box.create results some site builds in place (nvBA_)
     headerStructs: Vector<u32>;        // defined by the exports header (ADR 0030)
@@ -73,6 +74,7 @@ struct CEmitter {
         sites: Map<PairKey, u32>.create(),
         siteList: Vector<CSite>.create(),
         usedLibrary: Vector<bool>.create(),
+        usedVariants: Vector<u64>.create(),
         usedTypes: Vector<bool>.create(),
         inPlaceResults: Vector<bool>.create(),
         headerStructs: Vector<u32>.create(),

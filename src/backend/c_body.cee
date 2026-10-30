@@ -33,6 +33,7 @@ fn appendSignature(
     let source = borrow c.hir.functions[function.source as usize];
     appendCTypeName(c, mut e.buf, source.returnType)?;
     e.t(" ")?;
+    appendVariantPrefix(mut e.buf, function.variant)?;
     appendCFunctionName(c, mut e.buf, function.source)?;
     e.t("(")?;
     var count: u32 = 0;
@@ -1531,6 +1532,7 @@ fn appendRvalue(
                 appendBuiltinCall(e, c, n, sources, f, out, c.name(function.name), arguments)?;
                 return out.push(')');
             }
+            appendVariantPrefix(out, n.rvalueVariants[r as usize])?;
             appendCFunctionName(c, out, callee)?;
             out.push('(')?;
             appendOperandList(e, c, n, sources, f, out, arguments, 0)?;

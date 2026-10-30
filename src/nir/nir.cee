@@ -104,6 +104,8 @@ struct NirFunction {
     locals: Vector<NirLocal>;
     parameterCount: u32;
     blocks: Vector<NirBlock>; // the reachable ones, in the order they were made; blocks[0] is the entry
+    variant: u32;             // 0, or a variant closure-call specialisation made (optimisations.md §5)
+    bindings: Vector<u64>;    // a variant's bound parameters: (index << 32) | the closure's HIR function, by index
 }
 
 struct NirProgram {
@@ -116,7 +118,8 @@ struct NirProgram {
     projections: Vector<NirProjection>;
     rvalues: Vector<NirRvalue>;
     rvalueTypes: Vector<u32>;
-    rvalueSpans: Vector<Span>; // a Binary's, Unary's or FloatToInt's span, where it may panic
+    rvalueSpans: Vector<Span>;   // a Binary's, Unary's or FloatToInt's span, where it may panic
+    rvalueVariants: Vector<u32>; // a Call's callee variant (NirCall.Variant), 0 unless specialisation chose one
     statements: Vector<NirStatement>;
     statementSpans: Vector<Span>;
     terminators: Vector<NirTerminator>;
@@ -134,6 +137,7 @@ struct NirProgram {
         rvalues: Vector<NirRvalue>.create(),
         rvalueTypes: Vector<u32>.create(),
         rvalueSpans: Vector<Span>.create(),
+        rvalueVariants: Vector<u32>.create(),
         statements: Vector<NirStatement>.create(),
         statementSpans: Vector<Span>.create(),
         terminators: Vector<NirTerminator>.create(),
@@ -161,6 +165,7 @@ struct NirProgram {
         this.rvalues.push(node)?;
         this.rvalueTypes.push(typ)?;
         this.rvalueSpans.push(span)?;
+        this.rvalueVariants.push(0)?;
         return Ok(truncate<u32>(this.rvalues.length - 1));
     }
 

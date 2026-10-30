@@ -31,18 +31,30 @@ fn runtimeFile(k: usize, prefix: StringView) -> Result<CFile, AllocError> {
 
 /// Lowers a checked program to C files (Generate): false, with N0300 reported, if an executable needs a `main` the
 /// program lacks.
+/// The C backend's options (the reference's CEmitOptions and Generate's arguments).
+struct CBuildOptions {
+    requireMain: bool;
+    freestanding: bool;
+    lineDirectives: bool;
+    split: bool;
+    programName: Vector<u8>;
+    exportsHeader: Vector<u8>;
+    closureSpecialisation: bool; // optimisations.md §5 (off: --no-closure-specialisation)
+}
+
 fn generateC(
     c: borrow mut Checker,
-    n: borrow NirProgram,
+    n: borrow mut NirProgram,
     sources: borrow Vector<SourceText>,
-    requireMain: bool,
-    freestanding: bool,
-    lineDirectives: bool,
-    split: bool,
-    programName: Slice<u8>,
-    exportsHeaderName: Slice<u8>,
+    o: borrow CBuildOptions,
     out: borrow mut Vector<CFile>,
 ) -> Result<bool, AllocError> {
+    let requireMain = o.requireMain;
+    let freestanding = o.freestanding;
+    let lineDirectives = o.lineDirectives;
+    let split = o.split;
+    let programName = o.programName.view();
+    let exportsHeaderName = o.exportsHeader.view();
     var hasMain = false;
     for (f in c.hir.functions.view()) {
         if (f.registered && f.owner == none() && sameText(c.name(f.name), "main")) {
@@ -60,6 +72,10 @@ fn generateC(
         return Ok(false);
     }
     computeLayouts(c);
+    if (o.closureSpecialisation) {
+        // Calls through known closures become direct (optimisations.md §5).
+        specialiseClosures(c, n, true)?;
+    }
     // Twice: the location constants come before the code that uses them, and only emitting the code finds them.
     var trial = CEmitter.create(true);
     trial.lineDirectives = lineDirectives;
@@ -77,6 +93,7 @@ fn generateC(
     emitter.siteList = trial.siteList;
     emitter.inPlaceResults = trial.inPlaceResults;
     emitter.usedLibrary = trial.usedLibrary;
+    emitter.usedVariants = trial.usedVariants;
     emitter.usedTypes = trial.usedTypes;
     setUpEmitter(mut emitter, c, n)?;
     emitProgram(mut emitter, c, n, sources)?;

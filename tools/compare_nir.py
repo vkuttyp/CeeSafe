@@ -53,8 +53,16 @@ def main():
     parser.add_argument("--root", required=True)
     parser.add_argument("--jobs", type=int, default=os.cpu_count())
     parser.add_argument("--list", help="write every differing file's path to FILE, sorted, one per line")
+    parser.add_argument("--on", action="append", default=[],
+                        choices=("closure-specialisation", "placement", "bce", "oce", "structured"),
+                        help="leave this part on (its novac default) for both compilers (repeatable)")
     parser.add_argument("paths", nargs="+")
     args = parser.parse_args()
+    off = {"closure-specialisation": "--no-closure-specialisation", "placement": "--no-placement", "bce": "--no-bce",
+           "oce": "--no-oce", "structured": "--flat-c"}
+    for part in args.on:
+        if off[part] in OFF:
+            OFF.remove(off[part])
     ceesafec = os.path.abspath(args.ceesafec)
     novac = os.path.expanduser(args.novac)
     work = [(args.root, ceesafec, novac, path) for path in files(args.root, args.paths)]
