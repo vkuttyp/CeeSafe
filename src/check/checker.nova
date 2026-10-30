@@ -24,6 +24,7 @@ enum Entity {
 /// The reference's Builtin enum members S1 uses, by declaration index.
 fn builtinConsole() -> u32 => 0;
 fn builtinProcess() -> u32 => 1;
+fn builtinThread() -> u32 => 25;
 
 // BuiltinFunction members are in src/hir/builtins.nova (generated); only ConsoleWrite (0) and ConsoleWriteLine (1)
 // print by name (HirPrinter.BuiltinName).

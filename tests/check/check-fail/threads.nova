@@ -1,0 +1,54 @@
+interface Job {
+    fn run(borrow this) -> u64;
+}
+struct Plain { n: u64; }
+impl Job for Plain {
+    fn run(borrow this) -> u64 => this.n;
+}
+
+fn borrowed(text: StringView) -> Thread<usize> => Thread.spawn(move () => text.length)!;
+fn wrongKnown() -> Thread<bool> => Thread.spawn(move () => 1u64)!;
+fn twoTypes(flag: bool) {
+    let t = Thread.spawn(move () => {
+        if (flag) {
+            return 1u64;
+        }
+        return true;
+    })!;
+}
+
+fn main() {
+    let text = "static";
+    let back = Thread.spawn(move () => text)!;
+    let notMove = Thread.spawn(() => 1u64)!;
+    let withParameter = Thread.spawn(move (x: u64) => x)!;
+    let two = Thread.spawn(move () => 1u64, move () => 2u64)!;
+    let plain: Box<dyn Job> = Box.create(Plain { n: 1 })!;
+    let captured = Thread.spawn(move () => plain.run())!;
+    let boxed: Box<dyn fn() -> u64> = Box.create(move () => 1u64)!;
+    let fromBox = Thread.spawn(boxed)!;
+    let notBox = Thread.spawn(5)!;
+    let other = Thread.start(move () => 1u64)!;
+    let ok = Thread.spawn(move () => 2u64)!;
+    let joined = ok.join(1);
+    let detached = ok.detach();
+    Thread.both(() => {});
+    Thread.both(move () => {}, () => {});
+    let f: borrow fn() = () => {};
+    Thread.both(f, () => {});
+    let held: Box<dyn Job> = Box.create(Plain { n: 2 })!;
+    Thread.both(() => {
+        held.run();
+    }, () => {});
+    var count: u64 = 0;
+    let bump = () => {
+        count += 1;
+    };
+    Thread.both(() => {
+        bump();
+    }, () => {});
+    let g = () => {};
+    Thread.both(() => {
+        g();
+    }, () => {});
+}

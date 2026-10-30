@@ -1,0 +1,41 @@
+struct Point { x: u64; y: u64; }
+
+fn worker(n: u64) -> Thread<u64> => Thread.spawn(move () => n * 2)!;
+fn sum(xs: Vector<u64>) -> Result<Thread<u64>, SpawnError> =>
+    Thread.spawn(move () => {
+        var total: u64 = 0;
+        for (x in xs) {
+            total += x;
+        }
+        return total;
+    });
+fn job() {}
+
+fn main() {
+    let t = worker(3);
+    var xs = Vector<u64>.create();
+    xs.push(1)!;
+    let s = sum(xs)!;
+    let p = Point { x: 1, y: 2 };
+    let moved = Thread.spawn(move () => p.x + p.y)!;
+    let quiet = Thread.spawn(move () => {
+        Console.writeLine("hello");
+    })!;
+    var counter: u64 = 0;
+    let boxed: Box<dyn mut fn() -> u64 + Send> = Box.create(move () => {
+        counter += 1;
+        return counter;
+    })!;
+    let fromBox = Thread.spawn(boxed)!;
+    var left: u64 = 0;
+    var right: u64 = 0;
+    let shared = 5u64;
+    Thread.both(() => {
+        left = shared + 1;
+    }, () => {
+        right = shared + 2;
+    });
+    Thread.both(job, () => {});
+    quiet.join();
+    Console.writeLine(t.join() + s.join() + moved.join() + fromBox.join() + left + right);
+}

@@ -100,9 +100,12 @@ fn resolvePointee(c: borrow mut Checker, syntax: u32) -> Result<u32, AllocError>
 }
 
 /// The method `name` of `dyn I` (DynMethod, §37.3): the interface's signature with the dyn type as its receiver's,
-/// no body. None if `I` has no such method.
+/// no body. None if `I` has no such method, and for a `dyn fn`, which has no methods (the reference crashes there).
 fn dynMethod(c: borrow mut Checker, dynType: u32, name: u32) -> Result<u32, AllocError> {
     let bound = c.types.info(dynType).dynInterface;
+    if (bound == none()) {
+        return Ok(none());
+    }
     let b = c.types.bounds[bound as usize];
     let methods = interfaceMethods(c, b.interfaceEntry);
     var slot = none();

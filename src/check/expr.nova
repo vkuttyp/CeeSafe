@@ -858,6 +858,9 @@ fn synthCall(
                                 if (b == builtinBox()) {
                                     return checkBoxCreate(c, member, arguments, expected, span);
                                 }
+                                if (b == builtinThread()) {
+                                    return checkThreadSpawn(c, member, arguments, expected, span);
+                                }
                                 if (b == builtinFile() || b == builtinTcpListener() || b == builtinTcpStream()) {
                                     return checkResourceFunction(c, b, member, arguments, span);
                                 }

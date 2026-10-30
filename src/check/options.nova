@@ -119,11 +119,9 @@ fn resolveGenericType(
     if (sameText(n, "Box") && (arguments.count == 1 || arguments.count == 2)) {
         return resolveBoxType(c, arguments);
     }
-    let one = arguments.count == 1;
-    let known = sameText(n, "Thread") && one; // `Thread<T>` comes with threads (S6)
-    if (known) {
-        c.notPorted(span.start, span.end, "this built-in generic type", "S6")?;
-        return Ok(c.types.error);
+    if (sameText(n, "Thread") && arguments.count == 1) {
+        let result = c.resolveType(c.front.ast.at(arguments, 0), true)?;
+        return if (c.types.isBottom(result)) Ok(c.types.error) else c.types.threadOf(result); // §38.2
     }
     var message = Vector<u8>.create();
     if (sameText(n, "Slice") || sameText(n, "SliceMut")) {
@@ -305,6 +303,8 @@ fn checkResultOperand(c: borrow mut Checker, operand: u32, text: StringView, exp
         c.types.info(c.types.info(expected).pointee).dynInterface == none()) {
         let allocError = c.allocErrorType;
         hint = resultOf(c, expected, allocError)?;
+    } else if (expected != none() && c.types.is(expected, TypeKind.Thread)) {
+        hint = expected; // Thread.spawn reads the result type from it (§38.2)
     }
     let value = synth(c, operand, hint)?;
     if (c.isBottom(value)) {

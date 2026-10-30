@@ -380,9 +380,23 @@ fn checkClosureWith(
     c.function = savedFunction;
     c.loopDepth = savedLoop;
     if (callable == none() && literal.block != none() && moveLiteral && returnsValue(c, body)) {
-        // A spawned body's result is its first `return`'s type (§38.2): threads, S6d.
-        c.notPorted(span.start, span.end, "a spawned body's result", "S6d")?;
-        return c.errorResult(span.start, span.end);
+        // A spawned body's result is its first `return`'s type; every other `return` must have it (§38.2).
+        var returned = Vector<u32>.create();
+        returnTypes(c, body, mut returned)?;
+        let first = if (returned.length > 0) returned[0] else c.types.error;
+        c.hir.functions[function as usize].returnType = first;
+        for (t in returned.view()) {
+            if (t != first) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "this thread's body returns both ")?;
+                appendQuotedType(mut message, c, first)?;
+                appendText(mut message, " and ")?;
+                appendQuotedType(mut message, c, t)?;
+                appendText(mut message, ": give every 'return' the same type (type-system.md §38.2)")?;
+                c.error(typeMismatch(), span.start, span.end, message)?;
+                return c.errorResult(span.start, span.end);
+            }
+        }
     } else if (callable == none() && literal.block != none()) {
         if (returnsValue(c, body)) {
             var message = Vector<u8>.create();
@@ -466,6 +480,39 @@ fn boundInCurrentScope(c: borrow Checker, symbol: u32) -> bool {
         }
     }
     return false;
+}
+
+/// The types of the values a statement returns, outside nested closures, bottom ones left out (Returns).
+fn returnTypes(c: borrow Checker, stmt: u32, out: borrow mut Vector<u32>) -> Result<void, AllocError> {
+    match (c.hir.stmts[stmt as usize]) {
+        HirStmt.Return(value) => {
+            if (value != none() && !c.types.isBottom(c.typeOf(value))) {
+                out.push(c.typeOf(value))?;
+            }
+        }
+        HirStmt.Block(statements) => {
+            for (k in 0..statements.count) {
+                returnTypes(c, c.hir.at(statements, k), out)?;
+            }
+        }
+        HirStmt.If(_, then, otherwise) => {
+            returnTypes(c, then, out)?;
+            if (otherwise != none()) {
+                returnTypes(c, otherwise, out)?;
+            }
+        }
+        HirStmt.While(_, body) => { returnTypes(c, body, out)?; }
+        HirStmt.Loop(body) => { returnTypes(c, body, out)?; }
+        HirStmt.For(_, _, _, body) => { returnTypes(c, body, out)?; }
+        HirStmt.Match(_, arms, _, _) => {
+            for (k in 0..arms.count) {
+                returnTypes(c, c.hir.arms[c.hir.at(arms, k) as usize].body, out)?;
+            }
+        }
+        HirStmt.Defer(body) => { returnTypes(c, body, out)?; }
+        _ => {}
+    }
+    return Ok();
 }
 
 /// Does a statement return a value (ReturnsValue), outside nested closures?

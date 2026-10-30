@@ -1,0 +1,295 @@
+// Threads (the reference's CheckThreadSpawn, CheckThreadBoth and CheckThreadMethod): P3 S6d (type-system.md §38).
+// `Thread<T>` is resolved with the other built-in generic types (options.nova); Arc, Mutex and the atomics are lib/std
+// and lib/core code, checked like user code since S5.
+
+/// `Thread.spawn(move () => body)` (CheckThreadSpawn, §38.2): the body's result type comes from an expected `Thread<T>`
+/// or is inferred; its captures and its result must be Send (N0334). The environment becomes the thread's closure, a
+/// `dyn mut fn() -> T` whose table is recorded here. `Thread.both` is CheckThreadBoth.
+fn checkThreadSpawn(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    expected: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let memberIdent = c.front.ast.idents[member as usize];
+    if (sameText(c.name(memberIdent.symbol), "both")) {
+        return checkThreadBoth(c, arguments, span);
+    }
+    if (!sameText(c.name(memberIdent.symbol), "spawn")) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'Thread' has no function ")?;
+        appendQuotedName(mut message, c, memberIdent.symbol)?;
+        appendText(mut message, "; use 'Thread.spawn(move () => …)' or 'Thread.both(() => …, () => …)'")?;
+        c.error(undefinedName(), memberIdent.start, memberIdent.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let spawnSymbol = c.intern("SpawnError")?;
+    let spawnError = match (c.item(spawnSymbol)) {
+        Entity.Enum(index) => c.enums[index as usize].typ,
+        _ => c.types.error,
+    };
+    let literal = if (arguments.count == 1) match (c.front.ast.exprs[c.front.ast.at(arguments, 0) as usize]) {
+        ExprNode.Closure(closure) => closure,
+        _ => none(),
+    } else none();
+    if (arguments.count == 1 && literal == none()) {
+        // A boxed closure (§38.2): `Box<dyn mut fn() -> T + Send>`, already Send by its type.
+        let boxedSyntax = c.front.ast.at(arguments, 0);
+        let boxedSpan = c.front.ast.exprSpans[boxedSyntax as usize];
+        let boxed = synth(c, boxedSyntax, none())?;
+        if (c.isBottom(boxed)) {
+            return c.errorResult(span.start, span.end);
+        }
+        let boxedType = c.typeOf(boxed);
+        var closureType = none();
+        if (c.types.isDynBox(boxedType)) {
+            let d = c.types.info(c.types.info(boxedType).pointee);
+            if (d.dynInterface == none() && d.mutableDynFunction && d.sendDyn && d.parameters.count == 0) {
+                closureType = c.types.info(boxedType).pointee;
+            }
+        }
+        if (closureType == none()) {
+            var message = Vector<u8>.create();
+            appendText(
+                mut message,
+                "'Thread.spawn' takes a 'move' closure with no parameters, or a 'Box<dyn mut fn() -> T + Send>'; this is a ",
+            )?;
+            appendQuotedType(mut message, c, boxedType)?;
+            appendText(mut message, " (type-system.md §38.2)")?;
+            c.error(moveLiteralPlace(), boxedSpan.start, boxedSpan.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+        let result = c.types.info(closureType).result;
+        if (!c.types.isSendType(result)?) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "this thread's body returns a ")?;
+            appendQuotedType(mut message, c, result)?;
+            appendText(mut message, ", which is not Send (type-system.md §38.1)")?;
+            c.error(notSend(), boxedSpan.start, boxedSpan.end, message)?;
+            return c.errorResult(span.start, span.end);
+        }
+        let thread = c.types.threadOf(result)?;
+        let resultType = resultOf(c, thread, spawnError)?;
+        let values = [boxed];
+        let list = c.hir.list(values[..])?;
+        return c.expr(HirExpr.BuiltinCall(bfThreadSpawnBoxed(), list), resultType, span.start, span.end);
+    }
+    if (literal == none() || !c.front.ast.closures[literal as usize].isMove ||
+        c.front.ast.closures[literal as usize].parameters.count != 0) {
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            "'Thread.spawn' takes a 'move' closure with no parameters: 'Thread.spawn(move () => …)' (type-system.md §38.2)",
+        )?;
+        c.error(moveLiteralPlace(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    var known = none();
+    if (expected != none()) {
+        let threadType = if (isResultType(c, expected)) resultOk(c, expected) else expected;
+        if (c.types.is(threadType, TypeKind.Thread)) {
+            known = c.types.info(threadType).element;
+        }
+    }
+    var moveInto = none();
+    if (known != none()) {
+        let none0 = Vector<u32>.create();
+        moveInto = c.types.dynFunctionOf(none0.view(), known, allEffects(), true, false)?;
+    }
+    let literalSpan = c.front.ast.exprSpans[c.front.ast.at(arguments, 0) as usize];
+    let environment = checkClosureWith(c, literal, none(), moveInto, true, literalSpan)?;
+    if (c.isBottom(environment)) {
+        return c.errorResult(span.start, span.end);
+    }
+    var function = none();
+    var captures = emptyRange();
+    match (c.hir.exprs[environment as usize]) {
+        HirExpr.Closure(f, range) => {
+            function = f;
+            captures = range;
+        }
+        _ => {}
+    }
+    if (function == none()) {
+        return c.errorResult(span.start, span.end);
+    }
+    let result = c.hir.functions[function as usize].returnType;
+    var ok = true;
+    for (k in 0..captures.count) {
+        let local = c.hir.captures[(captures.start + k) as usize].local;
+        let localType = c.hir.locals[local as usize].typ;
+        if (!c.types.isSendType(localType)?) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "this thread's closure captures ")?;
+            appendQuotedName(mut message, c, c.hir.locals[local as usize].name)?;
+            appendText(mut message, ", a ")?;
+            appendQuotedType(mut message, c, localType)?;
+            appendText(mut message, ", which is not Send: it cannot move to another thread (type-system.md §38.1)")?;
+            c.error(notSend(), literalSpan.start, literalSpan.end, message)?;
+            ok = false;
+        }
+    }
+    if (!c.types.isSendType(result)?) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "this thread's body returns a ")?;
+        appendQuotedType(mut message, c, result)?;
+        appendText(mut message, ", which is not Send: 'join' could not take it back (type-system.md §38.1)")?;
+        c.error(notSend(), literalSpan.start, literalSpan.end, message)?;
+        ok = false;
+    }
+    if (!ok) {
+        return c.errorResult(span.start, span.end);
+    }
+    let none0 = Vector<u32>.create();
+    let dynType = c.types.dynFunctionOf(none0.view(), result, allEffects(), true, false)?;
+    let environmentType = c.typeOf(environment);
+    var recorded = false;
+    for (t in c.dynTables.view()) {
+        if (t.implementation == environmentType && t.dynType == dynType) {
+            recorded = true;
+        }
+    }
+    if (!recorded) {
+        let functions = [function];
+        let list = c.hir.list(functions[..])?;
+        c.dynTables.push(DynTable { implementation: environmentType, dynType: dynType, methods: list })?;
+    }
+    let thread = c.types.threadOf(result)?;
+    let resultType = resultOf(c, thread, spawnError)?;
+    let values = [environment];
+    let list = c.hir.list(values[..])?;
+    return c.expr(HirExpr.BuiltinCall(bfThreadSpawn(), list), resultType, span.start, span.end);
+}
+
+/// `Thread.both(a, b)` (CheckThreadBoth, §38.6): each argument a closure literal with no parameters and a `void` result,
+/// or an `fn()` value (adapted to a closure), so its captures are known. Each capture must be usable from two threads
+/// at once: shared ones Share, mutable ones Send (IsForkSafe); a captured closure is refused (N0334).
+fn checkThreadBoth(c: borrow mut Checker, arguments: Range, span: Span) -> Result<u32, AllocError> {
+    if (arguments.count != 2) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'Thread.both' takes two closures, found ")?;
+        appendDecimal(mut message, arguments.count as u64)?;
+        appendText(mut message, " argument(s) (type-system.md §38.6)")?;
+        c.error(argumentCount(), span.start, span.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let none0 = Vector<u32>.create();
+    let voidType = c.types.voidType;
+    let body = c.types.closureTo(none0.view(), voidType, allEffects())?;
+    let expected = c.types.referenceTo(body, true)?;
+    var values = Vector<u32>.create();
+    var ok = true;
+    for (k in 0..2u32) {
+        let syntax = c.front.ast.at(arguments, k);
+        let syntaxSpan = c.front.ast.exprSpans[syntax as usize];
+        let isMove = match (c.front.ast.exprs[syntax as usize]) {
+            ExprNode.Closure(closure) => c.front.ast.closures[closure as usize].isMove,
+            _ => false,
+        };
+        if (isMove) {
+            var message = Vector<u8>.create();
+            appendText(
+                mut message,
+                "'Thread.both' takes closures that borrow, not 'move' literals: they run only during the call (type-system.md §38.6)",
+            )?;
+            c.error(notSend(), syntaxSpan.start, syntaxSpan.end, message)?;
+            ok = false;
+            continue;
+        }
+        let argument = checkExpr(c, syntax, expected)?;
+        if (c.isBottom(argument)) {
+            ok = false;
+            continue;
+        }
+        var inner = argument;
+        match (c.hir.exprs[argument as usize]) {
+            HirExpr.Cast(operand) => { inner = operand; }
+            _ => {}
+        }
+        var captures = emptyRange();
+        var isClosure = false;
+        match (c.hir.exprs[inner as usize]) {
+            HirExpr.Closure(_, range) => {
+                captures = range;
+                isClosure = true;
+            }
+            _ => {}
+        }
+        if (!isClosure) {
+            var message = Vector<u8>.create();
+            appendText(
+                mut message,
+                "'Thread.both' takes a closure literal or an 'fn()' value, whose captures it can check; this is a ",
+            )?;
+            appendQuotedType(mut message, c, c.typeOf(argument))?;
+            appendText(mut message, " (type-system.md §38.6)")?;
+            c.error(notSend(), syntaxSpan.start, syntaxSpan.end, message)?;
+            ok = false;
+            continue;
+        }
+        for (j in 0..captures.count) {
+            let capture = c.hir.captures[(captures.start + j) as usize];
+            let local = c.hir.locals[capture.local as usize];
+            let t = if (capture.field != none()) c.types.fields[capture.field as usize].typ else local.typ;
+            let mutably = isMutableCapture(capture.mode);
+            let pointee = c.types.info(t).pointee;
+            if (c.types.is(t, TypeKind.Closure) || (pointee != none() && c.types.is(pointee, TypeKind.Closure))) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "this closure captures ")?;
+                appendQuotedName(mut message, c, local.name)?;
+                appendText(
+                    mut message,
+                    ", a closure: 'Thread.both' does not take closures that capture closures (type-system.md §38.6)",
+                )?;
+                c.error(notSend(), syntaxSpan.start, syntaxSpan.end, message)?;
+                ok = false;
+            } else if (!c.types.isForkSafe(t, mutably)?) {
+                var message = Vector<u8>.create();
+                appendText(mut message, if (mutably) "this closure changes " else "this closure reads ")?;
+                appendQuotedName(mut message, c, local.name)?;
+                appendText(mut message, ", a ")?;
+                appendQuotedType(mut message, c, t)?;
+                appendText(
+                    mut message,
+                    if (mutably) ", which is not Send: it cannot be changed from another thread (type-system.md §38.6)" else ", which is not Share: it cannot be read from another thread (type-system.md §38.6)",
+                )?;
+                c.error(notSend(), syntaxSpan.start, syntaxSpan.end, message)?;
+                ok = false;
+            }
+        }
+        values.push(argument)?;
+    }
+    if (!ok) {
+        return c.errorResult(span.start, span.end);
+    }
+    let list = c.hir.list(values.view())?;
+    return c.expr(HirExpr.BuiltinCall(bfThreadBoth(), list), voidType, span.start, span.end);
+}
+
+/// `t.join()` (CheckThreadMethod, §38.2): consumes the thread, waits for it, and gives its body's result.
+fn checkThreadMethod(
+    c: borrow mut Checker,
+    member: u32,
+    arguments: Range,
+    thread: u32,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let memberIdent = c.front.ast.idents[member as usize];
+    let threadType = c.typeOf(thread);
+    if (!sameText(c.name(memberIdent.symbol), "join") || arguments.count != 0) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, threadType)?;
+        appendText(mut message, " has only 'join()' (type-system.md §38.2)")?;
+        c.error(undefinedName(), memberIdent.start, memberIdent.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let element = c.types.info(threadType).element;
+    let values = [thread];
+    let list = c.hir.list(values[..])?;
+    return c.expr(HirExpr.BuiltinCall(bfThreadJoin(), list), element, span.start, span.end);
+}

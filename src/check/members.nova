@@ -353,6 +353,9 @@ fn checkMethodCall(
         let s = c.spanOf(vector);
         vector = c.expr(HirExpr.Deref(vector), c.types.info(t).pointee, s.start, s.end)?;
     }
+    if (c.types.is(c.typeOf(vector), TypeKind.Thread)) {
+        return checkThreadMethod(c, member, arguments, vector, span);
+    }
     if (c.types.is(c.typeOf(vector), TypeKind.Vector)) {
         return checkVectorMethod(c, member, arguments, vector, targetSpan, span);
     }
@@ -525,13 +528,11 @@ fn checkNonStructMethod(
         return c.errorResult(span.start, span.end);
     }
     let isParameter = c.types.is(structType, TypeKind.TypeParameter);
-    if (c.types.is(structType, TypeKind.Dyn)) {
+    // A `dyn fn` has no methods (§36.5): the general message below. The reference crashes here (novac 0.5.0's
+    // DynMethod dereferences the absent interface); docs/p3-plan.md records the divergence.
+    if (c.types.is(structType, TypeKind.Dyn) && c.types.info(structType).dynInterface != none()) {
         let bound = c.types.info(structType).dynInterface;
         var message = Vector<u8>.create();
-        if (bound == none()) {
-            c.notPorted(span.start, span.end, "a 'dyn fn' method", "S6")?;
-            return c.errorResult(span.start, span.end);
-        }
         quotedBound(mut message, c, bound)?;
         appendText(mut message, " has no method ")?;
         appendQuotedName(mut message, c, memberIdent.symbol)?;
