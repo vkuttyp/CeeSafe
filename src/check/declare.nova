@@ -84,6 +84,7 @@ fn checkProgram(
     front: Frontend,
     fileIsLibrary: Vector<bool>,
     fileTexts: Vector<Vector<u8>>,
+    filePaths: Vector<Vector<u8>>,
     noFloat: bool,
 ) -> Result<Checker, AllocError> {
     var c = Checker {
@@ -92,11 +93,18 @@ fn checkProgram(
         hir: HirProgram.create(),
         fileIsLibrary: fileIsLibrary,
         fileTexts: fileTexts,
+        filePaths: filePaths,
         noFloat: noFloat,
         rootItems: Map<Word, Entity>.create(),
         coreItems: Map<Word, Entity>.create(),
         builtins: Map<Word, u32>.create(),
         builtinNames: Vector<u32>.create(),
+        structs: Vector<StructEntry>.create(),
+        enums: Vector<EnumEntry>.create(),
+        membersResolved: false,
+        allocErrorType: none(),
+        ioErrorType: none(),
+        systemHeapType: none(),
         constants: Vector<ConstEntry>.create(),
         reserved: Vector<u32>.create(),
         thisSymbol: 0,
@@ -139,8 +147,20 @@ fn checkProgram(
         for (k in 0..items.count) {
             let item = c.front.ast.at(items, k);
             match (c.front.ast.items[item as usize].kind) {
-                ItemKind.Struct(_) => { declareTypeItem(mut c, item, "a struct", "S2")?; }
-                ItemKind.Enum(_, _, _) => { declareTypeItem(mut c, item, "an enum", "S2")?; }
+                ItemKind.Struct(_) => {
+                    if (isLibraryFile(c)) {
+                        declareTypeItem(mut c, item, "a struct", "S5")?;
+                    } else {
+                        declareStruct(mut c, item)?;
+                    }
+                }
+                ItemKind.Enum(_, _, _) => {
+                    if (isLibraryFile(c)) {
+                        declareTypeItem(mut c, item, "an enum", "S5")?;
+                    } else {
+                        declareEnum(mut c, item)?;
+                    }
+                }
                 ItemKind.Extern(_, _, structs) => {
                     for (s in 0..structs.count) {
                         let imported = c.front.ast.at(structs, s);
@@ -164,6 +184,10 @@ fn checkProgram(
             }
         }
     }
+
+    resolveAllMembers(mut c)?;
+    checkStructRecursion(mut c)?;
+    computeCopyAndDrop(mut c)?;
 
     for (k in 0..c.constants.length) {
         evaluateConstant(mut c, truncate<u32>(k))?;
@@ -193,10 +217,9 @@ fn declareBuiltinItems(c: borrow mut Checker) -> Result<void, AllocError> {
         };
         if (index != none()) {
             c.builtinNames.push(symbol)?;
-            c.coreItems.put(Word { value: symbol as u64 }, Entity.BuiltinItem(index))?;
         }
     }
-    return Ok();
+    return declareBuiltinTypes(c);
 }
 
 fn isLibraryFile(c: borrow Checker) -> bool => c.fileIsLibrary[c.file as usize];
@@ -210,14 +233,10 @@ fn isReservedName(c: borrow mut Checker, ident: u32) -> Result<bool, AllocError>
             reserved = true;
         }
     }
-    match (c.coreItems.get(Word { value: id.symbol as u64 })) {
-        Some(e) => {
-            match (e) {
-                Entity.BuiltinItem(_) => { reserved = true; }
-                _ => {}
-            }
+    for (b in c.builtinNames.view()) {
+        if (b == id.symbol) {
+            reserved = true;
         }
-        null => {}
     }
     if (!reserved) {
         return Ok(false);
@@ -399,6 +418,21 @@ fn declareFunction(c: borrow mut Checker, f: u32, owner: u32) -> Result<u32, All
     let name = c.front.ast.idents[decl.name as usize].symbol;
     let library = isLibraryFile(c);
     let function = c.hir.addFunction(name, owner, returnType, c.file, f, library)?;
+    if (owner != none() && decl.typeParameters.count > 0) {
+        let tp = c.front.ast.typeParameters[c.front.ast.at(decl.typeParameters, 0) as usize];
+        c.notPorted(tp.start, tp.end, "a method with type parameters", "S4")?;
+    }
+    if (owner != none() && receiverIndex(decl.receiver) != 0) {
+        // `this` is an immutable binding: the struct by value, or a reference to it (§12, §13.2).
+        let thisType = match (decl.receiver) {
+            ReceiverKind.Borrow => c.types.referenceTo(owner, false)?,
+            ReceiverKind.BorrowMut => c.types.referenceTo(owner, true)?,
+            _ => owner,
+        };
+        let thisSymbol = c.thisSymbol;
+        let local = c.hir.addLocal(function, thisSymbol, thisType, false, true, decl.receiverStart, decl.receiverEnd)?;
+        c.hir.functions[function as usize].parameters.push(local)?;
+    }
     var seen = Vector<u32>.create();
     for (k in 0..decl.parameters.count) {
         let p = c.front.ast.parameters[c.front.ast.at(decl.parameters, k) as usize];

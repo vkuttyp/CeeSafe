@@ -325,18 +325,9 @@ fn resolveAssignmentTarget(c: borrow mut Checker, target: u32) -> Result<u32, Al
             }
         }
         ExprNode.Paren(_) => {}
-        ExprNode.Member(_, _) => {
-            c.notPorted(span.start, span.end, "assigning to a field", "S2")?;
-            return Ok(none());
-        }
-        ExprNode.Index(_, _) => {
-            c.notPorted(span.start, span.end, "assigning to an element", "S2")?;
-            return Ok(none());
-        }
-        ExprNode.This => {
-            c.notPorted(span.start, span.end, "assigning to 'this'", "S2")?;
-            return Ok(none());
-        }
+        ExprNode.Member(_, _) => {}
+        ExprNode.This => {}
+        ExprNode.Index(_, _) => {}
         _ => {
             var message = Vector<u8>.create();
             appendText(
@@ -351,66 +342,49 @@ fn resolveAssignmentTarget(c: borrow mut Checker, target: u32) -> Result<u32, Al
     if (c.isBottom(value)) {
         return Ok(none());
     }
-    let root = match (c.hir.exprs[value as usize]) {
-        HirExpr.LocalRef(local) => local,
-        _ => none(),
-    };
-    if (root == none()) {
+    var place = toPlace(c, value)?;
+    if (place == none()) {
         var message = Vector<u8>.create();
         appendText(mut message, "only variables, their fields, and places reached through references can be assigned")?;
         c.error(unsupported(), span.start, span.end, message)?;
         return Ok(none());
     }
-    let local = c.hir.locals[root as usize];
-    if (local.isUsing && !c.types.is(local.typ, TypeKind.Reference)) {
+    let p = c.hir.places[place as usize];
+    let root = c.hir.locals[p.root as usize];
+    let isLocal = p.projections.count == 0;
+    if (isLocal && root.isUsing && !c.types.is(p.typ, TypeKind.Reference)) {
         var message = Vector<u8>.create();
         appendText(mut message, "cannot assign to ")?;
-        appendQuotedName(mut message, c, local.name)?;
+        appendQuotedName(mut message, c, root.name)?;
         appendText(mut message, ": a 'using' binding stays the same value until the end of its block")?;
         c.error(assignToImmutable(), span.start, span.end, message)?;
         return Ok(none());
     }
-    if (c.types.is(local.typ, TypeKind.Reference)) {
-        c.notPorted(span.start, span.end, "assigning through a reference", "S2")?;
+    if (c.types.isClosure(p.typ) && isLocal) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "cannot assign through ")?;
+        appendQuotedName(mut message, c, root.name)?;
+        appendText(mut message, ": it is a closure, and its callable object is not a value (type-system.md §36.2)")?;
+        c.error(assignToImmutable(), span.start, span.end, message)?;
         return Ok(none());
     }
-    if (!local.mutable) {
-        var reason = Vector<u8>.create();
-        let scoped = c.types.isScoped(local.typ);
-        if (!local.parameter && scoped) {
-            appendQuotedName(mut reason, c, local.name)?;
-            appendText(mut reason, " is not mutable; bind it with 'using' (a scoped value cannot be a 'var')")?;
-        } else if (local.name == c.thisSymbol) {
-            appendText(mut reason, "'this' is immutable in a by-value method; use 'borrow mut this'")?;
-        } else if (local.parameter) {
-            appendText(mut reason, "parameters are immutable")?;
-        } else {
-            appendQuotedName(mut reason, c, local.name)?;
-            appendText(mut reason, " was declared with 'let'; use 'var' for a mutable variable")?;
-        }
+    // Assigning to a reference local writes through it (§13.3); assigning to a reference-typed field or element
+    // replaces the reference stored there (§25.4).
+    if (c.types.is(p.typ, TypeKind.Reference) && isLocal) {
+        place = project(c, place, derefProjection())?;
+    }
+    var reason = Vector<u8>.create();
+    mutabilityError(c, place, mut reason)?;
+    if (reason.length > 0) {
         var message = Vector<u8>.create();
         appendText(mut message, "cannot assign to ")?;
-        appendQuotedName(mut message, c, local.name)?;
+        describePlace(c, place, mut message)?;
         appendText(mut message, ": ")?;
         appendBytes(mut message, reason.view())?;
-        // LetToVar: `let` → `var`, unless the local is a reference or another scoped value.
-        let letStart = c.letKeywordOf(root);
-        if (!local.parameter && !scoped && local.name != c.thisSymbol && letStart != none()) {
-            var title = Vector<u8>.create();
-            appendText(mut title, "declare ")?;
-            appendQuotedName(mut title, c, local.name)?;
-            appendText(mut title, " with 'var'")?;
-            var text = Vector<u8>.create();
-            appendText(mut text, "var")?;
-            c.errorWithFix(assignToImmutable(), span.start, span.end, message, title, letStart, letStart + 3, text)?;
-        } else {
-            c.error(assignToImmutable(), span.start, span.end, message)?;
-        }
+        errorWithLetToVar(c, assignToImmutable(), span.start, span.end, message, place, reason)?;
         return Ok(none());
     }
-    let t = local.typ;
-    let projections = Vector<HirProjection>.create();
-    return c.hir.addPlace(root, projections.view(), t);
+    return Ok(place);
 }
 
 fn checkIf(c: borrow mut Checker, stmt: u32) -> Result<u32, AllocError> {

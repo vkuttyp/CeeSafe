@@ -1,0 +1,392 @@
+// Struct members in expressions (the reference's ResolveField, CheckPrivate, SynthStructLiteral, StaticOwner,
+// CheckStaticCall, FindMethod and CheckMethodCall): P3 S2a. Methods of built-in types (integers, floats, views,
+// vectors, resources, regions) come with S3; impl and bound methods with S4.
+
+fn unknownField() -> u32 => 230;
+fn missingField() -> u32 => 229;
+fn duplicateFieldInit() -> u32 => 231;
+fn methodCallKind() -> u32 => 233;
+fn notAStruct() -> u32 => 234;
+fn privateField() -> u32 => 296;
+
+/// N0296 if a private field is reached from another file (CheckPrivate; NotPublic across packages comes with S8).
+fn checkPrivate(c: borrow mut Checker, definition: u32, field: u32, span: Span) -> Result<void, AllocError> {
+    let d = borrow c.types.structs[definition as usize];
+    if (c.types.fields[field as usize].isPrivate && d.file != c.file) {
+        let item = c.front.ast.items[d.item as usize];
+        var message = Vector<u8>.create();
+        appendText(mut message, "field ")?;
+        appendQuotedName(mut message, c, c.types.fields[field as usize].name)?;
+        appendText(mut message, " of ")?;
+        appendQuotedName(mut message, c, c.front.ast.idents[item.name as usize].symbol)?;
+        appendText(mut message, " is private to ")?;
+        appendBytes(mut message, c.filePaths[d.file as usize].view())?;
+        appendText(mut message, ": only code there can reach it (type-system.md §12)")?;
+        c.error(privateField(), span.start, span.end, message)?;
+    }
+    return Ok();
+}
+
+/// ResolveField: the field `name` of a value of `typ`, or none after N0230/N0234.
+fn resolveField(c: borrow mut Checker, typ: u32, name: u32) -> Result<u32, AllocError> {
+    if (c.types.isBottom(typ)) {
+        return Ok(none());
+    }
+    let ident = c.front.ast.idents[name as usize];
+    let span = Span { start: ident.start, end: ident.end };
+    let definition = c.types.info(typ).structDef;
+    if (definition == none()) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "type ")?;
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, " has no fields; ")?;
+        appendQuotedName(mut message, c, ident.symbol)?;
+        appendText(mut message, " cannot be accessed")?;
+        c.error(notAStruct(), span.start, span.end, message)?;
+        return Ok(none());
+    }
+    let field = findField(c, definition, ident.symbol);
+    if (field != none()) {
+        checkPrivate(c, definition, field, span)?;
+        return Ok(field);
+    }
+    var message = Vector<u8>.create();
+    if (findStructFunction(c, definition, ident.symbol) != none()) {
+        appendText(mut message, "'")?;
+        appendBytes(mut message, c.typeName(typ))?;
+        appendText(mut message, ".")?;
+        appendBytes(mut message, c.name(ident.symbol))?;
+        appendText(mut message, "' is a function; call it with '(...)'")?;
+    } else {
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, " has no field named ")?;
+        appendQuotedName(mut message, c, ident.symbol)?;
+    }
+    c.error(unknownField(), span.start, span.end, message)?;
+    return Ok(none());
+}
+
+/// SynthStructLiteral for a struct without type parameters.
+fn synthStructLiteral(
+    c: borrow mut Checker,
+    typeName: u32,
+    fields: Range,
+    typeArguments: Range,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let nameIdent = c.front.ast.idents[typeName as usize];
+    let nameSpan = Span { start: nameIdent.start, end: nameIdent.end };
+    let index = match (c.item(nameIdent.symbol)) {
+        Entity.Struct(s) => s,
+        _ => none(),
+    };
+    if (index == none()) {
+        let isLibrary = match (c.item(nameIdent.symbol)) {
+            Entity.LibraryItem(_) => true,
+            _ => false,
+        };
+        if (isLibrary) {
+            c.notPorted(span.start, span.end, "a literal of a generic or library struct", "S4/S5")?;
+            return c.errorResult(span.start, span.end);
+        }
+        var text = Vector<u8>.create();
+        appendBytes(mut text, c.name(nameIdent.symbol))?;
+        let unknown = c.types.lookup(text.view()) == none() && isNone(c.lookup(nameIdent.symbol));
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, nameIdent.symbol)?;
+        appendText(mut message, " is not a struct type")?;
+        c.error(if (unknown) unknownType() else notAStruct(), nameSpan.start, nameSpan.end, message)?;
+        for (k in 0..fields.count) {
+            let init = c.front.ast.fieldInits[c.front.ast.at(fields, k) as usize];
+            synth(c, init.value, none())?;
+        }
+        return c.errorResult(span.start, span.end);
+    }
+    if (typeArguments.count > 0) {
+        var message = Vector<u8>.create();
+        appendQuotedName(mut message, c, nameIdent.symbol)?;
+        appendText(mut message, " is not generic; write it without type arguments")?;
+        c.error(unknownType(), nameSpan.start, nameSpan.end, message)?;
+    }
+    let typ = c.structs[index as usize].typ;
+    let definition = c.types.info(typ).structDef;
+    var values = Vector<HirFieldValue>.create();
+    var seen = Vector<u32>.create();
+    var ok = true;
+    for (k in 0..fields.count) {
+        let init = c.front.ast.fieldInits[c.front.ast.at(fields, k) as usize];
+        let id = c.front.ast.idents[init.name as usize];
+        let idSpan = Span { start: id.start, end: id.end };
+        let field = findField(c, definition, id.symbol);
+        if (field != none()) {
+            checkPrivate(c, definition, field, idSpan)?;
+        }
+        if (field == none()) {
+            var message = Vector<u8>.create();
+            appendQuotedName(mut message, c, nameIdent.symbol)?;
+            appendText(mut message, " has no field named ")?;
+            appendQuotedName(mut message, c, id.symbol)?;
+            c.error(unknownField(), idSpan.start, idSpan.end, message)?;
+            synth(c, init.value, none())?;
+            ok = false;
+            continue;
+        }
+        if (containsSymbol(seen, field)) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "field ")?;
+            appendQuotedName(mut message, c, c.types.fields[field as usize].name)?;
+            appendText(mut message, " is initialized more than once")?;
+            c.error(duplicateFieldInit(), idSpan.start, idSpan.end, message)?;
+            ok = false;
+            continue;
+        }
+        seen.push(field)?;
+        let fieldType = c.types.fields[field as usize].typ;
+        let value = checkExpr(c, init.value, fieldType)?;
+        values.push(HirFieldValue { field: field, value: value })?;
+    }
+    var missing = Vector<u8>.create();
+    var missingCount: u32 = 0;
+    for (f in c.types.structs[definition as usize].fields.view()) {
+        if (!containsSymbol(seen, f)) {
+            if (missingCount > 0) {
+                appendText(mut missing, ", ")?;
+            }
+            appendQuotedName(mut missing, c, c.types.fields[f as usize].name)?;
+            missingCount += 1;
+        }
+    }
+    if (missingCount > 0 && ok) {
+        var message = Vector<u8>.create();
+        appendText(mut message, if (missingCount == 1) "missing field " else "missing fields ")?;
+        appendBytes(mut message, missing.view())?;
+        appendText(mut message, " in ")?;
+        appendQuotedName(mut message, c, nameIdent.symbol)?;
+        appendText(mut message, " literal")?;
+        c.error(missingField(), nameSpan.start, nameSpan.end, message)?;
+        ok = false;
+    }
+    if (!ok) {
+        return c.errorResult(span.start, span.end);
+    }
+    let start = truncate<u32>(c.hir.fieldValues.length);
+    for (v in values.view()) {
+        c.hir.fieldValues.push(v)?;
+    }
+    let range = Range { start: start, count: truncate<u32>(values.length) };
+    return c.expr(HirExpr.StructLiteral(range), typ, span.start, span.end);
+}
+
+fn isNone(e: Entity) -> bool => match (e) {
+    Entity.None => true,
+    _ => false,
+};
+
+/// `S.f(args)`: a static function of struct S (CheckStaticCall).
+fn checkStaticCall(
+    c: borrow mut Checker,
+    index: u32,
+    member: u32,
+    arguments: Range,
+    calleeSpan: Span,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let typ = c.structs[index as usize].typ;
+    let memberIdent = c.front.ast.idents[member as usize];
+    if (index == 1 && (sameText(
+        c.name(memberIdent.symbol),
+        "failAfter",
+    ) || sameText(c.name(memberIdent.symbol), "reset"))) {
+        c.notPorted(span.start, span.end, "FailingAllocator's functions", "S3")?;
+        return c.errorResult(span.start, span.end);
+    }
+    let definition = c.types.info(typ).structDef;
+    let function = findStructFunction(c, definition, memberIdent.symbol);
+    if (function == none()) {
+        var message = Vector<u8>.create();
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, " has no function named ")?;
+        appendQuotedName(mut message, c, memberIdent.symbol)?;
+        c.error(undefinedName(), memberIdent.start, memberIdent.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (isMethod(c, function)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, c.typeName(typ))?;
+        appendText(mut message, ".")?;
+        appendBytes(mut message, c.name(memberIdent.symbol))?;
+        appendText(mut message, "' is a method; call it on a value: value.")?;
+        appendBytes(mut message, c.name(memberIdent.symbol))?;
+        appendText(mut message, "(...)")?;
+        c.error(methodCallKind(), calleeSpan.start, calleeSpan.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    return checkUserCall(c, function, arguments, span);
+}
+
+/// A method: declared with a `this` receiver, inside a struct (HirFunction.IsMethod).
+fn isMethod(c: borrow Checker, function: u32) -> bool {
+    let f = borrow c.hir.functions[function as usize];
+    return f.owner != none() && receiverIndex(c.front.ast.functions[f.syntax as usize].receiver) != 0;
+}
+
+/// CheckMethodCall for methods of structs.
+fn checkMethodCall(
+    c: borrow mut Checker,
+    target: u32,
+    member: u32,
+    arguments: Range,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let targetSpan = c.front.ast.exprSpans[target as usize];
+    let memberIdent = c.front.ast.idents[member as usize];
+    var receiver = synth(c, target, none())?;
+    if (c.isBottom(receiver)) {
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    let read = autoDeref(c, receiver)?;
+    let readType = c.typeOf(read);
+    if (!c.types.is(readType, TypeKind.Struct) || c.types.info(readType).structDef == none()) {
+        return checkNonStructMethod(c, receiver, readType, member, arguments, span);
+    }
+    let receiverType = c.typeOf(receiver);
+    if (c.types.is(receiverType, TypeKind.Box)) {
+        receiver = read; // the method receives the box's contents (§18.2)
+    }
+    let currentType = c.typeOf(receiver);
+    let structType = if (c.types.is(
+        currentType,
+        TypeKind.Reference,
+    )) c.types.info(currentType).pointee else currentType;
+    let definition = c.types.info(structType).structDef;
+    let function = if (definition == none()) none() else findStructFunction(c, definition, memberIdent.symbol);
+    if (function == none()) {
+        var message = Vector<u8>.create();
+        if (definition != none() && findField(c, definition, memberIdent.symbol) != none()) {
+            appendText(mut message, "'")?;
+            appendBytes(mut message, c.typeName(currentType))?;
+            appendText(mut message, ".")?;
+            appendBytes(mut message, c.name(memberIdent.symbol))?;
+            appendText(mut message, "' is a field, not a function")?;
+        } else {
+            appendQuotedType(mut message, c, currentType)?;
+            appendText(mut message, " has no method named ")?;
+            appendQuotedName(mut message, c, memberIdent.symbol)?;
+        }
+        c.error(undefinedName(), memberIdent.start, memberIdent.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (!isMethod(c, function)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, c.typeName(structType))?;
+        appendText(mut message, ".")?;
+        appendBytes(mut message, c.name(memberIdent.symbol))?;
+        appendText(mut message, "' is a static function; call it as ")?;
+        appendBytes(mut message, c.typeName(structType))?;
+        appendText(mut message, ".")?;
+        appendBytes(mut message, c.name(memberIdent.symbol))?;
+        appendText(mut message, "(...)")?;
+        c.error(methodCallKind(), memberIdent.start, memberIdent.end, message)?;
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    // The receiver is passed as `this` by value, by shared borrow, or by mutable borrow (§13.2).
+    let syntax = c.front.ast.functions[c.hir.functions[function as usize].syntax as usize];
+    var argument: u32 = 0;
+    match (syntax.receiver) {
+        ReceiverKind.Borrow => {
+            let shared = c.types.referenceTo(structType, false)?;
+            if (c.types.is(currentType, TypeKind.Reference)) {
+                argument = coerce(c, receiver, shared, targetSpan)?;
+            } else {
+                let place = toPlace(c, receiver)?;
+                if (place != none()) {
+                    argument = c.expr(HirExpr.Borrow(false, place), shared, targetSpan.start, targetSpan.end)?;
+                } else if (isPathThroughReference(c, receiver, false)?) {
+                    argument = c.expr(HirExpr.BorrowPath(false, receiver), shared, targetSpan.start, targetSpan.end)?;
+                } else {
+                    argument = c.expr(HirExpr.BorrowTemp(false, receiver), shared, targetSpan.start, targetSpan.end)?;
+                }
+            }
+        }
+        ReceiverKind.BorrowMut => {
+            if (c.types.info(currentType).mutableReference) {
+                argument = coerce(c, receiver, currentType, targetSpan)?;
+            } else if (c.types.is(currentType, TypeKind.Reference)) {
+                var message = Vector<u8>.create();
+                appendQuotedName(mut message, c, memberIdent.symbol)?;
+                appendText(mut message, " takes 'borrow mut this', but this value is behind a shared reference")?;
+                c.error(borrowMutOfImmutable(), targetSpan.start, targetSpan.end, message)?;
+                argument = c.errorResult(targetSpan.start, targetSpan.end)?;
+            } else {
+                argument = borrowPlace(c, receiver, true, targetSpan)?;
+            }
+        }
+        _ => { argument = autoDeref(c, receiver)?; }
+    }
+    if (c.isBottom(argument)) {
+        checkArgumentsLoosely(c, arguments)?;
+        return c.errorResult(span.start, span.end);
+    }
+    return checkUserCallWith(c, function, arguments, span, argument);
+}
+
+fn isIntegerMethodName(name: Slice<u8>) -> bool =>
+    sameText(name, "wrappingAdd") || sameText(name, "wrappingSub") || sameText(name, "wrappingMul") ||
+        sameText(name, "checkedAdd") || sameText(name, "checkedSub") || sameText(name, "checkedMul") ||
+        sameText(name, "saturatingAdd") || sameText(name, "saturatingSub") || sameText(name, "saturatingMul");
+
+fn isFloatMethodName(name: Slice<u8>) -> bool =>
+    sameText(name, "bits") || sameText(name, "sqrt") || sameText(name, "abs") || sameText(name, "floor") ||
+        sameText(name, "ceil") || sameText(name, "min") || sameText(name, "max");
+
+/// A method call on a value that is not a struct: the built-in methods of S3 and S4, else N0234.
+fn checkNonStructMethod(
+    c: borrow mut Checker,
+    receiver: u32,
+    readType: u32,
+    member: u32,
+    arguments: Range,
+    span: Span,
+) -> Result<u32, AllocError> {
+    let memberIdent = c.front.ast.idents[member as usize];
+    var name = Vector<u8>.create();
+    appendBytes(mut name, c.name(memberIdent.symbol))?;
+    let receiverType = c.typeOf(receiver);
+    let structType = if (c.types.is(
+        receiverType,
+        TypeKind.Reference,
+    )) c.types.info(receiverType).pointee else receiverType;
+    let builtinReceiver = c.types.is(readType, TypeKind.Array) || c.types.is(readType, TypeKind.Vector) ||
+        c.types.is(readType, TypeKind.SlotMap) || c.types.is(readType, TypeKind.StableVector) ||
+        c.types.is(readType, TypeKind.Resource) || c.types.is(readType, TypeKind.Thread) ||
+        c.types.is(readType, TypeKind.Region) || c.types.is(readType, TypeKind.RawPointer) ||
+        c.types.is(readType, TypeKind.FunctionPointer) || readType == c.ioErrorType ||
+        c.types.is(structType, TypeKind.Region) || c.types.is(receiverType, TypeKind.Box) ||
+        (c.types.is(structType, TypeKind.Integer) && isIntegerMethodName(name.view())) ||
+        (c.types.is(structType, TypeKind.Float) && isFloatMethodName(name.view()));
+    if (builtinReceiver) {
+        c.notPorted(span.start, span.end, "this built-in method", "S3")?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (c.types.is(structType, TypeKind.TypeParameter) || c.types.is(structType, TypeKind.Dyn) ||
+        c.types.is(structType, TypeKind.Enum)) {
+        c.notPorted(span.start, span.end, "this kind of method", "S4")?;
+        return c.errorResult(span.start, span.end);
+    }
+    var message = Vector<u8>.create();
+    appendText(mut message, "type ")?;
+    appendQuotedType(mut message, c, structType)?;
+    appendText(mut message, " has no methods; ")?;
+    appendQuotedName(mut message, c, memberIdent.symbol)?;
+    appendText(mut message, " cannot be called on it")?;
+    c.error(notAStruct(), memberIdent.start, memberIdent.end, message)?;
+    checkArgumentsLoosely(c, arguments)?;
+    return c.errorResult(span.start, span.end);
+}

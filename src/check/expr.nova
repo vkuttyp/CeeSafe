@@ -125,6 +125,11 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
         ExprNode.Binary(left, op, right) => { return synthBinary(c, left, op, right, expected, span); }
         ExprNode.Call(callee, arguments) => { return synthCall(c, callee, arguments, expected, span); }
         ExprNode.This => {
+            let receiver = c.lookupLocal(c.thisSymbol);
+            if (receiver != none()) {
+                let t = c.hir.locals[receiver as usize].typ;
+                return c.expr(HirExpr.LocalRef(receiver), t, span.start, span.end);
+            }
             var message = Vector<u8>.create();
             appendText(mut message, "'this' can only be used inside a method")?;
             c.error(thisOutsideMethod(), span.start, span.end, message)?;
@@ -132,6 +137,9 @@ fn synth(c: borrow mut Checker, e: u32, expected: u32) -> Result<u32, AllocError
         }
         ExprNode.Error => { return c.errorResult(span.start, span.end); }
         ExprNode.Member(target, member) => { return synthMember(c, target, member, span); }
+        ExprNode.StructLiteral(typeName, fields, typeArguments) => {
+            return synthStructLiteral(c, typeName, fields, typeArguments, span);
+        }
         ExprNode.FloatLiteral(digits, suffix) => { return checkFloatLiteral(c, digits, suffix, expected, span); }
         ExprNode.CharLiteral(value) => { return checkCharLiteral(c, value, expected, span); }
         ExprNode.Cast(operand, typ) => { return synthCast(c, operand, typ, span); }
@@ -218,7 +226,13 @@ fn synthName(c: borrow mut Checker, name: u32, span: Span) -> Result<u32, AllocE
         }
         Entity.Function(function) => { return functionValue(c, function, span); }
         Entity.LibraryItem(_) => { c.notPorted(span.start, span.end, "a library or not-yet-ported item", "S2-S7")?; }
-        Entity.BuiltinItem(_) => {
+        Entity.Struct(_) => {
+            var message = Vector<u8>.create();
+            appendQuotedName(mut message, c, symbol)?;
+            appendText(mut message, " is a type, not a value")?;
+            c.error(notCallable(), span.start, span.end, message)?;
+        }
+        Entity.Enum(_) => {
             var message = Vector<u8>.create();
             appendQuotedName(mut message, c, symbol)?;
             appendText(mut message, " is a type, not a value")?;
@@ -614,6 +628,19 @@ fn synthCall(
                                 if (b == builtinConsole() || b == builtinProcess() || b == 23 || b == 24) {
                                     return checkBuiltinMemberCall(c, b, targetName, member, arguments, span);
                                 }
+                                c.notPorted(span.start, span.end, "this built-in's functions", "S3")?;
+                                return c.errorResult(span.start, span.end);
+                            }
+                            Entity.Struct(index) => {
+                                return checkStaticCall(c, index, member, arguments, calleeSpan, span);
+                            }
+                            Entity.Enum(_) => {
+                                c.notPorted(span.start, span.end, "an enum variant", "S2b")?;
+                                return c.errorResult(span.start, span.end);
+                            }
+                            Entity.LibraryItem(_) => {
+                                c.notPorted(span.start, span.end, "calling this item", "S2-S5")?;
+                                return c.errorResult(span.start, span.end);
                             }
                             _ => {}
                         }
@@ -621,8 +648,7 @@ fn synthCall(
                 }
                 _ => {}
             }
-            c.notPorted(span.start, span.end, "this call", "S2-S7")?;
-            return c.errorResult(span.start, span.end);
+            return checkMethodCall(c, target, member, arguments, span);
         }
         _ => {}
     }
@@ -634,11 +660,23 @@ fn synthCall(
 }
 
 /// CheckUserCall for a top-level function.
-fn checkUserCall(c: borrow mut Checker, function: u32, arguments: Range, span: Span) -> Result<u32, AllocError> {
+fn checkUserCall(c: borrow mut Checker, function: u32, arguments: Range, span: Span) -> Result<u32, AllocError> =>
+    checkUserCallWith(c, function, arguments, span, none());
+
+/// CheckUserCall: for a method, `receiver` is the already-checked `this` argument, before the explicit ones.
+fn checkUserCallWith(
+    c: borrow mut Checker,
+    function: u32,
+    arguments: Range,
+    span: Span,
+    receiver: u32,
+) -> Result<u32, AllocError> {
     let f = borrow c.hir.functions[function as usize];
-    let parameterCount = f.parameters.length;
+    let skip: usize = if (receiver == none()) 0 else 1;
+    let parameterCount = f.parameters.length - skip;
     let returnType = f.returnType;
     let name = f.name;
+    let owner = f.owner;
     let syntax = c.front.ast.functions[f.syntax as usize];
     if (syntax.isUnsafe || syntax.isExtern) {
         c.notPorted(span.start, span.end, "calling an unsafe or C function", "S7")?;
@@ -646,8 +684,13 @@ fn checkUserCall(c: borrow mut Checker, function: u32, arguments: Range, span: S
     }
     if (arguments.count as usize != parameterCount) {
         var message = Vector<u8>.create();
-        appendQuotedName(mut message, c, name)?;
-        appendText(mut message, " takes ")?;
+        appendText(mut message, "'")?;
+        if (owner != none()) {
+            appendBytes(mut message, c.typeName(owner))?;
+            appendText(mut message, ".")?;
+        }
+        appendBytes(mut message, c.name(name))?;
+        appendText(mut message, "' takes ")?;
         appendDecimal(mut message, parameterCount as u64)?;
         appendText(mut message, " argument(s) but ")?;
         appendDecimal(mut message, arguments.count as u64)?;
@@ -655,11 +698,14 @@ fn checkUserCall(c: borrow mut Checker, function: u32, arguments: Range, span: S
         c.error(argumentCount(), span.start, span.end, message)?;
     }
     var values = Vector<u32>.create();
+    if (receiver != none()) {
+        values.push(receiver)?;
+    }
     for (k in 0..arguments.count) {
         let parameterType =
             if ((k as usize) <
-                parameterCount) c.hir.locals[c.hir.functions[function as usize]
-                .parameters[k as usize] as usize].typ else none();
+                parameterCount) c.hir.locals[c.hir.functions[function as usize].parameters[k as usize +
+                skip] as usize].typ else none();
         let argument = c.front.ast.at(arguments, k);
         values.push(checkArgument(c, argument, parameterType)?)?;
     }
@@ -984,15 +1030,15 @@ fn synthMember(c: borrow mut Checker, target: u32, member: u32, span: Span) -> R
             if (typeArguments.count == 0) {
                 let symbol = c.front.ast.idents[name as usize].symbol;
                 match (c.lookup(symbol)) {
-                    Entity.Builtin(_) => {
-                        var message = Vector<u8>.create();
-                        appendText(mut message, "'")?;
-                        appendBytes(mut message, c.name(symbol))?;
-                        appendText(mut message, ".")?;
-                        appendBytes(mut message, c.name(c.front.ast.idents[member as usize].symbol))?;
-                        appendText(mut message, "' is not a value; call it with '(...)'")?;
-                        c.error(notCallable(), span.start, span.end, message)?;
+                    Entity.Enum(_) => {
+                        c.notPorted(span.start, span.end, "an enum variant", "S2b")?;
                         return c.errorResult(span.start, span.end);
+                    }
+                    Entity.Builtin(_) => {
+                        return notAValue(c, symbol, member, span);
+                    }
+                    Entity.Struct(_) => {
+                        return notAValue(c, symbol, member, span);
                     }
                     _ => {}
                 }
@@ -1000,6 +1046,40 @@ fn synthMember(c: borrow mut Checker, target: u32, member: u32, span: Span) -> R
         }
         _ => {}
     }
-    c.notPorted(span.start, span.end, "a member access", "S2")?;
+    let synthesized = synth(c, target, none())?;
+    var through = synthesized;
+    while (c.types.is(c.typeOf(through), TypeKind.Reference)) {
+        let s = c.spanOf(through);
+        let pointee = c.types.info(c.typeOf(through)).pointee;
+        through = c.expr(HirExpr.Deref(through), pointee, s.start, s.end)?;
+    }
+    let throughType = c.typeOf(through);
+    if (c.types.is(throughType, TypeKind.SlotMap) || c.types.is(throughType, TypeKind.Vector)) {
+        c.notPorted(span.start, span.end, "a container's length or capacity", "S3")?;
+        return c.errorResult(span.start, span.end);
+    }
+    let value = autoDeref(c, synthesized)?;
+    let valueType = c.typeOf(value);
+    if (c.types.is(valueType, TypeKind.Array)) {
+        c.notPorted(span.start, span.end, "an array's or slice's length", "S2e")?;
+        return c.errorResult(span.start, span.end);
+    }
+    let field = resolveField(c, valueType, member)?;
+    if (field == none()) {
+        return c.errorResult(span.start, span.end);
+    }
+    let fieldType = c.types.fields[field as usize].typ;
+    return c.expr(HirExpr.FieldAccess(value, field), fieldType, span.start, span.end);
+}
+
+/// `Console.writeLine` or `Point.origin` without a call: N0210.
+fn notAValue(c: borrow mut Checker, symbol: u32, member: u32, span: Span) -> Result<u32, AllocError> {
+    var message = Vector<u8>.create();
+    appendText(mut message, "'")?;
+    appendBytes(mut message, c.name(symbol))?;
+    appendText(mut message, ".")?;
+    appendBytes(mut message, c.name(c.front.ast.idents[member as usize].symbol))?;
+    appendText(mut message, "' is not a value; call it with '(...)'")?;
+    c.error(notCallable(), span.start, span.end, message)?;
     return c.errorResult(span.start, span.end);
 }

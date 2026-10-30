@@ -1,0 +1,654 @@
+// Structs and enums (the reference's DeclareStruct, DeclareEnum, the built-in items of DeclareAllocError,
+// ResolveStructMembers, ResolveEnumVariants, CheckStructRecursion and ComputeCopyAndDrop): P3 S2a. Generic ones come
+// with S4, attributes with S7, and the library's with S5 (until then they are known by name only).
+
+fn recursiveStruct() -> u32 => 227;
+fn scopedFieldNeedsRegion() -> u32 => 270;
+
+/// A struct: a declaration in the AST, or a built-in one (SystemHeap, FailingAllocator).
+struct StructEntry {
+    item: u32; // Ast.items, or none for a built-in
+    file: u32; // none for a built-in
+    typ: u32;
+}
+
+/// An enum: a declaration in the AST, or a built-in one (AllocError, IoError).
+struct EnumEntry {
+    item: u32;
+    file: u32;
+    typ: u32;
+    builtin: u32; // 0 AllocError, 1 IoError, none for a declared enum
+}
+
+/// The built-in items, as the reference declares them first (DeclareAllocError, DeclareIoError,
+/// DeclareAllocatorType): AllocError, IoError, SystemHeap, FailingAllocator. Their names were interned by
+/// declareBuiltinItems.
+fn declareBuiltinTypes(c: borrow mut Checker) -> Result<void, AllocError> {
+    let allocName = c.builtinNames[0];
+    let allocError = c.types.createEnum(c.front.symbols.name(Symbol { id: allocName }), none(), none(), false)?;
+    c.enums.push(EnumEntry { item: none(), file: none(), typ: allocError, builtin: 0 })?;
+    c.coreItems.put(Word { value: allocName as u64 }, Entity.Enum(0))?;
+    let ioName = c.builtinNames[1];
+    let ioError = c.types.createEnum(c.front.symbols.name(Symbol { id: ioName }), none(), none(), false)?;
+    c.enums.push(EnumEntry { item: none(), file: none(), typ: ioError, builtin: 1 })?;
+    c.coreItems.put(Word { value: ioName as u64 }, Entity.Enum(1))?;
+    for (k in 2..4usize) {
+        let name = c.builtinNames[k];
+        let t = c.types.createStruct(c.front.symbols.name(Symbol { id: name }), none(), none(), false)?;
+        c.structs.push(StructEntry { item: none(), file: none(), typ: t })?;
+        let index = truncate<u32>(c.structs.length - 1);
+        c.coreItems.put(Word { value: name as u64 }, Entity.Struct(index))?;
+    }
+    c.allocErrorType = allocError;
+    c.ioErrorType = ioError;
+    c.systemHeapType = c.structs[0].typ;
+    return Ok();
+}
+
+/// N0201 for a struct or enum named like a built-in type (both reasons, in DeclareStruct's and DeclareEnum's order).
+fn checkTypeItemName(c: borrow mut Checker, ident: Ident) -> Result<bool, AllocError> {
+    var text = Vector<u8>.create();
+    appendBytes(mut text, c.name(ident.symbol))?;
+    if (c.types.lookup(text.view()) != none()) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, text.view())?;
+        appendText(mut message, "' is the name of a built-in type")?;
+        c.error(duplicateItem(), ident.start, ident.end, message)?;
+        return Ok(false);
+    }
+    if (isDeclared(c, ident.symbol)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, "'")?;
+        appendBytes(mut message, text.view())?;
+        appendText(mut message, "' is already defined")?;
+        c.error(duplicateItem(), ident.start, ident.end, message)?;
+        return Ok(false);
+    }
+    return Ok(true);
+}
+
+/// DeclareStruct for a user struct without type parameters.
+fn declareStruct(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
+    let entry = c.front.ast.items[item as usize];
+    let ident = c.front.ast.idents[entry.name as usize];
+    if (isReservedName(c, entry.name)?) {
+        return Ok();
+    }
+    let s = match (entry.kind) {
+        ItemKind.Struct(index) => c.front.ast.structs[index as usize],
+        _ => { return Ok(); }
+    };
+    if (s.regionParameters.count > 0) {
+        c.notPorted(ident.start, ident.end, "a struct with region parameters", "S3")?;
+    }
+    if (!checkTypeItemName(c, ident)?) {
+        return Ok();
+    }
+    if (s.typeParameters.count > 0) {
+        c.notPorted(ident.start, ident.end, "a generic struct", "S4")?;
+        ownItem(c, ident.symbol, Entity.LibraryItem(item))?;
+        return Ok();
+    }
+    if (entry.attributes.count > 0) {
+        c.notPorted(entry.start, entry.end, "attributes on a struct", "S7")?;
+    }
+    let t = c.types.createStruct(
+        c.front.symbols.name(Symbol { id: ident.symbol }),
+        item,
+        c.file,
+        s.regionParameters.count > 0,
+    )?;
+    c.structs.push(StructEntry { item: item, file: c.file, typ: t })?;
+    let index = truncate<u32>(c.structs.length - 1);
+    ownItem(c, ident.symbol, Entity.Struct(index))?;
+    return Ok();
+}
+
+/// DeclareEnum for a user enum without type parameters.
+fn declareEnum(c: borrow mut Checker, item: u32) -> Result<void, AllocError> {
+    let entry = c.front.ast.items[item as usize];
+    let ident = c.front.ast.idents[entry.name as usize];
+    if (isReservedName(c, entry.name)?) {
+        return Ok();
+    }
+    let parameters = match (entry.kind) {
+        ItemKind.Enum(_, typeParameters, regionParameters) => typeParameters.count + regionParameters.count,
+        _ => { return Ok(); }
+    };
+    if (!checkTypeItemName(c, ident)?) {
+        return Ok();
+    }
+    if (parameters > 0) {
+        c.notPorted(ident.start, ident.end, "a generic enum or one with region parameters", "S3/S4")?;
+        ownItem(c, ident.symbol, Entity.LibraryItem(item))?;
+        return Ok();
+    }
+    if (entry.attributes.count > 0) {
+        c.notPorted(entry.start, entry.end, "attributes on an enum", "S7")?;
+    }
+    let t = c.types.createEnum(c.front.symbols.name(Symbol { id: ident.symbol }), item, c.file, false)?;
+    c.enums.push(EnumEntry { item: item, file: c.file, typ: t, builtin: none() })?;
+    let index = truncate<u32>(c.enums.length - 1);
+    ownItem(c, ident.symbol, Entity.Enum(index))?;
+    return Ok();
+}
+
+/// The fixpoint over the growing struct and enum lists (Check()): members, then `membersResolved`.
+fn resolveAllMembers(c: borrow mut Checker) -> Result<void, AllocError> {
+    var s: usize = 0;
+    var e: usize = 0;
+    while (s < c.structs.length || e < c.enums.length) {
+        while (s < c.structs.length) {
+            resolveStructMembers(c, truncate<u32>(s))?;
+            s += 1;
+        }
+        while (e < c.enums.length) {
+            resolveEnumVariants(c, truncate<u32>(e))?;
+            e += 1;
+        }
+    }
+    c.membersResolved = true;
+    return Ok();
+}
+
+fn addField(
+    c: borrow mut Checker,
+    definition: u32,
+    name: u32,
+    typ: u32,
+    start: u32,
+    end: u32,
+) -> Result<u32, AllocError> {
+    let index = truncate<u32>(c.types.structs[definition as usize].fields.length);
+    c.types.fields.push(StructField {
+        name: name,
+        typ: typ,
+        index: index,
+        start: start,
+        end: end,
+        offset: 0,
+        hasNovaCName: false,
+        hasCName: false,
+        cName: emptyRange(),
+        isPrivate: false,
+        isPublic: false,
+        isRegionPart: false,
+    })?;
+    let field = truncate<u32>(c.types.fields.length - 1);
+    c.types.structs[definition as usize].fields.push(field)?;
+    return Ok(field);
+}
+
+/// The field named `name` of a struct definition, or none (FindField).
+fn findField(c: borrow Checker, definition: u32, name: u32) -> u32 {
+    for (f in c.types.structs[definition as usize].fields.view()) {
+        if (c.types.fields[f as usize].name == name) {
+            return f;
+        }
+    }
+    return none();
+}
+
+/// The function named `name` of a struct definition, or none (Functions.TryGetValue).
+fn findStructFunction(c: borrow Checker, definition: u32, name: u32) -> u32 {
+    let d = borrow c.types.structs[definition as usize];
+    for (k in 0..d.functionNames.length) {
+        if (d.functionNames[k] == name) {
+            return d.functions[k];
+        }
+    }
+    return none();
+}
+
+/// Field and payload types: N0246 for a region value or pool box, N0270 for another scoped type without a region.
+fn checkMemberType(
+    c: borrow mut Checker,
+    typ: u32,
+    span: Span,
+    what: StringView,
+    container: StringView,
+    declaration: u32,
+) -> Result<u32, AllocError> {
+    if (c.types.holdsRegionValue(typ)) {
+        var message = Vector<u8>.create();
+        appendText(mut message, what)?;
+        appendText(mut message, " cannot hold ")?;
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, ": region values and pool boxes stay in locals (type-system.md §25.4)")?;
+        c.error(referenceNotAllowed(), span.start, span.end, message)?;
+        return Ok(c.types.error);
+    }
+    if (c.types.isScoped(typ)) {
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            if (sameText(container.bytes(), "struct")) "a field of scoped type " else "a payload of scoped type ",
+        )?;
+        appendQuotedType(mut message, c, typ)?;
+        appendText(mut message, " needs a region parameter on the ")?;
+        appendText(mut message, container)?;
+        appendText(mut message, ": '")?;
+        appendText(mut message, container)?;
+        appendText(mut message, " ")?;
+        appendBytes(mut message, c.name(declaration))?;
+        appendText(mut message, "<region r>' (type-system.md §25.4)")?;
+        c.error(scopedFieldNeedsRegion(), span.start, span.end, message)?;
+        return Ok(c.types.error);
+    }
+    return Ok(typ);
+}
+
+/// ResolveStructMembers: fields, the drop block (a `borrow mut this` method named `drop`), then functions.
+fn resolveStructMembers(c: borrow mut Checker, index: u32) -> Result<void, AllocError> {
+    let entry = c.structs[index as usize];
+    if (entry.item == none()) {
+        return Ok(); // a built-in allocator: no members
+    }
+    let savedFile = c.file;
+    c.file = entry.file;
+    let definition = c.types.info(entry.typ).structDef;
+    let item = c.front.ast.items[entry.item as usize];
+    let declarationName = c.front.ast.idents[item.name as usize].symbol;
+    let s = match (item.kind) {
+        ItemKind.Struct(k) => c.front.ast.structs[k as usize],
+        _ => { return Ok(); }
+    };
+    var memberNames = Vector<u32>.create();
+    for (k in 0..s.fields.count) {
+        let field = c.front.ast.fields[c.front.ast.at(s.fields, k) as usize];
+        let typeSpan = c.front.ast.typeSpans[field.typ as usize];
+        let resolved = c.resolveType(field.typ, false)?;
+        let typ = checkMemberType(c, resolved, typeSpan, "a struct field", "struct", declarationName)?;
+        let id = c.front.ast.idents[field.name as usize];
+        if (containsSymbol(memberNames, id.symbol)) {
+            var message = Vector<u8>.create();
+            appendQuotedType(mut message, c, entry.typ)?;
+            appendText(mut message, " already has a member named ")?;
+            appendQuotedName(mut message, c, id.symbol)?;
+            c.error(duplicateMember(), id.start, id.end, message)?;
+            continue;
+        }
+        memberNames.push(id.symbol)?;
+        let added = addField(c, definition, id.symbol, typ, id.start, id.end)?;
+        c.types.fields[added as usize].isPrivate = isVisibility(field.visibility, 3);
+        c.types.fields[added as usize].isPublic = isVisibility(field.visibility, 1);
+    }
+    if (s.dropBlock != none()) {
+        // The drop block is checked as a `borrow mut this` method that user code cannot call.
+        let dropSpan = c.front.ast.stmtSpans[s.dropBlock as usize];
+        let dropSymbol = c.intern("drop")?;
+        let dropIdent = c.front.ast.addIdent(
+            Ident { symbol: dropSymbol, start: dropSpan.start, end: dropSpan.end, missing: false },
+        )?;
+        c.front.ast.functions.push(Function {
+            visibility: Visibility.Private,
+            name: dropIdent,
+            receiver: ReceiverKind.BorrowMut,
+            receiverStart: dropSpan.start,
+            receiverEnd: dropSpan.end,
+            parameters: emptyRange(),
+            returnType: none(),
+            body: s.dropBlock,
+            expressionBody: none(),
+            typeParameters: emptyRange(),
+            regionParameters: emptyRange(),
+            isUnsafe: false,
+            hasDoc: s.hasDropDoc,
+            doc: s.dropDoc,
+            isExtern: false,
+            attributes: emptyRange(),
+            start: dropSpan.start,
+            end: dropSpan.end,
+        })?;
+        let syntax = truncate<u32>(c.front.ast.functions.length - 1);
+        let dropFunction = declareFunction(c, syntax, entry.typ)?;
+        c.types.structs[definition as usize].dropFunction = dropFunction;
+    }
+    for (k in 0..s.functions.count) {
+        let f = c.front.ast.at(s.functions, k);
+        let id = c.front.ast.idents[c.front.ast.functions[f as usize].name as usize];
+        if (containsSymbol(memberNames, id.symbol)) {
+            var message = Vector<u8>.create();
+            appendQuotedType(mut message, c, entry.typ)?;
+            appendText(mut message, " already has a member named ")?;
+            appendQuotedName(mut message, c, id.symbol)?;
+            c.error(duplicateMember(), id.start, id.end, message)?;
+            continue;
+        }
+        memberNames.push(id.symbol)?;
+        let function = declareFunction(c, f, entry.typ)?;
+        c.types.structs[definition as usize].functions.push(function)?;
+        c.types.structs[definition as usize].functionNames.push(id.symbol)?;
+    }
+    c.file = savedFile;
+    return Ok();
+}
+
+fn containsSymbol(list: borrow Vector<u32>, symbol: u32) -> bool {
+    for (s in list.view()) {
+        if (s == symbol) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Visibility by index: 0 default, 1 public, 2 internal, 3 private.
+fn isVisibility(v: Visibility, index: u32) -> bool => match (v) {
+    Visibility.Default => index == 0,
+    Visibility.Public => index == 1,
+    Visibility.Internal => index == 2,
+    Visibility.Private => index == 3,
+};
+
+/// IoError's variants, in the runtime's order (DeclareIoError's built-in source).
+fn ioErrorVariant(k: usize) -> StringView => match (k) {
+    0 => "NotFound",
+    1 => "PermissionDenied",
+    2 => "AlreadyExists",
+    3 => "IsDirectory",
+    4 => "NotDirectory",
+    5 => "InvalidInput",
+    6 => "BrokenPipe",
+    7 => "ConnectionRefused",
+    8 => "AddressInUse",
+    9 => "OutOfMemory",
+    _ => "Other",
+};
+
+fn addVariant(c: borrow mut Checker, definition: u32, name: u32, start: u32, end: u32) -> Result<u32, AllocError> {
+    let index = truncate<u32>(c.types.enums[definition as usize].variants.length);
+    c.types.variants.push(
+        EnumVariant { name: name, index: index, start: start, end: end, payload: Vector<u32>.create() },
+    )?;
+    let variant = truncate<u32>(c.types.variants.length - 1);
+    c.types.enums[definition as usize].variants.push(variant)?;
+    return Ok(variant);
+}
+
+fn addPayload(c: borrow mut Checker, variant: u32, k: u32, typ: u32, start: u32, end: u32) -> Result<void, AllocError> {
+    var name = Vector<u8>.create();
+    name.push('_')?;
+    appendDecimal(mut name, k as u64)?;
+    let symbol = c.front.symbols.intern(name.view())?;
+    c.types.fields.push(StructField {
+        name: symbol.id,
+        typ: typ,
+        index: k,
+        start: start,
+        end: end,
+        offset: 0,
+        hasNovaCName: false,
+        hasCName: false,
+        cName: emptyRange(),
+        isPrivate: false,
+        isPublic: false,
+        isRegionPart: false,
+    })?;
+    c.types.variants[variant as usize].payload.push(truncate<u32>(c.types.fields.length - 1))?;
+    return Ok();
+}
+
+/// The variant named `name` of an enum definition, or none (FindVariant).
+fn findVariant(c: borrow Checker, definition: u32, name: u32) -> u32 {
+    for (v in c.types.enums[definition as usize].variants.view()) {
+        if (c.types.variants[v as usize].name == name) {
+            return v;
+        }
+    }
+    return none();
+}
+
+/// ResolveEnumVariants: each variant with its payload types, in declaration order.
+fn resolveEnumVariants(c: borrow mut Checker, index: u32) -> Result<void, AllocError> {
+    let entry = c.enums[index as usize];
+    let definition = c.types.info(entry.typ).enumDef;
+    if (entry.builtin == 0) {
+        let symbol = c.intern("OutOfMemory")?;
+        addVariant(c, definition, symbol, 18, 29)?;
+        return Ok();
+    }
+    if (entry.builtin == 1) {
+        for (k in 0..11usize) {
+            let symbol = c.intern(ioErrorVariant(k))?;
+            let variant = addVariant(c, definition, symbol, 0, 0)?;
+            if (k == 10) {
+                let i32Type = c.types.i32;
+                addPayload(c, variant, 0, i32Type, 0, 0)?;
+            }
+        }
+        return Ok();
+    }
+    let savedFile = c.file;
+    c.file = entry.file;
+    let item = c.front.ast.items[entry.item as usize];
+    let declarationName = c.front.ast.idents[item.name as usize].symbol;
+    let variants = match (item.kind) {
+        ItemKind.Enum(v, _, _) => v,
+        _ => emptyRange(),
+    };
+    for (k in 0..variants.count) {
+        let v = c.front.ast.variants[c.front.ast.at(variants, k) as usize];
+        let id = c.front.ast.idents[v.name as usize];
+        if (findVariant(c, definition, id.symbol) != none()) {
+            var message = Vector<u8>.create();
+            appendQuotedType(mut message, c, entry.typ)?;
+            appendText(mut message, " already has a variant named ")?;
+            appendQuotedName(mut message, c, id.symbol)?;
+            c.error(duplicateMember(), id.start, id.end, message)?;
+            continue;
+        }
+        let variant = addVariant(c, definition, id.symbol, id.start, id.end)?;
+        for (p in 0..v.payload.count) {
+            let typeSyntax = c.front.ast.at(v.payload, p);
+            let typeSpan = c.front.ast.typeSpans[typeSyntax as usize];
+            let resolved = c.resolveType(typeSyntax, false)?;
+            let typ = checkMemberType(c, resolved, typeSpan, "an enum payload", "enum", declarationName)?;
+            addPayload(c, variant, p, typ, typeSpan.start, typeSpan.end)?;
+        }
+    }
+    c.file = savedFile;
+    return Ok();
+}
+
+/// The types an aggregate contains by value, looking through arrays, results and optionals (Contained, Flatten),
+/// with the field that holds each.
+fn containedTypes(
+    c: borrow Checker,
+    typ: u32,
+    out: borrow mut Vector<u32>,
+    fields: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    let t = c.types.info(typ);
+    if (t.structDef != none()) {
+        for (f in c.types.structs[t.structDef as usize].fields.view()) {
+            flatten(c, c.types.fields[f as usize].typ, f, out, fields)?;
+        }
+    } else if (t.enumDef != none() && (c.types.enums[t.enumDef as usize].item != none() || isBuiltinEnum(c, typ))) {
+        for (v in c.types.enums[t.enumDef as usize].variants.view()) {
+            for (f in c.types.variants[v as usize].payload.view()) {
+                flatten(c, c.types.fields[f as usize].typ, f, out, fields)?;
+            }
+        }
+    }
+    return Ok();
+}
+
+/// Is `typ` AllocError or IoError, whose payloads count as a declared enum's (they have a source)?
+fn isBuiltinEnum(c: borrow Checker, typ: u32) -> bool => typ == c.allocErrorType || typ == c.ioErrorType;
+
+fn flatten(
+    c: borrow Checker,
+    typ: u32,
+    field: u32,
+    out: borrow mut Vector<u32>,
+    fields: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    let t = c.types.info(typ);
+    if (c.types.is(typ, TypeKind.Array)) {
+        return flatten(c, t.element, field, out, fields);
+    }
+    if (t.enumDef != none()) {
+        let e = borrow c.types.enums[t.enumDef as usize];
+        if (e.resultOk != none()) {
+            flatten(c, e.resultOk, field, out, fields)?;
+            return flatten(c, e.resultErr, field, out, fields);
+        }
+        if (e.optionType != none()) {
+            return flatten(c, e.optionType, field, out, fields);
+        }
+    }
+    out.push(typ)?;
+    fields.push(field)?;
+    return Ok();
+}
+
+fn isAggregate(c: borrow Checker, typ: u32) -> bool =>
+    c.types.is(typ, TypeKind.Struct) || c.types.is(typ, TypeKind.Enum);
+
+/// N0227: an aggregate may not contain itself by value (CheckStructRecursion, a depth-first search).
+fn checkStructRecursion(c: borrow mut Checker) -> Result<void, AllocError> {
+    var state = Vector<u8>.create(); // by type id: 0 new, 1 on the stack, 2 done
+    while (state.length < c.types.types.length) {
+        state.push(0)?;
+    }
+    var stack = Vector<u32>.create();
+    var order = Vector<u32>.create();
+    for (s in c.structs.view()) {
+        order.push(s.typ)?;
+    }
+    for (e in c.enums.view()) {
+        order.push(e.typ)?;
+    }
+    for (t in order.view()) {
+        if (state[t as usize] == 0) {
+            visitRecursion(c, t, mut state, mut stack)?;
+        }
+    }
+    return Ok();
+}
+
+fn visitRecursion(
+    c: borrow mut Checker,
+    typ: u32,
+    state: borrow mut Vector<u8>,
+    stack: borrow mut Vector<u32>,
+) -> Result<void, AllocError> {
+    state[typ as usize] = 1;
+    stack.push(typ)?;
+    var inner = Vector<u32>.create();
+    var fields = Vector<u32>.create();
+    containedTypes(c, typ, mut inner, mut fields)?;
+    for (k in 0..inner.length) {
+        let t = inner[k];
+        if (!isAggregate(c, t)) {
+            continue;
+        }
+        while (state.length < c.types.types.length) {
+            state.push(0)?;
+        }
+        if (state[t as usize] == 0) {
+            visitRecursion(c, t, state, stack)?;
+        } else if (state[t as usize] == 1) {
+            // Every type on the cycle is recursive; report at the one that closes it.
+            var from: usize = 0;
+            for (i in 0..stack.length) {
+                if (stack[i] == t) {
+                    from = i;
+                    break;
+                }
+            }
+            for (i in from..stack.length) {
+                let member = c.types.info(stack[i]);
+                if (member.structDef != none()) {
+                    c.types.structs[member.structDef as usize].isRecursive = true;
+                } else {
+                    c.types.enums[member.enumDef as usize].isRecursive = true;
+                }
+            }
+            let field = c.types.fields[fields[k] as usize];
+            let saved = c.file;
+            c.file = sourceOfAggregate(c, typ);
+            var message = Vector<u8>.create();
+            appendQuotedType(mut message, c, typ)?;
+            appendText(mut message, " contains ")?;
+            appendQuotedType(mut message, c, t)?;
+            appendText(mut message, " by value, which contains ")?;
+            appendQuotedType(mut message, c, typ)?;
+            appendText(mut message, ": the type would have infinite size")?;
+            c.error(recursiveStruct(), field.start, field.end, message)?;
+            c.file = saved;
+        }
+    }
+    stack.truncate(stack.length - 1);
+    state[typ as usize] = 2;
+    return Ok();
+}
+
+/// The file that declares an aggregate.
+fn sourceOfAggregate(c: borrow Checker, typ: u32) -> u32 {
+    let t = c.types.info(typ);
+    if (t.structDef != none()) {
+        return c.types.structs[t.structDef as usize].file;
+    }
+    return c.types.enums[t.enumDef as usize].file;
+}
+
+/// Copy and needs-drop for every struct and enum, contained types first (ComputeCopyAndDrop, §14.1, §15.1).
+fn computeCopyAndDrop(c: borrow mut Checker) -> Result<void, AllocError> {
+    var done = Vector<bool>.create();
+    var order = Vector<u32>.create();
+    for (s in c.structs.view()) {
+        order.push(s.typ)?;
+    }
+    for (e in c.enums.view()) {
+        order.push(e.typ)?;
+    }
+    for (t in order.view()) {
+        visitCopy(c, t, mut done)?;
+    }
+    return Ok();
+}
+
+fn visitCopy(c: borrow mut Checker, typ: u32, done: borrow mut Vector<bool>) -> Result<void, AllocError> {
+    while (done.length < c.types.types.length) {
+        done.push(false)?;
+    }
+    if (done[typ as usize]) {
+        return Ok();
+    }
+    done[typ as usize] = true;
+    let t = c.types.info(typ);
+    if ((t.structDef != none() && c.types.structs[t.structDef as usize].isRecursive) ||
+        (t.enumDef != none() && c.types.enums[t.enumDef as usize].isRecursive)) {
+        return Ok();
+    }
+    var contained = Vector<u32>.create();
+    var fields = Vector<u32>.create();
+    containedTypes(c, typ, mut contained, mut fields)?;
+    for (inner in contained.view()) {
+        if (isAggregate(c, inner)) {
+            visitCopy(c, inner, done)?;
+        }
+    }
+    var anyDrop = false;
+    var allCopy = true;
+    for (inner in contained.view()) {
+        if (c.types.needsDrop(inner)) {
+            anyDrop = true;
+        }
+        if (!c.types.isCopy(inner)) {
+            allCopy = false;
+        }
+    }
+    if (t.structDef != none()) {
+        let hasDrop = c.types.structs[t.structDef as usize].dropFunction != none();
+        c.types.structs[t.structDef as usize].needsDrop = hasDrop || anyDrop;
+        c.types.structs[t.structDef as usize].isCopy = !hasDrop && allCopy;
+    } else if (t.enumDef != none()) {
+        c.types.enums[t.enumDef as usize].needsDrop = anyDrop;
+        c.types.enums[t.enumDef as usize].isCopy = allCopy;
+    }
+    return Ok();
+}

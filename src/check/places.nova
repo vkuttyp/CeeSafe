@@ -1,0 +1,296 @@
+// Places (the reference's ToPlace, Project, MutabilityError, DescribePlace, LetToVar, IsPathThroughReference and
+// BorrowPlace): a local and the projections that reach a part of it, built from a checked expression.
+
+fn borrowOfNonPlace() -> u32 => 247;
+fn borrowMutOfImmutable() -> u32 => 248;
+
+/// The type after one projection, from the type before it (Projection.Apply).
+fn applyProjection(c: borrow Checker, typ: u32, p: HirProjection) -> u32 => match (p.kind) {
+    ProjectionKind.Field => c.types.fields[p.field as usize].typ,
+    ProjectionKind.Deref => c.types.info(typ).pointee,
+    ProjectionKind.Downcast => typ,
+    ProjectionKind.Index => c.types.info(typ).element,
+};
+
+/// The root local and projections of the place an expression denotes, or false (ToPlace).
+fn collectPlace(
+    c: borrow Checker,
+    e: u32,
+    root: borrow mut u32,
+    projections: borrow mut Vector<HirProjection>,
+) -> Result<bool, AllocError> {
+    match (c.hir.exprs[e as usize]) {
+        HirExpr.LocalRef(local) => {
+            root = local;
+            return Ok(true);
+        }
+        HirExpr.FieldAccess(target, field) => {
+            if (!collectPlace(c, target, root, projections)?) {
+                return Ok(false);
+            }
+            projections.push(
+                HirProjection { kind: ProjectionKind.Field, field: field, variant: none(), index: none() },
+            )?;
+            return Ok(true);
+        }
+        HirExpr.Deref(reference) => {
+            if (!collectPlace(c, reference, root, projections)?) {
+                return Ok(false);
+            }
+            projections.push(
+                HirProjection { kind: ProjectionKind.Deref, field: none(), variant: none(), index: none() },
+            )?;
+            return Ok(true);
+        }
+        HirExpr.Index(target, index) => {
+            if (!collectPlace(c, target, root, projections)?) {
+                return Ok(false);
+            }
+            projections.push(
+                HirProjection { kind: ProjectionKind.Index, field: none(), variant: none(), index: index },
+            )?;
+            return Ok(true);
+        }
+        _ => { return Ok(false); }
+    }
+}
+
+/// ToPlace: a new place for the expression, or none if it is not one.
+fn toPlace(c: borrow mut Checker, e: u32) -> Result<u32, AllocError> {
+    var root = none();
+    var projections = Vector<HirProjection>.create();
+    if (!collectPlace(c, e, mut root, mut projections)?) {
+        return Ok(none());
+    }
+    let typ = c.typeOf(e);
+    return c.hir.addPlace(root, projections.view(), typ);
+}
+
+/// A copy of `place` with one more projection (Project).
+fn project(c: borrow mut Checker, place: u32, p: HirProjection) -> Result<u32, AllocError> {
+    let old = c.hir.places[place as usize];
+    var projections = Vector<HirProjection>.create();
+    for (k in 0..old.projections.count) {
+        projections.push(c.hir.projections[(old.projections.start + k) as usize])?;
+    }
+    projections.push(p)?;
+    let typ = applyProjection(c, old.typ, p);
+    return c.hir.addPlace(old.root, projections.view(), typ);
+}
+
+fn derefProjection() -> HirProjection => HirProjection {
+    kind: ProjectionKind.Deref,
+    field: none(),
+    variant: none(),
+    index: none(),
+};
+
+fn isDerefProjection(p: HirProjection) -> bool => match (p.kind) {
+    ProjectionKind.Deref => true,
+    _ => false,
+};
+
+fn isFieldProjection(p: HirProjection) -> bool => match (p.kind) {
+    ProjectionKind.Field => true,
+    _ => false,
+};
+
+fn isIndexProjection(p: HirProjection) -> bool => match (p.kind) {
+    ProjectionKind.Index => true,
+    _ => false,
+};
+
+/// Null (an empty reason) if the place may be written or mutably borrowed; otherwise why not (MutabilityError).
+fn mutabilityError(c: borrow Checker, place: u32, reason: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let p = c.hir.places[place as usize];
+    let root = c.hir.locals[p.root as usize];
+    var mutable = root.mutable;
+    var typ = root.typ;
+    var throughShared = false;
+    for (k in 0..p.projections.count) {
+        let projection = c.hir.projections[(p.projections.start + k) as usize];
+        if (isDerefProjection(projection) && c.types.isString(typ)) {
+            return appendText(
+                reason,
+                "the bytes of a 'String' cannot be modified: they must stay valid UTF-8 (add text with 'append')",
+            );
+        }
+        // A box's or vector's contents are as mutable as it is (§18.2, §23.1).
+        if (isDerefProjection(projection) && !c.types.is(typ, TypeKind.Box) && !c.types.is(typ, TypeKind.Vector) &&
+            !c.types.is(typ, TypeKind.StableVector)) {
+            // Once behind a shared reference, always: a `borrow mut` stored there gives no mutable access (§13.2).
+            if (!c.types.info(typ).mutableReference) {
+                throughShared = true;
+            }
+            mutable = !throughShared;
+        }
+        typ = applyProjection(c, typ, projection);
+    }
+    if (mutable) {
+        return Ok();
+    }
+    if (!throughShared && !root.parameter && c.types.isScoped(root.typ) && !c.types.is(root.typ, TypeKind.Reference)) {
+        appendQuotedName(reason, c, root.name)?;
+        return appendText(reason, " is not mutable; bind it with 'using' (a scoped value cannot be a 'var')");
+    }
+    if (throughShared) {
+        return appendText(
+            reason,
+            "it is behind a shared reference ('borrow'); a 'borrow mut' reference is needed to modify it",
+        );
+    }
+    if (root.name == c.thisSymbol) {
+        return appendText(reason, "'this' is immutable in a by-value method; use 'borrow mut this'");
+    }
+    if (root.parameter) {
+        return appendText(reason, "parameters are immutable");
+    }
+    appendQuotedName(reason, c, root.name)?;
+    return appendText(reason, " was declared with 'let'; use 'var' for a mutable variable");
+}
+
+/// How messages name a place (DescribePlace).
+fn describePlace(c: borrow Checker, place: u32, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let p = c.hir.places[place as usize];
+    let root = c.hir.locals[p.root as usize];
+    var text = Vector<u8>.create();
+    appendBytes(mut text, c.name(root.name))?;
+    var hasField = false;
+    var hasDeref = false;
+    var hasIndex = false;
+    for (k in 0..p.projections.count) {
+        let projection = c.hir.projections[(p.projections.start + k) as usize];
+        if (isFieldProjection(projection)) {
+            text.push('.')?;
+            appendBytes(mut text, c.name(c.types.fields[projection.field as usize].name))?;
+            hasField = true;
+        }
+        if (isDerefProjection(projection)) {
+            hasDeref = true;
+        }
+        if (isIndexProjection(projection)) {
+            hasIndex = true;
+        }
+    }
+    if (hasDeref && c.types.is(root.typ, TypeKind.Box) && !hasField) {
+        appendText(out, "the contents of '")?;
+        appendBytes(out, text.view())?;
+        return appendText(out, "'");
+    }
+    if (hasIndex) {
+        appendText(out, "an element of '")?;
+        appendBytes(out, text.view())?;
+        return appendText(out, "'");
+    }
+    if (hasField || p.projections.count == 0) {
+        appendText(out, "'")?;
+        appendBytes(out, text.view())?;
+        return appendText(out, "'");
+    }
+    appendText(out, "the value '")?;
+    appendBytes(out, text.view())?;
+    return appendText(out, "' refers to");
+}
+
+/// The `let` → `var` fix's span start for a place that is immutable only because its root is a `let` (LetToVar),
+/// or none.
+fn letToVarStart(c: borrow Checker, place: u32, reason: Slice<u8>) -> u32 {
+    let suffix = "use 'var' for a mutable variable".bytes();
+    if (reason.length < suffix.length || !sameBytes(reason[(reason.length - suffix.length)..], suffix)) {
+        return none();
+    }
+    let root = c.hir.places[place as usize].root;
+    let t = c.hir.locals[root as usize].typ;
+    if (c.types.is(t, TypeKind.Reference) || c.types.isScoped(t)) {
+        return none();
+    }
+    return c.letKeywordOf(root);
+}
+
+/// Reports `message` (the reason appended) with the `let` → `var` fix when it applies.
+fn errorWithLetToVar(
+    c: borrow mut Checker,
+    code: u32,
+    start: u32,
+    end: u32,
+    message: Vector<u8>,
+    place: u32,
+    reason: borrow Vector<u8>,
+) -> Result<void, AllocError> {
+    let letStart = letToVarStart(c, place, reason.view());
+    if (letStart == none()) {
+        return c.error(code, start, end, message);
+    }
+    let root = c.hir.places[place as usize].root;
+    var title = Vector<u8>.create();
+    appendText(mut title, "declare ")?;
+    appendQuotedName(mut title, c, c.hir.locals[root as usize].name)?;
+    appendText(mut title, " with 'var'")?;
+    var text = Vector<u8>.create();
+    appendText(mut text, "var")?;
+    return c.errorWithFix(code, start, end, message, title, letStart, letStart + 3, text);
+}
+
+/// Is the expression a place reached through a reference that is not a place itself, such as a call's result
+/// (IsPathThroughReference)? For a mutable borrow every reference on the way must be mutable (§13.2).
+fn isPathThroughReference(c: borrow Checker, e: u32, mutable: bool) -> Result<bool, AllocError> {
+    match (c.hir.exprs[e as usize]) {
+        HirExpr.FieldAccess(target, _) => { return isPathThroughReference(c, target, mutable); }
+        HirExpr.Index(target, _) => {
+            return Ok(!c.types.isUnsized(c.typeOf(target)) && isPathThroughReference(c, target, mutable)?);
+        }
+        HirExpr.Deref(reference) => {
+            let t = c.typeOf(reference);
+            if (!c.types.is(t, TypeKind.Reference) || (mutable && !c.types.info(t).mutableReference)) {
+                return Ok(false);
+            }
+            var root = none();
+            var projections = Vector<HirProjection>.create();
+            if (!collectPlace(c, reference, mut root, mut projections)?) {
+                let nested = match (c.hir.exprs[reference as usize]) {
+                    HirExpr.Deref(_) => true,
+                    HirExpr.FieldAccess(_, _) => true,
+                    HirExpr.Index(_, _) => true,
+                    _ => false,
+                };
+                return Ok(!nested);
+            }
+            return isPathThroughReference(c, reference, mutable);
+        }
+        _ => { return Ok(false); }
+    }
+}
+
+/// BorrowPlace: `borrow p` or `borrow mut p` of the place a checked expression denotes (N0247, N0248).
+fn borrowPlace(c: borrow mut Checker, value: u32, mutable: bool, span: Span) -> Result<u32, AllocError> {
+    let place = toPlace(c, value)?;
+    if (place == none() && isPathThroughReference(c, value, mutable)?) {
+        let t = c.types.referenceTo(c.typeOf(value), mutable)?;
+        return c.expr(HirExpr.BorrowPath(mutable, value), t, span.start, span.end);
+    }
+    if (place == none()) {
+        var message = Vector<u8>.create();
+        appendText(
+            mut message,
+            "only a variable, a field, or a place reached through a reference can be borrowed; bind the value to a local first",
+        )?;
+        c.error(borrowOfNonPlace(), span.start, span.end, message)?;
+        return c.errorResult(span.start, span.end);
+    }
+    if (mutable) {
+        var reason = Vector<u8>.create();
+        mutabilityError(c, place, mut reason)?;
+        if (reason.length > 0) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "cannot borrow ")?;
+            describePlace(c, place, mut message)?;
+            appendText(mut message, " as mutable: ")?;
+            appendBytes(mut message, reason.view())?;
+            errorWithLetToVar(c, borrowMutOfImmutable(), span.start, span.end, message, place, reason)?;
+            return c.errorResult(span.start, span.end);
+        }
+    }
+    let placeType = c.hir.places[place as usize].typ;
+    let t = c.types.referenceTo(placeType, mutable)?;
+    return c.expr(HirExpr.Borrow(mutable, place), t, span.start, span.end);
+}

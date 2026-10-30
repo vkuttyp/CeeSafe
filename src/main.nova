@@ -332,10 +332,12 @@ fn checkCommand() -> i32 {
         return report(options.json, front.diagnostics, sources);
     }
     var texts = Vector<Vector<u8>>.create();
+    var paths = Vector<Vector<u8>>.create();
     for (i in 0..sources.length) {
         texts.push(copyBytes(sources[i].text.view())!)!;
+        paths.push(copyBytes(sources[i].path.view())!)!;
     }
-    let checker = checkProgram(front, fileIsLibrary, texts, options.noFloat)!;
+    let checker = checkProgram(front, fileIsLibrary, texts, paths, options.noFloat)!;
     if (options.dumpHir) {
         var printer = HirPrinter.create();
         printer.printProgram(checker.hir, checker.types, checker.front.symbols)!;

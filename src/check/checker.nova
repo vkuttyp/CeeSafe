@@ -14,7 +14,8 @@ enum Entity {
     Function(u32),    // HirProgram.functions
     Constant(u32),    // Checker.constants
     LibraryItem(u32), // a library item not yet ported (S5): its AST item
-    BuiltinItem(u32), // AllocError, IoError, SystemHeap, FailingAllocator: their index in builtinNames
+    Struct(u32),      // Checker.structs
+    Enum(u32),        // Checker.enums
     Builtin(u32),     // Console, Process, ... (the reference's Builtin enum, by declaration index)
 }
 
@@ -54,11 +55,18 @@ struct Checker {
     hir: HirProgram;
     fileIsLibrary: Vector<bool>;
     fileTexts: Vector<Vector<u8>>; // each file's bytes, for fixes that quote source text
+    filePaths: Vector<Vector<u8>>; // each file's path, as messages name it
     noFloat: bool;                 // --no-float (type-system.md §35.9)
     rootItems: Map<Word, Entity>;
     coreItems: Map<Word, Entity>;
     builtins: Map<Word, u32>;
     builtinNames: Vector<u32>; // the symbols of AllocError, IoError, SystemHeap, FailingAllocator
+    structs: Vector<StructEntry>;
+    enums: Vector<EnumEntry>;
+    membersResolved: bool;
+    allocErrorType: u32;
+    ioErrorType: u32;
+    systemHeapType: u32;
     constants: Vector<ConstEntry>;
     reserved: Vector<u32>; // symbols of the reserved names (s_reservedNames)
     thisSymbol: u32;
@@ -275,7 +283,14 @@ struct Checker {
                 let ident = this.front.ast.idents[this.front.ast.at(q.parts, 0) as usize];
                 var text = Vector<u8>.create();
                 appendBytes(mut text, this.name(ident.symbol))?;
-                let found = this.types.lookup(text.view());
+                var found = this.types.lookup(text.view());
+                if (found == none()) {
+                    match (this.item(ident.symbol)) {
+                        Entity.Struct(s) => { found = this.structs[s as usize].typ; }
+                        Entity.Enum(e) => { found = this.enums[e as usize].typ; }
+                        _ => {}
+                    }
+                }
                 if (found == none()) {
                     match (this.item(ident.symbol)) {
                         Entity.None => {
