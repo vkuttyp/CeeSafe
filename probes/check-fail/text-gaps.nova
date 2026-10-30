@@ -1,0 +1,22 @@
+// P1 probe: the text operations a compiler needs that Nova does not have (type-system §22.2, §23.2; ROADMAP N1).
+// Each line names what the port must do instead until N1 lands.
+
+fn main() {
+    var bytes = Vector<u8>.create();
+    bytes.push('a')!;
+    // Source read from a file is bytes; there is no checked conversion to text, so names stay byte slices.
+    let text = StringView.fromUtf8(bytes.view()); // error[N0200]
+    var s = String.create();
+    // A diagnostic message cannot include a name from the source; it is printed piece by piece instead.
+    s.appendBytes(bytes.view())!; // error[N0200]
+    // No copy of a `String`; copy the bytes into a new one.
+    let copy = s.clone(); // error[N0200]
+    // No ordering of text: sorting names for deterministic output needs a byte-wise compare function.
+    let less = "a" < "b"; // error[N0207]
+    // No number parsing: literals are decoded by hand (and exactly, ROADMAP §3.2).
+    let n = "42".parse(); // error[N0200]
+    // No searching.
+    let i = "abc".find("b"); // error[N0200]
+    // Arrays and slices cannot hold views, so keyword and operator tables are matches.
+    let names = ["a", "b"]; // error[N0246]
+}

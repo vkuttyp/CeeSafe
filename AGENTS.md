@@ -89,6 +89,8 @@ the markers, and never edit between them.
 ```sh
 python3 tools/run_corpus.py --compiler ~/.nova/bin/novac                 # Nova's corpus against a compiler
 python3 tools/run_corpus.py --compiler out/ceesafe --reference ~/.nova/bin/novac --family parse-pass
+python3 tools/run_corpus.py --compiler ~/.nova/bin/novac --corpus probes --family run-pass --family check-fail \
+    --family parse-fail                                                  # the P1 probes
 python3 tools/inventory.py                                               # regenerate docs/reference-inventory.md
 ```
 
@@ -110,6 +112,7 @@ src/                                    the compiler, in Nova
 docs/decisions/                         CeeSafe decisions
 bootstrap/                              stage-0 pin and reference manifest
 tools/                                  run_corpus.py (corpus runner), inventory.py (reference inventory)
+probes/                                 P1 capability probes in corpus format; upstream/ holds novac bug reproducers
 tests/                                  CeeSafe's own fixtures (planned)
 out/                                    build output, never committed
 ```

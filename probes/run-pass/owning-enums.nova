@@ -1,0 +1,131 @@
+// P1 probe: vectors of enums that own heap data (declarations with names, parameter lists and bodies), read through
+// borrows, matched without moving, changed in place, moved out, and destroyed in a known order.
+// Matching `taken` by value consumes it, so its record is destroyed when the arm ends (type-system §18.4): name first,
+// then the fields, in declaration order. The vector destroys its elements in index order when main returns.
+// expect-stdout: fn add(2 params)
+// expect-stdout: struct Point(2 fields)
+// expect-stdout: const LIMIT
+// expect-stdout: renamed: add_checked
+// expect-stdout: taken: Pointdrop Point
+// expect-stdout: drop x
+// expect-stdout: drop y
+// expect-stdout: , 2 left
+// expect-stdout: drop add_checked
+// expect-stdout: drop a
+// expect-stdout: drop b
+// expect-stdout: drop LIMIT
+
+struct Name {
+    bytes: Vector<u8>;
+
+    fn from(text: StringView) -> Result<Name, AllocError> {
+        var bytes = Vector<u8>.create();
+        for (b in text.bytes()) {
+            bytes.push(b)?;
+        }
+        return Ok(Name { bytes: bytes });
+    }
+
+    fn print(borrow this) {
+        Console.writeBytes(this.bytes.view());
+    }
+
+    drop {
+        Console.write("drop ");
+        Console.writeBytes(this.bytes.view());
+        Console.writeLine("");
+    }
+}
+
+struct Function {
+    name: Name;
+    params: Vector<Name>;
+}
+
+struct Record {
+    name: Name;
+    fields: Vector<Name>;
+}
+
+enum Item {
+    Fn(Function),
+    Struct(Record),
+    Const(Name),
+}
+
+fn describe(item: borrow Item) {
+    match (item) {
+        Item.Fn(f) => {
+            Console.write("fn ");
+            f.name.print();
+            Console.write("(");
+            Console.write(f.params.length);
+            Console.writeLine(" params)");
+        }
+        Item.Struct(s) => {
+            Console.write("struct ");
+            s.name.print();
+            Console.write("(");
+            Console.write(s.fields.length);
+            Console.writeLine(" fields)");
+        }
+        Item.Const(n) => {
+            Console.write("const ");
+            n.print();
+            Console.writeLine("");
+        }
+    }
+}
+
+// Arrays and slices cannot hold `StringView`s (N0246, type-system §16), so a list of names is built one by one.
+fn names(first: StringView, second: StringView) -> Result<Vector<Name>, AllocError> {
+    var result = Vector<Name>.create();
+    result.push(Name.from(first)?)?;
+    result.push(Name.from(second)?)?;
+    return Ok(result);
+}
+
+fn build() -> Result<Vector<Item>, AllocError> {
+    var items = Vector<Item>.create();
+    items.push(Item.Fn(Function { name: Name.from("add")?, params: names("a", "b")? }))?;
+    items.push(Item.Struct(Record { name: Name.from("Point")?, fields: names("x", "y")? }))?;
+    items.push(Item.Const(Name.from("LIMIT")?))?;
+    return Ok(items);
+}
+
+// Changes an element in place through a mutable borrow of it.
+fn rename(item: borrow mut Item, suffix: StringView) -> Result<void, AllocError> {
+    match (item) {
+        Item.Fn(f) => {
+            for (b in suffix.bytes()) {
+                f.name.bytes.push(b)?;
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn main() {
+    var items = build()!;
+    for (item in items) {
+        describe(item);
+    }
+    rename(mut items[0], "_checked")!;
+    Console.write("renamed: ");
+    match (borrow items[0]) {
+        Item.Fn(f) => { f.name.print(); }
+        _ => {}
+    }
+    Console.writeLine("");
+    items.swap(1, 2);
+    let taken = items.pop()!;
+    Console.write("taken: ");
+    match (taken) {
+        Item.Struct(s) => { s.name.print(); }
+        _ => {}
+    }
+    Console.write(", ");
+    Console.write(items.length);
+    Console.writeLine(" left");
+}

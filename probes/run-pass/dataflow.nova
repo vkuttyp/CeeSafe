@@ -1,0 +1,227 @@
+// P1 probe: bitsets and a worklist, as the safety passes use them (BorrowChecker, MoveChecker: per-block sets of loans
+// and move paths solved to a fixed point). It computes live variables backwards over a small control-flow graph
+// with a loop, and checks the fixed point by solving again in a different block order.
+//
+//   b0: x = 1; y = 2          -> b1
+//   b1: if (x < 10)           -> b2, b3
+//   b2: x = x + y             -> b1
+//   b3: z = x; return z
+// expect-stdout: live in: b0 {} b1 {x y} b2 {x y} b3 {x}
+// expect-stdout: live out: b0 {x y} b1 {x y} b2 {x y} b3 {}
+// expect-stdout: same fixed point in reverse order: true
+// expect-stdout: big set: 1000 bits, 334 set, union 667
+
+struct Bits {
+    words: Vector<u64>;
+
+    fn create(bits: usize) -> Result<Bits, AllocError> {
+        var words = Vector<u64>.create();
+        for (i in 0..((bits + 63) / 64)) {
+            words.push(0)?;
+        }
+        return Ok(Bits { words: words });
+    }
+
+    fn set(borrow mut this, bit: usize) {
+        this.words[bit / 64] |= 1u64 << truncate<u32>(bit % 64);
+    }
+
+    fn clear(borrow mut this, bit: usize) {
+        this.words[bit / 64] &= (1u64 << truncate<u32>(bit % 64)) ^ 0xFFFFFFFFFFFFFFFF;
+    }
+
+    fn has(borrow this, bit: usize) -> bool => (this.words[bit / 64] >> truncate<u32>(bit % 64)) & 1 == 1;
+
+    // this |= other; true if this changed.
+    fn unionWith(borrow mut this, other: borrow Bits) -> bool {
+        var changed = false;
+        for (i in 0..this.words.length) {
+            let merged = this.words[i] | other.words[i];
+            if (merged != this.words[i]) {
+                this.words[i] = merged;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    fn copyOf(borrow this) -> Result<Bits, AllocError> {
+        var words = Vector<u64>.create();
+        for (w in this.words) {
+            words.push(w)?;
+        }
+        return Ok(Bits { words: words });
+    }
+
+    fn equals(borrow this, other: borrow Bits) -> bool {
+        for (i in 0..this.words.length) {
+            if (this.words[i] != other.words[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn count(borrow this) -> u32 {
+        var n: u32 = 0;
+        for (w in this.words) {
+            var v = w;
+            while (v != 0) {
+                v &= v - 1;
+                n += 1;
+            }
+        }
+        return n;
+    }
+}
+
+struct Block {
+    uses: Bits;
+    defs: Bits;
+    successors: Vector<u32>;
+}
+
+struct Solution {
+    liveIn: Vector<Bits>;
+    liveOut: Vector<Bits>;
+    visits: u32;
+}
+
+const VARS: usize = 3; // x, y, z
+
+fn block(uses: StringView, defs: StringView, first: u32, second: u32) -> Result<Block, AllocError> {
+    var b = Block { uses: Bits.create(VARS)?, defs: Bits.create(VARS)?, successors: Vector<u32>.create() };
+    for (c in uses.bytes()) {
+        b.uses.set((c - 'x') as usize);
+    }
+    for (c in defs.bytes()) {
+        b.defs.set((c - 'x') as usize);
+    }
+    if (first != 9) {
+        b.successors.push(first)?;
+    }
+    if (second != 9) {
+        b.successors.push(second)?;
+    }
+    return Ok(b);
+}
+
+// live-in = uses | (live-out - defs); live-out = union of the successors' live-in. Solved with a worklist.
+fn solve(blocks: Slice<Block>, reverse: bool) -> Result<Solution, AllocError> {
+    var liveIn = Vector<Bits>.create();
+    var liveOut = Vector<Bits>.create();
+    var work = Vector<u32>.create();
+    var queued = Bits.create(blocks.length)?;
+    for (i in 0..blocks.length) {
+        liveIn.push(Bits.create(VARS)?)?;
+        liveOut.push(Bits.create(VARS)?)?;
+        let b = if (reverse) blocks.length - 1 - i else i;
+        work.push(truncate<u32>(b))?;
+        queued.set(b);
+    }
+    var visits: u32 = 0;
+    loop {
+        let next = work.pop();
+        if (next == null) {
+            break;
+        }
+        let b = next! as usize;
+        queued.clear(b);
+        visits += 1;
+        // live-out from the successors: read one table, write another.
+        for (s in blocks[b].successors) {
+            liveOut[b].unionWith(liveIn[s as usize]);
+        }
+        var fresh = liveOut[b].copyOf()?;
+        for (v in 0..VARS) {
+            if (blocks[b].defs.has(v)) {
+                fresh.clear(v);
+            }
+        }
+        fresh.unionWith(blocks[b].uses);
+        if (!fresh.equals(liveIn[b])) {
+            liveIn[b] = fresh;
+            // Predecessors must be revisited.
+            for (p in 0..blocks.length) {
+                for (s in blocks[p].successors) {
+                    if (s as usize == b && !queued.has(p)) {
+                        work.push(truncate<u32>(p))?;
+                        queued.set(p);
+                    }
+                }
+            }
+        }
+    }
+    return Ok(Solution { liveIn: liveIn, liveOut: liveOut, visits: visits });
+}
+
+fn printSet(bits: borrow Bits) {
+    Console.write("{");
+    var first = true;
+    for (v in 0..VARS) {
+        if (bits.has(v)) {
+            if (!first) {
+                Console.write(" ");
+            }
+            Console.write(match (v) {
+                0 => "x",
+                1 => "y",
+                _ => "z",
+            });
+            first = false;
+        }
+    }
+    Console.write("}");
+}
+
+fn main() {
+    var blocks = Vector<Block>.create();
+    blocks.push(block("", "xy", 1, 9)!)!;
+    blocks.push(block("x", "", 2, 3)!)!;
+    blocks.push(block("xy", "x", 1, 9)!)!;
+    blocks.push(block("x", "z", 9, 9)!)!;
+
+    let forward = solve(blocks.view(), false)!;
+    Console.write("live in:");
+    for (b in 0..blocks.length) {
+        Console.write(" b");
+        Console.write(b);
+        Console.write(" ");
+        printSet(forward.liveIn[b]);
+    }
+    Console.writeLine("");
+    Console.write("live out:");
+    for (b in 0..blocks.length) {
+        Console.write(" b");
+        Console.write(b);
+        Console.write(" ");
+        printSet(forward.liveOut[b]);
+    }
+    Console.writeLine("");
+
+    let backward = solve(blocks.view(), true)!;
+    var same = true;
+    for (b in 0..blocks.length) {
+        same = same && forward.liveIn[b].equals(backward.liveIn[b]) && forward.liveOut[b].equals(backward.liveOut[b]);
+    }
+    Console.write("same fixed point in reverse order: ");
+    Console.writeLine(same);
+
+    // A larger set: every third bit, then a union with every second bit (from 0).
+    var thirds = Bits.create(1000)!;
+    var halves = Bits.create(1000)!;
+    for (i in 0..1000usize) {
+        if (i % 3 == 0) {
+            thirds.set(i);
+        }
+        if (i % 2 == 0) {
+            halves.set(i);
+        }
+    }
+    let before = thirds.count();
+    thirds.unionWith(halves);
+    Console.write("big set: 1000 bits, ");
+    Console.write(before);
+    Console.write(" set, union ");
+    Console.writeLine(thirds.count());
+}

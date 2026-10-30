@@ -1,0 +1,180 @@
+// P1 probe: a tree stored as tables with typed IDs, as the compiler's AST/HIR will be (ROADMAP §3.1).
+// Recursive nodes refer to each other by ID; lists are ranges into a shared table; a pass reads one table and
+// writes another; a node is copied out before its table is changed.
+// expect-stdout: nodes 8, list items 3
+// expect-stdout: (1 + (2 * 3)) - -(4) = 11
+// expect-stdout: sum(10, 20, 30) = 60
+// expect-stdout: depths 2 3 3 2 1 2 1 0
+// expect-stdout: rewritten (1 + (2 * 3)) - -4 = 11
+
+struct ExprId {
+    index: u32;
+}
+
+struct Range {
+    start: u32;
+    count: u32;
+}
+
+enum Op {
+    Add,
+    Sub,
+    Mul,
+}
+
+enum Expr {
+    Int(i64),
+    Neg(ExprId),
+    Binary(Op, ExprId, ExprId),
+    Sum(Range),
+}
+
+struct Ast {
+    exprs: Vector<Expr>;
+    lists: Vector<ExprId>;
+
+    fn create() -> Ast => Ast { exprs: Vector<Expr>.create(), lists: Vector<ExprId>.create() };
+
+    fn add(borrow mut this, e: Expr) -> Result<ExprId, AllocError> {
+        let id = ExprId { index: truncate<u32>(this.exprs.length) };
+        this.exprs.push(e)?;
+        return Ok(id);
+    }
+
+    fn node(borrow this, id: ExprId) -> Expr => this.exprs[id.index as usize];
+}
+
+fn eval(ast: borrow Ast, id: ExprId) -> i64 {
+    return match (ast.node(id)) {
+        Expr.Int(v) => v,
+        Expr.Neg(inner) => -eval(ast, inner),
+        Expr.Binary(Op.Add, l, r) => eval(ast, l) + eval(ast, r),
+        Expr.Binary(Op.Sub, l, r) => eval(ast, l) - eval(ast, r),
+        Expr.Binary(Op.Mul, l, r) => eval(ast, l) * eval(ast, r),
+        Expr.Sum(range) => sum(ast, range),
+    };
+}
+
+fn sum(ast: borrow Ast, range: Range) -> i64 {
+    var total: i64 = 0;
+    for (i in 0..range.count) {
+        total += eval(ast, ast.lists[(range.start + i) as usize]);
+    }
+    return total;
+}
+
+fn opText(op: Op) -> StringView => match (op) {
+    Op.Add => " + ",
+    Op.Sub => " - ",
+    Op.Mul => " * ",
+};
+
+fn show(ast: borrow Ast, id: ExprId, nested: bool) {
+    match (ast.node(id)) {
+        Expr.Int(v) => { Console.write(v); }
+        Expr.Neg(inner) => {
+            Console.write("-(");
+            show(ast, inner, false);
+            Console.write(")");
+        }
+        Expr.Binary(op, l, r) => {
+            if (nested) { Console.write("("); }
+            show(ast, l, true);
+            Console.write(opText(op));
+            show(ast, r, true);
+            if (nested) { Console.write(")"); }
+        }
+        Expr.Sum(range) => {
+            Console.write("sum(");
+            for (i in 0..range.count) {
+                if (i > 0) { Console.write(", "); }
+                show(ast, ast.lists[(range.start + i) as usize], false);
+            }
+            Console.write(")");
+        }
+    }
+}
+
+// A pass that reads the expression table and writes a side table indexed by the same IDs.
+fn depths(ast: borrow Ast, id: ExprId, depth: u32, out: borrow mut Vector<u32>) {
+    out[id.index as usize] = depth;
+    match (ast.node(id)) {
+        Expr.Int(_) => {}
+        Expr.Neg(inner) => { depths(ast, inner, depth + 1, out); }
+        Expr.Binary(_, l, r) => {
+            depths(ast, l, depth + 1, out);
+            depths(ast, r, depth + 1, out);
+        }
+        Expr.Sum(range) => {
+            for (i in 0..range.count) {
+                depths(ast, ast.lists[(range.start + i) as usize], depth + 1, out);
+            }
+        }
+    }
+}
+
+// Rewrites in place: copy a node out, then write another node of the same table.
+fn foldNegations(ast: borrow mut Ast) {
+    for (i in 0..ast.exprs.length) {
+        let e = ast.exprs[i];
+        match (e) {
+            Expr.Neg(inner) => {
+                let target = ast.exprs[inner.index as usize];
+                match (target) {
+                    Expr.Int(v) => { ast.exprs[i] = Expr.Int(-v); }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn main() {
+    var ast = Ast.create();
+    let one = ast.add(Expr.Int(1))!;
+    let two = ast.add(Expr.Int(2))!;
+    let three = ast.add(Expr.Int(3))!;
+    let product = ast.add(Expr.Binary(Op.Mul, two, three))!;
+    let left = ast.add(Expr.Binary(Op.Add, one, product))!;
+    let four = ast.add(Expr.Int(4))!;
+    let negated = ast.add(Expr.Neg(four))!;
+    let root = ast.add(Expr.Binary(Op.Sub, left, negated))!;
+
+    let start = truncate<u32>(ast.lists.length);
+    let ten = ast.add(Expr.Int(10))!;
+    ast.lists.push(ten)!;
+    ast.lists.push(ast.add(Expr.Int(20))!)!;
+    ast.lists.push(ast.add(Expr.Int(30))!)!;
+    let total = ast.add(Expr.Sum(Range { start: start, count: 3 }))!;
+
+    Console.write("nodes ");
+    Console.write(root.index + 1);
+    Console.write(", list items ");
+    Console.writeLine(ast.lists.length);
+
+    show(ast, root, false);
+    Console.write(" = ");
+    Console.writeLine(eval(ast, root));
+    show(ast, total, false);
+    Console.write(" = ");
+    Console.writeLine(eval(ast, total));
+
+    var depth = Vector<u32>.create();
+    for (i in 0..ast.exprs.length) {
+        depth.push(0)!;
+    }
+    depths(ast, root, 0, mut depth);
+    Console.write("depths");
+    for (i in 0..(root.index as usize + 1)) {
+        Console.write(" ");
+        Console.write(depth[i]);
+    }
+    Console.writeLine("");
+
+    foldNegations(mut ast);
+    Console.write("rewritten ");
+    show(ast, root, false);
+    Console.write(" = ");
+    Console.writeLine(eval(ast, root));
+}

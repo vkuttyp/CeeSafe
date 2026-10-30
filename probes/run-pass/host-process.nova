@@ -1,0 +1,66 @@
+// P1 probe: the host services `ceesafec build` needs from today's library (type-system §26): write a C file, run the C
+// compiler on it with an argument vector, read its exit status, find its output file, and report on standard error.
+// Missing (ROADMAP N4): capturing a child's output, environment variables, the working directory, directories, stat,
+// temporary files and a clock. So `cc` is found on PATH by name, and its own messages go to the inherited stderr.
+// expect-stdout: true: 0
+// expect-stdout: sh exit 3: 3
+// expect-stdout: missing program: No such file or directory
+// expect-stdout: cc: 0, object written
+// expect-stdout: cc on bad C: failed
+
+fn show(label: StringView, result: Result<i32, IoError>) {
+    Console.write(label);
+    Console.write(": ");
+    match (result) {
+        Ok(code) => { Console.writeLine(code); }
+        Err(e) => { Console.writeLine(e.message()); }
+    }
+}
+
+fn writeText(path: StringView, text: StringView) {
+    var file = File.create(path)!;
+    file.write(text.bytes())!;
+}
+
+fn exists(path: StringView) -> bool => match (File.open(path)) {
+    Ok(_) => true,
+    Err(_) => false,
+};
+
+fn main() {
+    var none = Vector<StringView>.create();
+    show("true", Process.run("true", none));
+
+    var shell = Vector<StringView>.create();
+    shell.push("-c")!;
+    shell.push("exit 3")!;
+    show("sh exit 3", Process.run("sh", shell));
+
+    show("missing program", Process.run("ceesafe-probe-no-such-program", none));
+
+    writeText("probe-host.tmp.c", "int probe_answer(void) { return 42; }\n");
+    var cc = Vector<StringView>.create();
+    cc.push("-std=c11")!;
+    cc.push("-c")!;
+    cc.push("probe-host.tmp.c")!;
+    cc.push("-o")!;
+    cc.push("probe-host.tmp.o")!;
+    let code = Process.run("cc", cc)!;
+    Console.write("cc: ");
+    Console.write(code);
+    Console.writeLine(if (exists("probe-host.tmp.o")) ", object written" else ", no object");
+
+    writeText("probe-host.tmp.c", "int probe_answer(void) { return }\n");
+    var quiet = Vector<StringView>.create();
+    quiet.push("-c")!;
+    quiet.push("-w")!;
+    quiet.push("-fsyntax-only")!;
+    quiet.push("-fno-diagnostics-color")!;
+    quiet.push("probe-host.tmp.c")!;
+    Console.writeError("probe: the C compiler's error below is expected\n");
+    let bad = Process.run("cc", quiet)!;
+    Console.writeLine(if (bad != 0) "cc on bad C: failed" else "cc on bad C: accepted");
+
+    File.remove("probe-host.tmp.c")!;
+    File.remove("probe-host.tmp.o")!;
+}

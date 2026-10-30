@@ -107,7 +107,13 @@ language core is adequate, but its library and host support are not.
 | FFI | `extern "C"`, `.c` files linked by `build`, `@repr(C)` structs | `run --interp` runs no C | §28; `docs/unsafe.md` |
 | Scale | novac checks a 202k-line package in 13.1 s | the largest Nova program in the repository is ~360 lines; no parser has been written in Nova | ADR 0022; `lib/core/atomics.nova` |
 
-This is the port's largest risk, and the reason for the **N track** (§4) before and alongside P1–P3.
+This is the port's largest risk, and the reason for the **N track** (§4) before and alongside P1–P3. P1's probes
+(`docs/p1-probes.md`) narrowed it to three needs:
+- **N0**, a compiler crash;
+- **N1a**, turning bytes into text;
+- **N4**, host services.
+
+Maps, generic impls, `From` and borrow precision have accepted Nova-side patterns.
 
 ### 2.3 C# surfaces that need a native design
 
@@ -248,35 +254,39 @@ ledger has no unmapped items (inventory: 0 unmapped, 2026-10-30).
 
 ### N — Upstream Nova: self-hosting prerequisites (proposed Nova milestone M15)
 
-Dependencies: P1's probes decide the final list and its order. Each item is a Nova change approved by the owner and
-made under Nova's rules: spec and ADR first, then tests, docs, `roadmap.md` and `risks.md`. It ships in a novac
-release, and CeeSafe re-pins (`bootstrap/reference.md`). Candidates from §2.2, roughly in the order the port needs them:
+Each item is a Nova change approved by the owner and made under Nova's rules: spec and ADR first, then tests, docs,
+`roadmap.md` and `risks.md`. It ships in a novac release, and CeeSafe re-pins (`bootstrap/reference.md`). P1's probes
+(2026-10-30, `docs/p1-probes.md` §4) set this list and its order.
 
-- [ ] N1. Strings:
-  - `clone` (copying a `String`);
-  - ordering comparison;
-  - hashing;
-  - `find`, `startsWith`, `endsWith`;
-  - appending a byte or a Unicode scalar;
-  - UTF-8 char iteration and decoding;
-  - integer parsing, then float parsing (must agree with `FloatSemantics`).
-- [ ] N2. Collections: `HashMap<K, V>` and `HashSet<T>` with deterministic iteration (insertion order, or a specified
-  order) in `lib/core` or `lib/std`; binary search on slices.
-- [ ] N3. Language ergonomics: generic interface implementations (`impl<T> I for G<T>`) and `Self` (§21.1 lists them as
-  future work); `From` conversion for `?` (§17.4).
-- [ ] N4. Host services in `lib/std`:
-  - environment variables;
-  - the working directory;
-  - directory listing, `mkdir`, `rename`, stat and exists;
-  - temporary files;
-  - a monotonic clock;
-  - `Process` with captured stdout/stderr and stdin input;
-  - buffered stdin by line or by length (needed for LSP and MCP framing).
-- [ ] N5. Only if P1 proves it necessary: borrow precision for table-heavy code, such as disjoint borrows of two
-  elements by non-constant index, checked at run time like `splitAtMut`. This is a safety-relevant change and needs
-  its own ADR and mutation tests.
-- [ ] N6. A first draft of `~/Nova/docs/milestone-15.md`, citing OD-33. This is the **next Nova-side task**, after P1's
-  probes.
+- [ ] **N0. Fix the compiler crash** on a generic `Result` rebuild instantiated with `T = void`
+  (`probes/upstream/void-result-rebuild-crash.nova`). This is a bug fix with a corpus regression, not a language
+  change. Until it lands, `void` results use non-generic lifts.
+- [ ] **N1a. Bytes to text.** Add `StringView.fromUtf8(Slice<u8>) -> StringView?` (validating), and a way to append
+  checked bytes to a `String`. Needed by P2 so that diagnostics can quote source names, and by P8 so that JSON, fixes
+  and LSP/MCP replies can be built. **Before P2.**
+- [ ] **N4a. Host services for `build` and packages:**
+  - captured stdout and stderr, and stdin input, for child processes (`CBackend.cs:257-259`);
+  - environment variables (`CC`, `PATH`, `NOVA_HOME`, `NOVA_INDEX`, `INCLUDE`);
+  - creating and listing directories;
+  - file existence;
+  - temporary directories (`Program.cs:614`);
+  - the working directory.
+
+  **Before P5.**
+- [ ] **N4b. Stdin by line or length** (LSP/MCP framing). **Before P8.**
+- [ ] Optional ergonomics, none blocking:
+  - N1b, `Vector` bulk append from a slice (performance);
+  - N1c, text ordering, `clone`, `find`/`startsWith` and number parsing (until then, byte-wise functions in
+    `src/support/`);
+  - N1d, arrays of `StringView` (until then, `match` tables).
+- [x] ~~N2 library maps~~: not needed upstream. A generic insertion-ordered map works in Nova (`generic-map` probe) and
+  lives in `src/support/`.
+- [x] ~~N3 `impl<T>`, `Self`, `From`~~: not needed. Use one impl per instantiation, `K: Key<K>`, and lift functions
+  (`generic-impls`, `error-layers` probes).
+- [x] ~~N5 borrow precision~~: not needed. `splitAtMut`, copy-out and separate tables are accepted
+  (`aliasing-workarounds` probe).
+- [ ] N6. Draft `~/Nova/docs/milestone-15.md` citing OD-33, with N0, N1a, N4a and N4b. This is the **next Nova-side
+  task** and waits for the owner's go-ahead.
 
 Gate per item: the novac release passes Nova's full suite, and CeeSafe's affected probes pass after the re-pin.
 
@@ -284,18 +294,20 @@ Gate per item: the novac release passes Nova's full suite, and CeeSafe's affecte
 
 Dependencies: P0. Runs alongside the N track.
 
-- [ ] Capability probes compiled with the pinned novac:
-  - recursive nodes through IDs;
-  - vectors of owning enums;
-  - lookup in one table then mutation of another;
-  - a generic map key;
-  - worklists and bitsets;
-  - error propagation;
-  - deterministic drops.
+- [x] Capability probes (2026-10-30; `probes/`, `docs/p1-probes.md`). There are 12, covering:
+  - ID tables;
+  - owning enums;
+  - index aliasing, and the accepted workarounds;
+  - a generic map;
+  - a lexer and interner over all 525 Nova source files;
+  - error layers;
+  - dataflow bitsets and worklists;
+  - gaps in generic impls and text.
 
-  Every probe that fails becomes an N-track item or a reduced bug report against novac.
-- [ ] Probe host services: reading a source file, stdout and stderr, spawning `cc` with arguments, exit status. Record
-  the gaps as N4 entries.
+  Results: they pass on macOS and Linux, under GCC and clang, with and without ASan+UBSan. They found one compiler
+  crash (N0) and decided the N list.
+- [x] Host probe (2026-10-30). Writing a file, running `cc` with an argument vector, exit statuses, stderr and file
+  existence all work. Capturing output and the environment are missing (N4a).
 - [ ] `src/support/`:
   - typed ID tables;
   - an interner with first-seen IDs (`SymbolTable.cs:3`);
@@ -533,13 +545,15 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
 
 ## 9. Immediate work queue
 
-1. P1: the probes, starting with an ID-table AST built by a hand-written lexer over a real `.nova` file. Its results
-   finalise the N list.
-2. Alongside P1: the rest of the runner's C configuration matrix, and the package fixtures (`docs/parity.md` §3).
-3. N6: draft Nova `docs/milestone-15.md` and the first ADR (strings and maps). This changes `~/Nova`, so it waits for the
-   owner's go-ahead.
-4. Only then start P2 with `SourceText`, the line index and the interner, followed by tokens and the lexer. Do not begin
-   by translating `TypeChecker.cs`.
+1. P1: `src/support/`, promoted from the probes and tested against independent models:
+   - ID tables, the interner, bitsets and worklists, and the map;
+   - then exact integers, UTF-16 offsets and JSON.
+2. N6 (with the owner's go-ahead): draft Nova `docs/milestone-15.md` with N0 (the crash), N1a (bytes to text) and N4
+   (host services). Fix N0 first: it is a bug, not a language change.
+3. Alongside: the rest of the runner's C configuration matrix, and the package fixtures (`docs/parity.md` §3).
+4. P2 starts once N1a is released and re-pinned (or with an accepted decision to print names piece by piece until
+   then). Begin with `SourceText`, the line index and the interner, then tokens and the lexer. Do not begin by
+   translating `TypeChecker.cs`.
 
 Progress is measured in completed contracts and gates. There is no calendar estimate before P1 produces evidence.
 
@@ -550,14 +564,15 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 | 2026-10-29 | Read-only inspection of Nova and an empty CeeSafe; first roadmap draft; owner chose a full rename | planning only |
 | 2026-10-30 | Cross-checked the draft against Nova `07d561f` and the `docs/` specs. Owner decisions recorded as decision 0001. Roadmap rewritten. | Draft found stale: baseline, ADRs to 0027, counts, pipeline citation, and Nova's missing self-hosting prerequisites (§2.2) |
 | 2026-10-30 | `~/.nova/bin/novac new ceesafe --agent claude` (0.3.1) in a scratch directory, copied into `~/dev/CeeSafe`; `git init`; skeleton `src/main.nova`; `bootstrap/reference.md` | done |
+| 2026-10-30 | P0 inventory, ledger and runner: `tools/inventory.py`, `docs/reference-inventory.md`, `docs/parity.md`, `tools/run_corpus.py`; novac built from `07d561f` into a scratch directory for comparison | done; findings in `docs/parity.md` §3 |
+| 2026-10-30 | P0 gate on the Ryzen box | passed; P0 complete |
+| 2026-10-30 | P1 probes (`probes/`), the report (`docs/p1-probes.md`), and an upstream crash reproducer (`probes/upstream/`) | 12/12 pass; N list revised |
 
-**Tests run for the port** (2026-10-30, novac 0.3.1, Apple clang 21.0.0):
+**Tests run for the skeleton** (2026-10-30, novac 0.3.1, Apple clang 21.0.0):
 - `novac check` and `novac fmt --check`: clean.
 - `novac build`, then `./out/ceesafe --version`: printed `ceesafec 0.0.0-dev`, exit 0.
 - No arguments: exit 2. An unknown command: exit 2.
 - `novac run --interp -- --version` printed the same version.
-
-| 2026-10-30 | P0 inventory, ledger and runner: `tools/inventory.py`, `docs/reference-inventory.md`, `docs/parity.md`, `tools/run_corpus.py`; novac built from `07d561f` into a scratch directory for comparison | done; findings in `docs/parity.md` §3 |
 
 **Tests run for P0** (2026-10-30, macOS arm64, Apple clang 21.0.0, Python 3.9.6):
 - `tools/run_corpus.py --compiler ~/.nova/bin/novac` (0.3.1), all 457 files: 454 passed, 0 failed, 3 partial
@@ -580,4 +595,6 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 A probe build confirmed the flags took effect: the sanitizer runtime was linked in, and the clang build came from
 clang 18.1.8.
 
-Nothing in P1 or any later phase has been run.
+**P1 probes** (2026-10-30): the 12 probes and the lexer's 525-file run, on macOS and on the Ryzen box (Debian 12),
+under GCC 12, clang 18 and Apple clang, with and without ASan+UBSan. All passed. The commands and results are in
+`docs/p1-probes.md` §1. Not yet run: anything in `src/support/`, and P2 or later.
