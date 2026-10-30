@@ -1,0 +1,56 @@
+// Byte-string operations the compiler needs and Nova's library lacks (docs/p1-probes.md §4, N1c): source text and
+// names stay bytes until StringView.fromUtf8 exists (N1a).
+
+/// FNV-1a, 64-bit. Used only to find entries, never to order output.
+fn hashBytes(bytes: Slice<u8>) -> u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (b in bytes) {
+        h = (h ^ b as u64).wrappingMul(0x100000001b3);
+    }
+    return h;
+}
+
+fn sameBytes(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Ordinal comparison, as C#'s StringComparer.Ordinal on ASCII and as a byte-wise compare on UTF-8 (which orders by
+/// code point): -1, 0 or 1.
+fn compareBytes(a: Slice<u8>, b: Slice<u8>) -> i32 {
+    let n = if (a.length < b.length) a.length else b.length;
+    for (i in 0..n) {
+        if (a[i] != b[i]) {
+            return if (a[i] < b[i]) -1 else 1;
+        }
+    }
+    return if (a.length < b.length) -1 else if (a.length > b.length) 1 else 0;
+}
+
+fn sameText(a: Slice<u8>, b: StringView) -> bool => sameBytes(a, b.bytes());
+
+fn appendBytes(target: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    for (b in bytes) {
+        target.push(b)?;
+    }
+    return Ok();
+}
+
+fn appendText(target: borrow mut Vector<u8>, text: StringView) -> Result<void, AllocError> => appendBytes(
+    target,
+    text.bytes(),
+);
+
+/// A new vector holding a copy of `bytes`.
+fn copyBytes(bytes: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var result = Vector<u8>.create();
+    appendBytes(mut result, bytes)?;
+    return Ok(result);
+}

@@ -1,0 +1,104 @@
+// Interned names with first-seen IDs (Nova's Syntax/SymbolTable.cs:3: "Ids are assigned in first-seen order, so they
+// are deterministic per input"). The text of every name lives in one buffer. Promoted from probes/run-pass/lexer.nova.
+
+struct Symbol {
+    id: u32;
+}
+
+struct Interner {
+    text: Vector<u8>;
+    starts: Vector<u32>;
+    lengths: Vector<u32>;
+    slots: Vector<u32>; // 0: empty; otherwise the symbol's id plus one. The length is 0 or a power of two.
+
+    fn create() -> Interner => Interner {
+        text: Vector<u8>.create(),
+        starts: Vector<u32>.create(),
+        lengths: Vector<u32>.create(),
+        slots: Vector<u32>.create(),
+    };
+
+    fn count(borrow this) -> usize => this.starts.length;
+
+    /// The name's bytes.
+    fn name(borrow this, symbol: Symbol) -> Slice<u8> {
+        let start = this.starts[symbol.id as usize] as usize;
+        return this.text[start..(start + this.lengths[symbol.id as usize] as usize)];
+    }
+
+    fn find(borrow this, name: Slice<u8>) -> Symbol? {
+        if (this.slots.length == 0) {
+            return null;
+        }
+        let mask = this.slots.length - 1;
+        var i = truncate<usize>(hashBytes(name)) & mask;
+        loop {
+            let slot = this.slots[i];
+            if (slot == 0) {
+                return null;
+            }
+            let symbol = Symbol { id: slot - 1 };
+            if (sameBytes(this.name(symbol), name)) {
+                return symbol;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    fn intern(borrow mut this, name: Slice<u8>) -> Result<Symbol, AllocError> {
+        match (this.find(name)) {
+            Some(symbol) => { return Ok(symbol); }
+            null => {}
+        }
+        if ((this.starts.length + 1) * 4 > this.slots.length * 3) {
+            this.grow()?;
+        }
+        let symbol = Symbol { id: truncate<u32>(this.starts.length) };
+        let textLength = this.text.length;
+        // Every push happens before the name becomes findable; on failure the tables are put back.
+        match (this.store(name)) {
+            Ok() => {}
+            Err(e) => {
+                this.text.truncate(textLength);
+                this.starts.truncate(symbol.id as usize);
+                this.lengths.truncate(symbol.id as usize);
+                return Err(e);
+            }
+        }
+        this.place(symbol, hashBytes(name));
+        return Ok(symbol);
+    }
+
+    fn internText(borrow mut this, name: StringView) -> Result<Symbol, AllocError> => this.intern(name.bytes());
+
+    fn store(borrow mut this, name: Slice<u8>) -> Result<void, AllocError> {
+        this.starts.push(truncate<u32>(this.text.length))?;
+        this.lengths.push(truncate<u32>(name.length))?;
+        appendBytes(mut this.text, name)?;
+        return Ok();
+    }
+
+    fn place(borrow mut this, symbol: Symbol, hash: u64) {
+        let mask = this.slots.length - 1;
+        var i = truncate<usize>(hash) & mask;
+        while (this.slots[i] != 0) {
+            i = (i + 1) & mask;
+        }
+        this.slots[i] = symbol.id + 1;
+    }
+
+    fn grow(borrow mut this) -> Result<void, AllocError> {
+        let size: usize = if (this.slots.length == 0) 64 else this.slots.length * 2;
+        var slots = Vector<u32>.withCapacity(size)?;
+        for (i in 0..size) {
+            slots.push(0)?;
+        }
+        this.slots = slots;
+        for (id in 0..this.starts.length) {
+            let symbol = Symbol { id: truncate<u32>(id) };
+            let hash = hashBytes(this.name(symbol));
+            this.place(symbol, hash);
+        }
+        return Ok();
+    }
+}

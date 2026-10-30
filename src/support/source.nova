@@ -1,0 +1,154 @@
+// Source text as bytes, with the reference's positions (ROADMAP §3.2). Nova's SourceText (Syntax/SourceText.cs) holds
+// .NET's decoding of the file: File.ReadAllText drops a leading UTF-8 BOM and SourceText drops one more (so up to two
+// go, checked against novac 0.3.1), ill-formed UTF-8 becomes U+FFFD per maximal subpart (checked
+// against novac 0.3.1's columns, docs/p1-probes.md §6), lines end at "\r\n", "\r" or "\n", and lines and columns are
+// 1-based with columns in UTF-16 code units (grammar.md §1.1). Here offsets are bytes; positions are computed as the
+// reference computes them. Not handled yet: ReadAllText also decodes files that start with a UTF-16 or UTF-32 BOM as
+// UTF-16 or UTF-32; here they are bytes like any other.
+
+struct LinePosition {
+    line: u32;
+    column: u32;
+}
+
+/// One decoded UTF-8 sequence: a scalar value, or an ill-formed maximal subpart (shown as U+FFFD).
+struct Utf8 {
+    scalar: u32;
+    length: u32;
+    valid: bool;
+
+    /// The UTF-16 code units it decodes to.
+    fn utf16Units(this) -> u32 => if (this.valid && this.scalar >= 0x10000) 2 else 1;
+}
+
+/// Decodes the sequence that starts at `i`, following the Unicode Standard's well-formed byte sequences (Table 3-7);
+/// ill-formed input is one maximal subpart (at least one byte), as .NET's and Python's replacement decoders take it.
+fn decodeUtf8(bytes: Slice<u8>, i: usize) -> Utf8 {
+    let first = bytes[i];
+    if (first < 0x80) {
+        return Utf8 { scalar: first as u32, length: 1, valid: true };
+    }
+    var need: usize = 0;
+    var low: u8 = 0x80;
+    var high: u8 = 0xBF;
+    var scalar: u32 = 0;
+    if (first >= 0xC2 && first <= 0xDF) {
+        need = 1;
+        scalar = (first & 0x1F) as u32;
+    } else if (first >= 0xE0 && first <= 0xEF) {
+        need = 2;
+        scalar = (first & 0x0F) as u32;
+        if (first == 0xE0) {
+            low = 0xA0;
+        } else if (first == 0xED) {
+            high = 0x9F;
+        }
+    } else if (first >= 0xF0 && first <= 0xF4) {
+        need = 3;
+        scalar = (first & 0x07) as u32;
+        if (first == 0xF0) {
+            low = 0x90;
+        } else if (first == 0xF4) {
+            high = 0x8F;
+        }
+    } else {
+        return Utf8 { scalar: 0xFFFD, length: 1, valid: false };
+    }
+    var length: u32 = 1;
+    for (k in 0..need) {
+        let j = i + 1 + k;
+        if (j >= bytes.length) {
+            return Utf8 { scalar: 0xFFFD, length: length, valid: false };
+        }
+        let b = bytes[j];
+        let lo: u8 = if (k == 0) low else 0x80;
+        let hi: u8 = if (k == 0) high else 0xBF;
+        if (b < lo || b > hi) {
+            return Utf8 { scalar: 0xFFFD, length: length, valid: false };
+        }
+        scalar = (scalar << 6) | (b & 0x3F) as u32;
+        length += 1;
+    }
+    return Utf8 { scalar: scalar, length: length, valid: true };
+}
+
+struct SourceText {
+    path: Vector<u8>;
+    text: Vector<u8>;        // the file's bytes without a leading BOM
+    lineStarts: Vector<u32>; // byte offsets; the first is 0
+
+    fn create(path: Slice<u8>, bytes: Slice<u8>) -> Result<SourceText, AllocError> {
+        var skip: usize = 0;
+        for (k in 0..2) {
+            if (bytes.length >= skip + 3 && bytes[skip] == 0xEF && bytes[skip + 1] == 0xBB && bytes[skip + 2] == 0xBF) {
+                skip += 3;
+            }
+        }
+        var text = copyBytes(bytes[skip..])?;
+        var starts = Vector<u32>.create();
+        starts.push(0)?;
+        var i: usize = 0;
+        while (i < text.length) {
+            let c = text[i];
+            if (c == '\r') {
+                if (i + 1 < text.length && text[i + 1] == '\n') {
+                    i += 1;
+                }
+                starts.push(truncate<u32>(i + 1))?;
+            } else if (c == '\n') {
+                starts.push(truncate<u32>(i + 1))?;
+            }
+            i += 1;
+        }
+        return Ok(SourceText { path: copyBytes(path)?, text: text, lineStarts: starts });
+    }
+
+    fn lineCount(borrow this) -> usize => this.lineStarts.length;
+
+    /// The 0-based line holding byte `offset` (0 ≤ offset ≤ length): the last line start at or before it.
+    fn lineIndex(borrow this, offset: usize) -> usize {
+        var lo: usize = 0;
+        var hi: usize = this.lineStarts.length;
+        while (hi - lo > 1) {
+            let mid = lo + (hi - lo) / 2;
+            if (this.lineStarts[mid] as usize <= offset) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
+    /// The UTF-16 code units of the text from byte `from` to byte `to`, decoded as the reference decodes it.
+    fn utf16Length(borrow this, from: usize, to: usize) -> u32 {
+        var units: u32 = 0;
+        var i = from;
+        while (i < to) {
+            let d = decodeUtf8(this.text.view(), i);
+            units += d.utf16Units();
+            i += d.length as usize;
+        }
+        return units;
+    }
+
+    /// The reference's position of byte `offset`, which must start a sequence (or be the end).
+    fn position(borrow this, offset: usize) -> LinePosition {
+        let line = this.lineIndex(offset);
+        let column = this.utf16Length(this.lineStarts[line] as usize, offset);
+        return LinePosition { line: truncate<u32>(line + 1), column: column + 1 };
+    }
+
+    /// The reference's UTF-16 offset of byte `offset` (for spans in dumps and LSP).
+    fn utf16Offset(borrow this, offset: usize) -> u32 => this.utf16Length(0, offset);
+
+    /// A 1-based line's bytes without its terminator (SourceText.GetLineText).
+    fn lineText(borrow this, line: usize) -> Slice<u8> {
+        let start = this.lineStarts[line - 1] as usize;
+        var end = if (line < this.lineStarts.length) this.lineStarts[line] as usize else this.text.length;
+        while (end > start && (this.text[end - 1] == '\n' || this.text[end - 1] == '\r')) {
+            end -= 1;
+        }
+        return this.text[start..end];
+    }
+}

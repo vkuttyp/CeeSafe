@@ -1,0 +1,108 @@
+// src/support/map.nova against a naive model (linear search over insertion-ordered vectors) on 20,000 seeded
+// operations, checked after every step; the summary is pinned by tools/oracles/support_models.py.
+// expect-stdout: map: ops 20000, keys 600, puts 14920, hits 4852, misses 228, checksum 15942794981482534691
+// expect-stdout: map: bytes keys ok
+
+fn lcg(x: u64) -> u64 => x.wrappingMul(6364136223846793005).wrappingAdd(1442695040888963407);
+
+fn modelFind(keys: Slice<u64>, key: u64) -> usize? {
+    for (i in 0..keys.length) {
+        if (keys[i] == key) {
+            return i;
+        }
+    }
+    return null;
+}
+
+fn main() -> i32 {
+    var map = Map<Word, u64>.create();
+    var keys = Vector<u64>.create();
+    var values = Vector<u64>.create();
+    var x: u64 = 12345;
+    var puts: u32 = 0;
+    var hits: u32 = 0;
+    var misses: u32 = 0;
+    for (step in 0..20000u64) {
+        x = lcg(x);
+        let key = (x >> 33) % 600;
+        let op = (x >> 20) % 4;
+        if (op < 3) {
+            puts += 1;
+            let entry = map.put(Word { value: key }, step)!;
+            match (modelFind(keys.view(), key)) {
+                Some(i) => {
+                    values[i] = step;
+                    if (entry != i) {
+                        Console.writeLine("MISMATCH: entry index");
+                        return 1;
+                    }
+                }
+                null => {
+                    keys.push(key)!;
+                    values.push(step)!;
+                    if (entry != keys.length - 1) {
+                        Console.writeLine("MISMATCH: new entry index");
+                        return 1;
+                    }
+                }
+            }
+        } else {
+            let probe = Word { value: key };
+            let found = map.get(probe);
+            match (modelFind(keys.view(), key)) {
+                Some(i) => {
+                    hits += 1;
+                    if (found == null || found! != values[i]) {
+                        Console.writeLine("MISMATCH: get");
+                        return 1;
+                    }
+                }
+                null => {
+                    misses += 1;
+                    if (found != null) {
+                        Console.writeLine("MISMATCH: found a missing key");
+                        return 1;
+                    }
+                }
+            }
+        }
+        if (map.count() != keys.length) {
+            Console.writeLine("MISMATCH: count");
+            return 1;
+        }
+    }
+    var checksum: u64 = 0;
+    for (i in 0..map.count()) {
+        if (map.keys[i].value != keys[i] || map.values[i] != values[i]) {
+            Console.writeLine("MISMATCH: iteration order");
+            return 1;
+        }
+        checksum = checksum.wrappingMul(31).wrappingAdd(keys[i].wrappingMul(1000003)).wrappingAdd(values[i]);
+    }
+    Console.write("map: ops 20000, keys ");
+    Console.write(map.count());
+    Console.write(", puts ");
+    Console.write(puts);
+    Console.write(", hits ");
+    Console.write(hits);
+    Console.write(", misses ");
+    Console.write(misses);
+    Console.write(", checksum ");
+    Console.writeLine(checksum);
+
+    // Byte-string keys, including a value changed in place through getMut.
+    var words = Map<Bytes, u32>.create();
+    words.put(Bytes.fromText("alpha")!, 1)!;
+    words.put(Bytes.fromText("beta")!, 2)!;
+    words.put(Bytes.fromText("alpha")!, 3)!;
+    match (words.getMut(Bytes.fromText("beta")!)) {
+        Some(v) => { v += 10; }
+        null => {}
+    }
+    let ok = words.count() == 2 && words.get(
+        Bytes.fromText("alpha")!,
+    )! == 3 && words.get(Bytes.fromText("beta")!)! == 12 &&
+        words.get(Bytes.fromText("gamma")!) == null && sameText(words.keys[0].data.view(), "alpha");
+    Console.writeLine(if (ok) "map: bytes keys ok" else "MISMATCH: bytes keys");
+    return 0;
+}

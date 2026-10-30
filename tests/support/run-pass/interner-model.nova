@@ -1,0 +1,64 @@
+// src/support/interner.nova against a naive model (a list of names searched linearly) on 5,000 seeded interns of
+// short names over a four-letter alphabet (many repeats); ids must be first-seen order. The summary is pinned by
+// tools/oracles/support_models.py.
+// expect-stdout: interner: 5000 interns, 1653 names, 8577 bytes, checksum 16359793352618596385
+// expect-stdout: interner: lookups ok
+
+fn lcg(x: u64) -> u64 => x.wrappingMul(6364136223846793005).wrappingAdd(1442695040888963407);
+
+struct Model {
+    names: Vector<Bytes>;
+
+    fn find(borrow this, name: Slice<u8>) -> u32? {
+        for (i in 0..this.names.length) {
+            if (sameBytes(this.names[i].data.view(), name)) {
+                return truncate<u32>(i);
+            }
+        }
+        return null;
+    }
+}
+
+fn main() -> i32 {
+    var interner = Interner.create();
+    var model = Model { names: Vector<Bytes>.create() };
+    var x: u64 = 777;
+    var checksum: u64 = 0;
+    var name = Vector<u8>.create();
+    for (step in 0..5000) {
+        x = lcg(x);
+        let length = 1 + (x >> 40) % 6;
+        name.clear();
+        for (k in 0..length) {
+            x = lcg(x);
+            name.push('a' + truncate<u8>((x >> 50) % 4))!;
+        }
+        let symbol = interner.intern(name.view())!;
+        var expected = truncate<u32>(model.names.length);
+        match (model.find(name.view())) {
+            Some(id) => { expected = id; }
+            null => { model.names.push(Bytes.from(name.view())!)!; }
+        }
+        if (symbol.id != expected || !sameBytes(interner.name(symbol), name.view())) {
+            Console.writeLine("MISMATCH: intern");
+            return 1;
+        }
+        checksum = checksum.wrappingMul(131).wrappingAdd(symbol.id as u64);
+    }
+    Console.write("interner: 5000 interns, ");
+    Console.write(interner.count());
+    Console.write(" names, ");
+    Console.write(interner.text.length);
+    Console.write(" bytes, checksum ");
+    Console.writeLine(checksum);
+
+    var ok = interner.find("dddddd".bytes()) == null || model.find("dddddd".bytes()) != null;
+    for (i in 0..model.names.length) {
+        let found = interner.find(model.names[i].data.view());
+        ok = ok && found != null && found!.id as usize == i;
+    }
+    let fresh = interner.internText("not in the alphabet")!;
+    ok = ok && fresh.id as usize == model.names.length && sameText(interner.name(fresh), "not in the alphabet");
+    Console.writeLine(if (ok) "interner: lookups ok" else "MISMATCH: lookups");
+    return 0;
+}

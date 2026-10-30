@@ -1,0 +1,96 @@
+// Fixed-size bitsets for dataflow (the safety passes' loan and move-path sets). Promoted from
+// probes/run-pass/dataflow.nova.
+
+struct Bits {
+    words: Vector<u64>;
+    size: usize;
+
+    fn create(size: usize) -> Result<Bits, AllocError> {
+        let count = (size + 63) / 64;
+        var words = Vector<u64>.withCapacity(count)?;
+        for (i in 0..count) {
+            words.push(0)?;
+        }
+        return Ok(Bits { words: words, size: size });
+    }
+
+    fn copyOf(borrow this) -> Result<Bits, AllocError> {
+        var words = Vector<u64>.withCapacity(this.words.length)?;
+        for (w in this.words) {
+            words.push(w)?;
+        }
+        return Ok(Bits { words: words, size: this.size });
+    }
+
+    // A bit is checked only against the words (an index panic past the last one): Nova has no explicit panic, so a bit
+    // between `size` and the next multiple of 64 is not caught. Callers index by IDs below `size`.
+    fn set(borrow mut this, bit: usize) {
+        this.words[bit / 64] |= 1u64 << truncate<u32>(bit % 64);
+    }
+
+    fn clear(borrow mut this, bit: usize) {
+        this.words[bit / 64] &= (1u64 << truncate<u32>(bit % 64)) ^ 0xFFFFFFFFFFFFFFFF;
+    }
+
+    fn has(borrow this, bit: usize) -> bool => (this.words[bit / 64] >> truncate<u32>(bit % 64)) & 1 == 1;
+
+    /// this |= other; true if this changed. Both have the same size.
+    fn unionWith(borrow mut this, other: borrow Bits) -> bool {
+        var changed = false;
+        for (i in 0..this.words.length) {
+            let merged = this.words[i] | other.words[i];
+            if (merged != this.words[i]) {
+                this.words[i] = merged;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    /// this &= other.
+    fn intersectWith(borrow mut this, other: borrow Bits) {
+        for (i in 0..this.words.length) {
+            this.words[i] &= other.words[i];
+        }
+    }
+
+    /// this &= ~other.
+    fn subtract(borrow mut this, other: borrow Bits) {
+        for (i in 0..this.words.length) {
+            this.words[i] &= other.words[i] ^ 0xFFFFFFFFFFFFFFFF;
+        }
+    }
+
+    fn equals(borrow this, other: borrow Bits) -> bool {
+        if (this.size != other.size) {
+            return false;
+        }
+        for (i in 0..this.words.length) {
+            if (this.words[i] != other.words[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn count(borrow this) -> usize {
+        var n: usize = 0;
+        for (w in this.words) {
+            var v = w;
+            while (v != 0) {
+                v &= v - 1;
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    fn isEmpty(borrow this) -> bool {
+        for (w in this.words) {
+            if (w != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+}

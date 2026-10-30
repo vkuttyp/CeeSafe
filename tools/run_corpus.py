@@ -11,9 +11,11 @@ Normalisation is deliberately narrow and listed in NORMALISATIONS; it never remo
 panic location.
 
 usage: tools/run_corpus.py --compiler PATH [--reference PATH] [--corpus DIR] [--family F]... [--filter TEXT]
-                           [--jobs N] [--timeout S] [--cc CC] [--cflag=FLAG]... [--report FILE] [-v]
+                           [--jobs N] [--timeout S] [--cc CC] [--cflag=FLAG]... [--with FILE]... [--report FILE] [-v]
 
 Write C flags as --cflag=-O2: argparse reads a separate `-O2` as an option of its own.
+--with adds source files to every check and build (for tests of a library such as CeeSafe's src/support/); a
+diagnostic in one of them is a failure.
 """
 
 import argparse
@@ -210,6 +212,7 @@ def run_test(runner, family, path, work):
     text = read(os.path.join(runner.corpus, path))
     stem = os.path.join(runner.corpus, path[:-len(".nova")])
     options = compile_options(text)
+    extra = runner.args.with_files
     problems, outcomes = [], []
 
     def cmd(argv, out_dir=None, collect=()):
@@ -234,11 +237,11 @@ def run_test(runner, family, path, work):
         if family == "check-fail":
             parsed = diagnostics_of(cmd(["parse", "--diagnostics-format=json", path]), path, problems)
             problems += [f"check-fail input does not parse: {c} at {l}:{col}" for l, c, col, _ in parsed]
-        o = cmd(["check", "--diagnostics-format=json"] + options + [path])
+        o = cmd(["check", "--diagnostics-format=json"] + options + [path] + extra)
         found = diagnostics_of(o, path, problems)
         if family == "check-pass":
             problems += [f"unexpected {c} at {l}:{col}: {m}" for l, c, col, m in found]
-            dump = cmd(["check", "--dump-hir"] + options + [path])
+            dump = cmd(["check", "--dump-hir"] + options + [path] + extra)
             compare_snapshot(dump.stdout, stem + ".hir", problems, "HIR dump")
         else:
             expected = annotations(text)
@@ -248,7 +251,7 @@ def run_test(runner, family, path, work):
 
     elif family in ("run-pass", "run-fail", "ffi"):
         exe = os.path.join(work, "program")
-        inputs = [path]
+        inputs = [path] + extra
         if family == "ffi":
             inputs.append(path[:-len(".nova")] + ".c")
             # NAME.types.h is found from the corpus family's directory (FfiTests copies it beside the C).
@@ -344,10 +347,13 @@ def main():
     parser.add_argument("--timeout", type=float, default=60.0, help="seconds per command or program run")
     parser.add_argument("--cc", help="C compiler (sets $CC for the compiler)")
     parser.add_argument("--cflag", action="append", default=[], help="extra C flag for builds (repeatable)")
+    parser.add_argument("--with", dest="with_files", action="append", default=[],
+                        help="extra source file for every check and build (repeatable)")
     parser.add_argument("--report", help="write a JSON report here")
     parser.add_argument("-v", "--verbose", action="store_true", help="print every failure's details")
     args = parser.parse_args()
     args.corpus = os.path.abspath(args.corpus)
+    args.with_files = sorted(os.path.abspath(f) for f in args.with_files)
 
     compiler = resolve(args.compiler)
     reference = resolve(args.reference) if args.reference else None

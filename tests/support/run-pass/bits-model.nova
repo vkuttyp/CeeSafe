@@ -1,0 +1,134 @@
+// src/support/bits.nova against two vectors of booleans on 30,000 seeded sets and clears, then union, intersection
+// and difference; and src/support/bytes.nova's ordinal order. Summaries pinned by tools/oracles/support_models.py.
+// expect-stdout: bits: a 529, b 523, union 795, intersection 257, difference 272
+// expect-stdout: order: 0 5 6 1 10 2 3 4 7 8 9
+
+fn lcg(x: u64) -> u64 => x.wrappingMul(6364136223846793005).wrappingAdd(1442695040888963407);
+
+fn countTrue(v: Slice<bool>) -> usize {
+    var n: usize = 0;
+    for (b in v) {
+        if (b) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+fn agrees(bits: borrow Bits, model: Slice<bool>) -> bool {
+    if (bits.count() != countTrue(model)) {
+        return false;
+    }
+    for (i in 0..model.length) {
+        if (bits.has(i) != model[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn checkBits() -> bool {
+    let size: usize = 1000;
+    var a = Bits.create(size)!;
+    var b = Bits.create(size)!;
+    var ma = Vector<bool>.create();
+    var mb = Vector<bool>.create();
+    for (i in 0..size) {
+        ma.push(false)!;
+        mb.push(false)!;
+    }
+    var x: u64 = 99;
+    for (step in 0..30000) {
+        x = lcg(x);
+        let bit = ((x >> 33) % size as u64) as usize;
+        let op = (x >> 16) % 3;
+        let first = (x >> 8) % 2 == 0;
+        if (op == 0) {
+            if (first) { a.set(bit); ma[bit] = true; } else { b.set(bit); mb[bit] = true; }
+        } else if (op == 1) {
+            if (first) { a.clear(bit); ma[bit] = false; } else { b.clear(bit); mb[bit] = false; }
+        } else if (a.has(bit) != ma[bit] || b.has(bit) != mb[bit]) {
+            return false;
+        }
+    }
+    if (!agrees(a, ma.view()) || !agrees(b, mb.view())) {
+        return false;
+    }
+    var union = a.copyOf()!;
+    let changed = union.unionWith(b);
+    var inter = a.copyOf()!;
+    inter.intersectWith(b);
+    var diff = a.copyOf()!;
+    diff.subtract(b);
+    var mu = Vector<bool>.create();
+    var mi = Vector<bool>.create();
+    var md = Vector<bool>.create();
+    for (i in 0..size) {
+        mu.push(ma[i] || mb[i])!;
+        mi.push(ma[i] && mb[i])!;
+        md.push(ma[i] && !mb[i])!;
+    }
+    if (!agrees(union, mu.view()) || !agrees(inter, mi.view()) || !agrees(diff, md.view())) {
+        return false;
+    }
+    if (changed != !union.equals(a) || union.unionWith(b) || !a.copyOf()!.equals(a)) {
+        return false;
+    }
+    var empty = Bits.create(size)!;
+    if (!empty.isEmpty() || a.isEmpty()) {
+        return false;
+    }
+    Console.write("bits: a ");
+    Console.write(a.count());
+    Console.write(", b ");
+    Console.write(b.count());
+    Console.write(", union ");
+    Console.write(union.count());
+    Console.write(", intersection ");
+    Console.write(inter.count());
+    Console.write(", difference ");
+    Console.writeLine(diff.count());
+    return true;
+}
+
+// The words, by index: "" "a" "ab" "abc" "b" "B" "_" "z" "é" "€" "aa". Insertion sort with compareBytes.
+fn word(i: usize) -> StringView => match (i) {
+    0 => "",
+    1 => "a",
+    2 => "ab",
+    3 => "abc",
+    4 => "b",
+    5 => "B",
+    6 => "_",
+    7 => "z",
+    8 => "é",
+    9 => "€",
+    _ => "aa",
+};
+
+fn checkOrder() {
+    var order = Vector<usize>.create();
+    for (i in 0..11usize) {
+        order.push(i)!;
+        var j = order.length - 1;
+        while (j > 0 && compareBytes(word(order[j - 1]).bytes(), word(order[j]).bytes()) > 0) {
+            order.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    Console.write("order:");
+    for (i in order) {
+        Console.write(" ");
+        Console.write(i);
+    }
+    Console.writeLine("");
+}
+
+fn main() -> i32 {
+    if (!checkBits()) {
+        Console.writeLine("MISMATCH: bits");
+        return 1;
+    }
+    checkOrder();
+    return 0;
+}

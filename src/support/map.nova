@@ -1,0 +1,131 @@
+// A hash map with deterministic iteration (ROADMAP §3.1): entries are kept in insertion order, and an open-addressing
+// index of entry numbers finds them, so output never depends on hash values. There is no removal; the compiler's
+// tables only grow. Promoted from probes/run-pass/generic-map.nova.
+
+/// A key type: `K: Key<K>`, since Nova has no `Self` (type-system §21.1).
+interface Key<T> {
+    fn hashCode(borrow this) -> u64;
+    fn sameAs(borrow this, other: borrow T) -> bool;
+}
+
+struct Map<K: Key<K>, V> {
+    keys: Vector<K>;
+    values: Vector<V>;
+    slots: Vector<u32>; // 0: empty; otherwise the entry's index plus one. The length is 0 or a power of two.
+
+    fn create() -> Map<K, V> =>
+        Map { keys: Vector<K>.create(), values: Vector<V>.create(), slots: Vector<u32>.create() };
+
+    fn count(borrow this) -> usize => this.keys.length;
+
+    /// The entry index of `key`: entries are numbered 0, 1, … in insertion order.
+    fn find(borrow this, key: borrow K) -> usize? {
+        if (this.slots.length == 0) {
+            return null;
+        }
+        let mask = this.slots.length - 1;
+        var i = truncate<usize>(key.hashCode()) & mask;
+        loop {
+            let slot = this.slots[i];
+            if (slot == 0) {
+                return null;
+            }
+            let entry = (slot - 1) as usize;
+            if (this.keys[entry].sameAs(key)) {
+                return entry;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    fn get(borrow this, key: borrow K) -> borrow(this) V? {
+        let entry = this.find(key)?;
+        return borrow this.values[entry];
+    }
+
+    fn getMut(borrow mut this, key: borrow K) -> borrow mut(this) V? {
+        let entry = this.find(key)?;
+        return borrow mut this.values[entry];
+    }
+
+    /// Adds `key` or replaces its value; returns its entry index.
+    fn put(borrow mut this, key: K, value: V) -> Result<usize, AllocError> {
+        match (this.find(key)) {
+            Some(entry) => {
+                this.values[entry] = value;
+                return Ok(entry);
+            }
+            null => {}
+        }
+        if ((this.keys.length + 1) * 4 > this.slots.length * 3) {
+            this.grow()?;
+        }
+        let entry = this.keys.length;
+        // Push both before placing, so a failed push leaves the index unchanged.
+        let hash = key.hashCode();
+        this.keys.push(key)?;
+        match (this.values.push(value)) {
+            Ok() => {}
+            Err(e) => {
+                this.keys.truncate(entry);
+                return Err(e);
+            }
+        }
+        this.place(entry, hash);
+        return Ok(entry);
+    }
+
+    fn place(borrow mut this, entry: usize, hash: u64) {
+        let mask = this.slots.length - 1;
+        var i = truncate<usize>(hash) & mask;
+        while (this.slots[i] != 0) {
+            i = (i + 1) & mask;
+        }
+        this.slots[i] = truncate<u32>(entry + 1);
+    }
+
+    fn grow(borrow mut this) -> Result<void, AllocError> {
+        let size: usize = if (this.slots.length == 0) 8 else this.slots.length * 2;
+        var slots = Vector<u32>.withCapacity(size)?;
+        for (i in 0..size) {
+            slots.push(0)?;
+        }
+        this.slots = slots;
+        for (entry in 0..this.keys.length) {
+            let hash = this.keys[entry].hashCode();
+            this.place(entry, hash);
+        }
+        return Ok();
+    }
+}
+
+/// A byte-string key that owns its bytes.
+struct Bytes {
+    data: Vector<u8>;
+
+    fn from(bytes: Slice<u8>) -> Result<Bytes, AllocError> => Ok(Bytes { data: copyBytes(bytes)? });
+
+    fn fromText(text: StringView) -> Result<Bytes, AllocError> => Bytes.from(text.bytes());
+}
+
+impl Key<Bytes> for Bytes {
+    fn hashCode(borrow this) -> u64 => hashBytes(this.data.view());
+    fn sameAs(borrow this, other: borrow Bytes) -> bool => sameBytes(this.data.view(), other.data.view());
+}
+
+/// An integer key.
+struct Word {
+    value: u64;
+}
+
+impl Key<Word> for Word {
+    // splitmix64's finaliser.
+    fn hashCode(borrow this) -> u64 {
+        var z = this.value.wrappingAdd(0x9e3779b97f4a7c15);
+        z = (z ^ (z >> 30)).wrappingMul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrappingMul(0x94d049bb133111eb);
+        return z ^ (z >> 31);
+    }
+
+    fn sameAs(borrow this, other: borrow Word) -> bool => this.value == other.value;
+}
