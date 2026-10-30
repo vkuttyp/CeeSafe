@@ -5,7 +5,7 @@ lib/core, lib/std and lib/kernel, each in ordinal path order, with line endings 
 Each file is one string literal; its path is "lib/core/NAME.nova" and so on, which marks it as library code. The files
 come from a Nova checkout at the pinned tag, which must be clean.
 
-usage: python3 tools/gen_library.py [--nova PATH]   (default ~/Nova; formats with $NOVAC, default the pinned novac)
+usage: python3 tools/gen_library.py [--nova PATH]   (default ~/Nova; formats with $CEESAFEC, default out/ceesafec)
 """
 
 import argparse
@@ -123,8 +123,8 @@ fn libraryText(k: usize) -> Result<Vector<u8>, AllocError> {{
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(source)
-    novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/0.6.0/bin/novac"))
-    subprocess.run([novac, "fmt", path], check=True)
+    formatter = os.environ.get("CEESAFEC", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "out", "ceesafec"))
+    subprocess.run([formatter, "fmt", path], check=True)
     print(f"gen_library: wrote {path} ({len(files)} files from Nova {head})")
 
 

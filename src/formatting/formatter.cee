@@ -1,0 +1,1523 @@
+// The canonical formatter (the reference's Formatting/Formatter.cs; formatting.md). It prints the file's own tokens
+// and comments in their order and decides only the whitespace between them, and the trailing commas of §3.3, from the
+// syntax tree. Its output is checked: it must parse to the same tree and keep every comment (§6).
+
+/// The line width (formatting.md §2).
+fn lineWidth() -> u32 => 120;
+
+// Priorities for breaking a long line (formatting.md §3.4): lower breaks first, then the outermost.
+fn priorityFunctionBody() -> u32 => 0;
+fn priorityList() -> u32 => 1;
+fn priorityArm() -> u32 => 2;
+fn priorityInitializer() -> u32 => 3;
+fn priorityBinary() -> u32 => 4;
+fn priorityChain() -> u32 => 5;
+
+/// A delimited list or body that is laid out on one line or broken (formatting.md §3.2–§3.3). A `lines` container
+/// holds statements, members, variants or match arms, one per line when broken; the others (arguments, parameters,
+/// elements, field initialisers) keep the author's line breaks when broken.
+struct FmtContainer {
+    open: u32;
+    close: u32;
+    lines: bool;
+    priority: u32;
+    commas: bool;
+    firsts: Vector<u32>;
+    lasts: Vector<u32>;
+    newlineBefore: Vector<bool>; // whether the author started element k on a new line
+    authorBroken: bool;
+    broken: bool;
+    byWidth: bool;
+    group: u32; // the if/else chain whose blocks break together (an index into `groups`), or none
+}
+
+/// A place where an expression may continue on the next line (formatting.md §3.4): after a token, or before a '.'.
+struct FmtContinuation {
+    token: u32;
+    before: bool;
+    last: u32;
+    priority: u32;
+    authorBroken: bool;
+    broken: bool;
+}
+
+/// A comment: its span, and the end of its text (a line comment's without trailing whitespace).
+struct FmtComment {
+    start: u32;
+    end: u32;
+    textEnd: u32;
+    isLine: bool;
+    isDoc: bool;
+}
+
+struct FmtLine {
+    indent: u32;
+    code: Vector<u8>;
+    units: u32;    // the code's length in UTF-16 code units, which the reference's widths count
+    trailing: u32; // a trailing line comment, or none
+    blank: bool;
+}
+
+struct FmtLayout {
+    source: SourceText;
+    tokens: Vector<Token>; // without EndOfFile
+    matching: Vector<u32>; // the bracket matching each bracket, or none
+    byStart: Vector<u32>;  // the token starting at each offset, or none
+    byEnd: Vector<u32>;
+    comments: Vector<FmtComment>;
+    commentFirst: Vector<u32>; // the comments before token i are comments[commentFirst[i]..commentFirst[i + 1]]
+    glueBefore: Vector<bool>;
+    glueAfter: Vector<bool>;
+    containers: Vector<FmtContainer>;
+    groups: Vector<Vector<u32>>;
+    continuations: Vector<FmtContinuation>;
+    unitElements: Vector<u32>;
+    keptBreaks: Vector<u32>; // tokens before which the author's line break is kept: a declaration after an attribute
+    newlineBefore: Vector<bool>;
+    blankAllowed: Vector<bool>;
+    dropped: Vector<bool>;
+    commaAfter: Vector<bool>;
+    tokenLine: Vector<u32>;
+    failed: bool; // the tree and the tokens disagree: an internal error
+
+    fn count(borrow this) -> u32 => truncate<u32>(this.tokens.length);
+
+    fn kindAt(borrow this, i: u32) -> TokenKind => this.tokens[i as usize].kind;
+
+    fn isKind(borrow this, i: u32, kind: TokenKind) -> bool => sameKind(this.tokens[i as usize].kind, kind);
+
+    fn lineOf(borrow this, offset: u32) -> usize => this.source.lineIndex(offset as usize);
+
+    /// Whether the source has a line break between the end of token a and the start of token b.
+    fn newlineBetween(borrow this, a: i64, b: i64) -> bool {
+        if (a < 0 || b >= truncate<i64>(this.tokens.length)) {
+            return false;
+        }
+        return this.lineOf(this.tokens[truncate<usize>(a)].end) != this.lineOf(this.tokens[truncate<usize>(b)].start);
+    }
+
+    /// The token starting at `offset`.
+    fn first(borrow mut this, offset: u32) -> u32 {
+        let t = this.byStart[offset as usize];
+        if (t == none()) {
+            this.failed = true;
+            return 0;
+        }
+        return t;
+    }
+
+    /// The token ending at `offset`.
+    fn last(borrow mut this, offset: u32) -> u32 {
+        let t = this.byEnd[offset as usize];
+        if (t == none()) {
+            this.failed = true;
+            return 0;
+        }
+        return t;
+    }
+
+    /// The next token of a kind at or after an index.
+    fn find(borrow mut this, from: u32, kind: TokenKind) -> u32 {
+        var i = from;
+        while ((i as usize) < this.tokens.length) {
+            if (sameKind(this.tokens[i as usize].kind, kind)) {
+                return i;
+            }
+            i += 1;
+        }
+        this.failed = true;
+        return 0;
+    }
+
+    fn glueBeforeAt(borrow mut this, i: u32) {
+        if ((i as usize) < this.glueBefore.length) {
+            this.glueBefore[i as usize] = true;
+        } else {
+            this.failed = true;
+        }
+    }
+
+    fn glueAfterAt(borrow mut this, i: u32) {
+        if ((i as usize) < this.glueAfter.length) {
+            this.glueAfter[i as usize] = true;
+        } else {
+            this.failed = true;
+        }
+    }
+
+    fn addContainer(borrow mut this, open: u32, lines: bool, commas: bool, priority: u32) -> Result<u32, AllocError> {
+        this.containers.push(
+            FmtContainer {
+                open: open,
+                close: this.matching[open as usize],
+                lines: lines,
+                priority: priority,
+                commas: commas,
+                firsts: Vector<u32>.create(),
+                lasts: Vector<u32>.create(),
+                newlineBefore: Vector<bool>.create(),
+                authorBroken: false,
+                broken: false,
+                byWidth: false,
+                group: none(),
+            },
+        )?;
+        if (this.matching[open as usize] == none()) {
+            this.failed = true;
+        }
+        return Ok(truncate<u32>(this.containers.length - 1));
+    }
+
+    fn addElement(borrow mut this, container: u32, first: u32, last: u32) -> Result<void, AllocError> {
+        let newline = this.containers[container as usize].firsts.length > 0 &&
+            this.newlineBetween((first as i64) - 1, first as i64);
+        this.containers[container as usize].newlineBefore.push(newline)?;
+        this.containers[container as usize].firsts.push(first)?;
+        this.containers[container as usize].lasts.push(last)?;
+        return Ok();
+    }
+
+    fn addContinuation(
+        borrow mut this,
+        token: u32,
+        before: bool,
+        last: u32,
+        priority: u32,
+    ) -> Result<void, AllocError> {
+        this.continuations.push(
+            FmtContinuation {
+                token: token,
+                before: before,
+                last: last,
+                priority: priority,
+                authorBroken: false,
+                broken: false,
+            },
+        )?;
+        return Ok();
+    }
+}
+
+fn newFmtLayout(source: SourceText, lexed: borrow Lexed) -> Result<FmtLayout, AllocError> {
+    var tokens = Vector<Token>.create();
+    for (t in lexed.tokens.view()) {
+        if (!sameKind(t.kind, TokenKind.EndOfFile)) {
+            tokens.push(t)?;
+        }
+    }
+    let n = tokens.length;
+    var matching = Vector<u32>.create();
+    var stack = Vector<u32>.create();
+    for (i in 0..n) {
+        matching.push(none())?;
+    }
+    for (i in 0..n) {
+        let kind = tokens[i].kind;
+        if (sameKind(kind, TokenKind.OpenParen) || sameKind(kind, TokenKind.OpenBracket) ||
+            sameKind(kind, TokenKind.OpenBrace)) {
+            stack.push(truncate<u32>(i))?;
+        } else if ((sameKind(kind, TokenKind.CloseParen) || sameKind(kind, TokenKind.CloseBracket) ||
+            sameKind(kind, TokenKind.CloseBrace)) && stack.length > 0) {
+            let open = stack[stack.length - 1];
+            stack.pop();
+            matching[open as usize] = truncate<u32>(i);
+            matching[i] = open;
+        }
+    }
+    var byStart = Vector<u32>.create();
+    var byEnd = Vector<u32>.create();
+    for (k in 0..source.text.length + 1) {
+        byStart.push(none())?;
+        byEnd.push(none())?;
+    }
+    for (i in 0..n) {
+        byStart[tokens[i].start as usize] = truncate<u32>(i);
+        byEnd[tokens[i].end as usize] = truncate<u32>(i);
+    }
+    // Each comment belongs to the first token at or after it.
+    var comments = Vector<FmtComment>.create();
+    var commentFirst = Vector<u32>.create();
+    var owners = Vector<usize>.create(); // the token each comment belongs to
+    var next: usize = 0;
+    for (span in lexed.comments.view()) {
+        while (next < n && tokens[next].start < span.start) {
+            next += 1;
+        }
+        owners.push(next)?;
+        let text = source.text[span.start as usize..span.end as usize];
+        let isLine = text.length >= 2 && text[0] == '/' && text[1] == '/';
+        var textEnd = span.end;
+        if (isLine) {
+            textEnd = span.start + truncate<u32>(trimEndLength(text));
+        }
+        let isDoc = isLine && text.length >= 3 && text[2] == '/' && !(text.length >= 4 && text[3] == '/');
+        comments.push(FmtComment { start: span.start, end: span.end, textEnd: textEnd, isLine: isLine, isDoc: isDoc })?;
+    }
+    var c: usize = 0;
+    for (i in 0..n + 2) {
+        while (c < owners.length && owners[c] < i) {
+            c += 1;
+        }
+        commentFirst.push(truncate<u32>(c))?;
+    }
+    var glueBefore = Vector<bool>.create();
+    var glueAfter = Vector<bool>.create();
+    for (k in 0..n + 1) {
+        glueBefore.push(false)?;
+        glueAfter.push(false)?;
+    }
+    for (i in 1..n) {
+        // '>' '>' and '>' '>=' that touch are a shift (grammar.md §1.7); keep them touching.
+        if (sameKind(tokens[i - 1].kind, TokenKind.Greater) &&
+            (sameKind(tokens[i].kind, TokenKind.Greater) || sameKind(tokens[i].kind, TokenKind.GreaterEquals)) &&
+            tokens[i - 1].end == tokens[i].start) {
+            glueBefore[i] = true;
+        }
+    }
+    return Ok(
+        FmtLayout {
+            source: source,
+            tokens: tokens,
+            matching: matching,
+            byStart: byStart,
+            byEnd: byEnd,
+            comments: comments,
+            commentFirst: commentFirst,
+            glueBefore: glueBefore,
+            glueAfter: glueAfter,
+            containers: Vector<FmtContainer>.create(),
+            groups: Vector<Vector<u32>>.create(),
+            continuations: Vector<FmtContinuation>.create(),
+            unitElements: Vector<u32>.create(),
+            keptBreaks: Vector<u32>.create(),
+            newlineBefore: Vector<bool>.create(),
+            blankAllowed: Vector<bool>.create(),
+            dropped: Vector<bool>.create(),
+            commaAfter: Vector<bool>.create(),
+            tokenLine: Vector<u32>.create(),
+            failed: false,
+        },
+    );
+}
+
+/// The length of `text` without trailing white space (String.TrimEnd: char.IsWhiteSpace, in UTF-8).
+fn trimEndLength(text: Slice<u8>) -> usize {
+    var end = text.length;
+    loop {
+        if (end >= 1 && ((text[end - 1] >= 0x09 && text[end - 1] <= 0x0D) || text[end - 1] == ' ')) {
+            end -= 1;
+        } else if (end >= 2 && text[end - 2] == 0xC2 && (text[end - 1] == 0x85 || text[end - 1] == 0xA0)) {
+            end -= 2;
+        } else if (end >= 3 && isWideSpace(text[end - 3], text[end - 2], text[end - 1])) {
+            end -= 3;
+        } else {
+            return end;
+        }
+    }
+}
+
+/// The length of the white space that starts `text` (String.TrimStart).
+fn trimStartLength(text: Slice<u8>) -> usize {
+    var start: usize = 0;
+    loop {
+        if (start < text.length && ((text[start] >= 0x09 && text[start] <= 0x0D) || text[start] == ' ')) {
+            start += 1;
+        } else if (start + 1 < text.length && text[start] == 0xC2 &&
+            (text[start + 1] == 0x85 || text[start + 1] == 0xA0)) {
+            start += 2;
+        } else if (start + 2 < text.length && isWideSpace(text[start], text[start + 1], text[start + 2])) {
+            start += 3;
+        } else {
+            return start;
+        }
+    }
+}
+
+/// U+1680, U+2000–U+200A, U+2028, U+2029, U+202F, U+205F, U+3000 in UTF-8.
+fn isWideSpace(a: u8, b: u8, c: u8) -> bool =>
+    (a == 0xE1 && b == 0x9A && c == 0x80) || (a == 0xE2 && b == 0x80 && (c <= 0x8A || c == 0xA8 || c == 0xA9 ||
+        c == 0xAF) && c >= 0x80) || (a == 0xE2 && b == 0x81 && c == 0x9F) || (a == 0xE3 && b == 0x80 && c == 0x80);
+
+/// The UTF-16 code units of UTF-8 `bytes`: one per scalar, two above U+FFFF.
+fn utf16Units(bytes: Slice<u8>) -> u32 {
+    var units: u32 = 0;
+    for (b in bytes) {
+        if (b < 0x80 || b >= 0xC0) {
+            units += 1;
+        }
+        if (b >= 0xF0) {
+            units += 1;
+        }
+    }
+    return units;
+}
+
+// ---- Walking the tree: spacing roles, containers and continuations ----
+
+fn exprFirst(l: borrow mut FmtLayout, ast: borrow Ast, e: u32) -> u32 => l.first(ast.exprSpans[e as usize].start);
+
+fn exprLast(l: borrow mut FmtLayout, ast: borrow Ast, e: u32) -> u32 => l.last(ast.exprSpans[e as usize].end);
+
+fn stmtFirst(l: borrow mut FmtLayout, ast: borrow Ast, s: u32) -> u32 => l.first(ast.stmtSpans[s as usize].start);
+
+fn stmtLast(l: borrow mut FmtLayout, ast: borrow Ast, s: u32) -> u32 => l.last(ast.stmtSpans[s as usize].end);
+
+fn identLast(l: borrow mut FmtLayout, ast: borrow Ast, ident: u32) -> u32 => l.last(ast.idents[ident as usize].end);
+
+/// An item's first token: its first attribute's if it has one before it.
+fn firstWithAttributes(l: borrow mut FmtLayout, ast: borrow Ast, start: u32, attributes: Range) -> u32 {
+    let first = l.first(start);
+    if (attributes.count == 0) {
+        return first;
+    }
+    let attribute = l.first(ast.attributes[ast.at(attributes, 0) as usize].start);
+    return if (attribute < first) attribute else first;
+}
+
+fn functionFirst(l: borrow mut FmtLayout, ast: borrow Ast, f: u32) -> u32 {
+    let function = borrow ast.functions[f as usize];
+    return firstWithAttributes(l, ast, function.start, function.attributes);
+}
+
+fn itemFirst(l: borrow mut FmtLayout, ast: borrow Ast, item: u32) -> u32 {
+    let it = borrow ast.items[item as usize];
+    return firstWithAttributes(l, ast, it.start, it.attributes);
+}
+
+fn fmtWalkUnit(l: borrow mut FmtLayout, ast: borrow Ast, unit: borrow Unit) -> Result<void, AllocError> {
+    // A namespace or import declaration starts at its keyword, the token before its name.
+    if (unit.hasNamespace) {
+        let name = l.first(unit.namespaceName.start);
+        l.unitElements.push(if (name > 0) name - 1 else 0)?;
+    }
+    for (imported in unit.imports.view()) {
+        let name = l.first(imported.start);
+        l.unitElements.push(if (name > 0) name - 1 else 0)?;
+    }
+    for (k in 0..unit.items.count) {
+        let item = ast.at(unit.items, k);
+        let first = itemFirst(l, ast, item);
+        l.unitElements.push(first)?;
+        fmtWalkItem(l, ast, item)?;
+    }
+    return Ok();
+}
+
+fn fmtWalkAttributes(l: borrow mut FmtLayout, ast: borrow Ast, attributes: Range) -> Result<void, AllocError> {
+    for (k in 0..attributes.count) {
+        let attribute = borrow ast.attributes[ast.at(attributes, k) as usize];
+        let at = l.first(attribute.start);
+        l.glueAfterAt(at);
+        let last = l.last(attribute.end);
+        if (l.newlineBetween(last as i64, (last as i64) + 1)) {
+            l.keptBreaks.push(last + 1)?;
+        }
+        if (attribute.hasParentheses) {
+            let name = identLast(l, ast, attribute.name);
+            l.glueBeforeAt(name + 1);
+        }
+    }
+    return Ok();
+}
+
+/// Region and type parameters after a name: `<'r, T: I>`.
+fn fmtWalkTypeParameters(
+    l: borrow mut FmtLayout,
+    ast: borrow Ast,
+    nameToken: u32,
+    regions: Range,
+    types: Range,
+) -> Result<void, AllocError> {
+    if (regions.count + types.count == 0) {
+        return Ok();
+    }
+    let open = nameToken + 1;
+    l.glueBeforeAt(open);
+    l.glueAfterAt(open);
+    var end: u32 = 0;
+    for (r in 0..2) {
+        let range = if (r == 0) regions else types;
+        for (k in 0..range.count) {
+            let p = borrow ast.typeParameters[ast.at(range, k) as usize];
+            if (p.end > end) {
+                end = p.end;
+            }
+        }
+    }
+    let close = l.last(end) + 1;
+    l.glueBeforeAt(close);
+    for (r in 0..2) {
+        let range = if (r == 0) regions else types;
+        for (k in 0..range.count) {
+            let bounds = ast.typeParameters[ast.at(range, k) as usize].bounds;
+            for (b in 0..bounds.count) {
+                fmtWalkType(l, ast, ast.at(bounds, b))?;
+            }
+        }
+    }
+    return Ok();
+}
+
+fn fmtWalkItem(l: borrow mut FmtLayout, ast: borrow Ast, item: u32) -> Result<void, AllocError> {
+    let it = borrow ast.items[item as usize];
+    fmtWalkAttributes(l, ast, it.attributes)?;
+    match (it.kind) {
+        ItemKind.Function(f) => { fmtWalkFunction(l, ast, f, false)?; }
+        ItemKind.Struct(s) => { fmtWalkStruct(l, ast, it.name, s)?; }
+        ItemKind.Enum(variants, typeParameters, regionParameters) => {
+            let name = identLast(l, ast, it.name);
+            fmtWalkTypeParameters(l, ast, name, regionParameters, typeParameters)?;
+            let open = l.find(name, TokenKind.OpenBrace);
+            let body = l.addContainer(open, true, true, priorityList())?;
+            for (k in 0..variants.count) {
+                let variant = borrow ast.variants[ast.at(variants, k) as usize];
+                let first = l.first(variant.start);
+                let last = l.last(variant.end);
+                l.addElement(body, first, last)?;
+                if (variant.payload.count > 0) {
+                    let variantName = identLast(l, ast, variant.name);
+                    l.glueBeforeAt(variantName + 1);
+                }
+                for (p in 0..variant.payload.count) {
+                    fmtWalkType(l, ast, ast.at(variant.payload, p))?;
+                }
+            }
+        }
+        ItemKind.Interface(methods, typeParameters) => {
+            let name = identLast(l, ast, it.name);
+            fmtWalkTypeParameters(l, ast, name, emptyRange(), typeParameters)?;
+            let open = l.find(name, TokenKind.OpenBrace);
+            let body = l.addContainer(open, true, false, priorityList())?;
+            for (k in 0..methods.count) {
+                let method = ast.at(methods, k);
+                let first = functionFirst(l, ast, method);
+                let last = l.last(ast.functions[method as usize].end);
+                l.addElement(body, first, last)?;
+                fmtWalkAttributes(l, ast, ast.functions[method as usize].attributes)?;
+                fmtWalkFunction(l, ast, method, true)?;
+            }
+        }
+        ItemKind.Impl(interfaceType, forType, functions) => {
+            fmtWalkType(l, ast, interfaceType)?;
+            fmtWalkType(l, ast, forType)?;
+            let forLast = l.last(ast.typeSpans[forType as usize].end);
+            let open = l.find(forLast, TokenKind.OpenBrace);
+            let body = l.addContainer(open, true, false, priorityList())?;
+            for (k in 0..functions.count) {
+                let function = ast.at(functions, k);
+                let first = functionFirst(l, ast, function);
+                let last = l.last(ast.functions[function as usize].end);
+                l.addElement(body, first, last)?;
+                fmtWalkAttributes(l, ast, ast.functions[function as usize].attributes)?;
+                fmtWalkFunction(l, ast, function, false)?;
+            }
+        }
+        ItemKind.Extern(_, functions, structs) => {
+            let start = l.first(it.start);
+            let open = l.find(start, TokenKind.OpenBrace);
+            let body = l.addContainer(open, true, false, priorityList())?;
+            // The functions and structs in source order.
+            var f: u32 = 0;
+            var s: u32 = 0;
+            while (f < functions.count || s < structs.count) {
+                let takeFunction = s >= structs.count || (f < functions.count &&
+                    ast.functions[ast.at(functions, f) as usize].start < ast.items[ast.at(structs, s) as usize].start);
+                if (takeFunction) {
+                    let function = ast.at(functions, f);
+                    f += 1;
+                    let first = functionFirst(l, ast, function);
+                    let last = l.last(ast.functions[function as usize].end);
+                    l.addElement(body, first, last)?;
+                    fmtWalkAttributes(l, ast, ast.functions[function as usize].attributes)?;
+                    fmtWalkFunction(l, ast, function, false)?;
+                } else {
+                    let member = ast.at(structs, s);
+                    s += 1;
+                    let first = itemFirst(l, ast, member);
+                    let last = l.last(ast.items[member as usize].end);
+                    l.addElement(body, first, last)?;
+                    fmtWalkItem(l, ast, member)?;
+                }
+            }
+        }
+        ItemKind.Const(typ, value) => {
+            fmtWalkType(l, ast, typ)?;
+            let first = exprFirst(l, ast, value);
+            let last = exprLast(l, ast, value);
+            l.addContinuation(first - 1, false, last, priorityInitializer())?;
+            fmtWalkExpr(l, ast, value)?;
+        }
+        ItemKind.Static(_, typ, value) => {
+            fmtWalkType(l, ast, typ)?;
+            let first = exprFirst(l, ast, value);
+            let last = exprLast(l, ast, value);
+            l.addContinuation(first - 1, false, last, priorityInitializer())?;
+            fmtWalkExpr(l, ast, value)?;
+        }
+    }
+    return Ok();
+}
+
+fn fmtWalkFunction(l: borrow mut FmtLayout, ast: borrow Ast, f: u32, inInterface: bool) -> Result<void, AllocError> {
+    let function = borrow ast.functions[f as usize];
+    let name = identLast(l, ast, function.name);
+    fmtWalkTypeParameters(l, ast, name, function.regionParameters, function.typeParameters)?;
+    let open = l.find(name + 1, TokenKind.OpenParen);
+    l.glueBeforeAt(open);
+    let close = l.matching[open as usize];
+    if (!inInterface && close != none() && close > open + 1) {
+        let parameters = l.addContainer(open, false, true, priorityList())?;
+        match (function.receiver) {
+            ReceiverKind.None => {}
+            _ => {
+                let first = l.first(function.receiverStart);
+                let last = l.last(function.receiverEnd);
+                l.addElement(parameters, first, last)?;
+            }
+        }
+        for (k in 0..function.parameters.count) {
+            let parameter = borrow ast.parameters[ast.at(function.parameters, k) as usize];
+            let first = l.first(parameter.start);
+            let last = l.last(parameter.end);
+            l.addElement(parameters, first, last)?;
+        }
+    }
+    for (k in 0..function.parameters.count) {
+        fmtWalkType(l, ast, ast.parameters[ast.at(function.parameters, k) as usize].typ)?;
+    }
+    if (function.returnType != none()) {
+        fmtWalkType(l, ast, function.returnType)?;
+    }
+    if (function.body != none()) {
+        fmtWalkBlock(l, ast, function.body)?;
+    } else if (function.expressionBody != none()) {
+        let first = exprFirst(l, ast, function.expressionBody);
+        let last = exprLast(l, ast, function.expressionBody);
+        l.addContinuation(first - 1, false, last, priorityFunctionBody())?;
+        fmtWalkExpr(l, ast, function.expressionBody)?;
+    }
+    return Ok();
+}
+
+fn fmtWalkStruct(l: borrow mut FmtLayout, ast: borrow Ast, nameIdent: u32, s: u32) -> Result<void, AllocError> {
+    let structure = borrow ast.structs[s as usize];
+    let name = identLast(l, ast, nameIdent);
+    fmtWalkTypeParameters(l, ast, name, structure.regionParameters, structure.typeParameters)?;
+    if (structure.isOpaque) {
+        return Ok();
+    }
+    let open = l.find(name, TokenKind.OpenBrace);
+    let body = l.addContainer(open, true, false, priorityList())?;
+    // The members by their first token: fields (kind 0), functions (1) and the drop block (2).
+    var firsts = Vector<u32>.create();
+    var lasts = Vector<u32>.create();
+    var kinds = Vector<u32>.create();
+    var ids = Vector<u32>.create();
+    for (k in 0..structure.fields.count) {
+        let field = ast.at(structure.fields, k);
+        firsts.push(l.first(ast.fields[field as usize].start))?;
+        lasts.push(l.last(ast.fields[field as usize].end))?;
+        kinds.push(0)?;
+        ids.push(field)?;
+    }
+    for (k in 0..structure.functions.count) {
+        let function = ast.at(structure.functions, k);
+        firsts.push(functionFirst(l, ast, function))?;
+        lasts.push(l.last(ast.functions[function as usize].end))?;
+        kinds.push(1)?;
+        ids.push(function)?;
+    }
+    if (structure.dropBlock != none()) {
+        firsts.push(l.first(structure.dropStart))?;
+        lasts.push(stmtLast(l, ast, structure.dropBlock))?;
+        kinds.push(2)?;
+        ids.push(structure.dropBlock)?;
+    }
+    var order = Vector<usize>.create();
+    for (k in 0..firsts.length) {
+        order.push(k)?;
+        var at = order.length - 1;
+        while (at > 0 && firsts[order[at - 1]] > firsts[k]) {
+            order[at] = order[at - 1];
+            at -= 1;
+        }
+        order[at] = k;
+    }
+    for (k in order.view()) {
+        l.addElement(body, firsts[k], lasts[k])?;
+        if (kinds[k] == 0) {
+            fmtWalkType(l, ast, ast.fields[ids[k] as usize].typ)?;
+        } else if (kinds[k] == 1) {
+            fmtWalkAttributes(l, ast, ast.functions[ids[k] as usize].attributes)?;
+            fmtWalkFunction(l, ast, ids[k], false)?;
+        } else {
+            fmtWalkBlock(l, ast, ids[k])?;
+        }
+    }
+    return Ok();
+}
+
+/// The tokens of a type, without the parentheses of a parenthesised type (`borrow (T?)`).
+fn typeCore(l: borrow mut FmtLayout, ast: borrow Ast, t: u32) -> Span {
+    var first = l.first(ast.typeSpans[t as usize].start);
+    var last = l.last(ast.typeSpans[t as usize].end);
+    while (first < last && l.isKind(first, TokenKind.OpenParen) && l.matching[first as usize] == last) {
+        first += 1;
+        last -= 1;
+    }
+    return Span { start: first, end: last };
+}
+
+fn fmtWalkType(l: borrow mut FmtLayout, ast: borrow Ast, t: u32) -> Result<void, AllocError> {
+    let core = typeCore(l, ast, t);
+    match (ast.types[t as usize]) {
+        TypeNode.Generic(name, arguments) => {
+            let open = l.last(name.end) + 1;
+            l.glueBeforeAt(open);
+            l.glueAfterAt(open);
+            l.glueBeforeAt(core.end);
+            for (k in 0..arguments.count) {
+                fmtWalkType(l, ast, ast.at(arguments, k))?;
+            }
+        }
+        TypeNode.Optional(inner) => {
+            l.glueBeforeAt(core.end);
+            fmtWalkType(l, ast, inner)?;
+        }
+        TypeNode.Reference(_, hasSources, _, pointee) => {
+            if (hasSources) {
+                let open = l.find(core.start, TokenKind.OpenParen);
+                l.glueBeforeAt(open);
+            }
+            fmtWalkType(l, ast, pointee)?;
+        }
+        TypeNode.Pointer(_, pointee) => {
+            l.glueAfterAt(core.start);
+            fmtWalkType(l, ast, pointee)?;
+        }
+        TypeNode.Dyn(interfaceType, _, _) => { fmtWalkType(l, ast, interfaceType)?; }
+        TypeNode.Array(element, length) => {
+            fmtWalkType(l, ast, element)?;
+            fmtWalkExpr(l, ast, length)?;
+        }
+        TypeNode.Function(attributes, parameters, result) => {
+            fmtWalkAttributes(l, ast, attributes)?;
+            let fnToken = l.find(core.start, TokenKind.FnKeyword);
+            l.glueBeforeAt(fnToken + 1);
+            for (k in 0..parameters.count) {
+                fmtWalkType(l, ast, ast.at(parameters, k))?;
+            }
+            if (result != none()) {
+                fmtWalkType(l, ast, result)?;
+            }
+        }
+        TypeNode.FunctionPointer(_, parameters, result) => {
+            let fnToken = l.find(core.start, TokenKind.FnKeyword);
+            l.glueBeforeAt(fnToken + 1);
+            for (k in 0..parameters.count) {
+                fmtWalkType(l, ast, ast.at(parameters, k))?;
+            }
+            if (result != none()) {
+                fmtWalkType(l, ast, result)?;
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn fmtWalkBlock(l: borrow mut FmtLayout, ast: borrow Ast, block: u32) -> Result<u32, AllocError> {
+    let open = stmtFirst(l, ast, block);
+    let body = l.addContainer(open, true, false, priorityList())?;
+    match (ast.stmts[block as usize]) {
+        StmtNode.Block(statements) => {
+            for (k in 0..statements.count) {
+                let statement = ast.at(statements, k);
+                let first = stmtFirst(l, ast, statement);
+                let last = stmtLast(l, ast, statement);
+                l.addElement(body, first, last)?;
+                fmtWalkStmt(l, ast, statement)?;
+            }
+        }
+        _ => { l.failed = true; }
+    }
+    return Ok(body);
+}
+
+/// An if/else chain: its blocks are one group (formatting.md §3.2).
+fn fmtWalkIf(l: borrow mut FmtLayout, ast: borrow Ast, top: u32) -> Result<void, AllocError> {
+    var group = Vector<u32>.create();
+    var current = top;
+    while (current != none()) {
+        match (ast.stmts[current as usize]) {
+            StmtNode.If(condition, thenBlock, elseBranch) => {
+                fmtWalkExpr(l, ast, condition)?;
+                group.push(fmtWalkBlock(l, ast, thenBlock)?)?;
+                current = elseBranch;
+            }
+            _ => {
+                group.push(fmtWalkBlock(l, ast, current)?)?;
+                current = none();
+            }
+        }
+    }
+    if (group.length > 1) {
+        let index = truncate<u32>(l.groups.length);
+        for (c in group.view()) {
+            l.containers[c as usize].group = index;
+        }
+        l.groups.push(group)?;
+    }
+    return Ok();
+}
+
+fn fmtWalkStmt(l: borrow mut FmtLayout, ast: borrow Ast, s: u32) -> Result<void, AllocError> {
+    match (ast.stmts[s as usize]) {
+        StmtNode.Block(_) => { fmtWalkBlock(l, ast, s)?; }
+        StmtNode.Local(_, _, typ, initializer) => {
+            if (typ != none()) {
+                fmtWalkType(l, ast, typ)?;
+            }
+            if (initializer != none()) {
+                let first = exprFirst(l, ast, initializer);
+                let last = exprLast(l, ast, initializer);
+                l.addContinuation(first - 1, false, last, priorityInitializer())?;
+                fmtWalkExpr(l, ast, initializer)?;
+            }
+        }
+        StmtNode.Defer(body) => { fmtWalkStmt(l, ast, body)?; }
+        StmtNode.Match(scrutinee, arms) => {
+            fmtWalkExpr(l, ast, scrutinee)?;
+            let after = exprLast(l, ast, scrutinee) + 1;
+            let open = l.find(after, TokenKind.OpenBrace);
+            let body = l.addContainer(open, true, false, priorityList())?;
+            for (k in 0..arms.count) {
+                let arm = borrow ast.matchArms[ast.at(arms, k) as usize];
+                let first = l.first(arm.start);
+                let last = l.last(arm.end);
+                l.addElement(body, first, last)?;
+                fmtWalkPattern(l, ast, arm.pattern)?;
+                fmtWalkBlock(l, ast, arm.body)?;
+            }
+        }
+        StmtNode.If(_, _, _) => { fmtWalkIf(l, ast, s)?; }
+        StmtNode.While(condition, body) => {
+            fmtWalkExpr(l, ast, condition)?;
+            fmtWalkBlock(l, ast, body)?;
+        }
+        StmtNode.For(_, start, end, body) => {
+            fmtWalkExpr(l, ast, start)?;
+            if (end != none()) {
+                fmtWalkExpr(l, ast, end)?;
+            }
+            fmtWalkBlock(l, ast, body)?;
+        }
+        StmtNode.Loop(body) => { fmtWalkBlock(l, ast, body)?; }
+        StmtNode.Return(value) => {
+            if (value != none()) {
+                fmtWalkExpr(l, ast, value)?;
+            }
+        }
+        StmtNode.Assign(target, _, value) => {
+            fmtWalkExpr(l, ast, target)?;
+            let first = exprFirst(l, ast, value);
+            let last = exprLast(l, ast, value);
+            l.addContinuation(first - 1, false, last, priorityInitializer())?;
+            fmtWalkExpr(l, ast, value)?;
+        }
+        StmtNode.Expression(e) => { fmtWalkExpr(l, ast, e)?; }
+        StmtNode.Unsafe(body) => { fmtWalkBlock(l, ast, body)?; }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn fmtWalkPattern(l: borrow mut FmtLayout, ast: borrow Ast, p: u32) -> Result<void, AllocError> {
+    match (ast.patterns[p as usize]) {
+        PatternNode.Literal(e) => { fmtWalkExpr(l, ast, e)?; }
+        PatternNode.Variant(path, hasParentheses, bindings) => {
+            if (hasParentheses) {
+                let pathLast = l.last(path.end);
+                l.glueBeforeAt(pathLast + 1);
+                for (k in 0..bindings.count) {
+                    let nested = ast.bindings[ast.at(bindings, k) as usize].nested;
+                    if (nested != none()) {
+                        fmtWalkPattern(l, ast, nested)?;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn fmtIsBlockExpr(ast: borrow Ast, e: u32) -> bool => match (ast.exprs[e as usize]) {
+    ExprNode.Block(_) => true,
+    _ => false,
+};
+
+fn fmtWalkExpr(l: borrow mut FmtLayout, ast: borrow Ast, e: u32) -> Result<void, AllocError> {
+    match (ast.exprs[e as usize]) {
+        ExprNode.Name(name, typeArguments) => {
+            if (typeArguments.count > 0) {
+                let nameToken = identLast(l, ast, name);
+                fmtWalkTypeArguments(l, ast, nameToken, typeArguments)?;
+            }
+        }
+        ExprNode.Paren(inner) => { fmtWalkExpr(l, ast, inner)?; }
+        ExprNode.Unary(_, operand) => {
+            let first = exprFirst(l, ast, e);
+            l.glueAfterAt(first);
+            fmtWalkExpr(l, ast, operand)?;
+        }
+        ExprNode.Binary(left, _, right) => {
+            fmtWalkExpr(l, ast, left)?;
+            let first = exprFirst(l, ast, right);
+            let last = exprLast(l, ast, right);
+            l.addContinuation(first - 1, false, last, priorityBinary())?;
+            fmtWalkExpr(l, ast, right)?;
+        }
+        ExprNode.Cast(operand, typ) => {
+            fmtWalkExpr(l, ast, operand)?;
+            fmtWalkType(l, ast, typ)?;
+        }
+        ExprNode.Call(callee, arguments) => {
+            fmtWalkExpr(l, ast, callee)?;
+            let open = exprLast(l, ast, callee) + 1;
+            l.glueBeforeAt(open);
+            match (ast.exprs[callee as usize]) {
+                ExprNode.Member(_, member) => {
+                    // The chain continuation before this member reaches to the call's end.
+                    let token = l.first(ast.idents[member as usize].start) - 1;
+                    let end = exprLast(l, ast, e);
+                    var k = l.continuations.length;
+                    while (k > 0) {
+                        k -= 1;
+                        if (l.continuations[k].before && l.continuations[k].token == token) {
+                            l.continuations[k].last = end;
+                            k = 0;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if (arguments.count > 0) {
+                let container = l.addContainer(open, false, true, priorityList())?;
+                for (k in 0..arguments.count) {
+                    let argument = ast.at(arguments, k);
+                    let first = exprFirst(l, ast, argument);
+                    let last = exprLast(l, ast, argument);
+                    l.addElement(container, first, last)?;
+                    fmtWalkExpr(l, ast, argument)?;
+                }
+            }
+        }
+        ExprNode.Member(target, member) => {
+            fmtWalkExpr(l, ast, target)?;
+            let chained = match (ast.exprs[target as usize]) {
+                ExprNode.Call(_, _) => true,
+                ExprNode.Index(_, _) => true,
+                ExprNode.Unwrap(_) => true,
+                ExprNode.Try(_) => true,
+                _ => false,
+            };
+            if (chained) {
+                let token = l.first(ast.idents[member as usize].start) - 1;
+                let last = exprLast(l, ast, e);
+                l.addContinuation(token, true, last, priorityChain())?;
+            }
+        }
+        ExprNode.Unsafe(inner) => { fmtWalkExpr(l, ast, inner)?; }
+        ExprNode.If(condition, thenValue, elseValue) => {
+            fmtWalkExpr(l, ast, condition)?;
+            fmtWalkExpr(l, ast, thenValue)?;
+            fmtWalkExpr(l, ast, elseValue)?;
+        }
+        ExprNode.Match(scrutinee, arms) => {
+            fmtWalkExpr(l, ast, scrutinee)?;
+            let after = exprLast(l, ast, scrutinee) + 1;
+            let open = l.find(after, TokenKind.OpenBrace);
+            let body = l.addContainer(open, true, true, priorityList())?;
+            for (k in 0..arms.count) {
+                let arm = borrow ast.valueArms[ast.at(arms, k) as usize];
+                let first = l.first(arm.start);
+                let last = l.last(arm.end);
+                l.addElement(body, first, last)?;
+                fmtWalkPattern(l, ast, arm.pattern)?;
+                if (!fmtIsBlockExpr(ast, arm.value)) {
+                    let valueFirst = exprFirst(l, ast, arm.value);
+                    let valueLast = exprLast(l, ast, arm.value);
+                    l.addContinuation(valueFirst - 1, false, valueLast, priorityArm())?;
+                }
+                fmtWalkExpr(l, ast, arm.value)?;
+            }
+        }
+        ExprNode.Closure(c) => {
+            let closure = borrow ast.closures[c as usize];
+            for (k in 0..closure.parameters.count) {
+                let typ = ast.closureParameters[ast.at(closure.parameters, k) as usize].typ;
+                if (typ != none()) {
+                    fmtWalkType(l, ast, typ)?;
+                }
+            }
+            if (closure.block != none()) {
+                fmtWalkBlock(l, ast, closure.block)?;
+            } else if (closure.body != none()) {
+                let first = exprFirst(l, ast, closure.body);
+                let last = exprLast(l, ast, closure.body);
+                l.addContinuation(first - 1, false, last, priorityArm())?;
+                fmtWalkExpr(l, ast, closure.body)?;
+            }
+        }
+        ExprNode.Block(block) => { fmtWalkBlock(l, ast, block)?; }
+        ExprNode.Borrow(_, operand) => { fmtWalkExpr(l, ast, operand)?; }
+        ExprNode.Move(operand) => { fmtWalkExpr(l, ast, operand)?; }
+        ExprNode.MutArg(operand) => { fmtWalkExpr(l, ast, operand)?; }
+        ExprNode.StructLiteral(typeName, fields, typeArguments) => {
+            let nameToken = identLast(l, ast, typeName);
+            if (typeArguments.count > 0) {
+                fmtWalkTypeArguments(l, ast, nameToken, typeArguments)?;
+            }
+            let open = l.find(nameToken + 1, TokenKind.OpenBrace);
+            if (fields.count > 0) {
+                let container = l.addContainer(open, false, true, priorityList())?;
+                for (k in 0..fields.count) {
+                    let field = borrow ast.fieldInits[ast.at(fields, k) as usize];
+                    let first = l.first(field.start);
+                    let last = l.last(field.end);
+                    l.addElement(container, first, last)?;
+                    fmtWalkExpr(l, ast, field.value)?;
+                }
+            }
+        }
+        ExprNode.ArrayLiteral(elements) => {
+            let open = exprFirst(l, ast, e);
+            let container = l.addContainer(open, false, true, priorityList())?;
+            for (k in 0..elements.count) {
+                let element = ast.at(elements, k);
+                let first = exprFirst(l, ast, element);
+                let last = exprLast(l, ast, element);
+                l.addElement(container, first, last)?;
+                fmtWalkExpr(l, ast, element)?;
+            }
+        }
+        ExprNode.ArrayRepeat(value, count) => {
+            fmtWalkExpr(l, ast, value)?;
+            fmtWalkExpr(l, ast, count)?;
+        }
+        ExprNode.Index(target, index) => {
+            fmtWalkExpr(l, ast, target)?;
+            let after = exprLast(l, ast, target) + 1;
+            l.glueBeforeAt(after);
+            fmtWalkExpr(l, ast, index)?;
+        }
+        ExprNode.Slice(target, low, high) => {
+            fmtWalkExpr(l, ast, target)?;
+            let after = exprLast(l, ast, target) + 1;
+            l.glueBeforeAt(after);
+            if (low != none()) {
+                fmtWalkExpr(l, ast, low)?;
+            }
+            if (high != none()) {
+                fmtWalkExpr(l, ast, high)?;
+            }
+        }
+        ExprNode.Try(operand) => {
+            fmtWalkExpr(l, ast, operand)?;
+            let last = exprLast(l, ast, e);
+            l.glueBeforeAt(last);
+        }
+        ExprNode.Unwrap(operand) => {
+            fmtWalkExpr(l, ast, operand)?;
+            let last = exprLast(l, ast, e);
+            l.glueBeforeAt(last);
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn fmtWalkTypeArguments(
+    l: borrow mut FmtLayout,
+    ast: borrow Ast,
+    nameToken: u32,
+    arguments: Range,
+) -> Result<void, AllocError> {
+    let open = nameToken + 1;
+    l.glueBeforeAt(open);
+    l.glueAfterAt(open);
+    let lastArgument = ast.at(arguments, arguments.count - 1);
+    let close = l.last(ast.typeSpans[lastArgument as usize].end) + 1;
+    l.glueBeforeAt(close);
+    for (k in 0..arguments.count) {
+        fmtWalkType(l, ast, ast.at(arguments, k))?;
+    }
+    return Ok();
+}
+
+// ---- Deciding the breaks ----
+
+/// Whether the comments before token `i` include one (any, or only line comments).
+fn hasComment(l: borrow FmtLayout, i: u32, lineOnly: bool) -> bool {
+    for (k in l.commentFirst[i as usize]..l.commentFirst[(i + 1) as usize]) {
+        if (!lineOnly || l.comments[k as usize].isLine) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Whether the author broke a container (formatting.md §3.1): a body or block written across lines, or a list with a
+/// line break at one of its own separators. A line comment among a container's own tokens breaks it too.
+fn authorBroken(l: borrow FmtLayout, c: borrow FmtContainer) -> bool {
+    if (c.firsts.length == 0) {
+        for (i in c.open + 1..c.close + 1) {
+            if (hasComment(l, i, false)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (c.lines) {
+        if (l.newlineBetween(c.open as i64, c.close as i64)) {
+            return true;
+        }
+        for (i in c.open + 1..c.close + 1) {
+            if (hasComment(l, i, true)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (l.newlineBetween(c.open as i64, c.firsts[0] as i64) || l.newlineBetween((c.close as i64) - 1, c.close as i64)) {
+        return true;
+    }
+    for (b in c.newlineBefore.view()) {
+        if (b) {
+            return true;
+        }
+    }
+    if (hasComment(l, c.firsts[0], true) || hasComment(l, c.close, true)) {
+        return true;
+    }
+    for (k in 1..c.firsts.length) {
+        if (hasComment(l, c.firsts[k], true)) {
+            return true;
+        }
+    }
+    for (k in 0..c.lasts.length) {
+        if (c.lasts[k] + 1 < c.close && hasComment(l, c.lasts[k] + 1, true)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Whether the author started an 'else' of the chain on a new line.
+fn elseOnNewLine(l: borrow FmtLayout, group: borrow Vector<u32>) -> bool {
+    for (k in 0..group.length - 1) {
+        let close = l.containers[group[k] as usize].close;
+        if (l.newlineBetween(close as i64, (close as i64) + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn fillBools(v: borrow mut Vector<bool>, n: usize) -> Result<void, AllocError> {
+    v.clear();
+    for (k in 0..n) {
+        v.push(false)?;
+    }
+    return Ok();
+}
+
+fn plan(l: borrow mut FmtLayout) -> Result<void, AllocError> {
+    let n = l.tokens.length;
+    fillBools(mut l.newlineBefore, n + 1)?;
+    fillBools(mut l.blankAllowed, n + 1)?;
+    fillBools(mut l.dropped, n + 1)?;
+    fillBools(mut l.commaAfter, n + 1)?;
+    l.blankAllowed[n] = true; // before the comments that end the file
+    for (k in 0..l.unitElements.length) {
+        let token = l.unitElements[k] as usize;
+        l.newlineBefore[token] = k > 0;
+        l.blankAllowed[token] = true;
+    }
+    for (ci in 0..l.containers.length) {
+        let count = l.containers[ci].firsts.length;
+        let broken = l.containers[ci].broken && (count > 0 || l.containers[ci].authorBroken);
+        let close = l.containers[ci].close;
+        if (l.containers[ci].commas && count > 0) {
+            let last = l.containers[ci].lasts[count - 1];
+            let hasTrailing = last + 1 < close && l.isKind(last + 1, TokenKind.Comma);
+            // A match-expression arm whose value is a block takes no comma (formatting.md §3.3).
+            let endsInBlock = l.containers[ci].lines && l.isKind(last, TokenKind.CloseBrace);
+            if (broken && !hasTrailing && !endsInBlock) {
+                l.commaAfter[last as usize] = true;
+            } else if (!broken && hasTrailing) {
+                l.dropped[(last + 1) as usize] = true;
+            }
+        }
+        if (!broken) {
+            continue;
+        }
+        let open = l.containers[ci].open;
+        l.newlineBefore[(open + 1) as usize] = true;
+        l.newlineBefore[close as usize] = true;
+        for (k in 0..count) {
+            let first = l.containers[ci].firsts[k] as usize;
+            if (l.containers[ci].lines) {
+                l.newlineBefore[first] = true;
+                l.blankAllowed[first] = k > 0;
+            } else if (k > 0 && (l.containers[ci].byWidth || l.containers[ci].newlineBefore[k])) {
+                l.newlineBefore[first] = true;
+            }
+        }
+        l.blankAllowed[close as usize] = true;
+    }
+    for (k in 0..l.keptBreaks.length) {
+        let token = l.keptBreaks[k] as usize;
+        l.newlineBefore[token] = true;
+    }
+    for (k in 0..l.continuations.length) {
+        if (l.continuations[k].broken) {
+            let c = borrow l.continuations[k];
+            let token = if (c.before) c.token else c.token + 1;
+            l.newlineBefore[token as usize] = true;
+        }
+    }
+    return Ok();
+}
+
+fn indentOf(l: borrow FmtLayout, token: u32, comment: bool) -> u32 {
+    var depth: u32 = 0;
+    for (c in l.containers.view()) {
+        if (c.broken && c.open < token && (token < c.close || (comment && token == c.close)) &&
+            (c.firsts.length > 0 || c.authorBroken)) {
+            depth += 1;
+        }
+    }
+    for (c in l.continuations.view()) {
+        if (c.broken && (if (c.before) c.token <= token else c.token < token) && token <= c.last) {
+            depth += 1;
+        }
+    }
+    return depth;
+}
+
+/// The space between two tokens on one line.
+fn spaceBetween(l: borrow FmtLayout, previous: u32, token: u32) -> bool {
+    if (l.glueAfter[previous as usize] || l.glueBefore[token as usize]) {
+        return false;
+    }
+    let b = l.kindAt(token);
+    if (sameKind(b, TokenKind.CloseParen) || sameKind(b, TokenKind.CloseBracket) || sameKind(b, TokenKind.Comma) ||
+        sameKind(b, TokenKind.Semicolon) || sameKind(b, TokenKind.Dot) || sameKind(b, TokenKind.DotDot) ||
+        sameKind(b, TokenKind.Colon)) {
+        return false;
+    }
+    let a = l.kindAt(previous);
+    if (sameKind(a, TokenKind.OpenParen) || sameKind(a, TokenKind.OpenBracket) || sameKind(a, TokenKind.Dot) ||
+        sameKind(a, TokenKind.DotDot) || sameKind(a, TokenKind.At)) {
+        return false;
+    }
+    return !(sameKind(a, TokenKind.OpenBrace) && sameKind(b, TokenKind.CloseBrace));
+}
+
+fn blankLinesBetween(l: borrow FmtLayout, from: u32, to: u32) -> bool {
+    var newlines: u32 = 0;
+    for (i in from..to) {
+        if (l.source.text[i as usize] == '\n') {
+            newlines += 1;
+        }
+    }
+    return newlines >= 2;
+}
+
+fn isOpenOfBrokenContainer(l: borrow FmtLayout, token: u32) -> bool {
+    for (c in l.containers.view()) {
+        if (c.open == token && c.broken) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn isCloseOfBrokenContainer(l: borrow FmtLayout, token: u32) -> bool {
+    for (c in l.containers.view()) {
+        if (c.close == token && c.broken) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn appendLineCode(line: borrow mut FmtLine, bytes: Slice<u8>) -> Result<void, AllocError> {
+    appendBytes(mut line.code, bytes)?;
+    line.units += utf16Units(bytes);
+    return Ok();
+}
+
+/// Starts a line, after a blank one if `blank` and the last line is not blank already.
+fn startLine(lines: borrow mut Vector<FmtLine>, indent: u32, blank: bool) -> Result<void, AllocError> {
+    if (blank && lines.length > 0 && !lines[lines.length - 1].blank) {
+        lines.push(FmtLine { indent: 0, code: Vector<u8>.create(), units: 0, trailing: none(), blank: true })?;
+    }
+    lines.push(FmtLine { indent: indent, code: Vector<u8>.create(), units: 0, trailing: none(), blank: false })?;
+    return Ok();
+}
+
+fn renderLines(l: borrow mut FmtLayout) -> Result<Vector<FmtLine>, AllocError> {
+    plan(l)?;
+    let n = truncate<u32>(l.tokens.length);
+    l.tokenLine.clear();
+    for (k in 0..n) {
+        l.tokenLine.push(0)?;
+    }
+    var lines = Vector<FmtLine>.create();
+    var previous: i64 = -1;
+    var previousEnd: u32 = 0;
+    var pendingNewline = false;
+    var carried = Vector<u32>.create();
+    for (i in 0..n + 1) {
+        var comments = Vector<u32>.create();
+        for (c in carried.view()) {
+            comments.push(c)?;
+        }
+        for (c in l.commentFirst[i as usize]..l.commentFirst[(i + 1) as usize]) {
+            comments.push(c)?;
+        }
+        carried.clear();
+        if (i < n && l.dropped[i as usize]) {
+            for (c in comments.view()) {
+                carried.push(c)?;
+            }
+            continue;
+        }
+        var lastWasDoc = false;
+        for (ci in comments.view()) {
+            let comment = l.comments[ci as usize];
+            let text = l.source.text[comment.start as usize..comment.textEnd as usize];
+            let hasCurrent = lines.length > 0;
+            let trailing = hasCurrent && lines[lines.length - 1].code.length > 0 &&
+                lines[lines.length - 1].trailing == none() && !pendingNewline &&
+                l.lineOf(previousEnd) == l.lineOf(comment.start);
+            if (trailing) {
+                if (comment.isLine) {
+                    lines[lines.length - 1].trailing = ci;
+                    pendingNewline = true;
+                } else {
+                    appendLineCode(mut lines[lines.length - 1], " ".bytes())?;
+                    appendLineCode(mut lines[lines.length - 1], text)?;
+                }
+            } else {
+                let blank = hasCurrent && !lastWasDoc && l.blankAllowed[(if (i < n) i else n) as usize] &&
+                    (previous < 0 || !isOpenOfBrokenContainer(l, truncate<u32>(previous))) &&
+                    blankLinesBetween(l, previousEnd, comment.start);
+                if (hasCurrent &&
+                    lines[lines.length - 1].code.length == 0 && lines[lines.length - 1].trailing == none()) {
+                    appendLineCode(mut lines[lines.length - 1], text)?;
+                } else {
+                    startLine(mut lines, if (i < n) indentOf(l, i, true) else 0, blank)?;
+                    appendLineCode(mut lines[lines.length - 1], text)?;
+                }
+                pendingNewline = comment.isLine ||
+                    (i < n && l.lineOf(comment.end) != l.lineOf(l.tokens[i as usize].start));
+            }
+            lastWasDoc = comment.isDoc;
+            previousEnd = comment.end;
+        }
+        if (i == n) {
+            break;
+        }
+        if (lines.length == 0) {
+            startLine(mut lines, 0, false)?;
+        } else if (l.newlineBefore[i as usize] || pendingNewline) {
+            let blank = !lastWasDoc && l.blankAllowed[i as usize] && !isCloseOfBrokenContainer(l, i) &&
+                blankLinesBetween(l, previousEnd, l.tokens[i as usize].start);
+            if (lines[lines.length - 1].code.length == 0 && lines[lines.length - 1].trailing == none()) {
+                // A line that holds only the indentation so far.
+            } else {
+                startLine(mut lines, indentOf(l, i, false), blank)?;
+            }
+        } else if (previous >= 0 && spaceBetween(l, truncate<u32>(previous), i)) {
+            appendLineCode(mut lines[lines.length - 1], " ".bytes())?;
+        }
+        let token = l.tokens[i as usize];
+        appendLineCode(mut lines[lines.length - 1], l.source.text[token.start as usize..token.end as usize])?;
+        if (l.commaAfter[i as usize]) {
+            appendLineCode(mut lines[lines.length - 1], ",".bytes())?;
+        }
+        l.tokenLine[i as usize] = truncate<u32>(lines.length - 1);
+        pendingNewline = false;
+        previous = i as i64;
+        previousEnd = token.end;
+    }
+    return Ok(lines);
+}
+
+/// Breaks one more construct on the first line that is too long; false when none is left (formatting.md §3.4). The
+/// candidate with the lowest priority breaks, then the largest, then the first found.
+fn breakLongLine(l: borrow mut FmtLayout, lines: borrow Vector<FmtLine>) -> bool {
+    let n = truncate<u32>(l.tokens.length);
+    for (li in 0..lines.length) {
+        if (lines[li].indent * 4 + lines[li].units <= lineWidth()) {
+            continue;
+        }
+        let line = truncate<u32>(li);
+        var found = false;
+        var isContainer = false;
+        var best: usize = 0;
+        var bestPriority: u32 = 0;
+        var bestSize: u32 = 0;
+        for (k in 0..l.containers.length) {
+            let c = borrow l.containers[k];
+            if (!c.broken && c.firsts.length > 0 && l.tokenLine[c.open as usize] == line) {
+                let size = c.close - c.open;
+                if (!found || c.priority < bestPriority || (c.priority == bestPriority && size > bestSize)) {
+                    found = true;
+                    isContainer = true;
+                    best = k;
+                    bestPriority = c.priority;
+                    bestSize = size;
+                }
+            }
+        }
+        for (k in 0..l.continuations.length) {
+            let c = borrow l.continuations[k];
+            if (!c.broken && l.tokenLine[c.token as usize] == line && c.token + 1 < n) {
+                if (c.before && l.tokenLine[(c.token - 1) as usize] != line) {
+                    continue;
+                }
+                let size = c.last - c.token;
+                if (!found || c.priority < bestPriority || (c.priority == bestPriority && size > bestSize)) {
+                    found = true;
+                    isContainer = false;
+                    best = k;
+                    bestPriority = c.priority;
+                    bestSize = size;
+                }
+            }
+        }
+        if (!found) {
+            continue;
+        }
+        if (isContainer) {
+            let group = l.containers[best].group;
+            if (group == none()) {
+                l.containers[best].broken = true;
+                l.containers[best].byWidth = true;
+            } else {
+                for (m in 0..l.groups[group as usize].length) {
+                    let member = l.groups[group as usize][m] as usize;
+                    l.containers[member].broken = true;
+                    l.containers[member].byWidth = true;
+                }
+            }
+        } else {
+            l.continuations[best].broken = true;
+        }
+        return true;
+    }
+    return false;
+}
+
+/// The text: indentation, aligned trailing comments (formatting.md §5), one final newline.
+fn finishLines(l: borrow FmtLayout, lines: borrow Vector<FmtLine>) -> Result<Vector<u8>, AllocError> {
+    var codes = Vector<Vector<u8>>.create();
+    var units = Vector<u32>.create();
+    for (line in lines.view()) {
+        var code = Vector<u8>.create();
+        if (!line.blank) {
+            for (k in 0..line.indent * 4) {
+                code.push(' ')?;
+            }
+            appendBytes(mut code, line.code[0..trimEndLength(line.code.view())])?;
+        }
+        units.push(utf16Units(code.view()))?;
+        codes.push(code)?;
+    }
+    var li: usize = 0;
+    while (li < lines.length) {
+        if (lines[li].trailing == none() || trimStartLength(codes[li].view()) == codes[li].length) {
+            li += 1;
+            continue;
+        }
+        var end = li;
+        while (end + 1 < lines.length && lines[end + 1].trailing != none() &&
+            trimStartLength(codes[end + 1].view()) < codes[end + 1].length) {
+            end += 1;
+        }
+        var column: u32 = 0;
+        for (k in li..end + 1) {
+            if (units[k] > column) {
+                column = units[k];
+            }
+        }
+        column += 1;
+        for (k in li..end + 1) {
+            while (units[k] < column) {
+                codes[k].push(' ')?;
+                units[k] += 1;
+            }
+            let comment = l.comments[lines[k].trailing as usize];
+            appendBytes(mut codes[k], l.source.text[comment.start as usize..comment.textEnd as usize])?;
+        }
+        li = end + 1;
+    }
+    var count = codes.length;
+    while (count > 0 && codes[count - 1].length == 0) {
+        count -= 1;
+    }
+    var text = Vector<u8>.create();
+    for (k in 0..count) {
+        appendBytes(mut text, codes[k].view())?;
+        text.push('\n')?;
+    }
+    return Ok(text);
+}
+
+/// Lays out one parsed file; null if the tree and the tokens disagree.
+fn layOut(
+    source: SourceText,
+    lexed: borrow Lexed,
+    ast: borrow Ast,
+    unit: borrow Unit,
+) -> Result<Vector<u8>?, AllocError> {
+    var l = newFmtLayout(source, lexed)?;
+    fmtWalkUnit(mut l, ast, unit)?;
+    if (l.failed) {
+        return Ok(null);
+    }
+    for (k in 0..l.containers.length) {
+        let broken = authorBroken(l, l.containers[k]);
+        l.containers[k].authorBroken = broken;
+        l.containers[k].broken = broken;
+    }
+    for (g in 0..l.groups.length) {
+        var any = elseOnNewLine(l, l.groups[g]);
+        for (c in l.groups[g].view()) {
+            any = any || l.containers[c as usize].broken;
+        }
+        if (any) {
+            for (m in 0..l.groups[g].length) {
+                let c = l.groups[g][m] as usize;
+                l.containers[c].broken = true;
+            }
+        }
+    }
+    for (k in 0..l.continuations.length) {
+        let token = l.continuations[k].token as i64;
+        let broken = l.newlineBetween(token, token + 1) || l.newlineBetween(token - 1, token);
+        l.continuations[k].authorBroken = broken;
+        l.continuations[k].broken = broken;
+    }
+    loop {
+        let lines = renderLines(mut l)?;
+        if (!breakLongLine(mut l, lines)) {
+            return Ok(finishLines(l, lines)?);
+        }
+    }
+}

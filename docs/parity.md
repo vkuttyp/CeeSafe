@@ -20,8 +20,8 @@ Lines are C# lines from the inventory. A file shared between phases counts under
 | P5 flat C | `Backend.C/` (not `CStructurer`), `CoreLibrary` (4,406) | run-pass 153, run-fail 40, emit-c 24, ffi 6, freestanding 3 (partial) | C configurations (§3); `FaultInjectionTests`, `CollectionPropertyTests`, `SourceMapTests`, `NicheLayoutTests`, freestanding symbol checks | **done** (`docs/p5-plan.md`): C identical 284/284 in four forms; the C matrix, the fault sweep, the collection properties and the freestanding checks ported and passing. `SourceMapTests` and `NicheLayoutTests` read the C, which is novac's byte for byte with and without `-g` (inferred covered; not ported) |
 | P6/P6R | — | gen2 = gen3 comparison (`tools/fixed_point.py`) | rename fixtures | P6 **done** (`docs/p6-fixed-point.md`); P6R **done** (Decision 0002; `compare_packages.py --renamed all|root`) |
 | P7 optimisations | `CheckElimination`, `PlacementAnalysis`, `ClosureSpecialisation`, `CStructurer` (2,379) | bounds-checks 3, overflow-checks 2, placement 3, closure-calls 1 | `StructuredCTests`; on/off runs of each switch | not started |
-| P8 tools | `Interpreter/`, `Packages/`, `Formatting/`, `Documentation/`, `Tooling/` (8,627 + `Manifest.cs` 274) | — | protocol and CLI fixtures for every test class marked P8 in the inventory | not started |
-| CLI | `Program.cs` (1,211) | — | the 15 commands and 26 listed options, plus the unlisted ones (inventory §2) | skeleton only (`--version`, `--help`) |
+| P8 tools | `Interpreter/`, `Packages/`, `Formatting/`, `Documentation/`, `Tooling/` (8,627 + `Manifest.cs` 274) | — | protocol and CLI fixtures for every test class marked P8 in the inventory | in progress (`docs/p8-plan.md`): `explain`, `fix` and `fmt` identical (S0, S1) |
+| CLI | `Program.cs` (1,211) | — | the 15 commands and 26 listed options, plus the unlisted ones (inventory §2) | `parse`, `check`, `build` with every option, `fix`, `explain`, `fmt`; novac's usage text and usage errors (`tools/compare_cli.py`) |
 
 ## 2. Corpus baseline (run 2026-10-30)
 

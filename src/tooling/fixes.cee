@@ -1,0 +1,193 @@
+/// `fix`: applying diagnostics' fixes to their sources (the reference's Fixer and Program.FixFiles; tooling.md §5.3).
+/// One edit of a fix taken: a file's byte range and its new text (TextEdit).
+struct FixEdit {
+    file: u32;
+    start: u32;
+    end: u32;
+    diagnostic: usize; // the diagnostic whose first fix this edit belongs to
+    second: bool;      // the fix's second edit
+}
+
+/// The fix's edits, in its order.
+fn editsOf(d: borrow Diagnostic, index: usize, out: borrow mut Vector<FixEdit>) -> Result<void, AllocError> {
+    out.push(FixEdit { file: d.file, start: d.fixStart, end: d.fixEnd, diagnostic: index, second: false })?;
+    if (d.hasSecondEdit) {
+        out.push(FixEdit { file: d.file, start: d.secondStart, end: d.secondEnd, diagnostic: index, second: true })?;
+    }
+    return Ok();
+}
+
+/// Two edits conflict if their ranges share a character, or if one inserts at a point the other touches (Overlaps).
+fn editsOverlap(a: borrow FixEdit, b: borrow FixEdit) -> bool {
+    let aEmpty = a.start == a.end;
+    let bEmpty = b.start == b.end;
+    return (a.start < b.end && b.start < a.end) || a.start == b.start || a.end == b.end ||
+        (aEmpty && b.start <= a.start && a.start <= b.end) || (bEmpty && a.start <= b.start && b.start <= a.end);
+}
+
+/// The fixes taken from `diagnostics`, in diagnostic order (Fixer.Apply): each fixable diagnostic's first fix, unless
+/// one of its edits overlaps an edit already taken in the same file. `fixable` says which diagnostics may be taken.
+fn takeFixes(
+    diagnostics: borrow Diagnostics,
+    fixable: borrow Vector<bool>,
+    taken: borrow mut Vector<FixEdit>,
+    applied: borrow mut Vector<usize>,
+) -> Result<void, AllocError> {
+    for (i in 0..diagnostics.items.length) {
+        if (!fixable[i]) {
+            continue;
+        }
+        var edits = Vector<FixEdit>.create();
+        editsOf(diagnostics.items[i], i, mut edits)?;
+        var clashes = false;
+        for (e in edits.view()) {
+            for (t in taken.view()) {
+                if (t.file == e.file && editsOverlap(t, e)) {
+                    clashes = true;
+                }
+            }
+        }
+        if (clashes) {
+            continue;
+        }
+        for (e in edits.view()) {
+            taken.push(
+                FixEdit { file: e.file, start: e.start, end: e.end, diagnostic: e.diagnostic, second: e.second },
+            )?;
+        }
+        applied.push(i)?;
+    }
+    return Ok();
+}
+
+fn newTextOf(d: borrow Diagnostic, second: bool) -> Slice<u8> => if (second) d.secondText.view() else d.fixText.view();
+
+/// The new text of `file` with the taken edits in it, applied back to front so earlier offsets hold.
+fn fixedText(
+    diagnostics: borrow Diagnostics,
+    source: borrow SourceText,
+    file: u32,
+    taken: borrow Vector<FixEdit>,
+) -> Result<Vector<u8>, AllocError> {
+    // The file's edits by descending start; equal starts cannot occur (they overlap).
+    var order = Vector<usize>.create();
+    for (k in 0..taken.length) {
+        if (taken[k].file == file) {
+            order.push(k)?;
+            var at = order.length - 1;
+            while (at > 0 && taken[order[at - 1]].start < taken[k].start) {
+                order[at] = order[at - 1];
+                at -= 1;
+            }
+            order[at] = k;
+        }
+    }
+    var text = copyBytes(source.text.view())?;
+    for (k in order.view()) {
+        let e = borrow taken[k];
+        var next = copyBytes(text[0..e.start as usize])?;
+        appendBytes(mut next, newTextOf(diagnostics.items[e.diagnostic], e.second))?;
+        appendBytes(mut next, text[e.end as usize..])?;
+        text = next;
+    }
+    return Ok(text);
+}
+
+/// The exit status `fix` returns from one round to ask for another.
+fn fixAgain() -> i32 => -1;
+
+/// The end of one round of `fix` over checked `sources`: with no fixable diagnostic, or with --dry-run, or after the
+/// last round, the diagnostics are reported; otherwise the fixed files are written and another round is asked for.
+/// A diagnostic is fixable if it has a fix and its file is one of the inputs (`inputs`), not a library's or dependency's.
+fn finishFixRound(
+    json: bool,
+    dryRun: bool,
+    lastRound: bool,
+    diagnostics: borrow Diagnostics,
+    sources: borrow Vector<SourceText>,
+    inputs: borrow Vector<bool>,
+) -> i32 {
+    var fixable = Vector<bool>.create();
+    var any = false;
+    for (d in diagnostics.items.view()) {
+        let yes = d.hasFix && inputs[d.file as usize];
+        fixable.push(yes)!;
+        any = any || yes;
+    }
+    if (!any) {
+        return report(json, diagnostics, sources);
+    }
+    var taken = Vector<FixEdit>.create();
+    var applied = Vector<usize>.create();
+    takeFixes(diagnostics, fixable, mut taken, mut applied)!;
+    if (dryRun) {
+        var out = Vector<u8>.create();
+        for (e in taken.view()) {
+            let d = borrow diagnostics.items[e.diagnostic];
+            let source = borrow sources[e.file as usize];
+            let p = source.position(e.start as usize);
+            appendBytes(mut out, source.path.view())!;
+            out.push(':')!;
+            appendDecimal(mut out, p.line as u64)!;
+            out.push(':')!;
+            appendDecimal(mut out, p.column as u64)!;
+            appendText(mut out, ": ")!;
+            appendBytes(mut out, d.fixTitle.view())!;
+            appendText(mut out, ": '")!;
+            appendBytes(mut out, source.text[e.start as usize..e.end as usize])!;
+            appendText(mut out, "' -> '")!;
+            appendBytes(mut out, newTextOf(d, e.second))!;
+            appendText(mut out, "'\n")!;
+        }
+        Console.writeBytes(out.view());
+        return report(json, diagnostics, sources);
+    }
+    // The files in ordinal path order, each written once.
+    var files = Vector<u32>.create();
+    for (e in taken.view()) {
+        var seen = false;
+        for (f in files.view()) {
+            seen = seen || f == e.file;
+        }
+        if (!seen) {
+            files.push(e.file)!;
+            var at = files.length - 1;
+            while (at > 0 && compareBytes(
+                sources[files[at - 1] as usize].path.view(),
+                sources[e.file as usize].path.view(),
+            ) > 0) {
+                files[at] = files[at - 1];
+                at -= 1;
+            }
+            files[at] = e.file;
+        }
+    }
+    for (f in files.view()) {
+        let source = borrow sources[f as usize];
+        let text = fixedText(diagnostics, source, f, taken)!;
+        let path = StringView.fromUtf8(source.path.view())!;
+        match (writeFile(path, text.view())) {
+            Ok() => {}
+            Err(e) => {
+                var message = String.create();
+                message.append("cannot write '")!;
+                message.append(path)!;
+                message.append("': ")!;
+                message.append(e.message())!;
+                return fail(message.view());
+            }
+        }
+    }
+    if (!json) {
+        var message = copyBytes("ceesafec fix: applied ".bytes())!;
+        appendDecimal(mut message, applied.length as u64)!;
+        appendText(mut message, " fix(es) to ")!;
+        appendDecimal(mut message, files.length as u64)!;
+        appendText(mut message, " file(s)\n")!;
+        Console.writeError(StringView.fromUtf8(message.view())!);
+    }
+    if (lastRound) {
+        return report(json, diagnostics, sources);
+    }
+    return fixAgain();
+}

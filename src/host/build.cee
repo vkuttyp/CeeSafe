@@ -140,7 +140,7 @@ fn compileIn(
             truncate<u64>(if (outcome.status < 0) 0 - (outcome.status as i64) else outcome.status as i64),
         )!;
         appendText(mut message, ")")!;
-        Console.writeError("novac: ");
+        Console.writeError("ceesafec: ");
         Console.writeErrorLine(StringView.fromUtf8(message.view())!);
         return 1;
     }

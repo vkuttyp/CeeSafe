@@ -1,0 +1,708 @@
+/// `doc` (the reference's Documentation/DocGenerator.cs and Program.Document; tooling.md §1): a Markdown page of the
+/// files' public items, made from the syntax alone. Signatures are cut from the formatter's output, so they read as
+/// `fmt` prints them.
+/// A public item, or a public method of one (DocEntry). Methods follow their type, with `parent` its index.
+struct DocItem {
+    kind: u32; // docKindText
+    name: Vector<u8>;
+    signature: Vector<u8>;
+    hasDoc: bool;
+    doc: Vector<u8>;
+    file: u32;
+    line: u32;
+    parent: u32;                    // the type's entry for a method, or none
+    implements: Vector<Vector<u8>>; // the interfaces of the `impl` blocks for this type, as written
+}
+
+/// 0 fn, 1 const, 2 static, 3 struct, 4 enum, 5 interface.
+fn docKindText(kind: u32) -> StringView => match (kind) {
+    0 => "fn",
+    1 => "const",
+    2 => "static",
+    3 => "struct",
+    4 => "enum",
+    _ => "interface",
+};
+
+/// One parsed file with its formatted text, whose tokens are the original's apart from commas (FileEntries).
+struct DocFile {
+    source: SourceText;
+    front: Frontend;
+    lexed: Lexed;
+    formatted: SourceText;
+    formattedTokens: Vector<Token>;
+    toFormatted: Vector<u32>; // the formatted token of each original token, or none for a comma
+    byStart: Vector<u32>;
+    byEnd: Vector<u32>;
+}
+
+/// An `impl` block's interface, as written, for the type named `forName`.
+struct DocImpl {
+    forName: Vector<u8>;
+    interfaceText: Vector<u8>;
+}
+
+fn identName(file: borrow DocFile, ident: u32) -> Slice<u8> =>
+    file.front.symbols.name(Symbol { id: file.front.ast.idents[ident as usize].symbol });
+
+fn newDocFile(
+    source: SourceText,
+    front: Frontend,
+    lexed: Lexed,
+    formatted: borrow Vector<u8>,
+) -> Result<DocFile, AllocError> {
+    let formattedSource = SourceText.create(source.path.view(), formatted.view())?;
+    var scratch = Frontend.create();
+    let relexed = lex(formattedSource.text.view(), 0, mut scratch.symbols, mut scratch.diagnostics)?;
+    var formattedTokens = Vector<Token>.create();
+    for (t in relexed.tokens.view()) {
+        formattedTokens.push(t)?;
+    }
+    var byStart = Vector<u32>.create();
+    var byEnd = Vector<u32>.create();
+    for (k in 0..source.text.length + 1) {
+        byStart.push(none())?;
+        byEnd.push(none())?;
+    }
+    var toFormatted = Vector<u32>.create();
+    var j: usize = 0;
+    for (i in 0..lexed.tokens.length) {
+        let t = lexed.tokens[i];
+        byStart[t.start as usize] = truncate<u32>(i);
+        byEnd[t.end as usize] = truncate<u32>(i);
+        if (sameKind(t.kind, TokenKind.Comma)) {
+            toFormatted.push(none())?;
+            continue;
+        }
+        while (j < formattedTokens.length && sameKind(formattedTokens[j].kind, TokenKind.Comma)) {
+            j += 1;
+        }
+        toFormatted.push(truncate<u32>(j))?;
+        j += 1;
+    }
+    return Ok(
+        DocFile {
+            source: source,
+            front: front,
+            lexed: lexed,
+            formatted: formattedSource,
+            formattedTokens: formattedTokens,
+            toFormatted: toFormatted,
+            byStart: byStart,
+            byEnd: byEnd,
+        },
+    );
+}
+
+fn docFirst(file: borrow DocFile, offset: u32) -> u32 => file.byStart[offset as usize];
+
+fn docLast(file: borrow DocFile, offset: u32) -> u32 => file.byEnd[offset as usize];
+
+/// An item's first token: its first attribute's if that comes first.
+fn docFirstOf(file: borrow DocFile, start: u32, attributes: Range) -> u32 {
+    let first = docFirst(file, start);
+    if (attributes.count == 0) {
+        return first;
+    }
+    let attribute = docFirst(file, file.front.ast.attributes[file.front.ast.at(attributes, 0) as usize].start);
+    return if (attribute < first) attribute else first;
+}
+
+fn firstBrace(file: borrow DocFile, from: u32) -> u32 {
+    var i = from;
+    while ((i as usize) + 1 < file.lexed.tokens.length &&
+        !sameKind(file.lexed.tokens[i as usize].kind, TokenKind.OpenBrace)) {
+        i += 1;
+    }
+    return i;
+}
+
+/// The formatted text from original token `first` to `last`, dedented: every line after the first loses the first
+/// line's column of indentation, or all of its leading white space if it is shorter.
+fn docTextOf(file: borrow DocFile, first: u32, last: u32) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    let start = file.formattedTokens[file.toFormatted[first as usize] as usize].start as usize;
+    let end = file.formattedTokens[file.toFormatted[last as usize] as usize].end as usize;
+    let column = file.formatted.position(start).column - 1;
+    let text = file.formatted.text.view();
+    var lineStart = start;
+    var k: u32 = 0;
+    while (lineStart <= end) {
+        var lineEnd = lineStart;
+        while (lineEnd < end && text[lineEnd] != '\n') {
+            lineEnd += 1;
+        }
+        let line = text[lineStart..lineEnd];
+        if (k > 0) {
+            out.push('\n')?;
+        }
+        if (k == 0 || utf16Units(line) < column) {
+            appendBytes(mut out, line[trimStartLength(line)..])?;
+        } else {
+            // Drop `column` UTF-16 code units.
+            var cut: usize = 0;
+            var units: u32 = 0;
+            while (units < column && cut < line.length) {
+                units += if (line[cut] >= 0xF0) 2 else 1;
+                cut += 1;
+                while (cut < line.length && line[cut] >= 0x80 && line[cut] < 0xC0) {
+                    cut += 1;
+                }
+            }
+            appendBytes(mut out, line[cut..])?;
+        }
+        k += 1;
+        lineStart = lineEnd + 1;
+    }
+    return Ok(out);
+}
+
+/// The doc comment before a token: the run of `///` lines directly before it (grammar.md §1.2), each without `///`
+/// and one following space, so that Markdown indentation is kept. Any other comment resets the run.
+fn docCommentBefore(file: borrow DocFile, token: u32, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    let start = file.lexed.tokens[token as usize].start;
+    let previousEnd = if (token > 0) file.lexed.tokens[(token - 1) as usize].end else 0;
+    let text = file.source.text.view();
+    var lines = Vector<Vector<u8>>.create();
+    for (c in file.lexed.comments.view()) {
+        if (c.start < previousEnd || c.end > start) {
+            continue;
+        }
+        let body = text[c.start as usize..c.end as usize];
+        let isDoc = body.length >= 3 && body[0] == '/' && body[1] == '/' && body[2] == '/' &&
+            !(body.length >= 4 && body[3] == '/');
+        if (!isDoc) {
+            lines.clear();
+            continue;
+        }
+        let rest = body[3..];
+        let line = rest[0..trimEndLength(rest)];
+        lines.push(copyBytes(if (line.length > 0 && line[0] == ' ') line[1..] else line)?)?;
+    }
+    if (lines.length == 0) {
+        return Ok(false);
+    }
+    for (k in 0..lines.length) {
+        if (k > 0) {
+            out.push('\n')?;
+        }
+        appendBytes(out, lines[k].view())?;
+    }
+    return Ok(true);
+}
+
+fn docEntry(
+    file: borrow DocFile,
+    index: u32,
+    kind: u32,
+    nameIdent: u32,
+    first: u32,
+    signature: Vector<u8>,
+    parent: u32,
+) -> Result<DocItem, AllocError> {
+    var doc = Vector<u8>.create();
+    let hasDoc = docCommentBefore(file, first, mut doc)?;
+    let line = file.source.position(file.lexed.tokens[first as usize].start as usize).line;
+    return Ok(
+        DocItem {
+            kind: kind,
+            name: copyBytes(identName(file, nameIdent))?,
+            signature: signature,
+            hasDoc: hasDoc,
+            doc: doc,
+            file: index,
+            line: line,
+            parent: parent,
+            implements: Vector<Vector<u8>>.create(),
+        },
+    );
+}
+
+/// A function's entry: its signature up to the body (the token before '{', before '=>', or before ';').
+fn docFunction(file: borrow DocFile, index: u32, f: u32, parent: u32) -> Result<DocItem, AllocError> {
+    let function = borrow file.front.ast.functions[f as usize];
+    var last: u32 = 0;
+    if (function.body != none()) {
+        last = docFirst(file, file.front.ast.stmtSpans[function.body as usize].start) - 1;
+    } else if (function.expressionBody != none()) {
+        last = docFirst(file, file.front.ast.exprSpans[function.expressionBody as usize].start) - 2;
+    } else {
+        last = docLast(file, function.end) - 1;
+    }
+    let first = docFirstOf(file, function.start, function.attributes);
+    let signature = docTextOf(file, first, last)?;
+    return docEntry(file, index, 0, function.name, first, signature, parent);
+}
+
+/// `header {\n    member\n    …\n}`, members indented by four spaces; the header alone without members.
+fn docMembers(header: Vector<u8>, members: borrow Vector<Vector<u8>>) -> Result<Vector<u8>, AllocError> {
+    if (members.length == 0) {
+        return Ok(header);
+    }
+    var out = header;
+    appendText(mut out, " {\n")?;
+    for (m in members.view()) {
+        appendText(mut out, "    ")?;
+        for (b in m.view()) {
+            out.push(b)?;
+            if (b == '\n') {
+                appendText(mut out, "    ")?;
+            }
+        }
+        out.push('\n')?;
+    }
+    out.push('}')?;
+    return Ok(out);
+}
+
+/// The last identifier of a named or generic type, or empty (TypeName).
+fn docTypeName(file: borrow DocFile, t: u32) -> Slice<u8> {
+    let ast = borrow file.front.ast;
+    let parts = match (ast.types[t as usize]) {
+        TypeNode.Named(name) => name.parts,
+        TypeNode.Generic(name, _) => name.parts,
+        _ => emptyRange(),
+    };
+    if (parts.count == 0) {
+        return "".bytes();
+    }
+    return identName(file, ast.at(parts, parts.count - 1));
+}
+
+fn isPublic(visibility: Visibility) -> bool => match (visibility) {
+    Visibility.Public => true,
+    _ => false,
+};
+
+fn docImplements(entry: borrow mut DocItem, impls: borrow Vector<DocImpl>) -> Result<void, AllocError> {
+    for (i in impls.view()) {
+        if (sameBytes(i.forName.view(), entry.name.view())) {
+            entry.implements.push(copyBytes(i.interfaceText.view())?)?;
+        }
+    }
+    return Ok();
+}
+
+/// The file's public items, in order, with their methods after them (FileEntries.Entries).
+fn docEntries(
+    file: borrow DocFile,
+    index: u32,
+    impls: borrow Vector<DocImpl>,
+    out: borrow mut Vector<DocItem>,
+) -> Result<void, AllocError> {
+    let ast = borrow file.front.ast;
+    let unit = borrow ast.units[0];
+    for (k in 0..unit.items.count) {
+        let id = ast.at(unit.items, k);
+        let item = borrow ast.items[id as usize];
+        match (item.kind) {
+            ItemKind.Extern(_, functions, _) => {
+                for (m in 0..functions.count) {
+                    let f = ast.at(functions, m);
+                    if (isPublic(ast.functions[f as usize].visibility)) {
+                        out.push(docFunction(file, index, f, none())?)?;
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if (!isPublic(item.visibility)) {
+            continue;
+        }
+        let first = docFirstOf(file, item.start, item.attributes);
+        match (item.kind) {
+            ItemKind.Function(f) => { out.push(docFunction(file, index, f, none())?)?; }
+            ItemKind.Const(_, _) => {
+                let signature = docTextOf(file, first, docLast(file, item.end) - 1)?;
+                out.push(docEntry(file, index, 1, item.name, first, signature, none())?)?;
+            }
+            ItemKind.Static(_, _, _) => {
+                let signature = docTextOf(file, first, docLast(file, item.end) - 1)?;
+                out.push(docEntry(file, index, 2, item.name, first, signature, none())?)?;
+            }
+            ItemKind.Struct(s) => {
+                let structure = borrow ast.structs[s as usize];
+                let header = docTextOf(
+                    file,
+                    first,
+                    firstBrace(file, docLast(file, ast.idents[item.name as usize].end)) - 1,
+                )?;
+                var fields = Vector<Vector<u8>>.create();
+                for (m in 0..structure.fields.count) {
+                    let field = borrow ast.fields[ast.at(structure.fields, m) as usize];
+                    if (isPublic(field.visibility)) {
+                        fields.push(docTextOf(file, docFirst(file, field.start), docLast(file, field.end))?)?;
+                    }
+                }
+                if (structure.dropBlock != none()) {
+                    fields.push(copyBytes("drop { … }".bytes())?)?;
+                }
+                var entry = docEntry(file, index, 3, item.name, first, docMembers(header, fields)?, none())?;
+                docImplements(mut entry, impls)?;
+                let parent = truncate<u32>(out.length);
+                out.push(entry)?;
+                for (m in 0..structure.functions.count) {
+                    let f = ast.at(structure.functions, m);
+                    if (isPublic(ast.functions[f as usize].visibility)) {
+                        out.push(docFunction(file, index, f, parent)?)?;
+                    }
+                }
+            }
+            ItemKind.Enum(variants, _, _) => {
+                let header = docTextOf(
+                    file,
+                    first,
+                    firstBrace(file, docLast(file, ast.idents[item.name as usize].end)) - 1,
+                )?;
+                var members = Vector<Vector<u8>>.create();
+                for (m in 0..variants.count) {
+                    let variant = borrow ast.variants[ast.at(variants, m) as usize];
+                    var text = docTextOf(file, docFirst(file, variant.start), docLast(file, variant.end))?;
+                    text.push(',')?;
+                    members.push(text)?;
+                }
+                var entry = docEntry(file, index, 4, item.name, first, docMembers(header, members)?, none())?;
+                docImplements(mut entry, impls)?;
+                out.push(entry)?;
+            }
+            ItemKind.Interface(methods, _) => {
+                let header = docTextOf(
+                    file,
+                    first,
+                    firstBrace(file, docLast(file, ast.idents[item.name as usize].end)) - 1,
+                )?;
+                var members = Vector<Vector<u8>>.create();
+                for (m in 0..methods.count) {
+                    let method = borrow ast.functions[ast.at(methods, m) as usize];
+                    let methodFirst = docFirstOf(file, method.start, method.attributes);
+                    members.push(docTextOf(file, methodFirst, docLast(file, method.end))?)?;
+                }
+                out.push(docEntry(file, index, 5, item.name, first, docMembers(header, members)?, none())?)?;
+            }
+            _ => {}
+        }
+    }
+    return Ok();
+}
+
+/// GitHub's anchor for a heading: lower case, spaces to '-', other punctuation dropped; repeats numbered.
+fn appendAnchor(
+    out: borrow mut Vector<u8>,
+    heading: Slice<u8>,
+    seen: borrow mut Vector<Vector<u8>>,
+) -> Result<void, AllocError> {
+    var anchor = Vector<u8>.create();
+    for (b in heading) {
+        let c = if (b >= 'A' && b <= 'Z') b + 32 else b;
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c >= 0x80) {
+            anchor.push(c)?;
+        } else if (c == ' ') {
+            anchor.push('-')?;
+        }
+    }
+    var count: u64 = 0;
+    for (s in seen.view()) {
+        if (sameBytes(s.view(), anchor.view())) {
+            count += 1;
+        }
+    }
+    appendBytes(out, anchor.view())?;
+    if (count > 0) {
+        out.push('-')?;
+        appendDecimal(out, count)?;
+    }
+    seen.push(anchor)?;
+    return Ok();
+}
+
+fn docBody(out: borrow mut Vector<u8>, entry: borrow DocItem) -> Result<void, AllocError> {
+    appendText(out, "```nova\n")?;
+    appendBytes(out, entry.signature.view())?;
+    appendText(out, "\n```\n")?;
+    if (entry.hasDoc) {
+        out.push('\n')?;
+        appendBytes(out, entry.doc.view())?;
+        out.push('\n')?;
+    }
+    return Ok();
+}
+
+/// The page (tooling.md §1.2).
+fn renderDocPage(entries: borrow Vector<DocItem>, title: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var text = copyBytes("# ".bytes())?;
+    appendBytes(mut text, title)?;
+    appendText(mut text, "\n\n")?;
+    var seen = Vector<Vector<u8>>.create();
+    for (e in entries.view()) {
+        if (e.parent != none()) {
+            continue;
+        }
+        var heading = copyBytes(docKindText(e.kind).bytes())?;
+        heading.push(' ')?;
+        appendBytes(mut heading, e.name.view())?;
+        appendText(mut text, "- [")?;
+        appendBytes(mut text, heading.view())?;
+        appendText(mut text, "](#")?;
+        appendAnchor(mut text, heading.view(), mut seen)?;
+        appendText(mut text, ")\n")?;
+    }
+    for (k in 0..entries.length) {
+        let e = borrow entries[k];
+        if (e.parent != none()) {
+            continue;
+        }
+        appendText(mut text, "\n## ")?;
+        appendText(mut text, docKindText(e.kind))?;
+        text.push(' ')?;
+        appendBytes(mut text, e.name.view())?;
+        appendText(mut text, "\n\n")?;
+        docBody(mut text, e)?;
+        for (m in k + 1..entries.length) {
+            if (entries[m].parent == truncate<u32>(k)) {
+                appendText(mut text, "\n### ")?;
+                appendBytes(mut text, e.name.view())?;
+                text.push('.')?;
+                appendBytes(mut text, entries[m].name.view())?;
+                appendText(mut text, "\n\n")?;
+                docBody(mut text, entries[m])?;
+            }
+        }
+        for (name in e.implements.view()) {
+            appendText(mut text, "\nImplements `")?;
+            appendBytes(mut text, name.view())?;
+            appendText(mut text, "`.\n")?;
+        }
+    }
+    return Ok(text);
+}
+
+/// The public items and methods without a doc comment, as `path:line: kind name` (tooling.md §1.3).
+fn missingDocs(
+    entries: borrow Vector<DocItem>,
+    files: borrow Vector<DocFile>,
+    out: borrow mut Vector<u8>,
+) -> Result<u32, AllocError> {
+    var count: u32 = 0;
+    for (k in 0..entries.length) {
+        let e = borrow entries[k];
+        if (e.parent != none()) {
+            continue;
+        }
+        var lines = Vector<usize>.create();
+        if (!e.hasDoc) {
+            lines.push(k)?;
+        }
+        for (m in k + 1..entries.length) {
+            if (entries[m].parent == truncate<u32>(k) && !entries[m].hasDoc) {
+                lines.push(m)?;
+            }
+        }
+        for (i in lines.view()) {
+            let x = borrow entries[i];
+            appendBytes(out, files[x.file as usize].source.path.view())?;
+            out.push(':')?;
+            appendDecimal(out, x.line as u64)?;
+            appendText(out, ": ")?;
+            appendText(out, docKindText(x.kind))?;
+            out.push(' ')?;
+            if (i != k) {
+                appendBytes(out, e.name.view())?;
+                out.push('.')?;
+            }
+            appendBytes(out, x.name.view())?;
+            out.push('\n')?;
+            count += 1;
+        }
+    }
+    return Ok(count);
+}
+
+/// `ceesafec doc [-o file] [--title text] [--missing] path...` (Program.Document).
+fn docCommand(arguments: borrow Vector<Vector<u8>>) -> i32 {
+    var output = Vector<u8>.create();
+    var hasOutput = false;
+    var title = Vector<u8>.create();
+    var hasTitle = false;
+    var missing = false;
+    var paths = Vector<Vector<u8>>.create();
+    var i: usize = 0;
+    while (i < arguments.length) {
+        let a = arguments[i].view();
+        if ((sameText(a, "-o") || sameText(a, "--title")) && i + 1 >= arguments.length) {
+            var message = copyBytes(a)!;
+            appendText(mut message, " needs a value")!;
+            return fail(StringView.fromUtf8(message.view())!);
+        }
+        if (sameText(a, "-o")) {
+            output = copyBytes(arguments[i + 1].view())!;
+            hasOutput = true;
+            i += 1;
+        } else if (sameText(a, "--title")) {
+            title = copyBytes(arguments[i + 1].view())!;
+            hasTitle = true;
+            i += 1;
+        } else if (sameText(a, "--missing")) {
+            missing = true;
+        } else if (a.length > 0 && a[0] == '-') {
+            var message = copyBytes("unknown doc option '".bytes())!;
+            appendBytes(mut message, a)!;
+            message.push('\'')!;
+            return fail(StringView.fromUtf8(message.view())!);
+        } else {
+            paths.push(copyBytes(a)!)!;
+        }
+        i += 1;
+    }
+    var files = Vector<Vector<u8>>.create();
+    namedSourceFiles(paths, mut files)!;
+    if (paths.length == 0) {
+        let cwd = match (Directory.current()) {
+            Ok(d) => d,
+            Err(_) => { return fail("cannot read the current directory"); }
+        };
+        match (findManifestDirectory(cwd.view().bytes())!) {
+            Some(directory) => {
+                // The package's own public items (tooling.md §4.4).
+                var problem = Vector<u8>.create();
+                let manifest = match (readManifest(directory.view(), mut problem)!) {
+                    Some(m) => m,
+                    null => { return fail(StringView.fromUtf8(problem.view())!); }
+                };
+                var found = Vector<Vector<u8>>.create();
+                sourceFiles(manifest, mut found)!;
+                files.clear();
+                for (f in found.view()) {
+                    files.push(sourcePath(StringView.fromUtf8(f.view())!))!;
+                }
+                if (!hasTitle) {
+                    title = copyBytes(manifest.name.view())!;
+                    hasTitle = true;
+                }
+            }
+            null => {}
+        }
+    }
+    if (files.length == 0) {
+        return fail("no Nova input files");
+    }
+    // Every file is parsed and formatted; any syntax error stops the page (DocGenerator.Collect).
+    var sources = Vector<SourceText>.create();
+    var diagnostics = Diagnostics.create();
+    var docFiles = Vector<DocFile>.create();
+    for (file in files.view()) {
+        let path = StringView.fromUtf8(file.view())!;
+        let bytes = match (readFile(path)) {
+            Ok(b) => b,
+            Err(ReadError.Io(e)) => {
+                var message = String.create();
+                message.append("cannot read '")!;
+                message.append(path)!;
+                message.append("': ")!;
+                message.append(e.message())!;
+                return fail(message.view());
+            }
+            Err(ReadError.Memory) => { return fail("out of memory"); }
+        };
+        let name = sourcePath(path);
+        sources.push(SourceText.create(name.view(), bytes.view())!)!;
+        let index = sources.length - 1;
+        var front = Frontend.create();
+        let lexed = lex(sources[index].text.view(), truncate<u32>(index), mut front.symbols, mut front.diagnostics)!;
+        var scratch = Frontend.create();
+        let kept = lex(sources[index].text.view(), truncate<u32>(index), mut scratch.symbols, mut scratch.diagnostics)!;
+        front = parseFile(truncate<u32>(index), lexed, front)!;
+        let failed = front.diagnostics.hasErrors();
+        for (d in front.diagnostics.items.view()) {
+            diagnostics.items.push(copyDiagnostic(d)!)!;
+        }
+        if (failed) {
+            continue;
+        }
+        var ignored = Diagnostics.create();
+        let formatted = formatSource(sources[index], truncate<u32>(index), mut ignored)!;
+        let text = match (formatted.text) {
+            Some(t) => t,
+            null => {
+                var message = copyBytes("ceesafec doc: internal error in ".bytes())!;
+                appendBytes(mut message, sources[index].path.view())!;
+                appendText(mut message, ": the formatter failed\n")!;
+                Console.writeError(StringView.fromUtf8(message.view())!);
+                return 70;
+            }
+        };
+        let copy = SourceText.create(sources[index].path.view(), sources[index].text.view())!;
+        docFiles.push(newDocFile(copy, front, kept, text)!)!;
+    }
+    var rendered = Vector<u8>.create();
+    for (d in diagnostics.items.view()) {
+        render(mut rendered, d, sources[d.file as usize])!;
+    }
+    Console.writeError(StringView.fromUtf8(rendered.view())!);
+    if (diagnostics.hasErrors()) {
+        return 1;
+    }
+    // The impl blocks of every file, by the name of the type they are for.
+    var impls = Vector<DocImpl>.create();
+    for (f in docFiles.view()) {
+        let ast = borrow f.front.ast;
+        let unit = borrow ast.units[0];
+        for (k in 0..unit.items.count) {
+            match (ast.items[ast.at(unit.items, k) as usize].kind) {
+                ItemKind.Impl(interfaceType, forType, _) => {
+                    let span = ast.typeSpans[interfaceType as usize];
+                    impls.push(
+                        DocImpl {
+                            forName: copyBytes(docTypeName(f, forType))!,
+                            interfaceText: copyBytes(f.source.text[span.start as usize..span.end as usize])!,
+                        },
+                    )!;
+                }
+                _ => {}
+            }
+        }
+    }
+    var entries = Vector<DocItem>.create();
+    for (k in 0..docFiles.length) {
+        docEntries(docFiles[k], truncate<u32>(k), impls, mut entries)!;
+    }
+    if (missing) {
+        var out = Vector<u8>.create();
+        let count = missingDocs(entries, docFiles, mut out)!;
+        Console.writeBytes(out.view());
+        return if (count == 0) 0 else 1;
+    }
+    if (!hasTitle) {
+        // The first file's name without its extension.
+        let first = files[0].view();
+        var start = first.length;
+        while (start > 0 && first[start - 1] != '/' && first[start - 1] != '\\') {
+            start -= 1;
+        }
+        var end = first.length;
+        while (end > start && first[end - 1] != '.') {
+            end -= 1;
+        }
+        if (end == start) {
+            end = first.length + 1;
+        }
+        title = copyBytes(first[start..end - 1])!;
+    }
+    let page = renderDocPage(entries, title.view())!;
+    if (hasOutput) {
+        match (writeFile(StringView.fromUtf8(output.view())!, page.view())) {
+            Ok() => {}
+            Err(e) => {
+                var message = String.create();
+                message.append("cannot write '")!;
+                message.append(StringView.fromUtf8(output.view())!)!;
+                message.append("': ")!;
+                message.append(e.message())!;
+                return fail(message.view());
+            }
+        }
+    } else {
+        Console.writeBytes(page.view());
+    }
+    return 0;
+}

@@ -1,19 +1,152 @@
-/// ceesafec: the CeeSafe compiler, being ported from Nova's C# novac (ROADMAP.md).
-/// P2 in progress: `parse` lexes and parses its files and reports their diagnostics (text, or the reference's JSON
-/// with `--diagnostics-format=json`); `--dump-ast` prints the tree as the reference does, and `--dump-tokens` the
-/// lexer's output for the token-dump oracle. Every other command says which phase implements it.
-fn usage() {
-    Console.writeLine("usage: ceesafec <command> [options] <file.nova>...");
-    Console.writeLine("");
-    Console.writeLine("Commands are novac's (docs/reference-inventory.md §2). Implemented so far:");
-    Console.writeLine("  parse <file.nova>...   parse the files and report their diagnostics");
-    Console.writeLine("    --dump-ast                  print each file's syntax tree");
-    Console.writeLine("    --diagnostics-format=json   diagnostics as the reference's JSON document, on stdout");
-    Console.writeLine(
-        "    --dump-tokens               print the lexer's output (CeeSafe only; docs/p2-frontend.md §3)",
-    );
-    Console.writeLine("  --version    print the version");
-    Console.writeLine("  -h, --help   print this text");
+/// ceesafec: the CeeSafe compiler, ported from Nova's C# novac (ROADMAP.md). The commands and options are novac's
+/// (docs/reference-inventory.md §2), under CeeSafe's names; a command not yet ported says which phase brings it.
+/// novac's usage text (Program.Usage) under CeeSafe's names (ROADMAP §3.4).
+fn appendUsage(out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    appendText(out, "usage: ceesafec <command> [options] <file.cee>... [<file.c>...] [-- <program arguments>]\n")?;
+    appendText(out, "\n")?;
+    appendText(
+        out,
+        "Without files, parse, check, build, run, doc and fmt use the package of the nearest ceesafe.toml\n",
+    )?;
+    appendText(out, "(tooling.md §4); --offline uses only what is already fetched.\n")?;
+    appendText(out, "\n")?;
+    appendText(out, "commands:\n")?;
+    appendText(out, "  parse    lex and parse the files, report syntax errors\n")?;
+    appendText(out, "  check    parse and type-check the files as one package\n")?;
+    appendText(out, "  build    compile the package to C, and by default to an executable; .c files are compiled\n")?;
+    appendText(out, "           and linked with it (type-system.md §28.6)\n")?;
+    appendText(out, "  run      run the package with the NIR reference interpreter (--interp)\n")?;
+    appendText(out, "  fmt      rewrite the files (or the .cee files under a directory) in the canonical style\n")?;
+    appendText(out, "           (formatting.md); --check lists the files that would change, --stdout prints one\n")?;
+    appendText(
+        out,
+        "  new      make a package: ceesafec new <name> [--lib] [--agent <names>] [--no-agent] (tooling.md §4.4);\n",
+    )?;
+    appendText(
+        out,
+        "           it writes AGENTS.md for AI agents, and with --agent claude,gemini,copilot,cursor their files\n",
+    )?;
+    appendText(out, "           and MCP configurations too (tooling.md §7)\n")?;
+    appendText(
+        out,
+        "  agents   write or refresh the package's agent instructions: ceesafec agents [--agent <names>] (tooling.md §7.3)\n",
+    )?;
+    appendText(
+        out,
+        "  fetch    resolve the package's dependencies and write ceesafe.lock (--offline: no git; --update [name]:\n",
+    )?;
+    appendText(out, "           choose registry versions afresh, tooling.md §4.7)\n")?;
+    appendText(
+        out,
+        "  publish  check that the package can be published and print its index entry (tooling.md §4.8)\n",
+    )?;
+    appendText(
+        out,
+        "  index-check  check a package index's entries against their commits, for the index's CI (tooling.md §4.8)\n",
+    )?;
+    appendText(out, "  lsp      serve the Language Server Protocol on standard input and output (tooling.md §2)\n")?;
+    appendText(
+        out,
+        "  mcp      serve the Model Context Protocol on standard input and output, for AI agents (tooling.md §6)\n",
+    )?;
+    appendText(
+        out,
+        "  fix      apply the compiler's fixes to the files (or the package) and check again, until none\n",
+    )?;
+    appendText(out, "           applies (tooling.md §5.3); --dry-run prints the edits instead\n")?;
+    appendText(out, "  explain  print what a diagnostic code means: ceesafec explain N0249 (tooling.md §5.4)\n")?;
+    appendText(out, "  doc      write a Markdown page of the files' public items (tooling.md §1): -o <file>,\n")?;
+    appendText(out, "           --title <text>; --missing lists the public items without a doc comment\n")?;
+    appendText(out, "options:\n")?;
+    appendText(out, "  --diagnostics-format text|json\n")?;
+    appendText(
+        out,
+        "                    (parse, check, build, run, fmt, fix) diagnostics as text on standard error (default),\n",
+    )?;
+    appendText(out, "                    or as one JSON document on standard output, with fixes (tooling.md §5.1)\n")?;
+    appendText(out, "  --dump-ast        (parse) print the AST of each file\n")?;
+    appendText(out, "  --dump-hir        (check) print the typed HIR of the package\n")?;
+    appendText(out, "  --dump-nir        (build) print the NIR of the package\n")?;
+    appendText(
+        out,
+        "  --emit c|exe|obj  (build) write C sources (to the -o directory), an executable (default), or one\n",
+    )?;
+    appendText(out, "                    relocatable object (cosmoos/profiles.md §4.3)\n")?;
+    appendText(
+        out,
+        "  --kernel cosmoos  (build, check, with --profile freestanding) include lib/kernel, the library for a kernel\n",
+    )?;
+    appendText(
+        out,
+        "                    with CosmoOS's C API: locks, guards, per-CPU data, kernel objects (ADR 0025)\n",
+    )?;
+    appendText(out, "  --profile hosted|freestanding\n")?;
+    appendText(
+        out,
+        "                    (build, check) the profile: hosted (default) or freestanding, with no C library\n",
+    )?;
+    appendText(out, "                    and no operating system (cosmoos/profiles.md §4)\n")?;
+    appendText(
+        out,
+        "  --no-float        (build, check) reject every float type and literal, for code built without FP\n",
+    )?;
+    appendText(out, "                    registers such as a kernel (type-system.md §35.9)\n")?;
+    appendText(out, "  -o <path>         (build) output file or directory; default: name of the first input\n")?;
+    appendText(
+        out,
+        "  --cc <compiler>   (build) C compiler for --emit exe; default: $CC, else cc, or on Windows clang, gcc or\n",
+    )?;
+    appendText(out, "                    Visual Studio's cl, found and set up (tooling.md §8)\n")?;
+    appendText(out, "  --cflag <flag>    (build) extra flag for the C compiler (repeatable)\n")?;
+    appendText(
+        out,
+        "  --ld <linker>     (build --emit obj) join the objects with '<linker> -r' (e.g. ld.lld for ELF\n",
+    )?;
+    appendText(out, "                    cross builds) instead of the C compiler\n")?;
+    appendText(out, "  --line-directives (build) map the generated C to Nova lines with #line\n")?;
+    appendText(out, "  -g                (build) debug build: #line directives, C compiled with -g -O0\n")?;
+    appendText(
+        out,
+        "  --flat-c          (build) emit the flat form: one label per block, no if/loop reconstruction\n",
+    )?;
+    appendText(out, "  --interp          (run) interpret the checked NIR (intermediate-representation.md §5)\n")?;
+    appendText(
+        out,
+        "  --no-placement    (build, run) keep every box on the heap (placement is on by default, optimisations.md §4)\n",
+    )?;
+    appendText(out, "  --explain-allocations  (build) print where every allocation site's memory comes from\n")?;
+    appendText(
+        out,
+        "  --no-bce          (build, run) keep every index check (no bounds-check elimination, optimisations.md §2)\n",
+    )?;
+    appendText(out, "  --explain-bounds-checks  (build) print each index check and whether it was removed\n")?;
+    appendText(
+        out,
+        "  --no-oce          (build, run) keep every overflow check (no overflow-check elimination, optimisations.md §3)\n",
+    )?;
+    appendText(
+        out,
+        "  --explain-overflow-checks  (build) print each checked + - * and negation and whether its check was removed\n",
+    )?;
+    appendText(
+        out,
+        "  --no-closure-specialisation  (build, run) keep every call through a closure indirect (optimisations.md §5)\n",
+    )?;
+    appendText(
+        out,
+        "  --split           (build) write the C as nova_program.h, one .c per Nova file and nova_instances.c,\n",
+    )?;
+    appendText(out, "                    so it compiles in parallel (c-backend.md §2.4)\n")?;
+    appendText(
+        out,
+        "  --program <name>  (build --split) the name external C names carry; default: the package's, or the\n",
+    )?;
+    appendText(out, "                    first file's\n")?;
+    appendText(
+        out,
+        "  --explain-closure-calls  (build) print each call through a closure, whether it became direct, and each variant made\n",
+    )?;
+    return Ok();
 }
 
 /// The roadmap phase that brings a command to parity, or null if novac has no such command.
@@ -73,11 +206,18 @@ struct Options {
     cTexts: Vector<Vector<u8>>; // and texts
     defaultOutput: Vector<u8>;  // package mode: <package>/out/<name>
     files: Vector<String>;
+    fixing: bool; // `fix`: check, then apply the fixes (tooling.md §5.3)
+    dryRun: bool; // fix --dry-run
+    fixRound: u32;
 }
 
+/// A usage error: the message and the usage text on stderr (Program.Fail).
 fn fail(message: StringView) -> i32 {
-    Console.writeError("novac: ");
-    Console.writeErrorLine(message);
+    var out = copyBytes("ceesafec: ".bytes())!;
+    appendText(mut out, message)!;
+    out.push('\n')!;
+    appendUsage(mut out)!;
+    Console.writeError(StringView.fromUtf8(out.view())!);
     return 2;
 }
 
@@ -87,29 +227,65 @@ fn copyText(text: StringView) -> String {
     return s;
 }
 
-/// Reads the arguments after the command, or returns the exit status of a usage error.
-fn readOptions(options: borrow mut Options) -> i32 {
+/// The arguments after the command without `--diagnostics-format` (Program.TakeDiagnosticsFormat), for the commands
+/// that read no diagnostics options; or the exit status of a usage error.
+fn plainArguments(arguments: borrow mut Vector<Vector<u8>>, json: borrow mut bool) -> i32 {
     var a: usize = 2;
     while (a < Process.argumentCount()) {
         let arg = Process.argument(a)!;
         a += 1;
-        if (arg == "--diagnostics-format=json") {
-            options.json = true;
-        } else if (arg == "--diagnostics-format=text") {
-            options.json = false;
+        if (arg == "--") {
+            arguments.push(copyBytes(arg.bytes())!)!;
+            while (a < Process.argumentCount()) {
+                arguments.push(copyBytes(Process.argument(a)!.bytes())!)!;
+                a += 1;
+            }
+            return 0;
+        }
+        let bytes = arg.bytes();
+        var value: StringView? = null;
+        if (bytes.length >= 21 && sameText(bytes[0..21], "--diagnostics-format=")) {
+            value = StringView.fromUtf8(bytes[21..])!;
         } else if (arg == "--diagnostics-format") {
-            let value = match (Process.argument(a)) {
+            value = match (Process.argument(a)) {
                 Some(v) => v,
-                null => { return fail("option '--diagnostics-format' needs a value"); }
+                null => "",
             };
             a += 1;
-            if (value == "json") {
-                options.json = true;
-            } else if (value == "text") {
-                options.json = false;
-            } else {
-                return fail("--diagnostics-format must be 'text' or 'json'");
-            }
+        } else {
+            arguments.push(copyBytes(arg.bytes())!)!;
+            continue;
+        }
+        let given = value!;
+        if (given != "text" && given != "json") {
+            var message = String.create();
+            message.append("--diagnostics-format must be 'text' or 'json', not '")!;
+            message.append(given)!;
+            message.append("'")!;
+            return fail(message.view());
+        }
+        json = given == "json";
+    }
+    return 0;
+}
+
+/// Reads the arguments after the command, or returns the exit status of a usage error.
+fn readOptions(options: borrow mut Options) -> i32 {
+    // The format is taken out first, so its errors come before any other (Program.Run).
+    var ignored = Vector<Vector<u8>>.create();
+    let formatStatus = plainArguments(mut ignored, mut options.json);
+    if (formatStatus != 0) {
+        return formatStatus;
+    }
+    var a: usize = 2;
+    while (a < Process.argumentCount()) {
+        let arg = Process.argument(a)!;
+        a += 1;
+        let bytes = arg.bytes();
+        if (bytes.length >= 21 && sameText(bytes[0..21], "--diagnostics-format=")) {
+            // taken out above
+        } else if (arg == "--diagnostics-format") {
+            a += 1;
         } else if (arg == "--dump-ast") {
             options.dumpAst = true;
         } else if (arg == "--dump-hir") {
@@ -218,6 +394,8 @@ fn readOptions(options: borrow mut Options) -> i32 {
             }
         } else if (arg == "--dump-tokens") {
             options.dumpTokens = true;
+        } else if (options.fixing && arg == "--dry-run") {
+            options.dryRun = true;
         } else if (arg.length > 0 && arg[0] == '-') {
             var message = String.create();
             message.append("unknown option '")!;
@@ -275,9 +453,7 @@ fn loadFiles(files: borrow Vector<String>, sources: borrow mut Vector<SourceText
                 message.append(path)!;
                 message.append("': ")!;
                 message.append(e.message())!;
-                Console.writeError("novac: ");
-                Console.writeErrorLine(message.view());
-                return 2;
+                return fail(message.view());
             }
             Err(ReadError.Memory) => { return fail("out of memory"); }
         };
@@ -393,6 +569,9 @@ fn parseCommand() -> i32 {
         cTexts: Vector<Vector<u8>>.create(),
         defaultOutput: Vector<u8>.create(),
         files: Vector<String>.create(),
+        fixing: false,
+        dryRun: false,
+        fixRound: 0,
     };
     let status = readOptions(mut options);
     if (status != 0) {
@@ -572,13 +751,38 @@ fn loadPackage(
     return 0;
 }
 
-fn checkCommand() -> i32 => fileCommand(false);
+/// The end of `check` (or of one round of `fix`): the diagnostics reported, or the fixes applied.
+fn finish(
+    options: borrow Options,
+    diagnostics: borrow Diagnostics,
+    sources: borrow Vector<SourceText>,
+    inputs: borrow Vector<bool>,
+) -> i32 {
+    if (!options.fixing) {
+        return report(options.json, diagnostics, sources);
+    }
+    return finishFixRound(options.json, options.dryRun, options.fixRound == 7, diagnostics, sources, inputs);
+}
+
+fn checkCommand() -> i32 => fileCommand(false, false, 0);
+
+/// `fix` (Program.FixFiles): checks, applies every fix, writes the files and checks again, until no fix applies or
+/// after 8 rounds; then reports what remains. Only the given files (or the root package's own sources) are edited.
+fn fixCommand() -> i32 {
+    for (round in 0..8) {
+        let status = fileCommand(false, true, truncate<u32>(round));
+        if (status != fixAgain()) {
+            return status;
+        }
+    }
+    return 0;
+}
 
 /// `build --dump-nir` (P4): the checks, then the NIR after drop elaboration, printed as novac prints it with the
 /// optimisations turned off. Building C is P5.
-fn buildCommand() -> i32 => fileCommand(true);
+fn buildCommand() -> i32 => fileCommand(true, false, 0);
 
-fn fileCommand(building: bool) -> i32 {
+fn fileCommand(building: bool, fixing: bool, fixRound: u32) -> i32 {
     var options = Options {
         json: false,
         dumpTokens: false,
@@ -618,6 +822,9 @@ fn fileCommand(building: bool) -> i32 {
         cTexts: Vector<Vector<u8>>.create(),
         defaultOutput: Vector<u8>.create(),
         files: Vector<String>.create(),
+        fixing: fixing,
+        dryRun: false,
+        fixRound: fixRound,
     };
     let status = readOptions(mut options);
     if (status != 0) {
@@ -701,6 +908,10 @@ fn fileCommand(building: bool) -> i32 {
     while (fileIsLibrary.length < sources.length) {
         fileIsLibrary.push(false)!;
     }
+    var inputs = Vector<bool>.create(); // the files `fix` may edit: the root package's or the command line's
+    for (p in filePackage.view()) {
+        inputs.push(p == 0)!;
+    }
     var front = Frontend.create();
     for (i in 0..sources.length) {
         let source = borrow sources[i];
@@ -715,7 +926,7 @@ fn fileCommand(building: bool) -> i32 {
         }
     }
     if (front.diagnostics.hasErrors()) {
-        return report(options.json, front.diagnostics, sources);
+        return finish(options, front.diagnostics, sources, inputs);
     }
     var texts = Vector<Vector<u8>>.create();
     var paths = Vector<Vector<u8>>.create();
@@ -821,13 +1032,15 @@ fn fileCommand(building: bool) -> i32 {
         }
         return buildFiles(options, files, sources[user].path.view());
     }
-    return report(options.json, checker.front.diagnostics, sources);
+    return finish(options, checker.front.diagnostics, sources, inputs);
 }
 
 fn main() -> i32 {
     let argument = Process.argument(1);
     if (argument == null) {
-        usage();
+        var out = Vector<u8>.create();
+        appendUsage(mut out)!;
+        Console.writeBytes(out.view());
         return 2;
     }
     let command = argument!;
@@ -836,7 +1049,9 @@ fn main() -> i32 {
         return 0;
     }
     if (command == "-h" || command == "--help") {
-        usage();
+        var out = Vector<u8>.create();
+        appendUsage(mut out)!;
+        Console.writeBytes(out.view());
         return 0;
     }
     if (command == "parse") {
@@ -847,6 +1062,36 @@ fn main() -> i32 {
     }
     if (command == "build") {
         return buildCommand();
+    }
+    if (command == "fix") {
+        return fixCommand();
+    }
+    if (command == "fmt") {
+        var arguments = Vector<Vector<u8>>.create();
+        var json = false;
+        let status = plainArguments(mut arguments, mut json);
+        if (status != 0) {
+            return status;
+        }
+        return fmtCommand(arguments, json);
+    }
+    if (command == "doc") {
+        var arguments = Vector<Vector<u8>>.create();
+        var json = false;
+        let status = plainArguments(mut arguments, mut json);
+        if (status != 0) {
+            return status;
+        }
+        return docCommand(arguments);
+    }
+    if (command == "explain") {
+        var arguments = Vector<Vector<u8>>.create();
+        var json = false;
+        let status = plainArguments(mut arguments, mut json);
+        if (status != 0) {
+            return status;
+        }
+        return explainCommand(arguments);
     }
     match (phaseOf(command)) {
         Some(phase) => {

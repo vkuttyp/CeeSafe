@@ -6,8 +6,8 @@ of docs/diagnostics.md first, then of the other embedded documents under docs/ i
 docs/api/*.md, docs/decisions/*.md, docs/cosmoos/profiles.md); the first row for a code wins. The documents are read
 from a Nova checkout at the pinned tag, which must be clean.
 
-usage: python3 tools/gen_catalog.py [--nova PATH]   (default ~/Nova; formats with $NOVAC, default the pinned
-       ~/.nova/0.6.0/bin/novac; review the diff)
+usage: python3 tools/gen_catalog.py [--nova PATH]   (default ~/Nova; formats with $CEESAFEC, default
+       out/ceesafec; review the diff)
 """
 
 import argparse
@@ -73,8 +73,8 @@ fn summaryOf(number: u32) -> StringView => match (number) {{
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(source)
-    novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/0.6.0/bin/novac"))
-    subprocess.run([novac, "fmt", path], check=True)
+    formatter = os.environ.get("CEESAFEC", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "out", "ceesafec"))
+    subprocess.run([formatter, "fmt", path], check=True)
     print(f"gen_catalog: wrote {path} ({len(found)} codes from Nova {head})")
 
 

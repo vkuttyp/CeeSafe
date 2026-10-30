@@ -19,14 +19,14 @@ import tempfile
 import subprocess
 import sys
 
+from names import map_back
+
 
 def run(compiler, directory, arguments):
     result = subprocess.run([compiler, "check"] + arguments, cwd=directory, capture_output=True)
     return result.returncode, result.stdout + result.stderr
 
 
-MAP_BACK = ((b"ceesafec fetch", b"novac fetch"), (b"ceesafe.toml", b"nova.toml"), (b"ceesafe.lock", b"nova.lock"),
-            (b".cee", b".nova"))
 
 
 def renamed_copy(fixture, work):
@@ -45,9 +45,7 @@ def renamed_copy(fixture, work):
 
 def mapped_back(outcome):
     status, output = outcome
-    for new, old in MAP_BACK:
-        output = output.replace(new, old)
-    return status, output
+    return status, map_back(output)
 
 
 def main():

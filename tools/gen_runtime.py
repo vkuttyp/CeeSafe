@@ -5,7 +5,7 @@ ThreadRuntime; Nova.Compiler.csproj's embedded resources).
 The files are read with `git show TAG:PATH` from a Nova repository, so its working tree may be anywhere; line endings
 are made "\\n" as ReadResource does. Each file is split into string literals of at most 4,000 bytes (C11 §5.2.4.1).
 
-usage: python3 tools/gen_runtime.py [--nova PATH] [--tag TAG]   (default ~/Nova, v0.6.0; formats with $NOVAC)
+usage: python3 tools/gen_runtime.py [--nova PATH] [--tag TAG]   (default ~/Nova, v0.6.0; formats with $CEESAFEC, default out/ceesafec)
 """
 
 import argparse
@@ -93,8 +93,8 @@ fn appendRuntimeText(out: borrow mut Vector<u8>, k: usize) -> Result<void, Alloc
     path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "src", "library", "runtime.cee"))
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(source)
-    novac = os.environ.get("NOVAC", os.path.expanduser("~/.nova/0.6.0/bin/novac"))
-    subprocess.run([novac, "fmt", path], check=True)
+    formatter = os.environ.get("CEESAFEC", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "out", "ceesafec"))
+    subprocess.run([formatter, "fmt", path], check=True)
     print(f"gen_runtime: wrote {path} ({len(files)} files from Nova {args.tag})")
 
 

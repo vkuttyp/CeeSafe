@@ -82,8 +82,9 @@ the markers, and never edit between them.
   good `out/ceesafec` before changing the compiler, so a broken build can be rebuilt by the previous one.
   `~/.nova/bin/novac` is 0.3.1, which CosmoOS's `make nova` still pins: leave it there. The `novac` on `PATH` may be a
   development wrapper around `~/Nova`'s working tree and is not reproducible.
-- Formatting is still novac's until ceesafec has `fmt` (P8): `~/.nova/0.6.0/bin/novac fmt $(git ls-files 'src/*.cee')`
-  (`novac fmt` on a directory looks only for `.nova` files).
+- Format with ceesafec (P8 S1, identical to novac's formatter): `out/ceesafec fmt` formats the package's `.cee`
+  sources, `out/ceesafec fmt --check` lists the ones that would change. The generators (`tools/gen_*.py`) format their
+  output with it too ($CEESAFEC).
 - Nova and CeeSafe exist in parallel (Decision 0003): ceesafec reads only `ceesafe.toml` packages, but files named on
   the command line may have any extension, so Nova's corpus and `tests/` stay `.nova`, compared with novac. CeeSafe
   tracks Nova (its specifications, releases and corpus) until P8. Diagnostic codes keep the letter N.

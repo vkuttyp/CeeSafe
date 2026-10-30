@@ -1,0 +1,193 @@
+/// `explain`: a diagnostic code's row of the specification and the paragraphs of docs/diagnostics.md that cite it
+/// (the reference's DiagnosticCatalog and Program.Explain; tooling.md §5.4).
+/// One code's row: its meaning and example (DiagnosticEntry).
+struct CatalogEntry {
+    meaning: Vector<u8>;
+    example: Vector<u8>;
+}
+
+/// Whether `c` is whitespace to String.Trim (the ASCII part of char.IsWhiteSpace, and NBSP's UTF-8 is not trimmed).
+fn isTrimmedSpace(c: u8) -> bool => c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 0x0B || c == 0x0C;
+
+fn trimmed(text: Slice<u8>) -> Slice<u8> {
+    var start: usize = 0;
+    var end = text.length;
+    while (start < end && isTrimmedSpace(text[start])) {
+        start += 1;
+    }
+    while (end > start && isTrimmedSpace(text[end - 1])) {
+        end -= 1;
+    }
+    return text[start..end];
+}
+
+fn trimmedStart(text: Slice<u8>) -> Slice<u8> {
+    var start: usize = 0;
+    while (start < text.length && isTrimmedSpace(text[start])) {
+        start += 1;
+    }
+    return text[start..];
+}
+
+/// Whether `cell`, trimmed and without surrounding backquotes, is `code`, an N and four ASCII digits.
+fn cellIsCode(cell: Slice<u8>, code: Slice<u8>) -> bool {
+    let t = trimmed(cell);
+    var start: usize = 0;
+    var end = t.length;
+    while (start < end && t[start] == '`') {
+        start += 1;
+    }
+    while (end > start && t[end - 1] == '`') {
+        end -= 1;
+    }
+    let c = t[start..end];
+    if (c.length != 5 || c[0] != 'N') {
+        return false;
+    }
+    for (k in 1..c.length) {
+        if (c[k] < '0' || c[k] > '9') {
+            return false;
+        }
+    }
+    return sameBytes(c, code);
+}
+
+/// The first row `| N0123 | meaning | example |` for `code` in `text`, if there is one.
+fn rowFor(text: Slice<u8>, code: Slice<u8>) -> Result<CatalogEntry?, AllocError> {
+    var start: usize = 0;
+    while (start <= text.length) {
+        var end = start;
+        while (end < text.length && text[end] != '\n') {
+            end += 1;
+        }
+        let line = text[start..end];
+        start = end + 1;
+        if (line.length == 0 || line[0] != '|') {
+            continue;
+        }
+        // The cells between the bars, as String.Split('|') gives them.
+        var bars = Vector<usize>.create();
+        for (k in 0..line.length) {
+            if (line[k] == '|') {
+                bars.push(k)?;
+            }
+        }
+        if (bars.length < 3 || !cellIsCode(line[bars[0] + 1..bars[1]], code)) {
+            continue;
+        }
+        let meaning = copyBytes(trimmed(line[bars[1] + 1..bars[2]]))?;
+        var example = Vector<u8>.create();
+        if (bars.length > 3) {
+            example = copyBytes(trimmed(line[bars[2] + 1..bars[3]]))?;
+        }
+        return Ok(CatalogEntry { meaning: meaning, example: example });
+    }
+    return Ok(null);
+}
+
+/// The code's entry: docs/diagnostics.md first, then the other documents under docs/ in path order.
+fn catalogEntry(code: Slice<u8>) -> Result<CatalogEntry?, AllocError> {
+    let diagnostics = documentIndex("docs/diagnostics.md".bytes());
+    match (diagnostics) {
+        Some(k) => {
+            var text = Vector<u8>.create();
+            appendDocumentText(mut text, k)?;
+            match (rowFor(text.view(), code)?) {
+                Some(entry) => { return Ok(entry); }
+                null => {}
+            }
+        }
+        null => {}
+    }
+    for (k in 0..documentCount()) {
+        let path = documentPath(k).bytes();
+        if (path.length < 5 || !sameBytes(path[0..5], "docs/".bytes()) ||
+            sameBytes(path, "docs/diagnostics.md".bytes())) {
+            continue;
+        }
+        var text = Vector<u8>.create();
+        appendDocumentText(mut text, k)?;
+        match (rowFor(text.view(), code)?) {
+            Some(entry) => { return Ok(entry); }
+            null => {}
+        }
+    }
+    return Ok(null);
+}
+
+fn containsSlice(text: Slice<u8>, part: Slice<u8>) -> bool {
+    if (part.length > text.length) {
+        return false;
+    }
+    for (k in 0..text.length - part.length + 1) {
+        if (sameBytes(text[k..k + part.length], part)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Appends to `out`, each after an empty line, the paragraphs of docs/diagnostics.md (split at "\n\n") that mention
+/// `code` and are neither table rows nor headings (DiagnosticCatalog.Paragraphs).
+fn appendParagraphs(out: borrow mut Vector<u8>, code: Slice<u8>) -> Result<void, AllocError> {
+    var text = Vector<u8>.create();
+    match (documentIndex("docs/diagnostics.md".bytes())) {
+        Some(k) => { appendDocumentText(mut text, k)?; }
+        null => { return Ok(); }
+    }
+    var start: usize = 0;
+    while (start <= text.length) {
+        var end = start;
+        while (end + 1 < text.length && !(text[end] == '\n' && text[end + 1] == '\n')) {
+            end += 1;
+        }
+        if (end + 1 >= text.length) {
+            end = text.length;
+        }
+        let paragraph = text[start..end];
+        start = end + 2;
+        let lead = trimmedStart(paragraph);
+        if (containsSlice(paragraph, code) && !(lead.length > 0 && (lead[0] == '|' || lead[0] == '#'))) {
+            out.push('\n')?;
+            appendBytes(out, trimmed(paragraph))?;
+            out.push('\n')?;
+        }
+    }
+    return Ok();
+}
+
+/// `ceesafec explain CODE` (Program.Explain).
+fn explainCommand(arguments: borrow Vector<Vector<u8>>) -> i32 {
+    if (arguments.length != 1) {
+        return fail("usage: ceesafec explain <code>, for example ceesafec explain N0249");
+    }
+    var code = copyBytes(arguments[0].view())!;
+    for (k in 0..code.length) {
+        if (code[k] >= 'a' && code[k] <= 'z') {
+            code[k] = code[k] - 32;
+        }
+    }
+    match (catalogEntry(code.view())!) {
+        Some(entry) => {
+            var out = copyBytes(code.view())!;
+            appendText(mut out, ": ")!;
+            appendBytes(mut out, entry.meaning.view())!;
+            out.push('\n')!;
+            if (entry.example.length > 0) {
+                appendText(mut out, "example: ")!;
+                appendBytes(mut out, entry.example.view())!;
+                out.push('\n')!;
+            }
+            appendParagraphs(mut out, code.view())!;
+            Console.writeBytes(out.view());
+            return 0;
+        }
+        null => {
+            var message = copyBytes("ceesafec: unknown diagnostic code '".bytes())!;
+            appendBytes(mut message, code.view())!;
+            appendText(mut message, "'\n")!;
+            Console.writeError(StringView.fromUtf8(message.view())!);
+            return 2;
+        }
+    }
+}

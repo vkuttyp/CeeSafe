@@ -1,0 +1,300 @@
+/// `fmt` (the reference's Formatter.Format and Verify, and Program.Format; formatting.md §1, §6).
+/// The outcome of formatting one file: the text, or null after syntax errors; `problem` names an internal error.
+struct Formatted {
+    text: Vector<u8>?;
+    problem: Vector<u8>;
+}
+
+/// The token texts other than commas, and the comment texts, of a file: what formatting must keep.
+fn tokenTexts(text: Slice<u8>, lexed: borrow Lexed, out: borrow mut Vector<Vector<u8>>) -> Result<void, AllocError> {
+    for (t in lexed.tokens.view()) {
+        if (!sameKind(t.kind, TokenKind.Comma)) {
+            out.push(copyBytes(text[t.start as usize..t.end as usize])?)?;
+        }
+    }
+    return Ok();
+}
+
+fn sameTexts(a: borrow Vector<Vector<u8>>, b: borrow Vector<Vector<u8>>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (k in 0..a.length) {
+        if (!sameBytes(a[k].view(), b[k].view())) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Formats `source`, which is file `file` of the caller's list. Syntax errors are added to `diagnostics`.
+fn formatSource(
+    source: borrow SourceText,
+    file: u32,
+    diagnostics: borrow mut Diagnostics,
+) -> Result<Formatted, AllocError> {
+    var front = Frontend.create();
+    let lexed = lex(source.text.view(), file, mut front.symbols, mut front.diagnostics)?;
+    var scratch = Frontend.create();
+    let kept = lex(source.text.view(), file, mut scratch.symbols, mut scratch.diagnostics)?;
+    front = parseFile(file, lexed, front)?;
+    if (front.diagnostics.hasErrors()) {
+        for (d in front.diagnostics.items.view()) {
+            diagnostics.items.push(copyDiagnostic(d)?)?;
+        }
+        return Ok(Formatted { text: null, problem: Vector<u8>.create() });
+    }
+    var tree = AstPrinter.create();
+    tree.printUnit(front.ast, front.symbols, front.ast.units[0])?;
+    let laid = layOut(SourceText.create(source.path.view(), source.text.view())?, kept, front.ast, front.ast.units[0])?;
+    let text = match (laid) {
+        Some(t) => t,
+        null => {
+            return Ok(Formatted { text: null, problem: copyBytes("the tree and the tokens disagree".bytes())? });
+        }
+    };
+    // The formatter's own check (formatting.md §6): the same tree, the same tokens apart from commas, the same comments.
+    var again = Frontend.create();
+    let relexed = lex(text.view(), 0, mut again.symbols, mut again.diagnostics)?;
+    var scratchAgain = Frontend.create();
+    let relexedKept = lex(text.view(), 0, mut scratchAgain.symbols, mut scratchAgain.diagnostics)?;
+    again = parseFile(0, relexed, again)?;
+    var problem = Vector<u8>.create();
+    if (again.diagnostics.hasErrors()) {
+        appendText(mut problem, "the formatted text does not parse")?;
+    } else {
+        var newTree = AstPrinter.create();
+        newTree.printUnit(again.ast, again.symbols, again.ast.units[0])?;
+        var before = Vector<Vector<u8>>.create();
+        var after = Vector<Vector<u8>>.create();
+        tokenTexts(source.text.view(), kept, mut before)?;
+        tokenTexts(text.view(), relexedKept, mut after)?;
+        var commentsBefore = Vector<Vector<u8>>.create();
+        var commentsAfter = Vector<Vector<u8>>.create();
+        for (c in kept.comments.view()) {
+            let comment = source.text[c.start as usize..c.end as usize];
+            commentsBefore.push(copyBytes(comment[0..trimEndLength(comment)])?)?;
+        }
+        for (c in relexedKept.comments.view()) {
+            commentsAfter.push(copyBytes(text[c.start as usize..c.end as usize])?)?;
+        }
+        if (!sameBytes(tree.out.view(), newTree.out.view())) {
+            appendText(mut problem, "the formatted text parses to a different tree")?;
+        } else if (!sameTexts(before, after)) {
+            appendText(mut problem, "the formatted text has different tokens")?;
+        } else if (!sameTexts(commentsBefore, commentsAfter)) {
+            appendText(mut problem, "the formatted text has different comments")?;
+        }
+    }
+    if (problem.length > 0) {
+        return Ok(Formatted { text: null, problem: problem });
+    }
+    return Ok(Formatted { text: text, problem: problem });
+}
+
+fn copyDiagnostic(d: borrow Diagnostic) -> Result<Diagnostic, AllocError> {
+    var notes = Vector<DiagnosticNote>.create();
+    for (n in d.notes.view()) {
+        notes.push(DiagnosticNote { start: n.start, end: n.end, message: copyBytes(n.message.view())? })?;
+    }
+    return Ok(
+        Diagnostic {
+            code: d.code,
+            isError: d.isError,
+            file: d.file,
+            start: d.start,
+            end: d.end,
+            message: copyBytes(d.message.view())?,
+            hasFix: d.hasFix,
+            fixTitle: copyBytes(d.fixTitle.view())?,
+            fixStart: d.fixStart,
+            fixEnd: d.fixEnd,
+            fixText: copyBytes(d.fixText.view())?,
+            hasSecondEdit: d.hasSecondEdit,
+            secondStart: d.secondStart,
+            secondEnd: d.secondEnd,
+            secondText: copyBytes(d.secondText.view())?,
+            notes: notes,
+        },
+    );
+}
+
+/// The source files named, or under a directory named, in ordinal order (Program.NovaFiles).
+fn namedSourceFiles(paths: borrow Vector<Vector<u8>>, out: borrow mut Vector<Vector<u8>>) -> Result<void, AllocError> {
+    for (path in paths.view()) {
+        if (isDirectory(path.view())) {
+            var found = Vector<Vector<u8>>.create();
+            sourceFilesUnder(path.view(), mut found)?;
+            for (i in 1..found.length) {
+                var j = i;
+                while (j > 0 && lessBytes(found[j].view(), found[j - 1].view())) {
+                    found.swap(j, j - 1);
+                    j -= 1;
+                }
+            }
+            for (f in found.view()) {
+                out.push(copyBytes(f.view())?)?;
+            }
+        } else {
+            out.push(copyBytes(path.view())?)?;
+        }
+    }
+    return Ok();
+}
+
+/// The root package's own sources, as paths relative to the working directory, if there is a manifest here or above
+/// and no path was named; `status` is set after an error.
+fn packageSourceFiles(out: borrow mut Vector<Vector<u8>>, found: borrow mut bool) -> Result<i32, AllocError> {
+    let cwd = match (Directory.current()) {
+        Ok(d) => d,
+        Err(_) => { return Ok(0); }
+    };
+    let directory = match (findManifestDirectory(cwd.view().bytes())?) {
+        Some(d) => d,
+        null => { return Ok(0); }
+    };
+    found = true;
+    var problem = Vector<u8>.create();
+    let manifest = match (readManifest(directory.view(), mut problem)?) {
+        Some(m) => m,
+        null => { return Ok(fail(StringView.fromUtf8(problem.view())!)); }
+    };
+    var files = Vector<Vector<u8>>.create();
+    sourceFiles(manifest, mut files)?;
+    for (f in files.view()) {
+        out.push(sourcePath(StringView.fromUtf8(f.view())!))?;
+    }
+    return Ok(0);
+}
+
+/// `ceesafec fmt [--check | --stdout] path...` (Program.Format).
+fn fmtCommand(arguments: borrow Vector<Vector<u8>>, json: bool) -> i32 {
+    var check = false;
+    var stdout = false;
+    var paths = Vector<Vector<u8>>.create();
+    for (a in arguments.view()) {
+        if (sameText(a.view(), "--check")) {
+            check = true;
+        } else if (sameText(a.view(), "--stdout")) {
+            stdout = true;
+        }
+    }
+    if (check && stdout) {
+        return finishFmt(
+            json,
+            fail("fmt takes --check or --stdout, not both"),
+            Diagnostics.create(),
+            Vector<SourceText>.create(),
+        );
+    }
+    for (a in arguments.view()) {
+        if (a.length > 0 && a[0] == '-' && !sameText(a.view(), "--check") && !sameText(a.view(), "--stdout")) {
+            var message = String.create();
+            message.append("unknown fmt option '")!;
+            message.append(StringView.fromUtf8(a.view())!)!;
+            message.append("'")!;
+            return finishFmt(json, fail(message.view()), Diagnostics.create(), Vector<SourceText>.create());
+        }
+        if (!(a.length > 0 && a[0] == '-')) {
+            paths.push(copyBytes(a.view())!)!;
+        }
+    }
+    var files = Vector<Vector<u8>>.create();
+    namedSourceFiles(paths, mut files)!;
+    if (paths.length == 0) {
+        var found = false;
+        var packageFiles = Vector<Vector<u8>>.create();
+        let status = packageSourceFiles(mut packageFiles, mut found)!;
+        if (status != 0) {
+            return finishFmt(json, status, Diagnostics.create(), Vector<SourceText>.create());
+        }
+        if (found) {
+            files = packageFiles;
+        }
+    }
+    if (files.length == 0) {
+        return finishFmt(json, fail("no Nova input files"), Diagnostics.create(), Vector<SourceText>.create());
+    }
+    if (stdout && files.length != 1) {
+        return finishFmt(json, fail("fmt --stdout takes one file"), Diagnostics.create(), Vector<SourceText>.create());
+    }
+    var status = 0;
+    var sources = Vector<SourceText>.create();
+    var diagnostics = Diagnostics.create();
+    for (file in files.view()) {
+        let path = StringView.fromUtf8(file.view())!;
+        let bytes = match (readFile(path)) {
+            Ok(b) => b,
+            Err(ReadError.Io(e)) => {
+                var message = String.create();
+                message.append("cannot read '")!;
+                message.append(path)!;
+                message.append("': ")!;
+                message.append(e.message())!;
+                return finishFmt(json, fail(message.view()), diagnostics, sources);
+            }
+            Err(ReadError.Memory) => { return finishFmt(json, fail("out of memory"), diagnostics, sources); }
+        };
+        let name = sourcePath(path);
+        sources.push(SourceText.create(name.view(), bytes.view())!)!;
+        let index = sources.length - 1;
+        let reported = diagnostics.items.length;
+        let result = formatSource(sources[index], truncate<u32>(index), mut diagnostics)!;
+        let problem = copyBytes(result.problem.view())!;
+        match (result.text) {
+            Some(formatted) => {
+                if (stdout) {
+                    Console.writeBytes(formatted.view());
+                } else if (!sameBytes(formatted.view(), sources[index].text.view())) {
+                    if (check) {
+                        Console.writeBytes(file.view());
+                        Console.writeLine("");
+                        status = 1;
+                    } else {
+                        match (writeFile(path, formatted.view())) {
+                            Ok() => {}
+                            Err(e) => {
+                                var message = String.create();
+                                message.append("cannot write '")!;
+                                message.append(path)!;
+                                message.append("': ")!;
+                                message.append(e.message())!;
+                                return finishFmt(json, fail(message.view()), diagnostics, sources);
+                            }
+                        }
+                    }
+                }
+            }
+            null => {
+                if (problem.length > 0) {
+                    var message = copyBytes("ceesafec fmt: internal error in ".bytes())!;
+                    appendBytes(mut message, sources[index].path.view())!;
+                    appendText(mut message, ": ")!;
+                    appendBytes(mut message, problem.view())!;
+                    message.push('\n')!;
+                    Console.writeError(StringView.fromUtf8(message.view())!);
+                    return 70;
+                }
+                if (!json) {
+                    var text = Vector<u8>.create();
+                    for (k in reported..diagnostics.items.length) {
+                        render(mut text, diagnostics.items[k], sources[index])!;
+                    }
+                    Console.writeError(StringView.fromUtf8(text.view())!);
+                }
+                status = 1;
+            }
+        }
+    }
+    return finishFmt(json, status, diagnostics, sources);
+}
+
+/// With --diagnostics-format=json, the diagnostics of the files that did not parse, as one document (Program.Run).
+fn finishFmt(json: bool, status: i32, diagnostics: Diagnostics, sources: Vector<SourceText>) -> i32 {
+    if (json) {
+        let document = diagnosticsJson(diagnostics, sources)!;
+        Console.writeBytes(document.view());
+        Console.writeLine("");
+    }
+    return status;
+}
