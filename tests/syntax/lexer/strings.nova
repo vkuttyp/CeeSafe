@@ -1,0 +1,5 @@
+let a = "plain"; let b = "tab\t nl\n q\" bs\\ z\0 u\u{1F600} é 😀";
+let c = "\u{} \u{1234567} \u{D800} \u{110000} \u{41 \q \é end";
+let d = "unterminated
+let e = "also
+let f = "eof

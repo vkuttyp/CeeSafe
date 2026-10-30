@@ -1,0 +1,2298 @@
+// The parser (the reference's Syntax/Parser.cs; grammar.md §2-§3): recursive descent with Pratt-style binary
+// expressions, and grammar.md §3's recovery: after the first error the parser stays silent until it re-synchronises at a
+// statement, member or item boundary. Functions follow the reference's one for one, under the same names, so its
+// diagnostics come in the same order. The tree goes into `Ast`'s tables (src/syntax/ast.nova).
+
+fn comparisonPrecedence() -> u32 => 3;
+
+/// grammar.md §2.2 (M15 S3): blocks, statements, types, patterns and unary operands, and each link of a
+/// left-associative chain, count; past it the file is N0110 and its parse stops.
+fn maxNesting() -> u32 => 1000;
+
+/// The state every file's parse shares: names, diagnostics and the tree.
+struct Frontend {
+    symbols: Interner;
+    diagnostics: Diagnostics;
+    ast: Ast;
+
+    fn create() -> Frontend => Frontend {
+        symbols: Interner.create(),
+        diagnostics: Diagnostics.create(),
+        ast: Ast.create(),
+    };
+}
+
+/// A binary operator at the current token (TryPeekBinaryOp).
+struct BinaryOpAhead {
+    found: bool;
+    op: BinaryOp;
+    precedence: u32;
+    tokens: u32;
+}
+
+/// A doc comment found for a token: its text in `Ast.text`.
+struct DocRef {
+    found: bool;
+    text: Range;
+}
+
+fn noDoc() -> DocRef => DocRef { found: false, text: emptyRange() };
+
+/// `doc ?? other`.
+fn docOr(doc: DocRef, other: DocRef) -> DocRef => if (doc.found) doc else other;
+
+fn describeKind(message: borrow mut Vector<u8>, kind: TokenKind) -> Result<void, AllocError> {
+    match (describeWord(kind)) {
+        Some(word) => { appendText(message, word)?; }
+        null => {
+            message.push('\'')?;
+            appendText(message, tokenText(kind))?;
+            message.push('\'')?;
+        }
+    }
+    return Ok();
+}
+
+fn textMessage(text: StringView) -> Result<Vector<u8>, AllocError> {
+    var message = Vector<u8>.create();
+    appendText(mut message, text)?;
+    return Ok(message);
+}
+
+fn isItemStart(kind: TokenKind) -> bool => match (kind) {
+    TokenKind.FnKeyword => true,
+    TokenKind.UnsafeKeyword => true,
+    TokenKind.ConstKeyword => true,
+    TokenKind.StaticKeyword => true,
+    TokenKind.At => true,
+    TokenKind.ExternKeyword => true,
+    TokenKind.StructKeyword => true,
+    TokenKind.EnumKeyword => true,
+    TokenKind.InterfaceKeyword => true,
+    TokenKind.ImplKeyword => true,
+    TokenKind.PublicKeyword => true,
+    TokenKind.InternalKeyword => true,
+    TokenKind.PrivateKeyword => true,
+    _ => false,
+};
+
+/// Keywords that begin a declaration in some milestone; top-level recovery stops at them.
+fn isDeclarationKeyword(kind: TokenKind) -> bool => isItemStart(kind) || match (kind) {
+    TokenKind.NamespaceKeyword => true,
+    TokenKind.ClassKeyword => true,
+    TokenKind.LetKeyword => true,
+    TokenKind.VarKeyword => true,
+    TokenKind.ImportKeyword => true,
+    TokenKind.UsingKeyword => true,
+    TokenKind.TypeKeyword => true,
+    _ => false,
+};
+
+fn isStatementKeyword(kind: TokenKind) -> bool => match (kind) {
+    TokenKind.LetKeyword => true,
+    TokenKind.VarKeyword => true,
+    TokenKind.UsingKeyword => true,
+    TokenKind.DeferKeyword => true,
+    TokenKind.IfKeyword => true,
+    TokenKind.WhileKeyword => true,
+    TokenKind.LoopKeyword => true,
+    TokenKind.ReturnKeyword => true,
+    TokenKind.BreakKeyword => true,
+    TokenKind.ContinueKeyword => true,
+    TokenKind.MatchKeyword => true,
+    TokenKind.ForKeyword => true,
+    TokenKind.UnsafeKeyword => true,
+    _ => false,
+};
+
+/// Tokens that cannot start a statement but do start an item: a block ends before them.
+fn endsBlock(kind: TokenKind) -> bool => match (kind) {
+    TokenKind.CloseBrace => true,
+    TokenKind.EndOfFile => true,
+    TokenKind.FnKeyword => true,
+    TokenKind.PublicKeyword => true,
+    TokenKind.InternalKeyword => true,
+    TokenKind.PrivateKeyword => true,
+    _ => false,
+};
+
+fn isVisibilityKeyword(kind: TokenKind) -> bool => match (kind) {
+    TokenKind.PublicKeyword => true,
+    TokenKind.InternalKeyword => true,
+    TokenKind.PrivateKeyword => true,
+    _ => false,
+};
+
+struct Parser {
+    file: u32;
+    lexed: Lexed;
+    front: Frontend;
+    pos: usize;
+    parsingSignatures: bool; // inside an interface or extern block: functions end with ';' instead of a body
+    recovering: bool;
+    nesting: u32;
+    tooDeep: bool;
+    semicolonFixable: bool; // false while ending an expression statement that is not a call
+
+    // ---- Token access ----
+
+    fn current(borrow this) -> Token => this.lexed.tokens[this.pos];
+
+    fn previous(borrow this) -> Token => this.lexed.tokens[if (this.pos > 0) this.pos - 1 else 0];
+
+    fn peek(borrow this, offset: usize) -> Token {
+        let last = this.lexed.tokens.length - 1;
+        let i = this.pos + offset;
+        return this.lexed.tokens[if (i < last) i else last];
+    }
+
+    fn at(borrow this, kind: TokenKind) -> bool => sameKind(this.current().kind, kind);
+
+    fn peekIs(borrow this, offset: usize, kind: TokenKind) -> bool => sameKind(this.peek(offset).kind, kind);
+
+    fn advance(borrow mut this) -> Token {
+        let token = this.current();
+        if (!sameKind(token.kind, TokenKind.EndOfFile)) {
+            this.pos += 1;
+        }
+        return token;
+    }
+
+    fn eat(borrow mut this, kind: TokenKind) -> bool {
+        if (!this.at(kind)) {
+            return false;
+        }
+        this.advance();
+        return true;
+    }
+
+    /// The name of an identifier token.
+    fn nameIs(borrow this, token: Token, text: StringView) -> bool =>
+        sameText(this.front.symbols.name(Symbol { id: token.data }), text);
+
+    fn intern(borrow mut this, text: StringView) -> Result<u32, AllocError> {
+        let symbol = this.front.symbols.intern(text.bytes())?;
+        return Ok(symbol.id);
+    }
+
+    /// Consumes a token of the given kind, or reports N0100.
+    fn expect(borrow mut this, kind: TokenKind) -> Result<void, AllocError> {
+        if (this.at(kind)) {
+            this.advance();
+            return Ok();
+        }
+        // A missing ';' is reported right after the previous token, where it belongs.
+        let semicolon = sameKind(kind, TokenKind.Semicolon) && this.pos > 0;
+        let start = if (semicolon) this.previous().end else this.current().start;
+        let end = if (semicolon) this.previous().end else this.current().end;
+        var message = Vector<u8>.create();
+        appendText(mut message, "expected ")?;
+        describeKind(mut message, kind)?;
+        appendText(mut message, ", found ")?;
+        describeKind(mut message, this.current().kind)?;
+        // A sure fix only after a well-formed statement: not after a lexical or earlier syntax error (tooling.md §5.2).
+        if (semicolon && !this.recovering && !this.tooDeep && this.semicolonFixable &&
+            !this.front.diagnostics.anyIn(this.file)) {
+            this.recovering = true;
+            this.front.diagnostics.errorWithFix(
+                expectedToken(),
+                this.file,
+                start,
+                end,
+                message,
+                textMessage("insert ';'")?,
+                textMessage(";")?,
+            )?;
+        } else {
+            this.error(expectedToken(), start, end, message)?;
+        }
+        return Ok();
+    }
+
+    /// Enters one nesting level. Past the limit it reports N0110 once, skips to the end of the file and returns false;
+    /// every later error in the file is suppressed (each would only repeat it).
+    fn nest(borrow mut this) -> Result<bool, AllocError> {
+        if (this.tooDeep) {
+            return Ok(false);
+        }
+        if (this.nesting + 1 <= maxNesting()) {
+            this.nesting += 1;
+            return Ok(true);
+        }
+        this.tooDeep = true;
+        let at = this.current().start;
+        this.front.diagnostics.error(
+            nestingTooDeep(),
+            this.file,
+            at,
+            at,
+            textMessage(
+                "this is nested more than 1000 levels deep (blocks, expressions, types, patterns, and chains of operators, calls or members); the rest of the file is not parsed (grammar.md §2.2)",
+            )?,
+        )?;
+        this.pos = this.lexed.tokens.length - 1; // the end of the file
+        return Ok(false);
+    }
+
+    fn error(borrow mut this, code: u32, start: u32, end: u32, message: Vector<u8>) -> Result<void, AllocError> {
+        if (this.recovering || this.tooDeep) {
+            return Ok();
+        }
+        this.recovering = true;
+        return this.front.diagnostics.error(code, this.file, start, end, message);
+    }
+
+    /// An error at the current token: "<before><what the current token is><after>".
+    fn errorFound(borrow mut this, code: u32, before: StringView, after: StringView) -> Result<void, AllocError> {
+        var message = Vector<u8>.create();
+        appendText(mut message, before)?;
+        describeKind(mut message, this.current().kind)?;
+        appendText(mut message, after)?;
+        let token = this.current();
+        return this.error(code, token.start, token.end, message);
+    }
+
+    /// The end of a span from `start` to the end of the last consumed token.
+    fn endFrom(borrow this, start: u32) -> u32 {
+        let end = this.previous().end;
+        return if (end > start) end else start;
+    }
+
+    /// The doc comment of token `index`, copied into the tree's text.
+    fn docAt(borrow mut this, index: usize) -> Result<DocRef, AllocError> {
+        let target = truncate<u32>(index);
+        var lo: usize = 0;
+        var hi = this.lexed.docs.length;
+        while (lo < hi) {
+            let mid = lo + (hi - lo) / 2;
+            if (this.lexed.docs[mid].token < target) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo < this.lexed.docs.length && this.lexed.docs[lo].token == target) {
+            let text = this.front.ast.addText(this.lexed.docs[lo].text.view())?;
+            return Ok(DocRef { found: true, text: text });
+        }
+        return Ok(noDoc());
+    }
+
+    fn list(borrow mut this, ids: borrow Vector<u32>) -> Result<Range, AllocError> => this.front.ast.list(ids);
+
+    // ---- Items ----
+
+    fn parseCompilationUnit(borrow mut this) -> Result<void, AllocError> {
+        var hasNamespace = false;
+        var namespaceName = QualifiedName { parts: emptyRange(), start: 0, end: 0 };
+        if (this.at(TokenKind.NamespaceKeyword)) {
+            namespaceName = this.parseNamespace()?;
+            hasNamespace = true;
+            this.synchronizeItem();
+        }
+
+        var imports = Vector<QualifiedName>.create();
+        while (this.at(TokenKind.ImportKeyword)) {
+            imports.push(this.parseImport()?)?;
+            this.synchronizeItem();
+        }
+
+        var items = Vector<u32>.create();
+        while (!this.at(TokenKind.EndOfFile)) {
+            let startPos = this.pos;
+            if (this.at(TokenKind.ImportKeyword)) {
+                let token = this.current();
+                this.error(
+                    misplacedImport(),
+                    token.start,
+                    token.end,
+                    textMessage("an import declaration must come before the file's items")?,
+                )?;
+                this.parseImport()?;
+            } else if (this.at(TokenKind.NamespaceKeyword)) {
+                let token = this.current();
+                this.error(
+                    misplacedNamespace(),
+                    token.start,
+                    token.end,
+                    textMessage("a namespace declaration must be the first declaration in the file")?,
+                )?;
+                this.parseNamespace()?;
+            } else if (isItemStart(this.current().kind)) {
+                let item = this.parseItem()?;
+                if (item != none()) {
+                    items.push(item)?;
+                }
+            } else {
+                this.errorFound(expectedItem(), "expected 'fn', 'const', 'struct' or 'enum', found ", "")?;
+                this.advance();
+            }
+
+            this.synchronizeItem();
+            if (this.pos == startPos) {
+                this.advance();
+            }
+        }
+
+        let range = this.list(items)?;
+        this.front.ast.units.push(Unit {
+            file: this.file,
+            hasNamespace: hasNamespace,
+            namespaceName: namespaceName,
+            imports: imports,
+            items: range,
+        })?;
+        return Ok();
+    }
+
+    /// `'import' Identifier ('.' Identifier)? ';'` (grammar.md §2, M10 T5).
+    fn parseImport(borrow mut this) -> Result<QualifiedName, AllocError> {
+        this.advance();
+        let first = this.parseIdentifier()?;
+        var parts = Vector<u32>.create();
+        parts.push(first)?;
+        if (this.eat(TokenKind.Dot)) {
+            parts.push(this.parseIdentifier()?)?;
+        }
+        let start = this.front.ast.idents[first as usize].start;
+        let end = this.front.ast.idents[parts[parts.length - 1] as usize].end;
+        let name = QualifiedName { parts: this.list(parts)?, start: start, end: end };
+        this.expect(TokenKind.Semicolon)?;
+        return Ok(name);
+    }
+
+    fn parseNamespace(borrow mut this) -> Result<QualifiedName, AllocError> {
+        this.advance();
+        let name = this.parseQualifiedName()?;
+        this.expect(TokenKind.Semicolon)?;
+        return Ok(name);
+    }
+
+    fn synchronizeItem(borrow mut this) {
+        if (!this.recovering) {
+            return;
+        }
+        // Skip balanced { } groups, so keywords inside a skipped body do not restart parsing.
+        var depth: u32 = 0;
+        while (!this.at(TokenKind.EndOfFile)) {
+            let kind = this.current().kind;
+            if (depth == 0 && isDeclarationKeyword(kind)) {
+                break;
+            }
+            this.advance();
+            if (sameKind(kind, TokenKind.OpenBrace)) {
+                depth += 1;
+            } else if (sameKind(kind, TokenKind.CloseBrace) && depth > 0) {
+                depth -= 1;
+            }
+        }
+        this.recovering = false;
+    }
+
+    fn parseItem(borrow mut this) -> Result<u32, AllocError> {
+        let docPos = this.pos;
+        let doc = this.docAt(docPos)?; // before the attributes, if any (grammar.md §1.2)
+        let attributes = this.parseAttributes()?;
+        let item = this.parseItemCore()?;
+        if (item == none()) {
+            return Ok(none());
+        }
+        this.front.ast.items[item as usize].attributes = attributes;
+        match (this.front.ast.items[item as usize].kind) {
+            ItemKind.Function(f) => {
+                let function = borrow mut this.front.ast.functions[f as usize];
+                function.attributes = attributes;
+                if (doc.found) {
+                    function.hasDoc = true;
+                    function.doc = doc.text;
+                }
+            }
+            _ => {}
+        }
+        return Ok(item);
+    }
+
+    /// `('@' name ('(' argument (',' argument)* ')')?)*` (type-system.md §28.1).
+    fn parseAttributes(borrow mut this) -> Result<Range, AllocError> {
+        var attributes = Vector<u32>.create();
+        while (this.at(TokenKind.At)) {
+            let start = this.advance().start;
+            let name = this.parseIdentifier()?;
+            var arguments = Vector<u32>.create();
+            let hasParentheses = this.eat(TokenKind.OpenParen);
+            if (hasParentheses) {
+                while (!this.at(TokenKind.CloseParen) && !this.at(TokenKind.EndOfFile)) {
+                    if (this.at(
+                        TokenKind.Identifier,
+                    ) || this.at(TokenKind.StringLiteral) || this.at(TokenKind.IntLiteral)) {
+                        arguments.push(this.parsePrimary()?)?;
+                    } else {
+                        this.errorFound(
+                            expectedToken(),
+                            "expected a name, a string or an integer in an attribute, found ",
+                            "",
+                        )?;
+                        break;
+                    }
+                    if (!this.eat(TokenKind.Comma)) {
+                        break;
+                    }
+                }
+                this.expect(TokenKind.CloseParen)?;
+            }
+            let range = this.list(arguments)?;
+            this.front.ast.attributes.push(Attribute {
+                name: name,
+                arguments: range,
+                hasParentheses: hasParentheses,
+                start: start,
+                end: this.endFrom(start),
+            })?;
+            attributes.push(truncate<u32>(this.front.ast.attributes.length - 1))?;
+        }
+        return this.list(attributes);
+    }
+
+    fn addItem(
+        borrow mut this,
+        kind: ItemKind,
+        visibility: Visibility,
+        name: u32,
+        start: u32,
+    ) -> Result<u32, AllocError> {
+        this.front.ast.items.push(Item {
+            kind: kind,
+            visibility: visibility,
+            name: name,
+            attributes: emptyRange(),
+            start: start,
+            end: this.endFrom(start),
+        })?;
+        return Ok(truncate<u32>(this.front.ast.items.length - 1));
+    }
+
+    /// `extern "C" { (attributes visibility? (fn …; | struct …))* }` (type-system.md §28.2, §31).
+    fn parseExternBlock(borrow mut this, visibility: Visibility, start: u32) -> Result<u32, AllocError> {
+        this.expect(TokenKind.ExternKeyword)?;
+        let abiToken = this.current();
+        var abi = emptyRange();
+        if (this.at(TokenKind.StringLiteral)) {
+            let token = this.advance();
+            abi = this.front.ast.addText(this.lexed.strings[token.data as usize].view())?;
+        } else {
+            this.expect(TokenKind.StringLiteral)?;
+        }
+        var functions = Vector<u32>.create();
+        var structs = Vector<u32>.create();
+        this.expect(TokenKind.OpenBrace)?;
+        while (this.atFunction() || this.at(TokenKind.StructKeyword) || this.at(TokenKind.At) ||
+            isVisibilityKeyword(this.current().kind)) {
+            let memberStart = this.current().start;
+            let memberDocPos = this.pos;
+            let memberDoc = this.docAt(memberDocPos)?; // before the attributes, if any (grammar.md §1.2)
+            let attributes = this.parseAttributes()?;
+            let memberVisibility = this.parseVisibility();
+            if (this.at(TokenKind.StructKeyword)) {
+                let s = this.parseStruct(memberVisibility, memberStart, true)?;
+                this.front.ast.items[s as usize].attributes = attributes;
+                structs.push(s)?;
+                continue;
+            }
+            if (!this.atFunction()) {
+                this.expect(TokenKind.FnKeyword)?;
+                break;
+            }
+            this.parsingSignatures = true;
+            let f = this.parseFunction(memberVisibility, memberStart)?;
+            let function = borrow mut this.front.ast.functions[f as usize];
+            function.attributes = attributes;
+            function.isExtern = true;
+            if (memberDoc.found) {
+                function.hasDoc = true;
+                function.doc = memberDoc.text;
+            }
+            functions.push(f)?;
+            this.parsingSignatures = false;
+        }
+        this.expect(TokenKind.CloseBrace)?;
+        let symbol = this.intern("<extern>")?;
+        let name = this.front.ast.addIdent(
+            Ident { symbol: symbol, start: abiToken.start, end: abiToken.end, missing: true },
+        )?;
+        let functionRange = this.list(functions)?;
+        let structRange = this.list(structs)?;
+        return this.addItem(ItemKind.Extern(abi, functionRange, structRange), visibility, name, start);
+    }
+
+    fn parseItemCore(borrow mut this) -> Result<u32, AllocError> {
+        let start = this.current().start;
+        let visibility = this.parseVisibility();
+
+        if (this.atFunction()) {
+            let f = this.parseFunction(visibility, start)?;
+            let name = this.front.ast.functions[f as usize].name;
+            return this.addItem(ItemKind.Function(f), visibility, name, start);
+        }
+        if (this.at(TokenKind.ConstKeyword)) {
+            return this.parseConst(visibility, start);
+        }
+        if (this.at(TokenKind.StaticKeyword)) {
+            return this.parseStatic(visibility, start);
+        }
+        if (this.at(TokenKind.StructKeyword)) {
+            return this.parseStruct(visibility, start, false);
+        }
+        if (this.at(TokenKind.EnumKeyword)) {
+            return this.parseEnum(visibility, start);
+        }
+        if (this.at(TokenKind.InterfaceKeyword)) {
+            return this.parseInterface(visibility, start);
+        }
+        if (this.at(TokenKind.ImplKeyword)) {
+            return this.parseImpl(visibility, start);
+        }
+        if (this.at(TokenKind.ExternKeyword)) {
+            return this.parseExternBlock(visibility, start);
+        }
+
+        this.errorFound(expectedItem(), "expected 'fn', 'const', 'struct', 'enum', 'interface' or 'impl', found ", "")?;
+        // Consume the offender: recovery stops at declaration keywords, so leaving e.g. `let` would re-report it.
+        this.advance();
+        return Ok(none());
+    }
+
+    /// At `fn` or `unsafe fn` (type-system.md §27.4).
+    fn atFunction(borrow this) -> bool =>
+        this.at(TokenKind.FnKeyword) || (this.at(TokenKind.UnsafeKeyword) && this.peekIs(1, TokenKind.FnKeyword));
+
+    /// Splits parsed type parameters into the region ones and the others, in order.
+    fn splitTypeParameters(borrow mut this, parameters: Range) -> Result<TypeParameterLists, AllocError> {
+        var regions = Vector<u32>.create();
+        var types = Vector<u32>.create();
+        for (k in 0..parameters.count) {
+            let p = this.front.ast.at(parameters, k);
+            if (this.front.ast.typeParameters[p as usize].isRegion) {
+                regions.push(p)?;
+            } else {
+                types.push(p)?;
+            }
+        }
+        let typeRange = this.list(types)?;
+        let regionRange = this.list(regions)?;
+        return Ok(TypeParameterLists { types: typeRange, regions: regionRange });
+    }
+
+    fn parseFunction(borrow mut this, visibility: Visibility, start: u32) -> Result<u32, AllocError> {
+        // The doc comment belongs to the declaration's first token: the visibility, if any (grammar.md §1.2).
+        let firstToken =
+            if (this.pos > 0 &&
+                this.previous().start == start && this.current().start != start) this.pos - 1 else this.pos;
+        let doc = this.docAt(firstToken)?;
+        let isUnsafe = this.eat(TokenKind.UnsafeKeyword);
+        this.expect(TokenKind.FnKeyword)?;
+        let name = this.parseIdentifier()?;
+        let typeParameters = this.parseTypeParameters()?;
+
+        this.expect(TokenKind.OpenParen)?;
+        var receiver = ReceiverKind.None;
+        var receiverStart: u32 = 0;
+        var receiverEnd: u32 = 0;
+        var moreParameters = true;
+        let rs = this.current().start;
+        if (this.at(TokenKind.ThisKeyword) ||
+            (this.at(TokenKind.BorrowKeyword) &&
+                (this.peekIs(1, TokenKind.ThisKeyword) ||
+                    (this.peekIs(1, TokenKind.MutKeyword) && this.peekIs(2, TokenKind.ThisKeyword))))) {
+            receiver = ReceiverKind.Value;
+            if (this.eat(TokenKind.BorrowKeyword)) {
+                receiver = if (this.eat(TokenKind.MutKeyword)) ReceiverKind.BorrowMut else ReceiverKind.Borrow;
+            }
+            this.expect(TokenKind.ThisKeyword)?;
+            receiverStart = rs;
+            receiverEnd = this.endFrom(rs);
+            moreParameters = this.eat(TokenKind.Comma);
+        }
+        var parameters = Vector<u32>.create();
+        while (moreParameters && !this.at(TokenKind.CloseParen) && !this.at(TokenKind.EndOfFile) &&
+            !this.at(TokenKind.OpenBrace)) {
+            let paramStart = this.current().start;
+            let paramName = this.parseIdentifier()?;
+            this.expect(TokenKind.Colon)?;
+            let typ = this.parseType()?;
+            this.front.ast.parameters.push(Parameter {
+                name: paramName,
+                typ: typ,
+                start: paramStart,
+                end: this.endFrom(paramStart),
+            })?;
+            parameters.push(truncate<u32>(this.front.ast.parameters.length - 1))?;
+            if (!this.eat(TokenKind.Comma)) {
+                break;
+            }
+        }
+        this.expect(TokenKind.CloseParen)?;
+
+        let returnType = if (this.eat(TokenKind.Arrow)) this.parseType()? else none();
+
+        var body = none();
+        var expressionBody = none();
+        if (this.parsingSignatures && this.eat(TokenKind.Semicolon)) {
+            // An interface method: a signature without a body (type-system.md §21.1).
+        } else if (this.at(TokenKind.OpenBrace)) {
+            body = this.parseBlock()?;
+        } else if (this.eat(TokenKind.FatArrow)) {
+            expressionBody = this.parseExpr()?;
+            this.expect(TokenKind.Semicolon)?;
+        } else {
+            this.errorFound(expectedToken(), "expected '{' or '=>', found ", "")?;
+            let at = this.current().start;
+            expressionBody = this.front.ast.addExpr(ExprNode.Error, at, at)?;
+        }
+
+        let split = this.splitTypeParameters(typeParameters)?;
+        let parameterRange = this.list(parameters)?;
+        this.front.ast.functions.push(Function {
+            visibility: visibility,
+            name: name,
+            receiver: receiver,
+            receiverStart: receiverStart,
+            receiverEnd: receiverEnd,
+            parameters: parameterRange,
+            returnType: returnType,
+            body: body,
+            expressionBody: expressionBody,
+            typeParameters: split.types,
+            regionParameters: split.regions,
+            isUnsafe: isUnsafe,
+            hasDoc: doc.found,
+            doc: doc.text,
+            isExtern: false,
+            attributes: emptyRange(),
+            start: start,
+            end: this.endFrom(start),
+        })?;
+        return Ok(truncate<u32>(this.front.ast.functions.length - 1));
+    }
+
+    fn parseVisibility(borrow mut this) -> Visibility {
+        let visibility = match (this.current().kind) {
+            TokenKind.PublicKeyword => Visibility.Public,
+            TokenKind.InternalKeyword => Visibility.Internal,
+            TokenKind.PrivateKeyword => Visibility.Private,
+            _ => Visibility.Default,
+        };
+        if (isVisibilityKeyword(this.current().kind)) {
+            this.advance();
+        }
+        return visibility;
+    }
+
+    fn addStruct(
+        borrow mut this,
+        visibility: Visibility,
+        name: u32,
+        start: u32,
+        s: Struct,
+    ) -> Result<u32, AllocError> {
+        this.front.ast.structs.push(s)?;
+        let index = truncate<u32>(this.front.ast.structs.length - 1);
+        return this.addItem(ItemKind.Struct(index), visibility, name, start);
+    }
+
+    fn parseStruct(borrow mut this, visibility: Visibility, start: u32, imported: bool) -> Result<u32, AllocError> {
+        this.expect(TokenKind.StructKeyword)?;
+        let name = this.parseIdentifier()?;
+        let typeParameters = this.parseTypeParameters()?;
+        if (imported && this.at(TokenKind.Semicolon)) {
+            this.advance(); // `struct name;`: imported without fields (type-system.md §31.1)
+            let split = this.splitTypeParameters(typeParameters)?;
+            return this.addStruct(visibility, name, start, Struct {
+                fields: emptyRange(),
+                functions: emptyRange(),
+                dropBlock: none(),
+                hasDropDoc: false,
+                dropDoc: emptyRange(),
+                isImported: true,
+                isOpaque: true,
+                typeParameters: split.types,
+                regionParameters: split.regions,
+            });
+        }
+        var fields = Vector<u32>.create();
+        var functions = Vector<u32>.create();
+        var dropBlock = none();
+        var dropDoc = noDoc();
+        if (!this.at(TokenKind.OpenBrace)) {
+            this.expect(TokenKind.OpenBrace)?;
+            return this.addStruct(visibility, name, start, Struct {
+                fields: emptyRange(),
+                functions: emptyRange(),
+                dropBlock: none(),
+                hasDropDoc: false,
+                dropDoc: emptyRange(),
+                isImported: false,
+                isOpaque: false,
+                typeParameters: emptyRange(),
+                regionParameters: emptyRange(),
+            });
+        }
+        this.advance();
+
+        while (!this.at(TokenKind.CloseBrace) && !this.at(TokenKind.EndOfFile)) {
+            let startPos = this.pos;
+            let memberStart = this.current().start;
+            let memberDocPos = this.pos;
+            let memberDoc = this.docAt(memberDocPos)?;      // before the attributes, if any (grammar.md §1.2)
+            let memberAttributes = this.parseAttributes()?; // on methods: @effects, @context (type-system.md §32)
+            let methodAhead = this.atFunction() ||
+                (isVisibilityKeyword(this.current().kind) &&
+                    (this.peekIs(1, TokenKind.FnKeyword) || this.peekIs(1, TokenKind.UnsafeKeyword)));
+            if (memberAttributes.count > 0 && !methodAhead && !(imported && this.at(TokenKind.Identifier))) {
+                // @cname on an imported struct's field is allowed (type-system.md §31.1).
+                let first = this.front.ast.attributes[this.front.ast.at(memberAttributes, 0) as usize];
+                this.error(
+                    invalidAttribute(),
+                    first.start,
+                    first.end,
+                    textMessage("attributes in a struct apply only to its methods (type-system.md §28.1)")?,
+                )?;
+            }
+            let memberVisibility = this.parseVisibility();
+            if (this.at(TokenKind.DropKeyword)) {
+                let dropStart = this.advance().start;
+                let body = this.parseBlock()?;
+                if (dropBlock != none()) {
+                    this.error(
+                        duplicateMember(),
+                        dropStart,
+                        dropStart + 4,
+                        textMessage("a struct can have only one 'drop' block")?,
+                    )?;
+                } else {
+                    dropBlock = body;
+                    dropDoc = docOr(memberDoc, this.docAt(startPos)?);
+                }
+            } else if (this.atFunction()) {
+                let f = this.parseFunction(memberVisibility, memberStart)?;
+                let function = borrow mut this.front.ast.functions[f as usize];
+                function.attributes = memberAttributes;
+                if (memberDoc.found) {
+                    function.hasDoc = true;
+                    function.doc = memberDoc.text;
+                }
+                functions.push(f)?;
+            } else if (this.at(TokenKind.Identifier)) {
+                let fieldName = this.parseIdentifier()?;
+                this.expect(TokenKind.Colon)?;
+                let typ = this.parseType()?;
+                this.expect(TokenKind.Semicolon)?;
+                this.front.ast.fields.push(Field {
+                    visibility: memberVisibility,
+                    name: fieldName,
+                    typ: typ,
+                    attributes: if (imported) memberAttributes else emptyRange(),
+                    start: memberStart,
+                    end: this.endFrom(memberStart),
+                })?;
+                fields.push(truncate<u32>(this.front.ast.fields.length - 1))?;
+            } else {
+                this.errorFound(expectedMember(), "expected a field or 'fn' in struct, found ", "")?;
+                this.advance();
+            }
+            this.synchronizeMember();
+            if (this.pos == startPos) {
+                this.advance();
+            }
+        }
+        this.expect(TokenKind.CloseBrace)?;
+        let split = this.splitTypeParameters(typeParameters)?;
+        let fieldRange = this.list(fields)?;
+        let functionRange = this.list(functions)?;
+        return this.addStruct(visibility, name, start, Struct {
+            fields: fieldRange,
+            functions: functionRange,
+            dropBlock: dropBlock,
+            hasDropDoc: dropDoc.found,
+            dropDoc: dropDoc.text,
+            isImported: imported,
+            isOpaque: false,
+            typeParameters: split.types,
+            regionParameters: split.regions,
+        });
+    }
+
+    /// `interface I<T> { fn m(…) -> R; … }` (type-system.md §21.1).
+    fn parseInterface(borrow mut this, visibility: Visibility, start: u32) -> Result<u32, AllocError> {
+        this.expect(TokenKind.InterfaceKeyword)?;
+        let name = this.parseIdentifier()?;
+        let typeParameters = this.parseTypeParameters()?;
+        var methods = Vector<u32>.create();
+        this.expect(TokenKind.OpenBrace)?;
+        this.parsingSignatures = true;
+        while (this.atFunction() || this.at(TokenKind.At)) {
+            let methodStart = this.current().start;
+            let docPos = this.pos;
+            let doc = this.docAt(docPos)?;
+            let attributes = this.parseAttributes()?; // @effects, bounding every impl (type-system.md §37.3)
+            let f = this.parseFunction(Visibility.Default, methodStart)?;
+            if (attributes.count > 0) {
+                let function = borrow mut this.front.ast.functions[f as usize];
+                function.attributes = attributes;
+                if (doc.found) {
+                    function.hasDoc = true;
+                    function.doc = doc.text;
+                }
+            }
+            methods.push(f)?;
+        }
+        this.parsingSignatures = false;
+        this.expect(TokenKind.CloseBrace)?;
+        var types = Vector<u32>.create();
+        for (k in 0..typeParameters.count) {
+            let p = this.front.ast.at(typeParameters, k);
+            let parameter = this.front.ast.typeParameters[p as usize];
+            if (parameter.isRegion) {
+                this.error(
+                    unsupported(),
+                    parameter.start,
+                    parameter.end,
+                    textMessage("interfaces cannot have region parameters")?,
+                )?;
+            } else {
+                types.push(p)?;
+            }
+        }
+        let methodRange = this.list(methods)?;
+        let typeRange = this.list(types)?;
+        return this.addItem(ItemKind.Interface(methodRange, typeRange), visibility, name, start);
+    }
+
+    /// `impl I for T { fn … }` (type-system.md §21.1).
+    fn parseImpl(borrow mut this, visibility: Visibility, start: u32) -> Result<u32, AllocError> {
+        this.expect(TokenKind.ImplKeyword)?;
+        let interfaceType = this.parseType()?;
+        this.expect(TokenKind.ForKeyword)?;
+        let forType = this.parseType()?;
+        var functions = Vector<u32>.create();
+        this.expect(TokenKind.OpenBrace)?;
+        while (this.atFunction() || this.at(TokenKind.PublicKeyword) || this.at(TokenKind.At)) {
+            let functionStart = this.current().start;
+            let docPos = this.pos;
+            let doc = this.docAt(docPos)?;            // before the attributes, if any (grammar.md §1.2)
+            let attributes = this.parseAttributes()?; // @effects, @context (type-system.md §32)
+            let functionVisibility = this.parseVisibility();
+            let f = this.parseFunction(functionVisibility, functionStart)?;
+            let function = borrow mut this.front.ast.functions[f as usize];
+            function.attributes = attributes;
+            if (doc.found) {
+                function.hasDoc = true;
+                function.doc = doc.text;
+            }
+            functions.push(f)?;
+        }
+        this.expect(TokenKind.CloseBrace)?;
+        // The item's name is the interface's first name part (impl blocks are not named items).
+        var name = none();
+        match (this.front.ast.types[interfaceType as usize]) {
+            TypeNode.Named(q) => { name = this.front.ast.at(q.parts, 0); }
+            TypeNode.Generic(q, _) => { name = this.front.ast.at(q.parts, 0); }
+            _ => {}
+        }
+        if (name == none()) {
+            let span = this.front.ast.typeSpans[interfaceType as usize];
+            let symbol = this.intern("<impl>")?;
+            name = this.front.ast.addIdent(Ident { symbol: symbol, start: span.start, end: span.end, missing: true })?;
+        }
+        let functionRange = this.list(functions)?;
+        return this.addItem(ItemKind.Impl(interfaceType, forType, functionRange), visibility, name, start);
+    }
+
+    fn parseEnum(borrow mut this, visibility: Visibility, start: u32) -> Result<u32, AllocError> {
+        this.expect(TokenKind.EnumKeyword)?;
+        let name = this.parseIdentifier()?;
+        let typeParameters = this.parseTypeParameters()?;
+        var variants = Vector<u32>.create();
+        this.expect(TokenKind.OpenBrace)?;
+        while (this.at(TokenKind.Identifier)) {
+            let variantStart = this.current().start;
+            let variantName = this.parseIdentifier()?;
+            var payload = Vector<u32>.create();
+            if (this.eat(TokenKind.OpenParen)) {
+                while (!this.at(TokenKind.CloseParen) && !this.at(TokenKind.EndOfFile)) {
+                    payload.push(this.parseType()?)?;
+                    if (!this.eat(TokenKind.Comma)) {
+                        break;
+                    }
+                }
+                this.expect(TokenKind.CloseParen)?;
+            }
+            let payloadRange = this.list(payload)?;
+            this.front.ast.variants.push(Variant {
+                name: variantName,
+                payload: payloadRange,
+                start: variantStart,
+                end: this.endFrom(variantStart),
+            })?;
+            variants.push(truncate<u32>(this.front.ast.variants.length - 1))?;
+            if (!this.eat(TokenKind.Comma)) {
+                break;
+            }
+        }
+        this.expect(TokenKind.CloseBrace)?;
+        let split = this.splitTypeParameters(typeParameters)?;
+        let variantRange = this.list(variants)?;
+        return this.addItem(ItemKind.Enum(variantRange, split.types, split.regions), visibility, name, start);
+    }
+
+    /// Recovery inside a struct body (grammar.md §3): skip to the next member start or the closing brace.
+    fn synchronizeMember(borrow mut this) {
+        if (!this.recovering) {
+            return;
+        }
+        let last = this.previous().kind;
+        if (!sameKind(last, TokenKind.Semicolon) && !sameKind(last, TokenKind.CloseBrace)) {
+            var depth: i32 = 0;
+            while (!this.at(TokenKind.EndOfFile)) {
+                let kind = this.current().kind;
+                let memberStart = sameKind(kind, TokenKind.FnKeyword) || sameKind(kind, TokenKind.DropKeyword) ||
+                    isVisibilityKeyword(kind) || (sameKind(
+                    kind,
+                    TokenKind.Identifier,
+                ) && this.peekIs(1, TokenKind.Colon));
+                if (depth == 0 && (memberStart || sameKind(kind, TokenKind.CloseBrace))) {
+                    break;
+                }
+                this.advance();
+                if (sameKind(kind, TokenKind.OpenBrace)) {
+                    depth += 1;
+                } else if (sameKind(kind, TokenKind.CloseBrace)) {
+                    depth -= 1;
+                } else if (sameKind(kind, TokenKind.Semicolon) && depth == 0) {
+                    break;
+                }
+            }
+        }
+        this.recovering = false;
+    }
+
+    fn parseStatic(borrow mut this, visibility: Visibility, start: u32) -> Result<u32, AllocError> {
+        this.expect(TokenKind.StaticKeyword)?;
+        let mutable = this.at(TokenKind.MutKeyword);
+        if (mutable) {
+            this.advance();
+        }
+        let name = this.parseIdentifier()?;
+        this.expect(TokenKind.Colon)?;
+        let typ = this.parseType()?;
+        this.expect(TokenKind.Equals)?;
+        let value = this.parseExpr()?;
+        this.expect(TokenKind.Semicolon)?;
+        return this.addItem(ItemKind.Static(mutable, typ, value), visibility, name, start);
+    }
+
+    fn parseConst(borrow mut this, visibility: Visibility, start: u32) -> Result<u32, AllocError> {
+        this.expect(TokenKind.ConstKeyword)?;
+        let name = this.parseIdentifier()?;
+        this.expect(TokenKind.Colon)?;
+        let typ = this.parseType()?;
+        this.expect(TokenKind.Equals)?;
+        let value = this.parseExpr()?;
+        this.expect(TokenKind.Semicolon)?;
+        return this.addItem(ItemKind.Const(typ, value), visibility, name, start);
+    }
+
+    // ---- Names and types ----
+
+    fn parseIdentifier(borrow mut this) -> Result<u32, AllocError> {
+        if (this.at(TokenKind.Identifier)) {
+            let token = this.advance();
+            return this.front.ast.addIdent(
+                Ident { symbol: token.data, start: token.start, end: token.end, missing: false },
+            );
+        }
+        this.errorFound(expectedToken(), "expected identifier, found ", "")?;
+        let symbol = this.intern("<missing>")?;
+        let at = this.current().start;
+        return this.front.ast.addIdent(Ident { symbol: symbol, start: at, end: at, missing: true });
+    }
+
+    /// An identifier for a keyword used as a name (`this`, `static`), interned as the reference does.
+    fn keywordIdent(borrow mut this, text: StringView) -> Result<u32, AllocError> {
+        let symbol = this.intern(text)?;
+        let token = this.advance();
+        return this.front.ast.addIdent(Ident { symbol: symbol, start: token.start, end: token.end, missing: false });
+    }
+
+    fn parseQualifiedName(borrow mut this) -> Result<QualifiedName, AllocError> {
+        let start = this.current().start;
+        var parts = Vector<u32>.create();
+        parts.push(this.parseIdentifier()?)?;
+        while (this.at(TokenKind.Dot) && this.peekIs(1, TokenKind.Identifier)) {
+            this.advance();
+            parts.push(this.parseIdentifier()?)?;
+        }
+        let range = this.list(parts)?;
+        return Ok(QualifiedName { parts: range, start: start, end: this.endFrom(start) });
+    }
+
+    fn parseType(borrow mut this) -> Result<u32, AllocError> {
+        let start = this.current().start;
+        var typ = this.parseTypeCore()?;
+        while (this.at(TokenKind.Question)) {
+            this.advance();
+            typ = this.front.ast.addType(TypeNode.Optional(typ), start, this.endFrom(start))?; // `T?` (§22.1)
+        }
+        return Ok(typ);
+    }
+
+    /// After `borrow`: does the `(` begin a source list (§13.5), names separated by commas and followed by a type,
+    /// rather than a parenthesised type such as `borrow (T?)`?
+    fn isSourceList(borrow this) -> bool {
+        var k: usize = 1;
+        while (this.peekIs(k, TokenKind.Identifier) || this.peekIs(k, TokenKind.ThisKeyword) ||
+            this.peekIs(k, TokenKind.StaticKeyword)) {
+            k += 1;
+            if (this.peekIs(k, TokenKind.CloseParen)) {
+                let next = this.peek(k + 1).kind;
+                return match (next) {
+                    TokenKind.Identifier => true,
+                    TokenKind.BorrowKeyword => true,
+                    TokenKind.Star => true,
+                    TokenKind.OpenBracket => true,
+                    TokenKind.OpenParen => true,
+                    TokenKind.ExternKeyword => true,
+                    TokenKind.StaticKeyword => true,
+                    TokenKind.FnKeyword => true,
+                    TokenKind.At => true,
+                    _ => false,
+                };
+            }
+            if (!this.peekIs(k, TokenKind.Comma)) {
+                return false;
+            }
+            k += 1;
+        }
+        return false;
+    }
+
+    fn parseTypeCore(borrow mut this) -> Result<u32, AllocError> {
+        if (!this.nest()?) {
+            let at = this.current().start;
+            return this.front.ast.addType(TypeNode.Missing, at, at);
+        }
+        let result = this.parseTypeLevel();
+        this.nesting -= 1;
+        return result;
+    }
+
+    /// `(T, U)` after `fn`: the parameter types of a function or function pointer type.
+    fn parseTypeList(borrow mut this) -> Result<Range, AllocError> {
+        this.expect(TokenKind.OpenParen)?;
+        var parameters = Vector<u32>.create();
+        while (!this.at(TokenKind.CloseParen) && !this.at(TokenKind.EndOfFile)) {
+            parameters.push(this.parseType()?)?;
+            if (!this.eat(TokenKind.Comma)) {
+                break;
+            }
+        }
+        this.expect(TokenKind.CloseParen)?;
+        return this.list(parameters);
+    }
+
+    fn parseTypeLevel(borrow mut this) -> Result<u32, AllocError> {
+        if (this.at(TokenKind.ExternKeyword)) {
+            // A C function pointer `extern "C" fn(T, U) -> R` (type-system.md §29.5).
+            let start = this.advance().start;
+            var abi = emptyRange();
+            if (this.at(TokenKind.StringLiteral)) {
+                let token = this.advance();
+                abi = this.front.ast.addText(this.lexed.strings[token.data as usize].view())?;
+            }
+            if (abi.count == 0) {
+                this.expect(TokenKind.StringLiteral)?;
+            }
+            this.expect(TokenKind.FnKeyword)?;
+            let parameters = this.parseTypeList()?;
+            let result = if (this.eat(TokenKind.Arrow)) this.parseType()? else none();
+            return this.front.ast.addType(
+                TypeNode.FunctionPointer(abi, parameters, result),
+                start,
+                this.endFrom(start),
+            );
+        }
+        if (this.at(TokenKind.FnKeyword) || this.at(TokenKind.At)) {
+            // A function value `fn(T, U) -> R` (type-system.md §36.1), after an effect list `@effects(…)` (§36.3).
+            let start = this.current().start;
+            let attributes = this.parseAttributes()?;
+            this.expect(TokenKind.FnKeyword)?;
+            let parameters = this.parseTypeList()?;
+            let result = if (this.eat(TokenKind.Arrow)) this.parseType()? else none();
+            return this.front.ast.addType(
+                TypeNode.Function(attributes, parameters, result),
+                start,
+                this.endFrom(start),
+            );
+        }
+        if (this.at(TokenKind.Star)) {
+            // A raw pointer `*T` / `*mut T` (type-system.md §27.1).
+            let start = this.advance().start;
+            let isMutable = this.eat(TokenKind.MutKeyword);
+            let pointee = this.parseTypeCore()?;
+            return this.front.ast.addType(TypeNode.Pointer(isMutable, pointee), start, this.endFrom(start));
+        }
+        if (this.at(TokenKind.BorrowKeyword)) {
+            let start = this.advance().start;
+            let isMutable = this.eat(TokenKind.MutKeyword);
+            var sources = emptyRange();
+            var hasSources = false;
+            if (this.at(TokenKind.OpenParen) && this.isSourceList()) {
+                this.advance();
+                hasSources = true;
+                var names = Vector<u32>.create();
+                loop {
+                    // `this` may be named as a source too, and `static` as a region (§25.2).
+                    if (this.at(TokenKind.ThisKeyword)) {
+                        names.push(this.keywordIdent("this")?)?;
+                    } else if (this.at(TokenKind.StaticKeyword)) {
+                        names.push(this.keywordIdent("static")?)?;
+                    } else {
+                        names.push(this.parseIdentifier()?)?;
+                    }
+                    if (!this.eat(TokenKind.Comma)) {
+                        break;
+                    }
+                }
+                this.expect(TokenKind.CloseParen)?;
+                sources = this.list(names)?;
+            }
+            let pointee = this.parseTypeCore()?;
+            return this.front.ast.addType(
+                TypeNode.Reference(isMutable, hasSources, sources, pointee),
+                start,
+                this.endFrom(start),
+            );
+        }
+        if (this.at(TokenKind.OpenParen)) {
+            // A parenthesised type: `borrow (T?)` is a reference to an optional (M11, type-system.md §22.1).
+            let start = this.advance().start;
+            let inner = this.parseType()?;
+            this.expect(TokenKind.CloseParen)?;
+            this.front.ast.typeSpans[inner as usize] = Span { start: start, end: this.endFrom(start) };
+            return Ok(inner);
+        }
+        if (this.at(TokenKind.OpenBracket)) {
+            let start = this.advance().start;
+            let element = this.parseType()?;
+            this.expect(TokenKind.Semicolon)?;
+            let length = this.parsePrimary()?;
+            this.expect(TokenKind.CloseBracket)?;
+            return this.front.ast.addType(TypeNode.Array(element, length), start, this.endFrom(start));
+        }
+        if (this.at(TokenKind.StaticKeyword)) {
+            // The region `static` as a region argument (type-system.md §25.2).
+            let token = this.current();
+            let identifier = this.keywordIdent("static")?;
+            var parts = Vector<u32>.create();
+            parts.push(identifier)?;
+            let range = this.list(parts)?;
+            return this.front.ast.addType(
+                TypeNode.Named(QualifiedName { parts: range, start: token.start, end: token.end }),
+                token.start,
+                token.end,
+            );
+        }
+        let next = this.peek(1).kind;
+        if (this.at(TokenKind.Identifier) &&
+            (sameKind(next, TokenKind.Identifier) || sameKind(next, TokenKind.FnKeyword) ||
+                sameKind(next, TokenKind.MutKeyword) || sameKind(next, TokenKind.At)) &&
+            this.nameIs(this.current(), "dyn")) {
+            // `dyn I`: an interface instantiation dispatched at run time (type-system.md §37); `dyn` is a keyword only
+            // here. `dyn fn(…) -> R` and `dyn mut fn(…) -> R`: an owning closure's type (§36.5).
+            let start = this.advance().start;
+            let isMutable = this.eat(TokenKind.MutKeyword);
+            let interfaceType = this.parseTypeCore()?;
+            // `dyn I + Send` (type-system.md §38.4); `Send` is the only marker a dyn type takes.
+            let isSend = this.at(TokenKind.Plus) && this.peekIs(1, TokenKind.Identifier) && this.nameIs(
+                this.peek(1),
+                "Send",
+            );
+            if (isSend) {
+                this.advance();
+                this.advance();
+            }
+            return this.front.ast.addType(TypeNode.Dyn(interfaceType, isMutable, isSend), start, this.endFrom(start));
+        }
+        if (this.at(TokenKind.Identifier)) {
+            let name = this.parseQualifiedName()?;
+            if (this.at(TokenKind.Less)) {
+                let arguments = this.parseGenericArguments()?;
+                return this.front.ast.addType(TypeNode.Generic(name, arguments), name.start, this.endFrom(name.start));
+            }
+            return this.front.ast.addType(TypeNode.Named(name), name.start, name.end);
+        }
+        this.errorFound(expectedType(), "expected type, found ", "")?;
+        let at = this.current().start;
+        return this.front.ast.addType(TypeNode.Missing, at, at);
+    }
+
+    // ---- Statements ----
+
+    fn parseBlock(borrow mut this) -> Result<u32, AllocError> {
+        let start = this.current().start;
+        if (!this.at(TokenKind.OpenBrace)) {
+            this.expect(TokenKind.OpenBrace)?;
+            return this.front.ast.addStmt(StmtNode.Block(emptyRange()), start, start);
+        }
+        this.advance();
+
+        var statements = Vector<u32>.create();
+        while (!endsBlock(this.current().kind)) {
+            let startPos = this.pos;
+            statements.push(this.parseStatement()?)?;
+            this.synchronizeStatement();
+            if (this.pos == startPos) {
+                this.advance();
+            }
+        }
+        this.expect(TokenKind.CloseBrace)?;
+        let range = this.list(statements)?;
+        return this.front.ast.addStmt(StmtNode.Block(range), start, this.endFrom(start));
+    }
+
+    fn synchronizeStatement(borrow mut this) {
+        if (!this.recovering) {
+            return;
+        }
+        // A statement that failed but still ended at a boundary needs no skipping.
+        let last = this.previous().kind;
+        if (!sameKind(last, TokenKind.Semicolon) && !sameKind(last, TokenKind.CloseBrace)) {
+            // Skip balanced { } groups, so a broken `if (x = 1) { ... }` does not end the enclosing block.
+            var depth: i32 = 0;
+            while (!this.at(TokenKind.EndOfFile)) {
+                let kind = this.current().kind;
+                if (sameKind(kind, TokenKind.FnKeyword) || isVisibilityKeyword(kind)) {
+                    break;
+                }
+                if (depth == 0 && (sameKind(kind, TokenKind.CloseBrace) || isStatementKeyword(kind))) {
+                    break;
+                }
+                this.advance();
+                if (sameKind(kind, TokenKind.OpenBrace)) {
+                    depth += 1;
+                } else if (sameKind(kind, TokenKind.CloseBrace)) {
+                    depth -= 1;
+                    if (depth == 0) {
+                        break;
+                    }
+                } else if (sameKind(kind, TokenKind.Semicolon) && depth == 0) {
+                    break;
+                }
+            }
+        }
+        this.recovering = false;
+    }
+
+    fn parseStatement(borrow mut this) -> Result<u32, AllocError> {
+        if (!this.nest()?) {
+            let at = this.current().start;
+            return this.front.ast.addStmt(StmtNode.Block(emptyRange()), at, at);
+        }
+        let result = this.parseStatementLevel();
+        this.nesting -= 1;
+        return result;
+    }
+
+    fn parseStatementLevel(borrow mut this) -> Result<u32, AllocError> {
+        let start = this.current().start;
+        match (this.current().kind) {
+            TokenKind.OpenBrace => { return this.parseBlock(); }
+            TokenKind.LetKeyword => { return this.parseLocalDecl(); }
+            TokenKind.VarKeyword => { return this.parseLocalDecl(); }
+            TokenKind.UsingKeyword => {
+                this.advance();
+                let name = this.parseIdentifier()?;
+                let typ = if (this.eat(TokenKind.Colon)) this.parseType()? else none();
+                this.expect(TokenKind.Equals)?;
+                let initializer = this.parseExpr()?;
+                this.expect(TokenKind.Semicolon)?;
+                return this.front.ast.addStmt(
+                    StmtNode.Local(LocalKind.Using, name, typ, initializer),
+                    start,
+                    this.endFrom(start),
+                );
+            }
+            TokenKind.DeferKeyword => {
+                this.advance();
+                let body = this.parseStatement()?;
+                return this.front.ast.addStmt(StmtNode.Defer(body), start, this.endFrom(start));
+            }
+            TokenKind.MatchKeyword => { return this.parseMatch(); }
+            TokenKind.UnsafeKeyword => {
+                if (this.peekIs(1, TokenKind.OpenBrace)) {
+                    // In statement position `unsafe {` is always the block form (type-system.md §27.4).
+                    this.advance();
+                    let body = this.parseBlock()?;
+                    return this.front.ast.addStmt(StmtNode.Unsafe(body), start, this.endFrom(start));
+                }
+                return this.parseExpressionOrAssignment();
+            }
+            TokenKind.IfKeyword => { return this.parseIf(); }
+            TokenKind.WhileKeyword => {
+                this.advance();
+                let condition = this.parseParenthesizedCondition()?;
+                let body = this.parseBlock()?;
+                return this.front.ast.addStmt(StmtNode.While(condition, body), start, this.endFrom(start));
+            }
+            TokenKind.ForKeyword => {
+                this.advance();
+                this.expect(TokenKind.OpenParen)?;
+                let variable = this.parseIdentifier()?;
+                this.expect(TokenKind.InKeyword)?;
+                let first = this.parseExpr()?;
+                let end = if (this.eat(TokenKind.DotDot)) this.parseExpr()? else none();
+                this.expect(TokenKind.CloseParen)?;
+                let body = this.parseBlock()?;
+                return this.front.ast.addStmt(StmtNode.For(variable, first, end, body), start, this.endFrom(start));
+            }
+            TokenKind.LoopKeyword => {
+                this.advance();
+                let body = this.parseBlock()?;
+                return this.front.ast.addStmt(StmtNode.Loop(body), start, this.endFrom(start));
+            }
+            TokenKind.BreakKeyword => {
+                this.advance();
+                this.expect(TokenKind.Semicolon)?;
+                return this.front.ast.addStmt(StmtNode.Break, start, this.endFrom(start));
+            }
+            TokenKind.ContinueKeyword => {
+                this.advance();
+                this.expect(TokenKind.Semicolon)?;
+                return this.front.ast.addStmt(StmtNode.Continue, start, this.endFrom(start));
+            }
+            TokenKind.ReturnKeyword => {
+                this.advance();
+                let value = if (this.at(
+                    TokenKind.Semicolon,
+                ) || this.at(TokenKind.CloseBrace)) none() else this.parseExpr()?;
+                this.expect(TokenKind.Semicolon)?;
+                return this.front.ast.addStmt(StmtNode.Return(value), start, this.endFrom(start));
+            }
+            _ => { return this.parseExpressionOrAssignment(); }
+        }
+    }
+
+    fn parseMatch(borrow mut this) -> Result<u32, AllocError> {
+        let start = this.advance().start;
+        let scrutinee = this.parseParenthesizedCondition()?;
+        var arms = Vector<u32>.create();
+        this.expect(TokenKind.OpenBrace)?;
+        while (!this.at(TokenKind.CloseBrace) && !this.at(TokenKind.EndOfFile)) {
+            let armStart = this.current().start;
+            let startPos = this.pos;
+            let pattern = this.parsePattern()?;
+            this.expect(TokenKind.FatArrow)?;
+            let body = this.parseBlock()?;
+            this.front.ast.matchArms.push(MatchArm {
+                pattern: pattern,
+                body: body,
+                start: armStart,
+                end: this.endFrom(armStart),
+            })?;
+            arms.push(truncate<u32>(this.front.ast.matchArms.length - 1))?;
+            this.eat(TokenKind.Comma);
+            if (this.pos == startPos) {
+                this.advance();
+            }
+        }
+        this.expect(TokenKind.CloseBrace)?;
+        let range = this.list(arms)?;
+        return this.front.ast.addStmt(StmtNode.Match(scrutinee, range), start, this.endFrom(start));
+    }
+
+    /// `match (e) { p => v, ... }` in expression position (type-system.md §15.3).
+    fn parseMatchExpr(borrow mut this) -> Result<u32, AllocError> {
+        let start = this.advance().start;
+        let scrutinee = this.parseParenthesizedCondition()?;
+        var arms = Vector<u32>.create();
+        this.expect(TokenKind.OpenBrace)?;
+        while (!this.at(TokenKind.CloseBrace) && !this.at(TokenKind.EndOfFile)) {
+            let armStart = this.current().start;
+            let startPos = this.pos;
+            let pattern = this.parsePattern()?;
+            this.expect(TokenKind.FatArrow)?;
+            let value = this.parseBranch()?;
+            this.front.ast.valueArms.push(ValueArm {
+                pattern: pattern,
+                value: value,
+                start: armStart,
+                end: this.endFrom(armStart),
+            })?;
+            arms.push(truncate<u32>(this.front.ast.valueArms.length - 1))?;
+            // Value arms are separated by commas; a block arm needs none.
+            let isBlock = match (this.front.ast.exprs[value as usize]) {
+                ExprNode.Block(_) => true,
+                _ => false,
+            };
+            if (!this.eat(TokenKind.Comma) && !isBlock && !this.at(TokenKind.CloseBrace)) {
+                this.expect(TokenKind.Comma)?;
+            }
+            if (this.pos == startPos) {
+                this.advance();
+            }
+        }
+        this.expect(TokenKind.CloseBrace)?;
+        let range = this.list(arms)?;
+        return this.front.ast.addExpr(ExprNode.Match(scrutinee, range), start, this.endFrom(start));
+    }
+
+    /// `if (c) a else b` in expression position; the `else` is required (type-system.md §15.3). The reference recurses
+    /// for `else if`, outside the nesting limit; this loop builds the same nodes in the same order without recursing,
+    /// so a long chain cannot exhaust the stack (docs/p2-frontend.md §6).
+    fn parseIfExpr(borrow mut this) -> Result<u32, AllocError> {
+        var starts = Vector<u32>.create();
+        var conditions = Vector<u32>.create();
+        var thens = Vector<u32>.create();
+        var otherwise = none();
+        loop {
+            starts.push(this.advance().start)?;
+            conditions.push(this.parseParenthesizedCondition()?)?;
+            thens.push(this.parseBranch()?)?;
+            this.expect(TokenKind.ElseKeyword)?;
+            if (!this.at(TokenKind.IfKeyword)) {
+                otherwise = this.parseBranch()?;
+                break;
+            }
+        }
+        var k = starts.length;
+        while (k > 0) {
+            k -= 1;
+            otherwise = this.front.ast.addExpr(
+                ExprNode.If(conditions[k], thens[k], otherwise),
+                starts[k],
+                this.endFrom(starts[k]),
+            )?;
+        }
+        return Ok(otherwise);
+    }
+
+    /// Does the `(` here begin a closure: is its matching `)` followed by `=>` (type-system.md §36.2)?
+    fn isClosureStart(borrow this) -> bool {
+        var depth: i32 = 0;
+        var k: usize = 0;
+        loop {
+            let kind = this.peek(k).kind;
+            if (sameKind(kind, TokenKind.OpenParen)) {
+                depth += 1;
+            } else if (sameKind(kind, TokenKind.CloseParen)) {
+                depth -= 1;
+                if (depth == 0) {
+                    return this.peekIs(k + 1, TokenKind.FatArrow);
+                }
+            } else if (sameKind(kind, TokenKind.EndOfFile) || sameKind(kind, TokenKind.Semicolon) ||
+                sameKind(kind, TokenKind.OpenBrace) || sameKind(kind, TokenKind.CloseBrace)) {
+                return false;
+            }
+            k += 1;
+        }
+    }
+
+    /// `(x: T, y) => body`, the body a block or an expression (type-system.md §36.2).
+    fn parseClosure(borrow mut this) -> Result<u32, AllocError> {
+        let start = this.advance().start;
+        var parameters = Vector<u32>.create();
+        while (!this.at(TokenKind.CloseParen) && !this.at(TokenKind.EndOfFile)) {
+            let parameterStart = this.current().start;
+            let name = this.parseIdentifier()?;
+            let typ = if (this.eat(TokenKind.Colon)) this.parseType()? else none();
+            this.front.ast.closureParameters.push(ClosureParameter {
+                name: name,
+                typ: typ,
+                start: parameterStart,
+                end: this.endFrom(parameterStart),
+            })?;
+            parameters.push(truncate<u32>(this.front.ast.closureParameters.length - 1))?;
+            if (!this.eat(TokenKind.Comma)) {
+                break;
+            }
+        }
+        this.expect(TokenKind.CloseParen)?;
+        this.expect(TokenKind.FatArrow)?;
+        var block = none();
+        var body = none();
+        if (this.at(TokenKind.OpenBrace)) {
+            block = this.parseBlock()?;
+        } else {
+            body = this.parseExpr()?;
+        }
+        let range = this.list(parameters)?;
+        this.front.ast.closures.push(Closure { parameters: range, block: block, body: body, isMove: false })?;
+        let closure = truncate<u32>(this.front.ast.closures.length - 1);
+        return this.front.ast.addExpr(ExprNode.Closure(closure), start, this.endFrom(start));
+    }
+
+    /// A branch of an `if` or `match` expression: a block, or an expression.
+    fn parseBranch(borrow mut this) -> Result<u32, AllocError> {
+        if (this.at(TokenKind.OpenBrace)) {
+            let block = this.parseBlock()?;
+            let span = this.front.ast.stmtSpans[block as usize];
+            return this.front.ast.addExpr(ExprNode.Block(block), span.start, span.end);
+        }
+        return this.parseExpr();
+    }
+
+    fn parsePattern(borrow mut this) -> Result<u32, AllocError> {
+        if (!this.nest()?) {
+            let at = this.current().start;
+            return this.front.ast.addPattern(PatternNode.Wildcard, at, at);
+        }
+        let result = this.parsePatternLevel();
+        this.nesting -= 1;
+        return result;
+    }
+
+    fn parsePatternLevel(borrow mut this) -> Result<u32, AllocError> {
+        let token = this.current();
+        let start = token.start;
+        match (token.kind) {
+            TokenKind.Underscore => {
+                this.advance();
+                return this.front.ast.addPattern(PatternNode.Wildcard, token.start, token.end);
+            }
+            TokenKind.NullKeyword => {
+                this.advance();
+                return this.front.ast.addPattern(PatternNode.Null, token.start, token.end);
+            }
+            TokenKind.IntLiteral => { return this.literalPattern(start, false); }
+            TokenKind.CharLiteral => { return this.literalPattern(start, false); }
+            TokenKind.TrueKeyword => { return this.literalPattern(start, false); }
+            TokenKind.FalseKeyword => { return this.literalPattern(start, false); }
+            TokenKind.Minus => {
+                if (this.peekIs(1, TokenKind.IntLiteral)) {
+                    return this.literalPattern(start, true);
+                }
+            }
+            TokenKind.Identifier => {
+                let path = this.parseQualifiedName()?;
+                var hasBindings = false;
+                var bindings = Vector<u32>.create();
+                if (this.eat(TokenKind.OpenParen)) {
+                    hasBindings = true;
+                    while (!this.at(TokenKind.CloseParen) && !this.at(TokenKind.EndOfFile)) {
+                        if (this.startsNestedPattern()) {
+                            // M11 (G1): a pattern in a payload's position (type-system.md §15.2).
+                            let nested = this.parsePattern()?;
+                            this.front.ast.bindings.push(Binding { name: none(), mutable: false, nested: nested })?;
+                        } else {
+                            let isMutable = this.eat(TokenKind.VarKeyword); // M3c: `var x`
+                            let name = if (!isMutable && this.eat(
+                                TokenKind.Underscore,
+                            )) none() else this.parseIdentifier()?;
+                            this.front.ast.bindings.push(Binding { name: name, mutable: isMutable, nested: none() })?;
+                        }
+                        bindings.push(truncate<u32>(this.front.ast.bindings.length - 1))?;
+                        if (!this.eat(TokenKind.Comma)) {
+                            break;
+                        }
+                    }
+                    this.expect(TokenKind.CloseParen)?;
+                }
+                let range = this.list(bindings)?;
+                return this.front.ast.addPattern(
+                    PatternNode.Variant(path, hasBindings, range),
+                    start,
+                    this.endFrom(start),
+                );
+            }
+            _ => {}
+        }
+        this.errorFound(expectedPattern(), "expected a pattern, found ", "")?;
+        return this.front.ast.addPattern(PatternNode.Wildcard, start, start);
+    }
+
+    fn literalPattern(borrow mut this, start: u32, negated: bool) -> Result<u32, AllocError> {
+        let literal = if (negated) this.parseUnary()? else this.parsePrimary()?;
+        return this.front.ast.addPattern(PatternNode.Literal(literal), start, this.endFrom(start));
+    }
+
+    /// Whether a payload position holds a nested pattern rather than a binding: a literal, `null`, or a variant (an
+    /// identifier followed by `(` or `.`). A single identifier is a binding, and `_` the wildcard binding.
+    fn startsNestedPattern(borrow this) -> bool => match (this.current().kind) {
+        TokenKind.IntLiteral => true,
+        TokenKind.CharLiteral => true,
+        TokenKind.TrueKeyword => true,
+        TokenKind.FalseKeyword => true,
+        TokenKind.NullKeyword => true,
+        TokenKind.Minus => this.peekIs(1, TokenKind.IntLiteral),
+        TokenKind.Identifier => this.peekIs(1, TokenKind.OpenParen) || this.peekIs(1, TokenKind.Dot),
+        _ => false,
+    };
+
+    fn parseLocalDecl(borrow mut this) -> Result<u32, AllocError> {
+        let start = this.current().start;
+        let isMutable = sameKind(this.advance().kind, TokenKind.VarKeyword);
+        let name = this.parseIdentifier()?;
+        let typ = if (this.eat(TokenKind.Colon)) this.parseType()? else none();
+        let initializer = if (this.eat(TokenKind.Equals)) this.parseExpr()? else none();
+        this.expect(TokenKind.Semicolon)?;
+        let kind = if (isMutable) LocalKind.Var else LocalKind.Let;
+        return this.front.ast.addStmt(StmtNode.Local(kind, name, typ, initializer), start, this.endFrom(start));
+    }
+
+    /// An `if` statement and its `else if` chain, without recursing for each `else if` (as parseIfExpr).
+    fn parseIf(borrow mut this) -> Result<u32, AllocError> {
+        var starts = Vector<u32>.create();
+        var conditions = Vector<u32>.create();
+        var thens = Vector<u32>.create();
+        var otherwise = none();
+        loop {
+            starts.push(this.current().start)?;
+            this.advance();
+            conditions.push(this.parseParenthesizedCondition()?)?;
+            thens.push(this.parseBlock()?)?;
+            if (!this.eat(TokenKind.ElseKeyword)) {
+                break;
+            }
+            if (!this.at(TokenKind.IfKeyword)) {
+                otherwise = this.parseBlock()?;
+                break;
+            }
+        }
+        var k = starts.length;
+        while (k > 0) {
+            k -= 1;
+            otherwise = this.front.ast.addStmt(
+                StmtNode.If(conditions[k], thens[k], otherwise),
+                starts[k],
+                this.endFrom(starts[k]),
+            )?;
+        }
+        return Ok(otherwise);
+    }
+
+    fn parseParenthesizedCondition(borrow mut this) -> Result<u32, AllocError> {
+        this.expect(TokenKind.OpenParen)?;
+        let condition = this.parseExpr()?;
+        this.expect(TokenKind.CloseParen)?;
+        return Ok(condition);
+    }
+
+    fn parseExpressionOrAssignment(borrow mut this) -> Result<u32, AllocError> {
+        let start = this.current().start;
+        let expr = this.parseExpr()?;
+
+        let assign = this.peekAssignOp();
+        if (assign.found) {
+            let assignable = match (this.front.ast.exprs[expr as usize]) {
+                ExprNode.Name(_, _) => true,
+                ExprNode.Member(_, _) => true,
+                ExprNode.Index(_, _) => true,
+                ExprNode.Error => true,
+                _ => false,
+            };
+            if (!assignable) {
+                let span = this.front.ast.exprSpans[expr as usize];
+                this.error(
+                    invalidAssignmentTarget(),
+                    span.start,
+                    span.end,
+                    textMessage("invalid assignment target; only a variable, a member or an element can be assigned")?,
+                )?;
+            }
+            for (i in 0..assign.tokens) {
+                this.advance();
+            }
+            let value = this.parseExpr()?;
+            this.expect(TokenKind.Semicolon)?;
+            return this.front.ast.addStmt(StmtNode.Assign(expr, assign.op, value), start, this.endFrom(start));
+        }
+
+        // Only a call is a statement (N0225): a `;` after anything else is not a sure fix (tooling.md §5.2).
+        this.semicolonFixable = match (this.front.ast.exprs[expr as usize]) {
+            ExprNode.Call(_, _) => true,
+            _ => false,
+        };
+        this.expect(TokenKind.Semicolon)?;
+        this.semicolonFixable = true;
+        return this.front.ast.addStmt(StmtNode.Expression(expr), start, this.endFrom(start));
+    }
+
+    fn peekAssignOp(borrow this) -> AssignOpAhead {
+        let op: AssignOp? = match (this.current().kind) {
+            TokenKind.Equals => AssignOp.Assign,
+            TokenKind.PlusEquals => AssignOp.Add,
+            TokenKind.MinusEquals => AssignOp.Subtract,
+            TokenKind.StarEquals => AssignOp.Multiply,
+            TokenKind.SlashEquals => AssignOp.Divide,
+            TokenKind.PercentEquals => AssignOp.Remainder,
+            TokenKind.AmpEquals => AssignOp.BitAnd,
+            TokenKind.PipeEquals => AssignOp.BitOr,
+            TokenKind.CaretEquals => AssignOp.BitXor,
+            TokenKind.LessLessEquals => AssignOp.ShiftLeft,
+            _ => null,
+        };
+        match (op) {
+            Some(found) => { return AssignOpAhead { found: true, op: found, tokens: 1 }; }
+            null => {}
+        }
+        if (this.at(TokenKind.Greater) && this.isAdjacent(TokenKind.GreaterEquals)) {
+            return AssignOpAhead { found: true, op: AssignOp.ShiftRight, tokens: 2 };
+        }
+        return AssignOpAhead { found: false, op: AssignOp.Assign, tokens: 0 };
+    }
+
+    /// True if the token after the current one has the given kind and touches it (no space between).
+    fn isAdjacent(borrow this, next: TokenKind) -> bool =>
+        this.peekIs(1, next) && this.peek(1).start == this.current().end;
+
+    // ---- Expressions ----
+
+    fn parseExpr(borrow mut this) -> Result<u32, AllocError> => this.parseBinary(1);
+
+    fn parseBinary(borrow mut this, minPrecedence: u32) -> Result<u32, AllocError> {
+        var links: u32 = 0; // each link of the chain deepens the left operand's tree (maxNesting)
+        let result = this.parseBinaryChain(minPrecedence, mut links);
+        this.nesting -= links;
+        return result;
+    }
+
+    fn parseBinaryChain(borrow mut this, minPrecedence: u32, links: borrow mut u32) -> Result<u32, AllocError> {
+        let start = this.current().start;
+        var left = this.parseUnary()?;
+        var leftIsComparison = false;
+
+        loop {
+            let ahead = this.peekBinaryOp();
+            if (this.at(TokenKind.AsKeyword) || (ahead.found && ahead.precedence >= minPrecedence)) {
+                if (!this.nest()?) {
+                    return Ok(left);
+                }
+                links += 1;
+            }
+            if (this.at(TokenKind.AsKeyword)) {
+                this.advance();
+                let typ = this.parseType()?;
+                left = this.front.ast.addExpr(ExprNode.Cast(left, typ), start, this.endFrom(start))?;
+                leftIsComparison = false;
+                continue;
+            }
+
+            let op = this.peekBinaryOp();
+            if (!op.found || op.precedence < minPrecedence) {
+                return Ok(left);
+            }
+
+            if (op.precedence == comparisonPrecedence() && leftIsComparison) {
+                let from = this.current().start;
+                let to = this.peek((op.tokens - 1) as usize).end;
+                this.error(
+                    chainedComparison(),
+                    from,
+                    to,
+                    textMessage("comparison operators cannot be chained; combine the comparisons with '&&'")?,
+                )?;
+            }
+
+            for (i in 0..op.tokens) {
+                this.advance();
+            }
+            let right = this.parseBinary(op.precedence + 1)?;
+            left = this.front.ast.addExpr(ExprNode.Binary(left, op.op, right), start, this.endFrom(start))?;
+            leftIsComparison = op.precedence == comparisonPrecedence();
+        }
+    }
+
+    fn peekBinaryOp(borrow this) -> BinaryOpAhead {
+        let found: BinaryOpAhead? = match (this.current().kind) {
+            TokenKind.PipePipe => binaryAhead(BinaryOp.LogicalOr, 1),
+            TokenKind.AmpAmp => binaryAhead(BinaryOp.LogicalAnd, 2),
+            TokenKind.EqualsEquals => binaryAhead(BinaryOp.Equal, comparisonPrecedence()),
+            TokenKind.BangEquals => binaryAhead(BinaryOp.NotEqual, comparisonPrecedence()),
+            TokenKind.Less => binaryAhead(BinaryOp.Less, comparisonPrecedence()),
+            TokenKind.LessEquals => binaryAhead(BinaryOp.LessEqual, comparisonPrecedence()),
+            TokenKind.GreaterEquals => binaryAhead(BinaryOp.GreaterEqual, comparisonPrecedence()),
+            TokenKind.Pipe => binaryAhead(BinaryOp.BitOr, 4),
+            TokenKind.Caret => binaryAhead(BinaryOp.BitXor, 5),
+            TokenKind.Amp => binaryAhead(BinaryOp.BitAnd, 6),
+            TokenKind.LessLess => binaryAhead(BinaryOp.ShiftLeft, 7),
+            TokenKind.Plus => binaryAhead(BinaryOp.Add, 8),
+            TokenKind.Minus => binaryAhead(BinaryOp.Subtract, 8),
+            TokenKind.Star => binaryAhead(BinaryOp.Multiply, 9),
+            TokenKind.Slash => binaryAhead(BinaryOp.Divide, 9),
+            TokenKind.Percent => binaryAhead(BinaryOp.Remainder, 9),
+            _ => null,
+        };
+        match (found) {
+            Some(ahead) => { return ahead; }
+            null => {}
+        }
+        if (this.at(TokenKind.Greater)) {
+            if (this.isAdjacent(TokenKind.GreaterEquals)) {
+                return noBinaryOp(); // '>>=' is an assignment operator, not a binary operator
+            }
+            if (this.isAdjacent(TokenKind.Greater)) {
+                return BinaryOpAhead { found: true, op: BinaryOp.ShiftRight, precedence: 7, tokens: 2 };
+            }
+            return binaryAhead(BinaryOp.Greater, comparisonPrecedence());
+        }
+        return noBinaryOp();
+    }
+
+    fn parseUnary(borrow mut this) -> Result<u32, AllocError> {
+        if (!this.nest()?) {
+            let at = this.current().start;
+            return this.front.ast.addExpr(ExprNode.Error, at, at);
+        }
+        let result = this.parseUnaryLevel();
+        this.nesting -= 1;
+        return result;
+    }
+
+    fn parseUnaryLevel(borrow mut this) -> Result<u32, AllocError> {
+        let start = this.current().start;
+        if (this.at(TokenKind.BorrowKeyword)) {
+            this.advance();
+            let isMutable = this.eat(TokenKind.MutKeyword);
+            let operand = this.parseUnary()?;
+            return this.front.ast.addExpr(ExprNode.Borrow(isMutable, operand), start, this.endFrom(start));
+        }
+        if (this.at(TokenKind.MoveKeyword)) {
+            this.advance();
+            if (this.at(TokenKind.OpenParen) && this.isClosureStart()) {
+                // `move (x) => …`: a move literal (type-system.md §36.5).
+                let closure = this.parseClosure()?;
+                match (this.front.ast.exprs[closure as usize]) {
+                    ExprNode.Closure(c) => { this.front.ast.closures[c as usize].isMove = true; }
+                    _ => {}
+                }
+                this.front.ast.exprSpans[closure as usize] = Span { start: start, end: this.endFrom(start) };
+                return Ok(closure);
+            }
+            let operand = this.parseUnary()?;
+            return this.front.ast.addExpr(ExprNode.Move(operand), start, this.endFrom(start));
+        }
+        if (this.at(TokenKind.Minus) || this.at(TokenKind.Bang)) {
+            let op = if (sameKind(this.advance().kind, TokenKind.Minus)) UnaryOp.Negate else UnaryOp.Not;
+            let operand = this.parseUnary()?;
+            return this.front.ast.addExpr(ExprNode.Unary(op, operand), start, this.endFrom(start));
+        }
+        return this.parsePostfix();
+    }
+
+    fn parsePostfix(borrow mut this) -> Result<u32, AllocError> {
+        var links: u32 = 0; // each call, member, index, `?` or `!` deepens the tree (maxNesting)
+        let result = this.parsePostfixChain(mut links);
+        this.nesting -= links;
+        return result;
+    }
+
+    fn parsePostfixChain(borrow mut this, links: borrow mut u32) -> Result<u32, AllocError> {
+        let start = this.current().start;
+        var expr = this.parsePrimary()?;
+        loop {
+            if (this.at(TokenKind.OpenParen) || this.at(TokenKind.Dot) || this.at(TokenKind.Question) ||
+                this.at(TokenKind.Bang) || this.at(TokenKind.OpenBracket)) {
+                if (!this.nest()?) {
+                    return Ok(expr);
+                }
+                links += 1;
+            }
+            if (this.at(TokenKind.OpenParen)) {
+                this.advance();
+                var arguments = Vector<u32>.create();
+                while (!this.at(TokenKind.CloseParen) && !this.at(TokenKind.EndOfFile)) {
+                    let argumentStart = this.current().start;
+                    if (this.eat(TokenKind.MutKeyword)) {
+                        let operand = this.parseExpr()?;
+                        arguments.push(
+                            this.front.ast.addExpr(
+                                ExprNode.MutArg(operand),
+                                argumentStart,
+                                this.endFrom(argumentStart),
+                            )?,
+                        )?;
+                    } else {
+                        arguments.push(this.parseExpr()?)?;
+                    }
+                    if (!this.eat(TokenKind.Comma)) {
+                        break;
+                    }
+                }
+                this.expect(TokenKind.CloseParen)?;
+                let range = this.list(arguments)?;
+                expr = this.front.ast.addExpr(ExprNode.Call(expr, range), start, this.endFrom(start))?;
+            } else if (this.at(TokenKind.Dot)) {
+                this.advance();
+                let member = this.parseIdentifier()?;
+                expr = this.front.ast.addExpr(ExprNode.Member(expr, member), start, this.endFrom(start))?;
+            } else if (this.at(TokenKind.Question)) {
+                this.advance();
+                expr = this.front.ast.addExpr(ExprNode.Try(expr), start, this.endFrom(start))?;
+            } else if (this.at(TokenKind.Bang)) {
+                // After an operand, '!' can only be the postfix unwrap: prefix '!' starts an operand.
+                this.advance();
+                expr = this.front.ast.addExpr(ExprNode.Unwrap(expr), start, this.endFrom(start))?;
+            } else if (this.at(TokenKind.OpenBracket)) {
+                this.advance();
+                let low = if (this.at(TokenKind.DotDot)) none() else this.parseExpr()?;
+                if (this.eat(TokenKind.DotDot)) {
+                    let high = if (this.at(TokenKind.CloseBracket)) none() else this.parseExpr()?;
+                    this.expect(TokenKind.CloseBracket)?;
+                    expr = this.front.ast.addExpr(ExprNode.Slice(expr, low, high), start, this.endFrom(start))?;
+                } else {
+                    this.expect(TokenKind.CloseBracket)?;
+                    expr = this.front.ast.addExpr(ExprNode.Index(expr, low), start, this.endFrom(start))?;
+                }
+            } else {
+                return Ok(expr);
+            }
+        }
+    }
+
+    fn parsePrimary(borrow mut this) -> Result<u32, AllocError> {
+        let token = this.current();
+        match (token.kind) {
+            TokenKind.IntLiteral => {
+                this.advance();
+                let value = this.lexed.ints[token.data as usize];
+                return this.front.ast.addExpr(ExprNode.IntLiteral(value.value, value.suffix), token.start, token.end);
+            }
+            TokenKind.FloatLiteral => {
+                this.advance();
+                let digits = this.front.ast.addText(this.lexed.floats[token.data as usize].digits.view())?;
+                let suffix = this.lexed.floats[token.data as usize].suffix;
+                return this.front.ast.addExpr(ExprNode.FloatLiteral(digits, suffix), token.start, token.end);
+            }
+            TokenKind.StringLiteral => {
+                this.advance();
+                let value = this.front.ast.addText(this.lexed.strings[token.data as usize].view())?;
+                return this.front.ast.addExpr(ExprNode.StringLiteral(value), token.start, token.end);
+            }
+            TokenKind.CharLiteral => {
+                this.advance();
+                let value = this.lexed.chars[token.data as usize];
+                return this.front.ast.addExpr(ExprNode.CharLiteral(value), token.start, token.end);
+            }
+            TokenKind.IfKeyword => { return this.parseIfExpr(); }
+            TokenKind.MatchKeyword => { return this.parseMatchExpr(); }
+            TokenKind.OpenParen => {
+                if (this.isClosureStart()) {
+                    return this.parseClosure();
+                }
+                this.advance();
+                let inner = this.parseExpr()?;
+                this.expect(TokenKind.CloseParen)?;
+                return this.front.ast.addExpr(ExprNode.Paren(inner), token.start, this.endFrom(token.start));
+            }
+            TokenKind.UnsafeKeyword => {
+                if (this.peekIs(1, TokenKind.OpenBrace)) {
+                    // `unsafe { e }`: an unsafe expression (type-system.md §27.4).
+                    this.advance();
+                    this.advance();
+                    let inner = this.parseExpr()?;
+                    this.expect(TokenKind.CloseBrace)?;
+                    return this.front.ast.addExpr(ExprNode.Unsafe(inner), token.start, this.endFrom(token.start));
+                }
+            }
+            TokenKind.TrueKeyword => {
+                this.advance();
+                return this.front.ast.addExpr(ExprNode.BoolLiteral(true), token.start, token.end);
+            }
+            TokenKind.FalseKeyword => {
+                this.advance();
+                return this.front.ast.addExpr(ExprNode.BoolLiteral(false), token.start, token.end);
+            }
+            TokenKind.Identifier => {
+                let name = this.parseIdentifier()?;
+                if (this.at(TokenKind.Dot) && this.peekIs(
+                    1,
+                    TokenKind.Identifier,
+                ) && this.peekIs(2, TokenKind.OpenBrace)) {
+                    // `geometry.Point { … }`: a struct literal of a dependency's type, named as one dotted name that
+                    // the type checker resolves (type-system.md §2, M10 T5).
+                    this.advance();
+                    let member = this.parseIdentifier()?;
+                    let first = this.front.ast.idents[name as usize];
+                    let second = this.front.ast.idents[member as usize];
+                    var dotted = Vector<u8>.create();
+                    appendBytes(mut dotted, this.front.symbols.name(Symbol { id: first.symbol }))?;
+                    dotted.push('.')?;
+                    appendBytes(mut dotted, this.front.symbols.name(Symbol { id: second.symbol }))?;
+                    let symbol = this.front.symbols.intern(dotted.view())?;
+                    let ident = this.front.ast.addIdent(Ident {
+                        symbol: symbol.id,
+                        start: first.start,
+                        end: second.end,
+                        missing: false,
+                    })?;
+                    return this.parseStructLiteral(ident, token.start, emptyRange());
+                }
+                let typeArguments =
+                    if (this.isGenericArgumentListAhead()) this.parseGenericArguments()? else emptyRange();
+                if (this.at(TokenKind.OpenBrace)) {
+                    return this.parseStructLiteral(name, token.start, typeArguments);
+                }
+                return this.front.ast.addExpr(
+                    ExprNode.Name(name, typeArguments),
+                    token.start,
+                    this.endFrom(token.start),
+                );
+            }
+            TokenKind.ThisKeyword => {
+                this.advance();
+                return this.front.ast.addExpr(ExprNode.This, token.start, token.end);
+            }
+            TokenKind.NullKeyword => {
+                this.advance();
+                return this.front.ast.addExpr(ExprNode.NullLiteral, token.start, token.end);
+            }
+            TokenKind.OpenBracket => {
+                this.advance();
+                let first = this.parseExpr()?;
+                if (this.eat(TokenKind.Semicolon)) {
+                    let count = this.parsePrimary()?;
+                    this.expect(TokenKind.CloseBracket)?;
+                    return this.front.ast.addExpr(
+                        ExprNode.ArrayRepeat(first, count),
+                        token.start,
+                        this.endFrom(token.start),
+                    );
+                }
+                var elements = Vector<u32>.create();
+                elements.push(first)?;
+                while (this.eat(TokenKind.Comma) && !this.at(TokenKind.CloseBracket)) {
+                    elements.push(this.parseExpr()?)?;
+                }
+                this.expect(TokenKind.CloseBracket)?;
+                let range = this.list(elements)?;
+                return this.front.ast.addExpr(ExprNode.ArrayLiteral(range), token.start, this.endFrom(token.start));
+            }
+            _ => {}
+        }
+        this.errorFound(expectedExpression(), "expected expression, found ", "")?;
+        // Leave closing delimiters and terminators for the enclosing construct.
+        let leave = match (token.kind) {
+            TokenKind.Semicolon => true,
+            TokenKind.CloseParen => true,
+            TokenKind.CloseBrace => true,
+            TokenKind.CloseBracket => true,
+            TokenKind.Comma => true,
+            TokenKind.EndOfFile => true,
+            _ => false,
+        };
+        if (leave) {
+            return this.front.ast.addExpr(ExprNode.Error, token.start, token.start);
+        }
+        this.advance();
+        return this.front.ast.addExpr(ExprNode.Error, token.start, token.end);
+    }
+
+    /// A struct literal after its type name: `{ f: e, ... }` (grammar.md §2.1).
+    fn parseStructLiteral(borrow mut this, typeName: u32, start: u32, typeArguments: Range) -> Result<u32, AllocError> {
+        this.expect(TokenKind.OpenBrace)?;
+        var fields = Vector<u32>.create();
+        while (!this.at(TokenKind.CloseBrace) && !this.at(TokenKind.EndOfFile)) {
+            let fieldStart = this.current().start;
+            let fieldName = this.parseIdentifier()?;
+            this.expect(TokenKind.Colon)?;
+            let value = this.parseExpr()?;
+            this.front.ast.fieldInits.push(FieldInit {
+                name: fieldName,
+                value: value,
+                start: fieldStart,
+                end: this.endFrom(fieldStart),
+            })?;
+            fields.push(truncate<u32>(this.front.ast.fieldInits.length - 1))?;
+            if (!this.eat(TokenKind.Comma)) {
+                break;
+            }
+        }
+        if (!this.at(TokenKind.CloseBrace)) {
+            // Recover inside the literal: its own '}' must not be taken for the end of the enclosing block.
+            this.expect(TokenKind.CloseBrace)?;
+            var depth: i32 = 0;
+            while (!this.at(TokenKind.EndOfFile) && !(depth == 0 && this.at(TokenKind.Semicolon))) {
+                let kind = this.advance().kind;
+                if (sameKind(kind, TokenKind.OpenBrace)) {
+                    depth += 1;
+                } else if (sameKind(kind, TokenKind.CloseBrace)) {
+                    let was = depth;
+                    depth -= 1;
+                    if (was == 0) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            this.advance();
+        }
+        let range = this.list(fields)?;
+        return this.front.ast.addExpr(
+            ExprNode.StructLiteral(typeName, range, typeArguments),
+            start,
+            this.endFrom(start),
+        );
+    }
+
+    /// After an identifier: is the input `'<' Type (',' Type)* '>' '('`? Only then is '<' the start of generic
+    /// arguments rather than less-than (grammar.md §2.1).
+    fn isGenericArgumentListAhead(borrow this) -> bool {
+        if (!this.at(TokenKind.Less)) {
+            return false;
+        }
+        // Only tokens that can appear in types, with balanced '<' '>' and '[' ']' (§20.2). Parentheses and '->' only
+        // after `fn`, in a function type such as `Box<dyn fn(u64) -> u64>` (§36.5): `a < g(b), c > (d)` stays a
+        // comparison.
+        var depth: i32 = 0;
+        var inFunctionType = false;
+        var i: usize = 0;
+        loop {
+            let kind = this.peek(i).kind;
+            let functionPart = sameKind(kind, TokenKind.OpenParen) || sameKind(kind, TokenKind.CloseParen) ||
+                sameKind(kind, TokenKind.Arrow);
+            if (sameKind(kind, TokenKind.FnKeyword) || sameKind(kind, TokenKind.At)) {
+                inFunctionType = true;
+            } else if (functionPart && inFunctionType) {
+                // part of a function type
+            } else if (sameKind(kind, TokenKind.Less) || sameKind(kind, TokenKind.OpenBracket)) {
+                depth += 1;
+            } else if (sameKind(kind, TokenKind.Greater) || sameKind(kind, TokenKind.CloseBracket)) {
+                depth -= 1;
+                if (depth == 0) {
+                    // Then a call, a member (`Pair<i32>.make`) or a literal (`Pair<u8> { … }`); or a generic
+                    // function's instance as a value (`release<T>`, grammar.md §2), which a comparison cannot be.
+                    if (!sameKind(kind, TokenKind.Greater)) {
+                        return false;
+                    }
+                    return match (this.peek(i + 1).kind) {
+                        TokenKind.OpenParen => true,
+                        TokenKind.Dot => true,
+                        TokenKind.OpenBrace => true,
+                        TokenKind.CloseParen => true,
+                        TokenKind.Comma => true,
+                        TokenKind.Semicolon => true,
+                        TokenKind.CloseBracket => true,
+                        _ => false,
+                    };
+                }
+            } else {
+                let allowed = match (kind) {
+                    TokenKind.Identifier => true,
+                    TokenKind.Dot => true,
+                    TokenKind.Comma => true,
+                    TokenKind.Semicolon => true,
+                    TokenKind.IntLiteral => true,
+                    TokenKind.BorrowKeyword => true,
+                    TokenKind.MutKeyword => true,
+                    TokenKind.Star => true,
+                    TokenKind.Question => true,
+                    _ => false,
+                };
+                if (!allowed) {
+                    return false;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// `'<' T (':' Bound ('+' Bound)*)? (',' …)* '>'` after a declaration's name (§20.1, §21). All the parameters,
+    /// region ones included, in order.
+    fn parseTypeParameters(borrow mut this) -> Result<Range, AllocError> {
+        if (!this.eat(TokenKind.Less)) {
+            return Ok(emptyRange());
+        }
+        var parameters = Vector<u32>.create();
+        var afterTypeParameter = false;
+        loop {
+            let start = this.current().start;
+            // `region r` declares a region (type-system.md §25.1); `region` alone is an ordinary name.
+            let isRegion = this.at(TokenKind.Identifier) && this.peekIs(1, TokenKind.Identifier) &&
+                this.nameIs(this.current(), "region");
+            if (isRegion) {
+                if (afterTypeParameter) {
+                    let token = this.current();
+                    this.error(
+                        expectedToken(),
+                        token.start,
+                        token.end,
+                        textMessage("region parameters come before type parameters (type-system.md §25.1)")?,
+                    )?;
+                }
+                this.advance();
+            }
+            let name = this.parseIdentifier()?;
+            var bounds = Vector<u32>.create();
+            if (this.eat(TokenKind.Colon)) {
+                loop {
+                    bounds.push(this.parseType()?)?;
+                    if (!this.eat(TokenKind.Plus)) {
+                        break;
+                    }
+                }
+            }
+            let boundRange = this.list(bounds)?;
+            this.front.ast.typeParameters.push(TypeParameter {
+                name: name,
+                bounds: boundRange,
+                isRegion: isRegion,
+                start: start,
+                end: this.endFrom(start),
+            })?;
+            parameters.push(truncate<u32>(this.front.ast.typeParameters.length - 1))?;
+            if (!isRegion) {
+                afterTypeParameter = true;
+            }
+            if (!this.eat(TokenKind.Comma)) {
+                break;
+            }
+        }
+        this.expect(TokenKind.Greater)?;
+        return this.list(parameters);
+    }
+
+    fn parseGenericArguments(borrow mut this) -> Result<Range, AllocError> {
+        this.expect(TokenKind.Less)?;
+        var arguments = Vector<u32>.create();
+        loop {
+            arguments.push(this.parseType()?)?;
+            if (!this.eat(TokenKind.Comma)) {
+                break;
+            }
+        }
+        this.expect(TokenKind.Greater)?;
+        return this.list(arguments);
+    }
+}
+
+struct TypeParameterLists {
+    types: Range;
+    regions: Range;
+}
+
+struct AssignOpAhead {
+    found: bool;
+    op: AssignOp;
+    tokens: u32;
+}
+
+fn binaryAhead(op: BinaryOp, precedence: u32) -> BinaryOpAhead =>
+    BinaryOpAhead { found: true, op: op, precedence: precedence, tokens: 1 };
+
+fn noBinaryOp() -> BinaryOpAhead => BinaryOpAhead { found: false, op: BinaryOp.Add, precedence: 0, tokens: 0 };
+
+/// Parses one lexed file into `front` (Parser.Parse) and gives `front` back.
+fn parseFile(file: u32, lexed: Lexed, front: Frontend) -> Result<Frontend, AllocError> {
+    var parser = Parser {
+        file: file,
+        lexed: lexed,
+        front: front,
+        pos: 0,
+        parsingSignatures: false,
+        recovering: false,
+        nesting: 0,
+        tooDeep: false,
+        semicolonFixable: true,
+    };
+    parser.parseCompilationUnit()?;
+    return Ok(parser.front);
+}

@@ -54,3 +54,65 @@ fn copyBytes(bytes: Slice<u8>) -> Result<Vector<u8>, AllocError> {
     appendBytes(mut result, bytes)?;
     return Ok(result);
 }
+
+/// Appends `value` in decimal.
+fn appendDecimal(target: borrow mut Vector<u8>, value: u64) -> Result<void, AllocError> {
+    var buffer = [0u8; 20];
+    var n: usize = 0;
+    var v = value;
+    loop {
+        buffer[n] = '0' + truncate<u8>(v % 10);
+        n += 1;
+        v /= 10;
+        if (v == 0) {
+            break;
+        }
+    }
+    while (n > 0) {
+        n -= 1;
+        target.push(buffer[n])?;
+    }
+    return Ok();
+}
+
+/// Appends `value` in uppercase hexadecimal with at least `width` digits (.NET's "X4" for width 4).
+fn appendHex(target: borrow mut Vector<u8>, value: u64, width: usize) -> Result<void, AllocError> {
+    var buffer = [0u8; 16];
+    var n: usize = 0;
+    var v = value;
+    while (v != 0 || n < width) {
+        let d = truncate<u8>(v % 16);
+        buffer[n] = if (d < 10) '0' + d else 'A' + (d - 10);
+        n += 1;
+        v /= 16;
+        if (n == 16) {
+            break;
+        }
+    }
+    while (n > 0) {
+        n -= 1;
+        target.push(buffer[n])?;
+    }
+    return Ok();
+}
+
+/// Appends the UTF-8 encoding of a Unicode scalar value (a surrogate or a value above U+10FFFF becomes U+FFFD).
+fn appendUtf8(target: borrow mut Vector<u8>, scalar: u32) -> Result<void, AllocError> {
+    let c: u32 = if (scalar > 0x10FFFF || (scalar >= 0xD800 && scalar <= 0xDFFF)) 0xFFFD else scalar;
+    if (c < 0x80) {
+        target.push(truncate<u8>(c))?;
+    } else if (c < 0x800) {
+        target.push(truncate<u8>(0xC0 | (c >> 6)))?;
+        target.push(truncate<u8>(0x80 | (c & 0x3F)))?;
+    } else if (c < 0x10000) {
+        target.push(truncate<u8>(0xE0 | (c >> 12)))?;
+        target.push(truncate<u8>(0x80 | ((c >> 6) & 0x3F)))?;
+        target.push(truncate<u8>(0x80 | (c & 0x3F)))?;
+    } else {
+        target.push(truncate<u8>(0xF0 | (c >> 18)))?;
+        target.push(truncate<u8>(0x80 | ((c >> 12) & 0x3F)))?;
+        target.push(truncate<u8>(0x80 | ((c >> 6) & 0x3F)))?;
+        target.push(truncate<u8>(0x80 | (c & 0x3F)))?;
+    }
+    return Ok();
+}

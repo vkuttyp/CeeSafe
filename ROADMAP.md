@@ -341,14 +341,27 @@ novac 0.4.0, and the reproducers became regression probes at the re-pin.
 
 Dependencies: P1's text and storage, N1.
 
-- [ ] Port `SourceText`, the line index, interning, token kinds, the keyword table (`Keywords.Table`), literals,
-  trivia and doc comments, and the lexer.
-- [ ] Port the AST and the recursive-descent/Pratt parser: imports, attributes, generics and regions, patterns,
-  closures, FFI, recovery, and splitting adjacent `>`.
-- [ ] Add `parse` and `--dump-ast` with byte-identical dumps.
+- [x] Port `SourceText`, the line index, interning, token kinds, the keyword table (`Keywords.Table`), literals,
+  trivia and doc comments, and the lexer (2026-10-30; `docs/p2-frontend.md`). Checked by a token-dump oracle built
+  from the reference's own `Lexer`: byte-identical over all 540 `.nova` files of Nova `v0.4.1`, 21 edge cases and
+  3,000 random inputs. One documented difference: an invalid escape of a character above U+FFFF.
+- [x] Diagnostics, their text rendering and the JSON document (`--diagnostics-format=json`), with summaries generated
+  from the reference's documents (`tools/gen_catalog.py`).
+- [x] Port the AST and the recursive-descent/Pratt parser: imports, attributes, generics and regions, patterns,
+  closures, FFI, recovery, and splitting adjacent `>` (2026-10-30). The AST is tables of `Copy` nodes
+  (`docs/p2-frontend.md` §5). The `else if` chains and `T???…` are built and printed in loops, so they cannot exhaust
+  the stack where the reference does (§6).
+- [x] Add `parse` and `--dump-ast` with byte-identical dumps.
 
-Gate: all 40 parse-pass and 27 parse-fail fixtures match, including AST snapshots and exact diagnostics. Every `.nova`
+Gate: all 40 parse-pass and 28 parse-fail fixtures match, including AST snapshots and exact diagnostics. Every `.nova`
 file in Nova's repository and CeeSafe's own sources parse. Fuzzed malformed input ends with a controlled error.
+**Passed 2026-10-30** on macOS and the Ryzen box (`docs/p2-frontend.md` §4):
+- the parse families match novac 0.4.1 with no difference in exit status, stdout or stderr;
+- all 540 `.nova` files of Nova `v0.4.1` give identical trees and diagnostics;
+- so do CeeSafe's own files, except the documented escape span;
+- 5,000 mutated and 3,000 random inputs are identical to the reference;
+- the deep inputs end normally;
+- the sanitizers report nothing, and there are no leaks.
 
 ### P3 — Names, types, generics, HIR
 
@@ -563,10 +576,11 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
    track has no open blocking item.
 2. Alongside: the rest of the runner's C matrix (`-O0`, the overflow fallback, `--split`, TSan) and the package
    fixtures (`docs/parity.md` §3).
-3. P2, once N1a is released and re-pinned, or with an accepted decision to quote source names byte by byte until
-   then. Begin with tokens and the lexer over `src/support/source.nova` and `interner.nova`, compared through
-   `run_corpus.py --compiler out/ceesafe --family parse-pass --family parse-fail`. Do not begin by translating
-   `TypeChecker.cs`.
+3. P2 is done (`docs/p2-frontend.md`). Next is P3, names, types, generics and the HIR, starting with
+   `PackageNames.cs` and the type checker's declarations pass rather than translating `TypeChecker.cs` top to bottom.
+   Plan it from the inventory's P3 rows first.
+4. Owner's call: propose upstream that N0110 count `else if` links and `?` suffixes. novac's `--dump-ast` aborts on a
+   20,000-link `else if` chain (`docs/p2-frontend.md` §6).
 
 Progress is measured in completed contracts and gates. There is no calendar estimate before P1 produces evidence.
 
@@ -585,10 +599,11 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 | 2026-10-30 | Drafted Nova M15 (`docs/milestone-15.md`, Nova `34ce40a`, pushed) | proposed; awaiting the owner |
 | 2026-10-30 | Nova M15 S1–S6 implemented and pushed (Nova `4126457`, CI green); issues #1–#5 closed; ADR 0028 (S7) proposed. Checked against this repository with novac at `4126457`: probes 11/12 (the 12th, `text-gaps`, expects `StringView.fromUtf8` to be missing), support tests 6/6, fault sweep 573/573 | awaiting a release (0.3.2 / 0.4.0) to re-pin |
 | 2026-10-30 | Nova M15 S7 implemented (ADR 0028 accepted; Nova `61cb665`, `1d1f091`, CI green on Linux and Windows; `c3.py` passes in a CosmoOS aarch64 guest): `Process.capture`, `File.kind`, `Environment.variable`, `Directory` | M15 complete; re-pin waits for a release |
+| 2026-10-30 | Re-pinned to novac 0.4.0, then 0.4.1 (`80d8d8c`). 0.4.0 reserved its lib/std helper names (N7), fixed in Nova `24106b0` and released as the point release 0.4.1. All P1 workarounds removed; the four upstream reproducers became regression probes. Gates rerun with 0.4.1: macOS (Apple clang 21) and the Ryzen box (GCC 12; clang 18.1.8 -O2; clang 18.1.8 ASan+UBSan+LSan) | reference corpus at `v0.4.1` 467 pass, 3 partial, no leaks, on both; probes 16/16; support 6/6; fault sweep 573/573; skeleton builds; inventory regenerated, 0 unmapped |
+| 2026-10-30 | P2: lexer, diagnostics and JSON, AST tables, parser and `--dump-ast` (`src/syntax/`, `src/diagnostics/`); token-dump oracle from the reference's `Lexer`; `compare_tokens.py`, `compare_parse.py`, `lexer_fuzz.py`, `parser_fuzz.py`, `gen_catalog.py` | gate passed on macOS and Linux (`docs/p2-frontend.md` §4): parse families 68/68 with no reference difference, 540/540 reference files identical, 5,000 mutated and 3,000 random inputs identical, sanitizers clean, `live=0` |
 
 **Tests run for the skeleton** (2026-10-30, novac 0.3.1, Apple clang 21.0.0):
 - `novac check` and `novac fmt --check`: clean.
-| 2026-10-30 | Re-pinned to novac 0.4.0, then 0.4.1 (`80d8d8c`). 0.4.0 reserved its lib/std helper names (N7), fixed in Nova `24106b0` and released as the point release 0.4.1. All P1 workarounds removed; the four upstream reproducers became regression probes. Gates rerun with 0.4.1: macOS (Apple clang 21) and the Ryzen box (GCC 12; clang 18.1.8 -O2; clang 18.1.8 ASan+UBSan+LSan) | reference corpus at `v0.4.1` 467 pass, 3 partial, no leaks, on both; probes 16/16; support 6/6; fault sweep 573/573; skeleton builds; inventory regenerated, 0 unmapped |
 - `novac build`, then `./out/ceesafe --version`: printed `ceesafec 0.0.0-dev`, exit 0.
 - No arguments: exit 2. An unknown command: exit 2.
 - `novac run --interp -- --version` printed the same version.

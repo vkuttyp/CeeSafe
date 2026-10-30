@@ -1,0 +1,1018 @@
+// `parse --dump-ast`: the tree as indented S-expressions (the reference's Syntax/AstPrinter.cs). The format is the
+// reference's byte for byte: Nova's tests/corpus/parse-pass/*.ast snapshots are the check (tools/run_corpus.py).
+
+struct AstPrinter {
+    out: Vector<u8>;
+    indent: u32;
+
+    fn create() -> AstPrinter => AstPrinter { out: Vector<u8>.create(), indent: 0 };
+
+    fn text(borrow mut this, text: StringView) -> Result<void, AllocError> => appendText(mut this.out, text);
+
+    fn bytes(borrow mut this, bytes: Slice<u8>) -> Result<void, AllocError> => appendBytes(mut this.out, bytes);
+
+    /// Starts a line at the current indentation.
+    fn open(borrow mut this) -> Result<void, AllocError> {
+        for (k in 0..this.indent * 2) {
+            this.out.push(' ')?;
+        }
+        return Ok();
+    }
+
+    fn close(borrow mut this) -> Result<void, AllocError> {
+        this.out.push('\n')?;
+        return Ok();
+    }
+
+    fn line(borrow mut this, text: StringView) -> Result<void, AllocError> {
+        this.open()?;
+        this.text(text)?;
+        return this.close();
+    }
+
+    fn printUnit(
+        borrow mut this,
+        ast: borrow Ast,
+        symbols: borrow Interner,
+        unit: borrow Unit,
+    ) -> Result<void, AllocError> {
+        this.line("(unit")?;
+        this.indent += 1;
+        if (unit.hasNamespace) {
+            this.open()?;
+            this.text("(namespace ")?;
+            this.qualifiedName(ast, symbols, unit.namespaceName)?;
+            this.text(")")?;
+            this.close()?;
+        }
+        for (i in 0..unit.imports.length) {
+            this.open()?;
+            this.text("(import ")?;
+            this.qualifiedName(ast, symbols, unit.imports[i])?;
+            this.text(")")?;
+            this.close()?;
+        }
+        for (k in 0..unit.items.count) {
+            this.printItem(ast, symbols, ast.at(unit.items, k))?;
+        }
+        this.indent -= 1;
+        return this.line(")");
+    }
+
+    fn printAttributes(
+        borrow mut this,
+        ast: borrow Ast,
+        symbols: borrow Interner,
+        attributes: Range,
+    ) -> Result<void, AllocError> {
+        for (k in 0..attributes.count) {
+            let attribute = ast.attributes[ast.at(attributes, k) as usize];
+            this.open()?;
+            this.text("(@")?;
+            this.name(ast, symbols, attribute.name)?;
+            for (a in 0..attribute.arguments.count) {
+                this.text(" ")?;
+                this.expr(ast, symbols, ast.at(attribute.arguments, a))?;
+            }
+            this.text(")")?;
+            this.close()?;
+        }
+        return Ok();
+    }
+
+    fn printItem(borrow mut this, ast: borrow Ast, symbols: borrow Interner, id: u32) -> Result<void, AllocError> {
+        let item = ast.items[id as usize];
+        let visibility = visibilityText(item.visibility);
+        this.printAttributes(ast, symbols, item.attributes)?;
+        match (item.kind) {
+            ItemKind.Function(f) => { this.printFunction(ast, symbols, f)?; }
+            ItemKind.Extern(abi, functions, structs) => {
+                this.open()?;
+                this.text("(extern ")?;
+                this.text(visibility)?;
+                this.text(" ")?;
+                quote(mut this.out, ast.textOf(abi), '"')?;
+                this.close()?;
+                this.indent += 1;
+                for (k in 0..functions.count) {
+                    let f = ast.at(functions, k);
+                    this.printAttributes(ast, symbols, ast.functions[f as usize].attributes)?;
+                    this.printFunction(ast, symbols, f)?;
+                }
+                for (k in 0..structs.count) {
+                    this.printItem(ast, symbols, ast.at(structs, k))?;
+                }
+                this.indent -= 1;
+                this.line(")")?;
+            }
+            ItemKind.Struct(index) => {
+                let s = ast.structs[index as usize];
+                this.open()?;
+                this.text(if (s.isImported) "(c-struct " else "(struct ")?;
+                this.text(visibility)?;
+                this.text(" ")?;
+                this.name(ast, symbols, item.name)?;
+                this.typeParams(ast, symbols, s.regionParameters, s.typeParameters)?;
+                if (s.isOpaque) {
+                    this.text(" opaque")?;
+                }
+                this.close()?;
+                this.indent += 1;
+                for (k in 0..s.fields.count) {
+                    let field = ast.fields[ast.at(s.fields, k) as usize];
+                    this.open()?;
+                    this.text("(field ")?;
+                    this.text(visibilityText(field.visibility))?;
+                    this.text(" ")?;
+                    this.name(ast, symbols, field.name)?;
+                    this.text(" ")?;
+                    this.typeText(ast, symbols, field.typ)?;
+                    this.text(")")?;
+                    this.close()?;
+                }
+                for (k in 0..s.functions.count) {
+                    this.printFunction(ast, symbols, ast.at(s.functions, k))?;
+                }
+                if (s.dropBlock != none()) {
+                    this.line("(drop")?;
+                    this.indent += 1;
+                    this.printStmt(ast, symbols, s.dropBlock)?;
+                    this.indent -= 1;
+                    this.line(")")?;
+                }
+                this.indent -= 1;
+                this.line(")")?;
+            }
+            ItemKind.Enum(variants, typeParameters, regionParameters) => {
+                this.open()?;
+                this.text("(enum ")?;
+                this.text(visibility)?;
+                this.text(" ")?;
+                this.name(ast, symbols, item.name)?;
+                this.typeParams(ast, symbols, regionParameters, typeParameters)?;
+                this.close()?;
+                this.indent += 1;
+                for (k in 0..variants.count) {
+                    let variant = ast.variants[ast.at(variants, k) as usize];
+                    this.open()?;
+                    this.text("(variant ")?;
+                    this.name(ast, symbols, variant.name)?;
+                    for (t in 0..variant.payload.count) {
+                        this.text(" ")?;
+                        this.typeText(ast, symbols, ast.at(variant.payload, t))?;
+                    }
+                    this.text(")")?;
+                    this.close()?;
+                }
+                this.indent -= 1;
+                this.line(")")?;
+            }
+            ItemKind.Const(typ, value) => {
+                this.open()?;
+                this.text("(const ")?;
+                this.text(visibility)?;
+                this.text(" ")?;
+                this.name(ast, symbols, item.name)?;
+                this.text(" ")?;
+                this.typeText(ast, symbols, typ)?;
+                this.text(" ")?;
+                this.expr(ast, symbols, value)?;
+                this.text(")")?;
+                this.close()?;
+            }
+            ItemKind.Static(mutable, typ, value) => {
+                this.open()?;
+                this.text(if (mutable) "(static mut " else "(static ")?;
+                this.text(visibility)?;
+                this.text(" ")?;
+                this.name(ast, symbols, item.name)?;
+                this.text(" ")?;
+                this.typeText(ast, symbols, typ)?;
+                this.text(" ")?;
+                this.expr(ast, symbols, value)?;
+                this.text(")")?;
+                this.close()?;
+            }
+            ItemKind.Interface(methods, typeParameters) => {
+                this.open()?;
+                this.text("(interface ")?;
+                this.text(visibility)?;
+                this.text(" ")?;
+                this.name(ast, symbols, item.name)?;
+                this.typeParams(ast, symbols, emptyRange(), typeParameters)?;
+                this.close()?;
+                this.indent += 1;
+                for (k in 0..methods.count) {
+                    this.printFunction(ast, symbols, ast.at(methods, k))?;
+                }
+                this.indent -= 1;
+                this.line(")")?;
+            }
+            ItemKind.Impl(interfaceType, forType, functions) => {
+                this.open()?;
+                this.text("(impl ")?;
+                this.typeText(ast, symbols, interfaceType)?;
+                this.text(" for ")?;
+                this.typeText(ast, symbols, forType)?;
+                this.close()?;
+                this.indent += 1;
+                for (k in 0..functions.count) {
+                    this.printFunction(ast, symbols, ast.at(functions, k))?;
+                }
+                this.indent -= 1;
+                this.line(")")?;
+            }
+        }
+        return Ok();
+    }
+
+    fn printFunction(borrow mut this, ast: borrow Ast, symbols: borrow Interner, id: u32) -> Result<void, AllocError> {
+        let f = ast.functions[id as usize];
+        this.open()?;
+        this.text(if (f.isUnsafe) "(unsafe-fn " else "(fn ")?;
+        this.text(visibilityText(f.visibility))?;
+        this.text(" ")?;
+        this.name(ast, symbols, f.name)?;
+        this.typeParams(ast, symbols, f.regionParameters, f.typeParameters)?;
+        this.text(" (params")?;
+        match (f.receiver) {
+            ReceiverKind.None => {}
+            ReceiverKind.Value => { this.text(" this")?; }
+            ReceiverKind.Borrow => { this.text(" (borrow this)")?; }
+            ReceiverKind.BorrowMut => { this.text(" (borrow mut this)")?; }
+        }
+        for (k in 0..f.parameters.count) {
+            let p = ast.parameters[ast.at(f.parameters, k) as usize];
+            this.text(" (")?;
+            this.name(ast, symbols, p.name)?;
+            this.text(" ")?;
+            this.typeText(ast, symbols, p.typ)?;
+            this.text(")")?;
+        }
+        this.text(")")?;
+        if (f.returnType != none()) {
+            this.text(" (returns ")?;
+            this.typeText(ast, symbols, f.returnType)?;
+            this.text(")")?;
+        }
+        this.close()?;
+        this.indent += 1;
+        if (f.body != none()) {
+            this.printStmt(ast, symbols, f.body)?;
+        } else if (f.expressionBody != none()) {
+            this.open()?;
+            this.text("(=> ")?;
+            this.expr(ast, symbols, f.expressionBody)?;
+            this.text(")")?;
+            this.close()?;
+        }
+        this.indent -= 1;
+        return this.line(")");
+    }
+
+    /// A line `(<head>` with the statement `body` inside it, then `)`.
+    fn wrapped(
+        borrow mut this,
+        ast: borrow Ast,
+        symbols: borrow Interner,
+        head: StringView,
+        body: u32,
+    ) -> Result<void, AllocError> {
+        this.line(head)?;
+        this.indent += 1;
+        this.printStmt(ast, symbols, body)?;
+        this.indent -= 1;
+        return this.line(")");
+    }
+
+    fn printStmt(borrow mut this, ast: borrow Ast, symbols: borrow Interner, id: u32) -> Result<void, AllocError> {
+        match (ast.stmts[id as usize]) {
+            StmtNode.Block(statements) => {
+                if (statements.count == 0) {
+                    return this.line("(block)");
+                }
+                this.line("(block")?;
+                this.indent += 1;
+                for (k in 0..statements.count) {
+                    this.printStmt(ast, symbols, ast.at(statements, k))?;
+                }
+                this.indent -= 1;
+                this.line(")")?;
+            }
+            StmtNode.Local(kind, name, typ, initializer) => {
+                this.open()?;
+                this.text(match (kind) {
+                    LocalKind.Using => "(using ",
+                    LocalKind.Var => "(var ",
+                    LocalKind.Let => "(let ",
+                })?;
+                this.name(ast, symbols, name)?;
+                if (typ != none()) {
+                    this.text(" : ")?;
+                    this.typeText(ast, symbols, typ)?;
+                }
+                if (initializer != none()) {
+                    this.text(" = ")?;
+                    this.expr(ast, symbols, initializer)?;
+                }
+                this.text(")")?;
+                this.close()?;
+            }
+            StmtNode.If(_, _, _) => { this.printIfChain(ast, symbols, id)?; }
+            StmtNode.While(condition, body) => {
+                this.open()?;
+                this.text("(while ")?;
+                this.expr(ast, symbols, condition)?;
+                this.close()?;
+                this.indent += 1;
+                this.printStmt(ast, symbols, body)?;
+                this.indent -= 1;
+                this.line(")")?;
+            }
+            StmtNode.For(variable, first, end, body) => {
+                this.open()?;
+                this.text("(for ")?;
+                this.name(ast, symbols, variable)?;
+                this.text(" ")?;
+                this.expr(ast, symbols, first)?;
+                if (end != none()) {
+                    this.text(" .. ")?;
+                    this.expr(ast, symbols, end)?;
+                }
+                this.close()?;
+                this.indent += 1;
+                this.printStmt(ast, symbols, body)?;
+                this.indent -= 1;
+                this.line(")")?;
+            }
+            StmtNode.Loop(body) => { this.wrapped(ast, symbols, "(loop", body)?; }
+            StmtNode.Break => { this.line("(break)")?; }
+            StmtNode.Continue => { this.line("(continue)")?; }
+            StmtNode.Return(value) => {
+                if (value == none()) {
+                    return this.line("(return)");
+                }
+                this.open()?;
+                this.text("(return ")?;
+                this.expr(ast, symbols, value)?;
+                this.text(")")?;
+                this.close()?;
+            }
+            StmtNode.Assign(target, op, value) => {
+                this.open()?;
+                this.text("(")?;
+                this.text(assignOpText(op))?;
+                this.text(" ")?;
+                this.expr(ast, symbols, target)?;
+                this.text(" ")?;
+                this.expr(ast, symbols, value)?;
+                this.text(")")?;
+                this.close()?;
+            }
+            StmtNode.Expression(expr) => {
+                this.open()?;
+                this.text("(expr ")?;
+                this.expr(ast, symbols, expr)?;
+                this.text(")")?;
+                this.close()?;
+            }
+            StmtNode.Match(scrutinee, arms) => {
+                this.open()?;
+                this.text("(match ")?;
+                this.expr(ast, symbols, scrutinee)?;
+                this.close()?;
+                this.indent += 1;
+                for (k in 0..arms.count) {
+                    let arm = ast.matchArms[ast.at(arms, k) as usize];
+                    this.open()?;
+                    this.text("(arm ")?;
+                    this.patternText(ast, symbols, arm.pattern)?;
+                    this.close()?;
+                    this.indent += 1;
+                    this.printStmt(ast, symbols, arm.body)?;
+                    this.indent -= 1;
+                    this.line(")")?;
+                }
+                this.indent -= 1;
+                this.line(")")?;
+            }
+            StmtNode.Unsafe(body) => { this.wrapped(ast, symbols, "(unsafe", body)?; }
+            StmtNode.Defer(body) => { this.wrapped(ast, symbols, "(defer", body)?; }
+        }
+        return Ok();
+    }
+
+    /// An `if` statement and its `else if` chain, as the reference's recursion prints it, in a loop: `(if c` then, then
+    /// `(else` around the next `if`, and the closing lines in reverse.
+    fn printIfChain(borrow mut this, ast: borrow Ast, symbols: borrow Interner, id: u32) -> Result<void, AllocError> {
+        var current = id;
+        var levels: u32 = 0;
+        var lastHasElse = false;
+        loop {
+            match (ast.stmts[current as usize]) {
+                StmtNode.If(condition, then, otherwise) => {
+                    this.open()?;
+                    this.text("(if ")?;
+                    this.expr(ast, symbols, condition)?;
+                    this.close()?;
+                    this.indent += 1;
+                    this.printStmt(ast, symbols, then)?;
+                    levels += 1;
+                    if (otherwise == none()) {
+                        break;
+                    }
+                    this.line("(else")?;
+                    this.indent += 1;
+                    let nextIsIf = match (ast.stmts[otherwise as usize]) {
+                        StmtNode.If(_, _, _) => true,
+                        _ => false,
+                    };
+                    if (nextIsIf) {
+                        current = otherwise;
+                    } else {
+                        this.printStmt(ast, symbols, otherwise)?;
+                        lastHasElse = true;
+                        break;
+                    }
+                }
+                _ => { break; }
+            }
+        }
+        // Every level but the last has an `else`; the last has one if it ended in an `else` block.
+        for (level in 0..levels) {
+            if (level > 0 || lastHasElse) {
+                this.indent -= 1;
+                this.line(")")?;
+            }
+            this.indent -= 1;
+            this.line(")")?;
+        }
+        return Ok();
+    }
+
+    /// A statement printed on one line, for a block inside an expression (Inline): its lines, trimmed, joined by
+    /// spaces, with no space before a line that starts with ')'.
+    fn inline(borrow mut this, ast: borrow Ast, symbols: borrow Interner, id: u32) -> Result<void, AllocError> {
+        var inner = AstPrinter.create();
+        inner.printStmt(ast, symbols, id)?;
+        var first = true;
+        var i: usize = 0;
+        while (i < inner.out.length) {
+            var end = i;
+            while (end < inner.out.length && inner.out[end] != '\n') {
+                end += 1;
+            }
+            var from = i;
+            var to = end;
+            while (from < to && isTrimmed(inner.out[from])) {
+                from += 1;
+            }
+            while (to > from && isTrimmed(inner.out[to - 1])) {
+                to -= 1;
+            }
+            if (to > from) {
+                if (!first && inner.out[from] != ')') {
+                    this.out.push(' ')?;
+                }
+                appendBytes(mut this.out, inner.out[from..to])?;
+                first = false;
+            }
+            i = end + 1;
+        }
+        return Ok();
+    }
+
+    fn expr(borrow mut this, ast: borrow Ast, symbols: borrow Interner, id: u32) -> Result<void, AllocError> {
+        match (ast.exprs[id as usize]) {
+            ExprNode.IntLiteral(value, suffix) => {
+                appendDecimal(mut this.out, value)?;
+                this.text(intSuffixText(suffix))?;
+            }
+            ExprNode.FloatLiteral(digits, suffix) => {
+                this.bytes(ast.textOf(digits))?;
+                this.text(match (suffix) {
+                    FloatSuffix.F32 => "f32",
+                    FloatSuffix.F64 => "f64",
+                    FloatSuffix.None => "",
+                })?;
+            }
+            ExprNode.StringLiteral(value) => { quote(mut this.out, ast.textOf(value), '"')?; }
+            ExprNode.CharLiteral(value) => {
+                var encoded = Vector<u8>.create();
+                appendUtf8(mut encoded, value)?;
+                quote(mut this.out, encoded.view(), '\'')?;
+            }
+            ExprNode.BoolLiteral(value) => { this.text(if (value) "true" else "false")?; }
+            ExprNode.NullLiteral => { this.text("null")?; }
+            ExprNode.Name(name, typeArguments) => {
+                if (typeArguments.count == 0) {
+                    this.name(ast, symbols, name)?;
+                } else {
+                    this.text("(generic ")?;
+                    this.name(ast, symbols, name)?;
+                    for (k in 0..typeArguments.count) {
+                        this.text(" ")?;
+                        this.typeText(ast, symbols, ast.at(typeArguments, k))?;
+                    }
+                    this.text(")")?;
+                }
+            }
+            ExprNode.Paren(inner) => { this.unary(ast, symbols, "(paren ", inner)?; }
+            ExprNode.Unsafe(inner) => { this.unary(ast, symbols, "(unsafe ", inner)?; }
+            ExprNode.If(_, _, _) => {
+                // `(if-expr c t e)`, with the `else if` chain in a loop rather than recursion.
+                var current = id;
+                var levels: u32 = 0;
+                loop {
+                    match (ast.exprs[current as usize]) {
+                        ExprNode.If(condition, then, otherwise) => {
+                            this.text("(if-expr ")?;
+                            this.expr(ast, symbols, condition)?;
+                            this.text(" ")?;
+                            this.expr(ast, symbols, then)?;
+                            this.text(" ")?;
+                            levels += 1;
+                            current = otherwise;
+                        }
+                        _ => { break; }
+                    }
+                }
+                this.expr(ast, symbols, current)?;
+                for (level in 0..levels) {
+                    this.text(")")?;
+                }
+            }
+            ExprNode.Match(scrutinee, arms) => {
+                this.text("(match-expr ")?;
+                this.expr(ast, symbols, scrutinee)?;
+                for (k in 0..arms.count) {
+                    let arm = ast.valueArms[ast.at(arms, k) as usize];
+                    this.text(" (arm ")?;
+                    this.patternText(ast, symbols, arm.pattern)?;
+                    this.text(" ")?;
+                    this.expr(ast, symbols, arm.value)?;
+                    this.text(")")?;
+                }
+                this.text(")")?;
+            }
+            ExprNode.Block(block) => { this.inline(ast, symbols, block)?; }
+            ExprNode.Closure(index) => {
+                let closure = ast.closures[index as usize];
+                this.text(if (closure.isMove) "(move-closure (" else "(closure (")?;
+                for (k in 0..closure.parameters.count) {
+                    if (k > 0) {
+                        this.text(" ")?;
+                    }
+                    let p = ast.closureParameters[ast.at(closure.parameters, k) as usize];
+                    if (p.typ == none()) {
+                        this.name(ast, symbols, p.name)?;
+                    } else {
+                        this.text("(")?;
+                        this.name(ast, symbols, p.name)?;
+                        this.text(" ")?;
+                        this.typeText(ast, symbols, p.typ)?;
+                        this.text(")")?;
+                    }
+                }
+                this.text(") ")?;
+                if (closure.block != none()) {
+                    this.inline(ast, symbols, closure.block)?;
+                } else {
+                    this.expr(ast, symbols, closure.body)?;
+                }
+                this.text(")")?;
+            }
+            ExprNode.Unary(op, operand) => {
+                this.unary(ast, symbols, match (op) {
+                    UnaryOp.Negate => "(neg ",
+                    UnaryOp.Not => "(not ",
+                }, operand)?;
+            }
+            ExprNode.Binary(left, op, right) => {
+                this.text("(")?;
+                this.text(binaryOpText(op))?;
+                this.text(" ")?;
+                this.expr(ast, symbols, left)?;
+                this.text(" ")?;
+                this.expr(ast, symbols, right)?;
+                this.text(")")?;
+            }
+            ExprNode.Cast(operand, typ) => {
+                this.text("(as ")?;
+                this.expr(ast, symbols, operand)?;
+                this.text(" ")?;
+                this.typeText(ast, symbols, typ)?;
+                this.text(")")?;
+            }
+            ExprNode.Call(callee, arguments) => {
+                this.text("(call ")?;
+                this.expr(ast, symbols, callee)?;
+                for (k in 0..arguments.count) {
+                    this.text(" ")?;
+                    this.expr(ast, symbols, ast.at(arguments, k))?;
+                }
+                this.text(")")?;
+            }
+            ExprNode.Member(target, member) => {
+                this.text("(. ")?;
+                this.expr(ast, symbols, target)?;
+                this.text(" ")?;
+                this.name(ast, symbols, member)?;
+                this.text(")")?;
+            }
+            ExprNode.Error => { this.text("<error>")?; }
+            ExprNode.This => { this.text("this")?; }
+            ExprNode.Borrow(mutable, operand) => {
+                this.unary(ast, symbols, if (mutable) "(borrow-mut " else "(borrow ", operand)?;
+            }
+            ExprNode.MutArg(operand) => { this.unary(ast, symbols, "(mut-arg ", operand)?; }
+            ExprNode.Move(operand) => { this.unary(ast, symbols, "(move ", operand)?; }
+            ExprNode.StructLiteral(typeName, fields, typeArguments) => {
+                this.text("(new ")?;
+                this.name(ast, symbols, typeName)?;
+                if (typeArguments.count > 0) {
+                    this.text("<")?;
+                    for (k in 0..typeArguments.count) {
+                        if (k > 0) {
+                            this.text(" ")?;
+                        }
+                        this.typeText(ast, symbols, ast.at(typeArguments, k))?;
+                    }
+                    this.text(">")?;
+                }
+                for (k in 0..fields.count) {
+                    let field = ast.fieldInits[ast.at(fields, k) as usize];
+                    this.text(" (")?;
+                    this.name(ast, symbols, field.name)?;
+                    this.text(" ")?;
+                    this.expr(ast, symbols, field.value)?;
+                    this.text(")")?;
+                }
+                this.text(")")?;
+            }
+            ExprNode.ArrayLiteral(elements) => {
+                this.text("(array")?;
+                for (k in 0..elements.count) {
+                    this.text(" ")?;
+                    this.expr(ast, symbols, ast.at(elements, k))?;
+                }
+                this.text(")")?;
+            }
+            ExprNode.ArrayRepeat(value, count) => {
+                this.text("(array-repeat ")?;
+                this.expr(ast, symbols, value)?;
+                this.text(" ")?;
+                this.expr(ast, symbols, count)?;
+                this.text(")")?;
+            }
+            ExprNode.Try(operand) => { this.unary(ast, symbols, "(try ", operand)?; }
+            ExprNode.Unwrap(operand) => { this.unary(ast, symbols, "(unwrap ", operand)?; }
+            ExprNode.Index(target, index) => {
+                this.text("(index ")?;
+                this.expr(ast, symbols, target)?;
+                this.text(" ")?;
+                this.expr(ast, symbols, index)?;
+                this.text(")")?;
+            }
+            ExprNode.Slice(target, low, high) => {
+                this.text("(slice ")?;
+                this.expr(ast, symbols, target)?;
+                this.text(" ")?;
+                if (low == none()) {
+                    this.text("_")?;
+                } else {
+                    this.expr(ast, symbols, low)?;
+                }
+                this.text(" ")?;
+                if (high == none()) {
+                    this.text("_")?;
+                } else {
+                    this.expr(ast, symbols, high)?;
+                }
+                this.text(")")?;
+            }
+        }
+        return Ok();
+    }
+
+    /// `<head><operand>)`.
+    fn unary(
+        borrow mut this,
+        ast: borrow Ast,
+        symbols: borrow Interner,
+        head: StringView,
+        operand: u32,
+    ) -> Result<void, AllocError> {
+        this.text(head)?;
+        this.expr(ast, symbols, operand)?;
+        return this.text(")");
+    }
+
+    fn patternText(borrow mut this, ast: borrow Ast, symbols: borrow Interner, id: u32) -> Result<void, AllocError> {
+        match (ast.patterns[id as usize]) {
+            PatternNode.Wildcard => { this.text("_")?; }
+            PatternNode.Null => { this.text("null")?; }
+            PatternNode.Literal(literal) => { this.expr(ast, symbols, literal)?; }
+            PatternNode.Variant(path, hasBindings, bindings) => {
+                if (!hasBindings) {
+                    return this.qualifiedName(ast, symbols, path);
+                }
+                this.text("(")?;
+                this.qualifiedName(ast, symbols, path)?;
+                this.text(" ")?;
+                for (k in 0..bindings.count) {
+                    if (k > 0) {
+                        this.text(" ")?;
+                    }
+                    let b = ast.bindings[ast.at(bindings, k) as usize];
+                    if (b.nested != none()) {
+                        this.patternText(ast, symbols, b.nested)?;
+                    } else if (b.name == none()) {
+                        this.text("_")?;
+                    } else {
+                        if (b.mutable) {
+                            this.text("var ")?;
+                        }
+                        this.name(ast, symbols, b.name)?;
+                    }
+                }
+                this.text(")")?;
+            }
+        }
+        return Ok();
+    }
+
+    /// ` (@name args)` for each attribute of a function type.
+    fn typeAttributes(
+        borrow mut this,
+        ast: borrow Ast,
+        symbols: borrow Interner,
+        attributes: Range,
+    ) -> Result<void, AllocError> {
+        for (k in 0..attributes.count) {
+            let attribute = ast.attributes[ast.at(attributes, k) as usize];
+            this.text(" (@")?;
+            this.name(ast, symbols, attribute.name)?;
+            for (a in 0..attribute.arguments.count) {
+                this.text(" ")?;
+                this.expr(ast, symbols, ast.at(attribute.arguments, a))?;
+            }
+            this.text(")")?;
+        }
+        return Ok();
+    }
+
+    /// ` (T U) R` or ` (T U)`: a function type's parameters and result.
+    fn signature(
+        borrow mut this,
+        ast: borrow Ast,
+        symbols: borrow Interner,
+        parameters: Range,
+        result: u32,
+    ) -> Result<void, AllocError> {
+        this.text(" (")?;
+        for (k in 0..parameters.count) {
+            if (k > 0) {
+                this.text(" ")?;
+            }
+            this.typeText(ast, symbols, ast.at(parameters, k))?;
+        }
+        this.text(")")?;
+        if (result != none()) {
+            this.text(" ")?;
+            this.typeText(ast, symbols, result)?;
+        }
+        return this.text(")");
+    }
+
+    fn typeText(borrow mut this, ast: borrow Ast, symbols: borrow Interner, id: u32) -> Result<void, AllocError> {
+        match (ast.types[id as usize]) {
+            TypeNode.Named(name) => { this.qualifiedName(ast, symbols, name)?; }
+            TypeNode.Missing => { this.text("<missing-type>")?; }
+            TypeNode.Optional(_) => {
+                // `T???…` is a chain the parser builds in a loop; print it in one too.
+                var current = id;
+                var levels: u32 = 0;
+                loop {
+                    match (ast.types[current as usize]) {
+                        TypeNode.Optional(inner) => {
+                            this.text("(optional ")?;
+                            levels += 1;
+                            current = inner;
+                        }
+                        _ => { break; }
+                    }
+                }
+                this.typeText(ast, symbols, current)?;
+                for (level in 0..levels) {
+                    this.text(")")?;
+                }
+            }
+            TypeNode.Array(element, length) => {
+                this.text("[")?;
+                this.typeText(ast, symbols, element)?;
+                this.text("; ")?;
+                this.expr(ast, symbols, length)?;
+                this.text("]")?;
+            }
+            TypeNode.Generic(name, arguments) => {
+                this.text("(")?;
+                this.qualifiedName(ast, symbols, name)?;
+                this.text(" ")?;
+                for (k in 0..arguments.count) {
+                    if (k > 0) {
+                        this.text(" ")?;
+                    }
+                    this.typeText(ast, symbols, ast.at(arguments, k))?;
+                }
+                this.text(")")?;
+            }
+            TypeNode.Pointer(mutable, pointee) => {
+                this.text(if (mutable) "(ptr-mut " else "(ptr ")?;
+                this.typeText(ast, symbols, pointee)?;
+                this.text(")")?;
+            }
+            TypeNode.Dyn(interfaceType, mutable, send) => {
+                this.text(if (mutable) "(dyn mut " else "(dyn ")?;
+                this.typeText(ast, symbols, interfaceType)?;
+                if (send) {
+                    this.text(" +Send")?;
+                }
+                this.text(")")?;
+            }
+            TypeNode.FunctionPointer(abi, parameters, result) => {
+                this.text("(fn-ptr ")?;
+                quote(mut this.out, ast.textOf(abi), '"')?;
+                this.signature(ast, symbols, parameters, result)?;
+            }
+            TypeNode.Function(attributes, parameters, result) => {
+                this.text("(fn")?;
+                this.typeAttributes(ast, symbols, attributes)?;
+                this.signature(ast, symbols, parameters, result)?;
+            }
+            TypeNode.Reference(mutable, hasSources, sources, pointee) => {
+                this.text(if (mutable) "(borrow-mut" else "(borrow")?;
+                if (hasSources) {
+                    this.text("(")?;
+                    for (k in 0..sources.count) {
+                        if (k > 0) {
+                            this.text(" ")?;
+                        }
+                        this.name(ast, symbols, ast.at(sources, k))?;
+                    }
+                    this.text(")")?;
+                }
+                this.text(" ")?;
+                this.typeText(ast, symbols, pointee)?;
+                this.text(")")?;
+            }
+        }
+        return Ok();
+    }
+
+    fn name(borrow mut this, ast: borrow Ast, symbols: borrow Interner, ident: u32) -> Result<void, AllocError> =>
+        this.bytes(symbols.name(Symbol { id: ast.idents[ident as usize].symbol }));
+
+    fn qualifiedName(
+        borrow mut this,
+        ast: borrow Ast,
+        symbols: borrow Interner,
+        name: QualifiedName,
+    ) -> Result<void, AllocError> {
+        for (k in 0..name.parts.count) {
+            if (k > 0) {
+                this.text(".")?;
+            }
+            this.name(ast, symbols, ast.at(name.parts, k))?;
+        }
+        return Ok();
+    }
+
+    /// ` (type-params (region r) T (U I J))` for generic declarations, regions first; nothing otherwise.
+    fn typeParams(
+        borrow mut this,
+        ast: borrow Ast,
+        symbols: borrow Interner,
+        regions: Range,
+        types: Range,
+    ) -> Result<void, AllocError> {
+        if (regions.count + types.count == 0) {
+            return Ok();
+        }
+        this.text(" (type-params")?;
+        for (k in 0..(regions.count + types.count)) {
+            let p = if (k < regions.count) ast.at(regions, k) else ast.at(types, k - regions.count);
+            let parameter = ast.typeParameters[p as usize];
+            this.text(" ")?;
+            if (parameter.isRegion) {
+                this.text("(region ")?;
+                this.name(ast, symbols, parameter.name)?;
+                this.text(")")?;
+            } else if (parameter.bounds.count == 0) {
+                this.name(ast, symbols, parameter.name)?;
+            } else {
+                this.text("(")?;
+                this.name(ast, symbols, parameter.name)?;
+                for (b in 0..parameter.bounds.count) {
+                    this.text(" ")?;
+                    this.typeText(ast, symbols, ast.at(parameter.bounds, b))?;
+                }
+                this.text(")")?;
+            }
+        }
+        return this.text(")");
+    }
+}
+
+/// The characters .NET's `string.Trim()` removes that can occur in a printed line.
+fn isTrimmed(b: u8) -> bool => b == ' ' || b == '\t' || b == '\r' || b == 0x0B || b == 0x0C;
+
+fn visibilityText(visibility: Visibility) -> StringView => match (visibility) {
+    Visibility.Default => "default",
+    Visibility.Public => "public",
+    Visibility.Internal => "internal",
+    Visibility.Private => "private",
+};
+
+fn intSuffixText(suffix: IntSuffix) -> StringView => match (suffix) {
+    IntSuffix.None => "",
+    IntSuffix.I8 => "i8",
+    IntSuffix.I16 => "i16",
+    IntSuffix.I32 => "i32",
+    IntSuffix.I64 => "i64",
+    IntSuffix.ISize => "isize",
+    IntSuffix.U8 => "u8",
+    IntSuffix.U16 => "u16",
+    IntSuffix.U32 => "u32",
+    IntSuffix.U64 => "u64",
+    IntSuffix.USize => "usize",
+};
+
+fn binaryOpText(op: BinaryOp) -> StringView => match (op) {
+    BinaryOp.LogicalOr => "||",
+    BinaryOp.LogicalAnd => "&&",
+    BinaryOp.Equal => "==",
+    BinaryOp.NotEqual => "!=",
+    BinaryOp.Less => "<",
+    BinaryOp.LessEqual => "<=",
+    BinaryOp.Greater => ">",
+    BinaryOp.GreaterEqual => ">=",
+    BinaryOp.BitOr => "|",
+    BinaryOp.BitXor => "^",
+    BinaryOp.BitAnd => "&",
+    BinaryOp.ShiftLeft => "<<",
+    BinaryOp.ShiftRight => ">>",
+    BinaryOp.Add => "+",
+    BinaryOp.Subtract => "-",
+    BinaryOp.Multiply => "*",
+    BinaryOp.Divide => "/",
+    BinaryOp.Remainder => "%",
+};
+
+fn assignOpText(op: AssignOp) -> StringView => match (op) {
+    AssignOp.Assign => "=",
+    AssignOp.Add => "+=",
+    AssignOp.Subtract => "-=",
+    AssignOp.Multiply => "*=",
+    AssignOp.Divide => "/=",
+    AssignOp.Remainder => "%=",
+    AssignOp.BitAnd => "&=",
+    AssignOp.BitOr => "|=",
+    AssignOp.BitXor => "^=",
+    AssignOp.ShiftLeft => "<<=",
+    AssignOp.ShiftRight => ">>=",
+};
+
+/// Quotes UTF-8 text with Nova escapes (AstPrinter.Quote): \n \r \t \\ \0 and the quote are escaped, printable ASCII is
+/// itself, and every other scalar is \u{X} in uppercase hex.
+fn quote(out: borrow mut Vector<u8>, text: Slice<u8>, mark: u8) -> Result<void, AllocError> {
+    out.push(mark)?;
+    var i: usize = 0;
+    while (i < text.length) {
+        let d = decodeUtf8(text, i);
+        i += d.length as usize;
+        let c = d.scalar;
+        if (c == '\n') {
+            appendText(out, "\\n")?;
+        } else if (c == '\r') {
+            appendText(out, "\\r")?;
+        } else if (c == '\t') {
+            appendText(out, "\\t")?;
+        } else if (c == '\\') {
+            appendText(out, "\\\\")?;
+        } else if (c == 0) {
+            appendText(out, "\\0")?;
+        } else if (c == mark as u32) {
+            out.push('\\')?;
+            out.push(mark)?;
+        } else if (c >= 0x20 && c < 0x7F) {
+            out.push(truncate<u8>(c))?;
+        } else {
+            appendText(out, "\\u{")?;
+            appendHex(out, c as u64, 1)?;
+            out.push('}')?;
+        }
+    }
+    out.push(mark)?;
+    return Ok();
+}

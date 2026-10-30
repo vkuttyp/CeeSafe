@@ -1,0 +1,13 @@
+// line
+/// doc one
+///   doc two	
+//// not doc
+///
+fn a() {}
+/// orphan
+/* block */ /** blk */
+/// before block
+/* x */ fn b() {}
+/// last
+/* unterminated
+fn c() {}

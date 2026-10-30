@@ -1,0 +1,223 @@
+// Diagnostics (the reference's Diagnostics/Diagnostic.cs) and their JSON document (Tooling/DiagnosticJson.cs;
+// tooling.md §5.1). A code is kept as its number (N0001 is 1). Spans are byte offsets into the file's SourceText; the
+// JSON's positions are the reference's (1-based lines, UTF-16 columns). A diagnostic has at most one fix with one edit
+// in its own file, which is all the frontend makes (the parser's "insert ';'"); notes, and the fuller fixes of later
+// passes, come with those passes (P3, P4).
+
+// Codes the frontend reports (Diagnostic.cs's DiagnosticCodes).
+fn unexpectedCharacter() -> u32 => 1;
+fn unterminatedBlockComment() -> u32 => 3;
+fn integerLiteralTooLarge() -> u32 => 4;
+fn unterminatedString() -> u32 => 5;
+fn invalidEscape() -> u32 => 6;
+fn invalidCharLiteral() -> u32 => 7;
+fn invalidDigit() -> u32 => 8;
+fn invalidLiteralSuffix() -> u32 => 9;
+fn misplacedDigitSeparator() -> u32 => 10;
+fn expectedToken() -> u32 => 100;
+fn expectedItem() -> u32 => 101;
+fn expectedExpression() -> u32 => 102;
+fn chainedComparison() -> u32 => 103;
+fn invalidAssignmentTarget() -> u32 => 104;
+fn expectedType() -> u32 => 105;
+fn misplacedNamespace() -> u32 => 106;
+fn expectedMember() -> u32 => 107;
+fn expectedPattern() -> u32 => 108;
+fn misplacedImport() -> u32 => 109;
+fn nestingTooDeep() -> u32 => 110;
+fn unsupported() -> u32 => 216;
+fn duplicateMember() -> u32 => 228;
+fn invalidAttribute() -> u32 => 290;
+
+struct Diagnostic {
+    code: u32;
+    isError: bool;
+    file: u32; // the index of the SourceText in the compilation's list
+    start: u32;
+    end: u32;
+    message: Vector<u8>;
+    hasFix: bool;
+    fixTitle: Vector<u8>;
+    fixStart: u32;
+    fixEnd: u32;
+    fixText: Vector<u8>;
+}
+
+/// Diagnostics in the order they are reported (DiagnosticBag).
+struct Diagnostics {
+    items: Vector<Diagnostic>;
+
+    fn create() -> Diagnostics => Diagnostics { items: Vector<Diagnostic>.create() };
+
+    fn error(
+        borrow mut this,
+        code: u32,
+        file: u32,
+        start: u32,
+        end: u32,
+        message: Vector<u8>,
+    ) -> Result<void, AllocError> {
+        this.items.push(Diagnostic {
+            code: code,
+            isError: true,
+            file: file,
+            start: start,
+            end: end,
+            message: message,
+            hasFix: false,
+            fixTitle: Vector<u8>.create(),
+            fixStart: 0,
+            fixEnd: 0,
+            fixText: Vector<u8>.create(),
+        })?;
+        return Ok();
+    }
+
+    /// An error with a fix that replaces [start, end) of the same file with `fixText`.
+    fn errorWithFix(
+        borrow mut this,
+        code: u32,
+        file: u32,
+        start: u32,
+        end: u32,
+        message: Vector<u8>,
+        fixTitle: Vector<u8>,
+        fixText: Vector<u8>,
+    ) -> Result<void, AllocError> {
+        this.items.push(Diagnostic {
+            code: code,
+            isError: true,
+            file: file,
+            start: start,
+            end: end,
+            message: message,
+            hasFix: true,
+            fixTitle: fixTitle,
+            fixStart: start,
+            fixEnd: end,
+            fixText: fixText,
+        })?;
+        return Ok();
+    }
+
+    /// Whether any diagnostic so far is in `file`.
+    fn anyIn(borrow this, file: u32) -> bool {
+        for (i in 0..this.items.length) {
+            if (this.items[i].file == file) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn hasErrors(borrow this) -> bool {
+        for (i in 0..this.items.length) {
+            if (this.items[i].isError) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn count(borrow this, errors: bool) -> i64 {
+        var n: i64 = 0;
+        for (i in 0..this.items.length) {
+            if (this.items[i].isError == errors) {
+                n += 1;
+            }
+        }
+        return n;
+    }
+}
+
+/// "N0001" for 1.
+fn appendCode(target: borrow mut Vector<u8>, code: u32) -> Result<void, AllocError> {
+    target.push('N')?;
+    var digits = Vector<u8>.create();
+    appendDecimal(mut digits, code as u64)?;
+    for (k in digits.length..4) {
+        target.push('0')?;
+    }
+    appendBytes(target, digits.view())?;
+    return Ok();
+}
+
+fn writePosition(
+    json: borrow mut JsonWriter,
+    label: StringView,
+    source: borrow SourceText,
+    offset: u32,
+) -> Result<void, AllocError> {
+    let p = source.position(offset as usize);
+    json.name(label)?;
+    json.startObject()?;
+    json.name("line")?;
+    json.number(p.line as i64)?;
+    json.name("column")?;
+    json.number(p.column as i64)?;
+    json.endObject()?;
+    return Ok();
+}
+
+/// The whole JSON document for `diagnostics`, on one line (DiagnosticJson.Serialize).
+fn diagnosticsJson(
+    diagnostics: borrow Diagnostics,
+    sources: borrow Vector<SourceText>,
+) -> Result<Vector<u8>, AllocError> {
+    var json = JsonWriter.create();
+    json.startObject()?;
+    json.name("version")?;
+    json.number(1)?;
+    json.name("errors")?;
+    json.number(diagnostics.count(true))?;
+    json.name("warnings")?;
+    json.number(diagnostics.count(false))?;
+    json.name("diagnostics")?;
+    json.startArray()?;
+    for (i in 0..diagnostics.items.length) {
+        let d = borrow diagnostics.items[i];
+        let source = borrow sources[d.file as usize];
+        json.startObject()?;
+        json.name("code")?;
+        var code = Vector<u8>.create();
+        appendCode(mut code, d.code)?;
+        json.stringBytes(code.view())?;
+        json.name("severity")?;
+        json.string(if (d.isError) "error" else "warning")?;
+        json.name("file")?;
+        json.stringBytes(source.path.view())?;
+        writePosition(mut json, "start", source, d.start)?;
+        writePosition(mut json, "end", source, d.end)?;
+        json.name("message")?;
+        json.stringBytes(d.message.view())?;
+        json.name("summary")?;
+        json.string(summaryOf(d.code))?;
+        json.name("notes")?;
+        json.startArray()?;
+        json.endArray()?;
+        json.name("fixes")?;
+        json.startArray()?;
+        if (d.hasFix) {
+            json.startObject()?;
+            json.name("title")?;
+            json.stringBytes(d.fixTitle.view())?;
+            json.name("edits")?;
+            json.startArray()?;
+            json.startObject()?;
+            json.name("file")?;
+            json.stringBytes(source.path.view())?;
+            writePosition(mut json, "start", source, d.fixStart)?;
+            writePosition(mut json, "end", source, d.fixEnd)?;
+            json.name("newText")?;
+            json.stringBytes(d.fixText.view())?;
+            json.endObject()?;
+            json.endArray()?;
+            json.endObject()?;
+        }
+        json.endArray()?;
+        json.endObject()?;
+    }
+    json.endArray()?;
+    json.endObject()?;
+    return Ok(json.out);
+}

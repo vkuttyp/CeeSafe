@@ -1,2 +1,4 @@
 out/
 .DS_Store
+tools/oracles/*/bin/
+tools/oracles/*/obj/

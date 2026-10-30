@@ -1,0 +1,4 @@
+let a = 'x'; let b = '\n'; let c = 'é'; let d = '😀'; let e = '\u{41}';
+let f = ''; let g = 'ab'; let h = 'abc
+let i = '\q'; let j = '\u{D800}'; let k = '
+let l = '

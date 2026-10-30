@@ -1,0 +1,438 @@
+// The syntax tree (the reference's Syntax/Ast.cs; grammar.md §2), as tables (docs/p2-frontend.md §5). Every node is a
+// `Copy` value in its category's table, found by its index; children are indexes, and lists of children are ranges
+// into `lists`, one shared table of indexes whose meaning the owning field gives. `none()` marks an absent optional
+// child. Text the tree keeps (string literal values, doc comments, ABIs, float digits) is a range of `text`. Spans
+// are byte offsets into the file, kept beside each table.
+
+fn none() -> u32 => 0xFFFFFFFF;
+
+/// A run of `count` indexes in `Ast.lists` from `start`, or of bytes in `Ast.text`.
+struct Range {
+    start: u32;
+    count: u32;
+}
+
+fn emptyRange() -> Range => Range { start: 0, count: 0 };
+
+struct Ident {
+    symbol: u32;
+    start: u32;
+    end: u32;
+    missing: bool; // a placeholder for an identifier the parser expected but did not find
+}
+
+/// `a.b.c`: a range of identifiers.
+struct QualifiedName {
+    parts: Range;
+    start: u32;
+    end: u32;
+}
+
+enum Visibility {
+    Default,
+    Public,
+    Internal,
+    Private,
+}
+
+enum ReceiverKind {
+    None,
+    Value,
+    Borrow,
+    BorrowMut,
+}
+
+enum UnaryOp {
+    Negate,
+    Not,
+}
+
+enum BinaryOp {
+    LogicalOr,
+    LogicalAnd,
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    BitOr,
+    BitXor,
+    BitAnd,
+    ShiftLeft,
+    ShiftRight,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+}
+
+enum AssignOp {
+    Assign,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+    BitAnd,
+    BitOr,
+    BitXor,
+    ShiftLeft,
+    ShiftRight,
+}
+
+enum LocalKind {
+    Let,
+    Var,
+    Using,
+}
+
+// ---- Types ----
+
+enum TypeNode {
+    Named(QualifiedName),
+    Missing,
+    /// `extern "C" fn(T…) -> R`: the ABI's text, the parameter types, the result type or none.
+    FunctionPointer(Range, Range, u32),
+    /// `@effects(…) fn(T…) -> R`: attributes, parameter types, the result type or none.
+    Function(Range, Range, u32),
+    /// `*T` or `*mut T`: mutable, pointee.
+    Pointer(bool, u32),
+    /// `dyn I`, `dyn mut fn(…)`, `dyn I + Send`: the interface type, mutable, Send.
+    Dyn(u32, bool, bool),
+    Optional(u32),
+    /// `[T; N]`: element type, length expression.
+    Array(u32, u32),
+    Generic(QualifiedName, Range),
+    /// `borrow T`, `borrow mut (a, b) T`: mutable, whether sources are written, the sources (identifiers), pointee.
+    Reference(bool, bool, Range, u32),
+}
+
+// ---- Expressions ----
+
+enum ExprNode {
+    IntLiteral(u64, IntSuffix),
+    FloatLiteral(Range, FloatSuffix), // the digits without separators
+    StringLiteral(Range),             // UTF-8
+    CharLiteral(u32),
+    BoolLiteral(bool),
+    NullLiteral,
+    /// A name with type arguments (possibly none): identifier, types.
+    Name(u32, Range),
+    Paren(u32),
+    Unary(UnaryOp, u32),
+    Binary(u32, BinaryOp, u32),
+    Cast(u32, u32),
+    Call(u32, Range),
+    Member(u32, u32),
+    Error,
+    This,
+    Unsafe(u32),
+    If(u32, u32, u32),
+    /// `match (e) { p => v, … }`: scrutinee, value arms.
+    Match(u32, Range),
+    Closure(u32), // an index into `closures`
+    Block(u32),   // a block statement as a branch
+    Borrow(bool, u32),
+    Move(u32),
+    MutArg(u32),
+    /// `S<T> { f: e, … }`: the type name (an identifier), field initialisers, type arguments.
+    StructLiteral(u32, Range, Range),
+    ArrayLiteral(Range),
+    ArrayRepeat(u32, u32),
+    Index(u32, u32),
+    /// `a[lo..hi]`: target, low or none, high or none.
+    Slice(u32, u32, u32),
+    Try(u32),
+    Unwrap(u32),
+}
+
+struct Closure {
+    parameters: Range; // closureParameters
+    block: u32;        // a block statement, or none
+    body: u32;         // an expression, or none
+    isMove: bool;
+}
+
+struct ClosureParameter {
+    name: u32;
+    typ: u32; // or none
+    start: u32;
+    end: u32;
+}
+
+struct FieldInit {
+    name: u32;
+    value: u32;
+    start: u32;
+    end: u32;
+}
+
+struct ValueArm {
+    pattern: u32;
+    value: u32;
+    start: u32;
+    end: u32;
+}
+
+// ---- Patterns ----
+
+enum PatternNode {
+    Wildcard,
+    Null,
+    Literal(u32),
+    /// `E.V` or `E.V(x, var y, _, E.W(z))`: the path, whether there are parentheses, the bindings.
+    Variant(QualifiedName, bool, Range),
+}
+
+/// One position of a variant pattern: a binding (an identifier or none for `_`), or a nested pattern.
+struct Binding {
+    name: u32;
+    mutable: bool;
+    nested: u32; // a pattern, or none
+}
+
+// ---- Statements ----
+
+enum StmtNode {
+    Block(Range),
+    /// `let`, `var` or `using`: kind, identifier, type or none, initialiser or none.
+    Local(LocalKind, u32, u32, u32),
+    Defer(u32),
+    Match(u32, Range), // scrutinee, match arms
+    /// condition, then (a block), else (a block, an if, or none).
+    If(u32, u32, u32),
+    While(u32, u32),
+    /// `for (x in a..b)`: variable, start, end or none, body.
+    For(u32, u32, u32, u32),
+    Loop(u32),
+    Break,
+    Continue,
+    Return(u32),
+    Assign(u32, AssignOp, u32),
+    Expression(u32),
+    Unsafe(u32),
+}
+
+struct MatchArm {
+    pattern: u32;
+    body: u32; // a block statement
+    start: u32;
+    end: u32;
+}
+
+// ---- Items ----
+
+struct Attribute {
+    name: u32;
+    arguments: Range; // expressions
+    hasParentheses: bool;
+    start: u32;
+    end: u32;
+}
+
+struct TypeParameter {
+    name: u32;
+    bounds: Range; // types
+    isRegion: bool;
+    start: u32;
+    end: u32;
+}
+
+struct Parameter {
+    name: u32;
+    typ: u32;
+    start: u32;
+    end: u32;
+}
+
+struct Function {
+    visibility: Visibility;
+    name: u32;
+    receiver: ReceiverKind;
+    receiverStart: u32;
+    receiverEnd: u32;
+    parameters: Range;   // parameters
+    returnType: u32;     // or none
+    body: u32;           // a block statement, or none
+    expressionBody: u32; // or none
+    typeParameters: Range;
+    regionParameters: Range;
+    isUnsafe: bool;
+    hasDoc: bool;
+    doc: Range;
+    isExtern: bool;
+    attributes: Range;
+    start: u32;
+    end: u32;
+}
+
+struct Field {
+    visibility: Visibility;
+    name: u32;
+    typ: u32;
+    attributes: Range;
+    start: u32;
+    end: u32;
+}
+
+struct Variant {
+    name: u32;
+    payload: Range; // types
+    start: u32;
+    end: u32;
+}
+
+enum ItemKind {
+    Function(u32), // functions
+    /// `extern "C" { … }`: the ABI's text, functions, structs (items).
+    Extern(Range, Range, Range),
+    Struct(u32), // structs
+    /// variants, type parameters, region parameters.
+    Enum(Range, Range, Range),
+    /// methods (functions), type parameters.
+    Interface(Range, Range),
+    /// interface type, for type, functions.
+    Impl(u32, u32, Range),
+    Const(u32, u32),        // type, value
+    Static(bool, u32, u32), // mutable, type, value
+}
+
+struct Struct {
+    fields: Range;    // fields
+    functions: Range; // functions
+    dropBlock: u32;   // a block statement, or none
+    hasDropDoc: bool;
+    dropDoc: Range;
+    isImported: bool;
+    isOpaque: bool;
+    typeParameters: Range;
+    regionParameters: Range;
+}
+
+struct Item {
+    kind: ItemKind;
+    visibility: Visibility;
+    name: u32;
+    attributes: Range;
+    start: u32;
+    end: u32;
+}
+
+/// One file's tree.
+struct Unit {
+    file: u32;
+    hasNamespace: bool;
+    namespaceName: QualifiedName;
+    imports: Vector<QualifiedName>;
+    items: Range;
+}
+
+struct Ast {
+    lists: Vector<u32>;
+    text: Vector<u8>;
+    idents: Vector<Ident>;
+    types: Vector<TypeNode>;
+    typeSpans: Vector<Span>;
+    exprs: Vector<ExprNode>;
+    exprSpans: Vector<Span>;
+    patterns: Vector<PatternNode>;
+    patternSpans: Vector<Span>;
+    bindings: Vector<Binding>;
+    stmts: Vector<StmtNode>;
+    stmtSpans: Vector<Span>;
+    closures: Vector<Closure>;
+    closureParameters: Vector<ClosureParameter>;
+    fieldInits: Vector<FieldInit>;
+    valueArms: Vector<ValueArm>;
+    matchArms: Vector<MatchArm>;
+    attributes: Vector<Attribute>;
+    typeParameters: Vector<TypeParameter>;
+    parameters: Vector<Parameter>;
+    functions: Vector<Function>;
+    fields: Vector<Field>;
+    variants: Vector<Variant>;
+    structs: Vector<Struct>;
+    items: Vector<Item>;
+    units: Vector<Unit>;
+
+    fn create() -> Ast => Ast {
+        lists: Vector<u32>.create(),
+        text: Vector<u8>.create(),
+        idents: Vector<Ident>.create(),
+        types: Vector<TypeNode>.create(),
+        typeSpans: Vector<Span>.create(),
+        exprs: Vector<ExprNode>.create(),
+        exprSpans: Vector<Span>.create(),
+        patterns: Vector<PatternNode>.create(),
+        patternSpans: Vector<Span>.create(),
+        bindings: Vector<Binding>.create(),
+        stmts: Vector<StmtNode>.create(),
+        stmtSpans: Vector<Span>.create(),
+        closures: Vector<Closure>.create(),
+        closureParameters: Vector<ClosureParameter>.create(),
+        fieldInits: Vector<FieldInit>.create(),
+        valueArms: Vector<ValueArm>.create(),
+        matchArms: Vector<MatchArm>.create(),
+        attributes: Vector<Attribute>.create(),
+        typeParameters: Vector<TypeParameter>.create(),
+        parameters: Vector<Parameter>.create(),
+        functions: Vector<Function>.create(),
+        fields: Vector<Field>.create(),
+        variants: Vector<Variant>.create(),
+        structs: Vector<Struct>.create(),
+        items: Vector<Item>.create(),
+        units: Vector<Unit>.create(),
+    };
+
+    /// Appends `ids` to `lists` as one run.
+    fn list(borrow mut this, ids: borrow Vector<u32>) -> Result<Range, AllocError> {
+        let start = truncate<u32>(this.lists.length);
+        for (i in 0..ids.length) {
+            this.lists.push(ids[i])?;
+        }
+        return Ok(Range { start: start, count: truncate<u32>(ids.length) });
+    }
+
+    fn at(borrow this, range: Range, k: u32) -> u32 => this.lists[(range.start + k) as usize];
+
+    /// Appends bytes to `text`.
+    fn addText(borrow mut this, bytes: Slice<u8>) -> Result<Range, AllocError> {
+        let start = truncate<u32>(this.text.length);
+        appendBytes(mut this.text, bytes)?;
+        return Ok(Range { start: start, count: truncate<u32>(bytes.length) });
+    }
+
+    fn textOf(borrow this, range: Range) -> Slice<u8> =>
+        this.text[(range.start as usize)..((range.start + range.count) as usize)];
+
+    fn addIdent(borrow mut this, ident: Ident) -> Result<u32, AllocError> {
+        this.idents.push(ident)?;
+        return Ok(truncate<u32>(this.idents.length - 1));
+    }
+
+    fn addType(borrow mut this, node: TypeNode, start: u32, end: u32) -> Result<u32, AllocError> {
+        this.types.push(node)?;
+        this.typeSpans.push(Span { start: start, end: end })?;
+        return Ok(truncate<u32>(this.types.length - 1));
+    }
+
+    fn addExpr(borrow mut this, node: ExprNode, start: u32, end: u32) -> Result<u32, AllocError> {
+        this.exprs.push(node)?;
+        this.exprSpans.push(Span { start: start, end: end })?;
+        return Ok(truncate<u32>(this.exprs.length - 1));
+    }
+
+    fn addPattern(borrow mut this, node: PatternNode, start: u32, end: u32) -> Result<u32, AllocError> {
+        this.patterns.push(node)?;
+        this.patternSpans.push(Span { start: start, end: end })?;
+        return Ok(truncate<u32>(this.patterns.length - 1));
+    }
+
+    fn addStmt(borrow mut this, node: StmtNode, start: u32, end: u32) -> Result<u32, AllocError> {
+        this.stmts.push(node)?;
+        this.stmtSpans.push(Span { start: start, end: end })?;
+        return Ok(truncate<u32>(this.stmts.length - 1));
+    }
+}

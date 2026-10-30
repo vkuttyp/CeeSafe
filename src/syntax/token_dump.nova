@@ -1,0 +1,143 @@
+// `ceesafec parse --dump-tokens`: the lexer's whole output as text, in a format tools/oracles/token-dump prints from
+// the reference's Lexer, so the two can be compared byte for byte (docs/p2-frontend.md §3). The reference has no token
+// dump of its own. Offsets are the reference's: UTF-16 code units from the start of the text.
+//
+//   file <path>
+//   <Kind> <start> <end> [Identifier: <id> <name> | IntLiteral: <value> <suffix> | FloatLiteral: <digits> <suffix>
+//                         | StringLiteral: <UTF-8 as hex> | CharLiteral: <scalar>]
+//   doc <token index> <UTF-8 as hex>
+//   comment <start> <end>
+//   diagnostic <code> <start> <end> <message>
+
+/// Converts increasing byte offsets to UTF-16 offsets in one pass over the text.
+struct Utf16Cursor {
+    byte: usize;
+    units: u32;
+
+    fn create() -> Utf16Cursor => Utf16Cursor { byte: 0, units: 0 };
+
+    fn at(borrow mut this, text: Slice<u8>, offset: usize) -> u32 {
+        if (offset < this.byte) {
+            this.byte = 0;
+            this.units = 0;
+        }
+        while (this.byte < offset) {
+            let d = decodeUtf8(text, this.byte);
+            this.units += d.utf16Units();
+            this.byte += d.length as usize;
+        }
+        return this.units;
+    }
+}
+
+fn appendHexBytes(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    for (b in bytes) {
+        appendHex(out, b as u64, 2)?;
+    }
+    return Ok();
+}
+
+fn appendSpan(
+    out: borrow mut Vector<u8>,
+    cursor: borrow mut Utf16Cursor,
+    text: Slice<u8>,
+    start: u32,
+    end: u32,
+) -> Result<void, AllocError> {
+    out.push(' ')?;
+    appendDecimal(out, cursor.at(text, start as usize) as u64)?;
+    out.push(' ')?;
+    appendDecimal(out, cursor.at(text, end as usize) as u64)?;
+    return Ok();
+}
+
+fn dumpTokens(
+    out: borrow mut Vector<u8>,
+    source: borrow SourceText,
+    lexed: borrow Lexed,
+    symbols: borrow Interner,
+) -> Result<void, AllocError> {
+    let text = source.text.view();
+    appendText(out, "file ")?;
+    appendBytes(out, source.path.view())?;
+    out.push('\n')?;
+    var cursor = Utf16Cursor.create();
+    for (i in 0..lexed.tokens.length) {
+        let t = lexed.tokens[i];
+        appendText(out, kindName(t.kind))?;
+        appendSpan(out, mut cursor, text, t.start, t.end)?;
+        match (t.kind) {
+            TokenKind.Identifier => {
+                out.push(' ')?;
+                appendDecimal(out, t.data as u64)?;
+                out.push(' ')?;
+                appendBytes(out, symbols.name(Symbol { id: t.data }))?;
+            }
+            TokenKind.IntLiteral => {
+                let v = lexed.ints[t.data as usize];
+                out.push(' ')?;
+                appendDecimal(out, v.value)?;
+                out.push(' ')?;
+                appendText(out, intSuffixName(v.suffix))?;
+            }
+            TokenKind.FloatLiteral => {
+                let v = borrow lexed.floats[t.data as usize];
+                out.push(' ')?;
+                appendBytes(out, v.digits.view())?;
+                out.push(' ')?;
+                appendText(out, floatSuffixName(v.suffix))?;
+            }
+            TokenKind.StringLiteral => {
+                out.push(' ')?;
+                appendHexBytes(out, lexed.strings[t.data as usize].view())?;
+            }
+            TokenKind.CharLiteral => {
+                out.push(' ')?;
+                appendDecimal(out, lexed.chars[t.data as usize] as u64)?;
+            }
+            _ => {}
+        }
+        out.push('\n')?;
+    }
+    for (i in 0..lexed.docs.length) {
+        let d = borrow lexed.docs[i];
+        appendText(out, "doc ")?;
+        appendDecimal(out, d.token as u64)?;
+        out.push(' ')?;
+        appendHexBytes(out, d.text.view())?;
+        out.push('\n')?;
+    }
+    var commentCursor = Utf16Cursor.create();
+    for (i in 0..lexed.comments.length) {
+        let c = lexed.comments[i];
+        appendText(out, "comment")?;
+        appendSpan(out, mut commentCursor, text, c.start, c.end)?;
+        out.push('\n')?;
+    }
+    return Ok();
+}
+
+/// The diagnostics of file `file`, in the dump's format.
+fn dumpDiagnostics(
+    out: borrow mut Vector<u8>,
+    source: borrow SourceText,
+    file: u32,
+    diagnostics: borrow Diagnostics,
+) -> Result<void, AllocError> {
+    for (i in 0..diagnostics.items.length) {
+        let d = borrow diagnostics.items[i];
+        if (d.file != file) {
+            continue;
+        }
+        appendText(out, "diagnostic ")?;
+        appendCode(out, d.code)?;
+        out.push(' ')?;
+        appendDecimal(out, source.utf16Offset(d.start as usize) as u64)?;
+        out.push(' ')?;
+        appendDecimal(out, source.utf16Offset(d.end as usize) as u64)?;
+        out.push(' ')?;
+        appendBytes(out, d.message.view())?;
+        out.push('\n')?;
+    }
+    return Ok();
+}

@@ -1,11 +1,16 @@
 /// ceesafec: the CeeSafe compiler, being ported from Nova's C# novac (ROADMAP.md).
-/// The P1 skeleton: it knows the reference's commands, loads the files a command names into source texts, and says
-/// which phase implements the command. It compiles nothing yet.
+/// P2 in progress: `parse` lexes and parses its files and reports their diagnostics (text, or the reference's JSON
+/// with `--diagnostics-format=json`); `--dump-ast` prints the tree as the reference does, and `--dump-tokens` the
+/// lexer's output for the token-dump oracle. Every other command says which phase implements it.
 fn usage() {
     Console.writeLine("usage: ceesafec <command> [options] <file.nova>...");
     Console.writeLine("");
+    Console.writeLine("Commands are novac's (docs/reference-inventory.md §2). Implemented so far:");
+    Console.writeLine("  parse <file.nova>...   parse the files and report their diagnostics");
+    Console.writeLine("    --dump-ast                  print each file's syntax tree");
+    Console.writeLine("    --diagnostics-format=json   diagnostics as the reference's JSON document, on stdout");
     Console.writeLine(
-        "The commands are novac's (docs/reference-inventory.md §2); none is implemented yet, see ROADMAP.md.",
+        "    --dump-tokens               print the lexer's output (CeeSafe only; docs/p2-frontend.md §3)",
     );
     Console.writeLine("  --version    print the version");
     Console.writeLine("  -h, --help   print this text");
@@ -30,44 +35,225 @@ fn phaseOf(command: StringView) -> StringView? {
     return null;
 }
 
-/// Loads every argument after the command that is not an option, as the commands that take files will.
-fn loadFiles(sources: borrow mut Vector<SourceText>) -> i32 {
-    for (a in 2..Process.argumentCount()) {
-        let path = Process.argument(a)!;
-        if (path.length > 0 && path[0] == '-') {
-            continue;
-        }
-        let bytes = match (readFile(path)) {
-            Ok(b) => b,
-            Err(ReadError.Io(e)) => {
-                Console.writeError("ceesafec: cannot read '");
-                Console.writeError(path);
-                Console.writeError("': ");
-                Console.writeErrorLine(e.message());
-                return 1;
+/// The options of a file command, after `--diagnostics-format` is taken out (Program.cs's TakeDiagnosticsFormat and
+/// ParseOptions).
+struct Options {
+    json: bool;
+    dumpTokens: bool;
+    dumpAst: bool;
+    files: Vector<String>;
+}
+
+fn fail(message: StringView) -> i32 {
+    Console.writeError("novac: ");
+    Console.writeErrorLine(message);
+    return 2;
+}
+
+fn copyText(text: StringView) -> String {
+    var s = String.create();
+    s.append(text)!;
+    return s;
+}
+
+/// Reads the arguments after the command, or returns the exit status of a usage error.
+fn readOptions(options: borrow mut Options) -> i32 {
+    var a: usize = 2;
+    while (a < Process.argumentCount()) {
+        let arg = Process.argument(a)!;
+        a += 1;
+        if (arg == "--diagnostics-format=json") {
+            options.json = true;
+        } else if (arg == "--diagnostics-format=text") {
+            options.json = false;
+        } else if (arg == "--diagnostics-format") {
+            let value = match (Process.argument(a)) {
+                Some(v) => v,
+                null => { return fail("option '--diagnostics-format' needs a value"); }
+            };
+            a += 1;
+            if (value == "json") {
+                options.json = true;
+            } else if (value == "text") {
+                options.json = false;
+            } else {
+                return fail("--diagnostics-format must be 'text' or 'json'");
             }
-            Err(ReadError.Memory) => {
-                Console.writeErrorLine("ceesafec: out of memory");
-                return 1;
-            }
-        };
-        match (SourceText.create(path.bytes(), bytes.view())) {
-            Ok(s) => {
-                match (sources.push(s)) {
-                    Ok() => {}
-                    Err(_) => {
-                        Console.writeErrorLine("ceesafec: out of memory");
-                        return 1;
-                    }
-                }
-            }
-            Err(_) => {
-                Console.writeErrorLine("ceesafec: out of memory");
-                return 1;
-            }
+        } else if (arg == "--dump-ast") {
+            options.dumpAst = true;
+        } else if (arg == "--dump-tokens") {
+            options.dumpTokens = true;
+        } else if (arg.length > 0 && arg[0] == '-') {
+            var message = String.create();
+            message.append("unknown option '")!;
+            message.append(arg)!;
+            message.append("'")!;
+            return fail(message.view());
+        } else {
+            options.files.push(copyText(arg))!;
         }
     }
     return 0;
+}
+
+/// The path diagnostics name (SourceText.SourcePath, c-backend.md §7): `/` separators; an absolute path under the
+/// working directory becomes relative to it, and any other absolute path is reduced to its file name.
+fn sourcePath(path: StringView) -> Vector<u8> {
+    var result = Vector<u8>.create();
+    let bytes = path.bytes();
+    if (bytes.length > 0 && bytes[0] == '/') {
+        match (Directory.current()) {
+            Ok(cwd) => {
+                let base = cwd.view().bytes();
+                if (bytes.length > base.length + 1 && sameBytes(
+                    bytes[..base.length],
+                    base,
+                ) && bytes[base.length] == '/') {
+                    appendBytes(mut result, bytes[(base.length + 1)..])!;
+                    return result;
+                }
+            }
+            Err(_) => {}
+        }
+        var name = bytes.length;
+        while (name > 0 && bytes[name - 1] != '/') {
+            name -= 1;
+        }
+        appendBytes(mut result, bytes[name..])!;
+        return result;
+    }
+    for (b in bytes) {
+        result.push(if (b == '\\') '/' else b)!;
+    }
+    return result;
+}
+
+/// Loads each file into a source text, or returns the exit status after an error.
+fn loadFiles(files: borrow Vector<String>, sources: borrow mut Vector<SourceText>) -> i32 {
+    for (i in 0..files.length) {
+        let path = files[i].view();
+        let bytes = match (readFile(path)) {
+            Ok(b) => b,
+            Err(ReadError.Io(e)) => {
+                var message = String.create();
+                message.append("cannot read '")!;
+                message.append(path)!;
+                message.append("': ")!;
+                message.append(e.message())!;
+                Console.writeError("novac: ");
+                Console.writeErrorLine(message.view());
+                return 2;
+            }
+            Err(ReadError.Memory) => { return fail("out of memory"); }
+        };
+        let name = sourcePath(path);
+        sources.push(SourceText.create(name.view(), bytes.view())!)!;
+    }
+    return 0;
+}
+
+/// A diagnostic as text with a source excerpt and caret (DiagnosticRenderer.Render).
+fn render(out: borrow mut Vector<u8>, d: borrow Diagnostic, source: borrow SourceText) -> Result<void, AllocError> {
+    let position = source.position(d.start as usize);
+    appendBytes(out, source.path.view())?;
+    out.push(':')?;
+    appendDecimal(out, position.line as u64)?;
+    out.push(':')?;
+    appendDecimal(out, position.column as u64)?;
+    appendText(out, if (d.isError) ": error[" else ": warning[")?;
+    appendCode(out, d.code)?;
+    appendText(out, "]: ")?;
+    appendBytes(out, d.message.view())?;
+    out.push('\n')?;
+
+    var gutter = Vector<u8>.create();
+    appendDecimal(mut gutter, position.line as u64)?;
+    let line = source.lineText(position.line as usize);
+    for (k in 0..gutter.length) {
+        out.push(' ')?;
+    }
+    appendText(out, " |\n")?;
+    appendBytes(out, gutter.view())?;
+    appendText(out, " | ")?;
+    var shown = Vector<u8>.create();
+    appendDecoded(mut shown, line)?;
+    for (b in shown) {
+        out.push(if (b == '\t') ' ' else b)?;
+    }
+    out.push('\n')?;
+
+    // Underline the span, clipped to the first line it touches; at least one caret. Lengths are UTF-16 units.
+    let lineStart = source.lineStarts[(position.line - 1) as usize] as usize;
+    let lineUnits = source.utf16Length(lineStart, lineStart + line.length) as i64;
+    let spanUnits = source.utf16Length(d.start as usize, d.end as usize) as i64;
+    let room = lineUnits - position.column as i64 + 1;
+    var underline: i64 = if (spanUnits < room) spanUnits else room;
+    if (underline < 1) {
+        underline = 1;
+    }
+    for (k in 0..gutter.length) {
+        out.push(' ')?;
+    }
+    appendText(out, " | ")?;
+    for (k in 1..position.column) {
+        out.push(' ')?;
+    }
+    for (k in 0..underline) {
+        out.push('^')?;
+    }
+    out.push('\n')?;
+    return Ok();
+}
+
+fn parseCommand() -> i32 {
+    var options = Options { json: false, dumpTokens: false, dumpAst: false, files: Vector<String>.create() };
+    let status = readOptions(mut options);
+    if (status != 0) {
+        return status;
+    }
+    if (options.files.length == 0) {
+        return fail("package mode is not implemented yet (ROADMAP P8); name the files");
+    }
+    var sources = Vector<SourceText>.create();
+    let loaded = loadFiles(options.files, mut sources);
+    if (loaded != 0) {
+        return loaded;
+    }
+
+    var front = Frontend.create();
+    var dump = Vector<u8>.create();
+    for (i in 0..sources.length) {
+        let source = borrow sources[i];
+        let file = truncate<u32>(i);
+        let lexed = lex(source.text.view(), file, mut front.symbols, mut front.diagnostics)!;
+        if (options.dumpTokens) {
+            dumpTokens(mut dump, source, lexed, front.symbols)!;
+            dumpDiagnostics(mut dump, source, file, front.diagnostics)!;
+        }
+        front = parseFile(file, lexed, front)!;
+        if (options.dumpAst) {
+            var printer = AstPrinter.create();
+            printer.printUnit(front.ast, front.symbols, front.ast.units[i])!;
+            appendBytes(mut dump, printer.out.view())!;
+        }
+    }
+    Console.writeBytes(dump.view());
+
+    let diagnostics = borrow front.diagnostics;
+    if (options.json) {
+        let json = diagnosticsJson(diagnostics, sources)!;
+        Console.writeBytes(json.view());
+        Console.writeLine("");
+    } else {
+        var text = Vector<u8>.create();
+        for (i in 0..diagnostics.items.length) {
+            let d = borrow diagnostics.items[i];
+            render(mut text, d, sources[d.file as usize])!;
+        }
+        // Valid UTF-8: paths come from arguments, and source lines are decoded with U+FFFD.
+        Console.writeError(StringView.fromUtf8(text.view())!);
+    }
+    return if (diagnostics.hasErrors()) 1 else 0;
 }
 
 fn main() -> i32 {
@@ -85,34 +271,25 @@ fn main() -> i32 {
         usage();
         return 0;
     }
-    let phase = match (phaseOf(command)) {
-        Some(p) => p,
-        null => {
-            Console.writeError("ceesafec: unknown command: ");
-            Console.writeErrorLine(command);
-            return 2;
+    if (command == "parse") {
+        return parseCommand();
+    }
+    match (phaseOf(command)) {
+        Some(phase) => {
+            var message = String.create();
+            message.append("'")!;
+            message.append(command)!;
+            message.append("' is not implemented yet (ROADMAP ")!;
+            message.append(phase)!;
+            message.append(")")!;
+            return fail(message.view());
         }
-    };
-    var sources = Vector<SourceText>.create();
-    let status = loadFiles(mut sources);
-    if (status != 0) {
-        return status;
+        null => {
+            var message = String.create();
+            message.append("unknown command '")!;
+            message.append(command)!;
+            message.append("'")!;
+            return fail(message.view());
+        }
     }
-    var lines: usize = 0;
-    for (s in sources) {
-        lines += s.lineCount();
-    }
-    Console.writeError("ceesafec: '");
-    Console.writeError(command);
-    Console.writeError("' is not implemented yet (ROADMAP ");
-    Console.writeError(phase);
-    // Console.writeError takes text only: the counts are formatted into a String.
-    var counts = String.create();
-    counts.append("); read ")!;
-    counts.appendNumber(sources.length)!;
-    counts.append(" files, ")!;
-    counts.appendNumber(lines)!;
-    counts.append(" lines")!;
-    Console.writeErrorLine(counts.view());
-    return 2;
 }

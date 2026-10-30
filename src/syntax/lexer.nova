@@ -1,0 +1,655 @@
+// The lexer (the reference's Syntax/Lexer.cs; grammar.md §1), over the file's bytes. The reference lexes .NET's
+// decoding of the file, so where it sees one UTF-16 character this lexer sees one UTF-8 sequence (decodeUtf8), and
+// ill-formed UTF-8 is U+FFFD as there: in string and char values, doc comments and "unexpected character". The one
+// known difference: after a backslash, the reference steps over one UTF-16 unit, so the span of an invalid escape of a
+// character above the BMP ends inside its surrogate pair; here it ends after the character, one unit later
+// (docs/p2-frontend.md §2). The literal's value and the recovery are the reference's.
+
+struct Span {
+    start: u32;
+    end: u32;
+}
+
+/// The `///` lines before a token, joined by "\n" (grammar.md §1.2).
+struct DocComment {
+    token: u32;
+    text: Vector<u8>;
+}
+
+/// The lexer's output (LexedSource): tokens ending in EndOfFile, with the literal side tables.
+struct Lexed {
+    tokens: Vector<Token>;
+    ints: Vector<IntLiteral>;
+    floats: Vector<FloatLiteral>;
+    strings: Vector<Vector<u8>>; // UTF-8
+    chars: Vector<u32>;          // Unicode scalar values
+    docs: Vector<DocComment>;    // in token order
+    comments: Vector<Span>;      // every comment, in source order (for the formatter)
+}
+
+fn isIdentStart(c: i32) -> bool => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+
+fn isDecimalDigit(c: i32) -> bool => c >= '0' && c <= '9';
+
+fn isIdentContinue(c: i32) -> bool => isIdentStart(c) || isDecimalDigit(c);
+
+fn isHexDigit(c: i32) -> bool => isDecimalDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+
+fn isRadixDigit(c: i32, radix: u64) -> bool => if (radix == 16) isHexDigit(c) else isDecimalDigit(c);
+
+fn hexValue(c: i32) -> u64 {
+    if (c >= '0' && c <= '9') {
+        return truncate<u64>(c - '0');
+    }
+    if (c >= 'a' && c <= 'f') {
+        return truncate<u64>(c - 'a' + 10);
+    }
+    return truncate<u64>(c - 'A' + 10);
+}
+
+/// Appends `bytes` with each ill-formed UTF-8 subpart replaced by U+FFFD, as the reference's decoded text holds it.
+fn appendDecoded(target: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    var i: usize = 0;
+    while (i < bytes.length) {
+        let d = decodeUtf8(bytes, i);
+        if (d.valid) {
+            appendBytes(target, bytes[i..(i + d.length as usize)])?;
+        } else {
+            appendUtf8(target, 0xFFFD)?;
+        }
+        i += d.length as usize;
+    }
+    return Ok();
+}
+
+struct Lexer {
+    file: u32;
+    pos: usize;
+    out: Lexed;
+    pendingDoc: Vector<Vector<u8>>;
+
+    fn ch(borrow this, text: Slice<u8>, offset: usize) -> i32 {
+        let i = this.pos + offset;
+        return if (i < text.length) text[i] as i32 else -1;
+    }
+
+    fn error(
+        borrow this,
+        diagnostics: borrow mut Diagnostics,
+        code: u32,
+        start: usize,
+        end: usize,
+        message: Vector<u8>,
+    ) -> Result<void, AllocError> =>
+        diagnostics.error(code, this.file, truncate<u32>(start), truncate<u32>(end), message);
+
+    fn add(borrow mut this, kind: TokenKind, start: usize, data: u32) -> Result<void, AllocError> {
+        if (this.pendingDoc.length > 0) {
+            var text = Vector<u8>.create();
+            for (k in 0..this.pendingDoc.length) {
+                if (k > 0) {
+                    text.push('\n')?;
+                }
+                appendBytes(mut text, this.pendingDoc[k].view())?;
+            }
+            this.out.docs.push(DocComment { token: truncate<u32>(this.out.tokens.length), text: text })?;
+            this.pendingDoc.truncate(0);
+        }
+        this.out.tokens.push(
+            Token { kind: kind, start: truncate<u32>(start), end: truncate<u32>(this.pos), data: data },
+        )?;
+        return Ok();
+    }
+
+    fn run(
+        borrow mut this,
+        text: Slice<u8>,
+        symbols: borrow mut Interner,
+        diagnostics: borrow mut Diagnostics,
+    ) -> Result<void, AllocError> {
+        loop {
+            this.skipWhitespaceAndComments(text, diagnostics)?;
+            if (this.pos >= text.length) {
+                let end = truncate<u32>(text.length);
+                this.out.tokens.push(Token { kind: TokenKind.EndOfFile, start: end, end: end, data: 0 })?;
+                return Ok();
+            }
+            let start = this.pos;
+            let c = text[this.pos] as i32;
+            if (isIdentStart(c)) {
+                this.lexIdentifier(text, start, symbols)?;
+            } else if (isDecimalDigit(c)) {
+                this.lexNumber(text, start, diagnostics)?;
+            } else if (c == '"') {
+                this.lexString(text, start, diagnostics)?;
+            } else if (c == '\'') {
+                this.lexChar(text, start, diagnostics)?;
+            } else if (!this.lexPunctuation(text, start)?) {
+                // One whole character: a UTF-8 sequence, or one ill-formed subpart.
+                let d = decodeUtf8(text, this.pos);
+                this.pos += d.length as usize;
+                var message = Vector<u8>.create();
+                appendText(mut message, "unexpected character ")?;
+                if (d.scalar >= 0x20 && d.scalar < 0x7F) {
+                    message.push('\'')?;
+                    message.push(truncate<u8>(d.scalar))?;
+                    message.push('\'')?;
+                } else {
+                    appendText(mut message, "U+")?;
+                    appendHex(mut message, d.scalar as u64, 4)?;
+                }
+                this.error(diagnostics, unexpectedCharacter(), start, this.pos, message)?;
+            }
+        }
+    }
+
+    fn skipWhitespaceAndComments(
+        borrow mut this,
+        text: Slice<u8>,
+        diagnostics: borrow mut Diagnostics,
+    ) -> Result<void, AllocError> {
+        while (this.pos < text.length) {
+            let c = text[this.pos];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 0x0C) {
+                this.pos += 1;
+            } else if (c == '/' && this.ch(text, 1) == '/') {
+                let start = this.pos;
+                while (this.pos < text.length && text[this.pos] != '\n' && text[this.pos] != '\r') {
+                    this.pos += 1;
+                }
+                this.out.comments.push(Span { start: truncate<u32>(start), end: truncate<u32>(this.pos) })?;
+                // A doc comment is exactly "///" (grammar.md §1.2); any other comment ends a run of them.
+                let length = this.pos - start;
+                if (length >= 3 && text[start + 2] == '/' && (length == 3 || text[start + 3] != '/')) {
+                    var from = start + 3;
+                    while (from < this.pos && (text[from] == ' ' || text[from] == '\t')) {
+                        from += 1;
+                    }
+                    var line = Vector<u8>.create();
+                    appendDecoded(mut line, text[from..this.pos])?;
+                    this.pendingDoc.push(line)?;
+                } else {
+                    this.pendingDoc.truncate(0);
+                }
+            } else if (c == '/' && this.ch(text, 1) == '*') {
+                this.pendingDoc.truncate(0);
+                let start = this.pos;
+                var close = start + 2;
+                while (close + 1 < text.length && !(text[close] == '*' && text[close + 1] == '/')) {
+                    close += 1;
+                }
+                if (close + 1 >= text.length) {
+                    var message = Vector<u8>.create();
+                    appendText(mut message, "unterminated block comment")?;
+                    this.error(diagnostics, unterminatedBlockComment(), start, start + 2, message)?;
+                    this.pos = text.length;
+                } else {
+                    this.pos = close + 2;
+                }
+                this.out.comments.push(Span { start: truncate<u32>(start), end: truncate<u32>(this.pos) })?;
+            } else {
+                return Ok();
+            }
+        }
+        return Ok();
+    }
+
+    fn lexIdentifier(
+        borrow mut this,
+        text: Slice<u8>,
+        start: usize,
+        symbols: borrow mut Interner,
+    ) -> Result<void, AllocError> {
+        while (isIdentContinue(this.ch(text, 0))) {
+            this.pos += 1;
+        }
+        let name = text[start..this.pos];
+        if (name.length == 1 && name[0] == '_') {
+            return this.add(TokenKind.Underscore, start, 0);
+        }
+        match (keywordOf(name)) {
+            Some(keyword) => { return this.add(keyword, start, 0); }
+            null => {}
+        }
+        let symbol = symbols.intern(name)?;
+        return this.add(TokenKind.Identifier, start, symbol.id);
+    }
+
+    fn lexNumber(
+        borrow mut this,
+        text: Slice<u8>,
+        start: usize,
+        diagnostics: borrow mut Diagnostics,
+    ) -> Result<void, AllocError> {
+        var radix: u64 = 10;
+        let second = this.ch(text, 1);
+        if (text[this.pos] == '0' && (second == 'x' || second == 'b' || second == 'o')) {
+            radix = if (second == 'x') 16 else if (second == 'b') 2 else 8;
+            this.pos += 2;
+        }
+
+        let digitsStart = this.pos;
+        while (this.ch(text, 0) == '_' || (if (radix == 16) isHexDigit(
+            this.ch(text, 0),
+        ) else isDecimalDigit(this.ch(text, 0)))) {
+            this.pos += 1;
+        }
+        let digitsEnd = this.pos;
+
+        var isFloat = false;
+        if (radix == 10) {
+            if (this.ch(text, 0) == '.' && isDecimalDigit(this.ch(text, 1))) {
+                isFloat = true;
+                this.pos += 1;
+                this.skipDecimalDigits(text);
+            }
+            let e = this.ch(text, 0);
+            let e1 = this.ch(text, 1);
+            if ((e == 'e' || e == 'E') && (isDecimalDigit(e1) || ((e1 == '+' || e1 == '-') && isDecimalDigit(
+                this.ch(text, 2),
+            )))) {
+                isFloat = true;
+                this.pos += if (isDecimalDigit(e1)) 1 else 2;
+                this.skipDecimalDigits(text);
+            }
+        }
+
+        let bodyEnd = this.pos;
+        while (isIdentContinue(this.ch(text, 0))) {
+            this.pos += 1;
+        }
+        var suffixEnd = this.pos;
+
+        if (digitsStart == digitsEnd) {
+            // One error per literal: "0xg" reports the missing digits, not also the suffix "g".
+            var message = Vector<u8>.create();
+            appendText(mut message, "expected digits after '")?;
+            appendBytes(mut message, text[start..digitsStart])?;
+            message.push('\'')?;
+            this.error(diagnostics, invalidDigit(), start, digitsEnd, message)?;
+            suffixEnd = bodyEnd;
+        } else {
+            this.checkSeparators(text, digitsStart, bodyEnd, radix, diagnostics)?;
+        }
+        let suffix = text[bodyEnd..suffixEnd];
+
+        if (isFloat) {
+            var floatSuffix = FloatSuffix.None;
+            if (sameText(suffix, "f32")) {
+                floatSuffix = FloatSuffix.F32;
+            } else if (sameText(suffix, "f64")) {
+                floatSuffix = FloatSuffix.F64;
+            } else if (suffix.length > 0) {
+                this.badSuffix(text, bodyEnd, diagnostics)?;
+            }
+            var digits = Vector<u8>.create();
+            for (i in start..bodyEnd) {
+                if (text[i] != '_') {
+                    digits.push(text[i])?;
+                }
+            }
+            this.out.floats.push(FloatLiteral { digits: digits, suffix: floatSuffix })?;
+            return this.add(TokenKind.FloatLiteral, start, truncate<u32>(this.out.floats.length - 1));
+        }
+
+        var intSuffix = IntSuffix.None;
+        match (intSuffixOf(suffix)) {
+            Some(found) => { intSuffix = found; }
+            null => { this.badSuffix(text, bodyEnd, diagnostics)?; }
+        }
+        let value = this.computeIntValue(text, start, digitsStart, digitsEnd, radix, diagnostics)?;
+        this.out.ints.push(IntLiteral { value: value, suffix: intSuffix })?;
+        return this.add(TokenKind.IntLiteral, start, truncate<u32>(this.out.ints.length - 1));
+    }
+
+    fn skipDecimalDigits(borrow mut this, text: Slice<u8>) {
+        while (this.ch(text, 0) == '_' || isDecimalDigit(this.ch(text, 0))) {
+            this.pos += 1;
+        }
+    }
+
+    fn badSuffix(
+        borrow this,
+        text: Slice<u8>,
+        suffixStart: usize,
+        diagnostics: borrow mut Diagnostics,
+    ) -> Result<void, AllocError> {
+        var message = Vector<u8>.create();
+        appendText(mut message, "invalid literal suffix '")?;
+        appendBytes(mut message, text[suffixStart..this.pos])?;
+        message.push('\'')?;
+        return this.error(diagnostics, invalidLiteralSuffix(), suffixStart, this.pos, message);
+    }
+
+    /// A '_' must sit between two digits of the literal's radix (grammar.md §1.4).
+    fn checkSeparators(
+        borrow this,
+        text: Slice<u8>,
+        start: usize,
+        end: usize,
+        radix: u64,
+        diagnostics: borrow mut Diagnostics,
+    ) -> Result<void, AllocError> {
+        for (i in start..end) {
+            if (text[i] != '_') {
+                continue;
+            }
+            let before = i > start && isRadixDigit(text[i - 1] as i32, radix);
+            let after = i + 1 < end && isRadixDigit(text[i + 1] as i32, radix);
+            if (!before || !after) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "digit separator '_' must be between two digits")?;
+                return this.error(diagnostics, misplacedDigitSeparator(), i, i + 1, message);
+            }
+        }
+        return Ok();
+    }
+
+    fn computeIntValue(
+        borrow this,
+        text: Slice<u8>,
+        literalStart: usize,
+        digitsStart: usize,
+        digitsEnd: usize,
+        radix: u64,
+        diagnostics: borrow mut Diagnostics,
+    ) -> Result<u64, AllocError> {
+        var value: u64 = 0;
+        var overflowed = false;
+        for (i in digitsStart..digitsEnd) {
+            let c = text[i];
+            if (c == '_') {
+                continue;
+            }
+            let digit = hexValue(c as i32);
+            if (digit >= radix) {
+                var message = Vector<u8>.create();
+                appendText(mut message, "invalid digit '")?;
+                message.push(c)?;
+                appendText(mut message, "' in base-")?;
+                appendDecimal(mut message, radix)?;
+                appendText(mut message, " literal")?;
+                this.error(diagnostics, invalidDigit(), i, i + 1, message)?;
+                return Ok(0);
+            }
+            if (!overflowed) {
+                match (value.checkedMul(radix)) {
+                    Some(shifted) => {
+                        match (shifted.checkedAdd(digit)) {
+                            Some(next) => { value = next; }
+                            null => { overflowed = true; }
+                        }
+                    }
+                    null => { overflowed = true; }
+                }
+            }
+        }
+        if (overflowed) {
+            var message = Vector<u8>.create();
+            appendText(mut message, "integer literal is too large for 64 bits")?;
+            this.error(diagnostics, integerLiteralTooLarge(), literalStart, digitsEnd, message)?;
+            return Ok(0);
+        }
+        return Ok(value);
+    }
+
+    fn lexString(
+        borrow mut this,
+        text: Slice<u8>,
+        start: usize,
+        diagnostics: borrow mut Diagnostics,
+    ) -> Result<void, AllocError> {
+        this.pos += 1; // opening quote
+        var value = Vector<u8>.create();
+        loop {
+            let c = this.ch(text, 0);
+            if (c == -1 || c == '\n' || c == '\r') {
+                var message = Vector<u8>.create();
+                appendText(mut message, "unterminated string literal")?;
+                this.error(diagnostics, unterminatedString(), start, this.pos, message)?;
+                break;
+            }
+            if (c == '"') {
+                this.pos += 1;
+                break;
+            }
+            if (c == '\\') {
+                let scalar = this.lexEscape(text, diagnostics)?;
+                if (scalar >= 0) {
+                    appendUtf8(mut value, truncate<u32>(scalar))?;
+                } else if (scalar == -2) {
+                    appendUtf8(mut value, 0xFFFD)?; // the reference's lone low surrogate, as UTF-8 holds it
+                }
+            } else if (c < 0x80) {
+                value.push(truncate<u8>(c))?;
+                this.pos += 1;
+            } else {
+                let d = decodeUtf8(text, this.pos);
+                if (d.valid) {
+                    appendBytes(mut value, text[this.pos..(this.pos + d.length as usize)])?;
+                } else {
+                    appendUtf8(mut value, 0xFFFD)?;
+                }
+                this.pos += d.length as usize;
+            }
+        }
+        this.out.strings.push(value)?;
+        return this.add(TokenKind.StringLiteral, start, truncate<u32>(this.out.strings.length - 1));
+    }
+
+    fn lexChar(
+        borrow mut this,
+        text: Slice<u8>,
+        start: usize,
+        diagnostics: borrow mut Diagnostics,
+    ) -> Result<void, AllocError> {
+        this.pos += 1; // opening quote
+        var value: u32 = 0;
+        let c = this.ch(text, 0);
+        if (c == '\'') {
+            this.pos += 1;
+            var message = Vector<u8>.create();
+            appendText(mut message, "empty char literal")?;
+            this.error(diagnostics, invalidCharLiteral(), start, this.pos, message)?;
+        } else if (c == -1 || c == '\n' || c == '\r') {
+            var message = Vector<u8>.create();
+            appendText(mut message, "unterminated char literal")?;
+            this.error(diagnostics, invalidCharLiteral(), start, this.pos, message)?;
+        } else {
+            var split = false; // the reference's literal still holds a low surrogate (lexEscape)
+            if (c == '\\') {
+                let scalar = this.lexEscape(text, diagnostics)?;
+                value = if (scalar > 0) truncate<u32>(scalar) else 0;
+                split = scalar == -2;
+            } else {
+                let d = decodeUtf8(text, this.pos);
+                value = d.scalar;
+                this.pos += d.length as usize;
+            }
+
+            if (!split && this.ch(text, 0) == '\'') {
+                this.pos += 1;
+            } else {
+                // Recover by skipping to a closing quote on the same line, if there is one.
+                var scan = this.pos;
+                while (scan < text.length && text[scan] != '\'' && text[scan] != '\n' && text[scan] != '\r') {
+                    scan += 1;
+                }
+                let closed = scan < text.length && text[scan] == '\'';
+                this.pos = if (closed) scan + 1 else scan;
+                var message = Vector<u8>.create();
+                appendText(
+                    mut message,
+                    if (closed) "char literal must contain exactly one character" else "unterminated char literal",
+                )?;
+                this.error(diagnostics, invalidCharLiteral(), start, this.pos, message)?;
+            }
+        }
+        this.out.chars.push(value)?;
+        return this.add(TokenKind.CharLiteral, start, truncate<u32>(this.out.chars.length - 1));
+    }
+
+    /// Lexes an escape starting at '\'. Returns the scalar value, or -1 after reporting an error.
+    fn lexEscape(borrow mut this, text: Slice<u8>, diagnostics: borrow mut Diagnostics) -> Result<i64, AllocError> {
+        let start = this.pos;
+        this.pos += 1; // backslash
+        let e = this.ch(text, 0);
+        let simple: i64 = match (e) {
+            'n' => 10,
+            'r' => 13,
+            't' => 9,
+            '\\' => 92,
+            '"' => 34,
+            '\'' => 39,
+            '0' => 0,
+            _ => -1,
+        };
+        if (simple >= 0) {
+            this.pos += 1;
+            return Ok(simple);
+        }
+
+        if (e == 'u' && this.ch(text, 1) == '{') {
+            this.pos += 2;
+            let digitsStart = this.pos;
+            while (isHexDigit(this.ch(text, 0))) {
+                this.pos += 1;
+            }
+            let count = this.pos - digitsStart;
+            if (this.ch(text, 0) == '}' && count >= 1 && count <= 6) {
+                var value: i64 = 0;
+                for (i in digitsStart..this.pos) {
+                    value = value * 16 + truncate<i64>(hexValue(text[i] as i32));
+                }
+                this.pos += 1;
+                if (value <= 0x10FFFF && !(value >= 0xD800 && value <= 0xDFFF)) {
+                    return Ok(value);
+                }
+                var message = Vector<u8>.create();
+                appendText(mut message, "\\u{...} escape is not a Unicode scalar value")?;
+                this.error(diagnostics, invalidEscape(), start, this.pos, message)?;
+                return Ok(-1);
+            }
+            var message = Vector<u8>.create();
+            appendText(mut message, "\\u escape must be \\u{H} with 1 to 6 hex digits")?;
+            this.error(diagnostics, invalidEscape(), start, this.pos, message)?;
+            return Ok(-1);
+        }
+
+        var split = false;
+        if (e != -1 && e != '\n' && e != '\r') {
+            // The reference steps over one UTF-16 unit, so after a character above the BMP its low surrogate is left
+            // over (see the file comment). Here the whole character is stepped over and -2 says what was left.
+            let d = decodeUtf8(text, this.pos);
+            split = d.valid && d.scalar >= 0x10000;
+            this.pos += d.length as usize;
+        }
+        var message = Vector<u8>.create();
+        appendText(mut message, "invalid escape sequence")?;
+        this.error(diagnostics, invalidEscape(), start, this.pos, message)?;
+        return Ok(if (split) -2 else -1);
+    }
+
+    fn lexPunctuation(borrow mut this, text: Slice<u8>, start: usize) -> Result<bool, AllocError> {
+        let next = this.ch(text, 1);
+        let kind: TokenKind = match (text[this.pos]) {
+            '(' => TokenKind.OpenParen,
+            ')' => TokenKind.CloseParen,
+            '{' => TokenKind.OpenBrace,
+            '}' => TokenKind.CloseBrace,
+            '[' => TokenKind.OpenBracket,
+            ']' => TokenKind.CloseBracket,
+            ',' => TokenKind.Comma,
+            ';' => TokenKind.Semicolon,
+            ':' => TokenKind.Colon,
+            '@' => TokenKind.At,
+            '?' => TokenKind.Question,
+            '~' => TokenKind.Tilde,
+            '.' => if (next == '.') TokenKind.DotDot else TokenKind.Dot,
+            '-' => if (next == '>') TokenKind.Arrow else if (next == '=') TokenKind.MinusEquals else TokenKind.Minus,
+            '=' =>
+                if (next == '>') TokenKind.FatArrow else if (next == '=') TokenKind.EqualsEquals else TokenKind.Equals,
+            '+' => if (next == '=') TokenKind.PlusEquals else TokenKind.Plus,
+            '*' => if (next == '=') TokenKind.StarEquals else TokenKind.Star,
+            '/' => if (next == '=') TokenKind.SlashEquals else TokenKind.Slash,
+            '%' => if (next == '=') TokenKind.PercentEquals else TokenKind.Percent,
+            '^' => if (next == '=') TokenKind.CaretEquals else TokenKind.Caret,
+            '!' => if (next == '=') TokenKind.BangEquals else TokenKind.Bang,
+            '&' => if (next == '&') TokenKind.AmpAmp else if (next == '=') TokenKind.AmpEquals else TokenKind.Amp,
+            '|' => if (next == '|') TokenKind.PipePipe else if (next == '=') TokenKind.PipeEquals else TokenKind.Pipe,
+            '<' => if (next == '<') (if (this.ch(
+                text,
+                2,
+            ) ==
+                '=') TokenKind.LessLessEquals else TokenKind.LessLess) else if (next ==
+                '=') TokenKind.LessEquals else TokenKind.Less,
+            // Never '>>' or '>>=': the parser joins adjacent '>' tokens (grammar.md §1.7).
+            '>' => if (next == '=') TokenKind.GreaterEquals else TokenKind.Greater,
+            _ => { return Ok(false); }
+        };
+        this.pos += tokenText(kind).length;
+        this.add(kind, start, 0)?;
+        return Ok(true);
+    }
+}
+
+fn intSuffixOf(suffix: Slice<u8>) -> IntSuffix? {
+    if (suffix.length == 0) {
+        return IntSuffix.None;
+    }
+    for (k in 0..10usize) {
+        let s: IntSuffix = match (k) {
+            0 => IntSuffix.I8,
+            1 => IntSuffix.I16,
+            2 => IntSuffix.I32,
+            3 => IntSuffix.I64,
+            4 => IntSuffix.ISize,
+            5 => IntSuffix.U8,
+            6 => IntSuffix.U16,
+            7 => IntSuffix.U32,
+            8 => IntSuffix.U64,
+            _ => IntSuffix.USize,
+        };
+        let spelling: StringView = match (k) {
+            0 => "i8",
+            1 => "i16",
+            2 => "i32",
+            3 => "i64",
+            4 => "isize",
+            5 => "u8",
+            6 => "u16",
+            7 => "u32",
+            8 => "u64",
+            _ => "usize",
+        };
+        if (sameText(suffix, spelling)) {
+            return s;
+        }
+    }
+    return null;
+}
+
+/// Lexes one file (Lexer.Lex). Names are interned into `symbols`; errors go to `diagnostics` under `file`.
+fn lex(
+    text: Slice<u8>,
+    file: u32,
+    symbols: borrow mut Interner,
+    diagnostics: borrow mut Diagnostics,
+) -> Result<Lexed, AllocError> {
+    var lexer = Lexer {
+        file: file,
+        pos: 0,
+        out: Lexed {
+            tokens: Vector<Token>.create(),
+            ints: Vector<IntLiteral>.create(),
+            floats: Vector<FloatLiteral>.create(),
+            strings: Vector<Vector<u8>>.create(),
+            chars: Vector<u32>.create(),
+            docs: Vector<DocComment>.create(),
+            comments: Vector<Span>.create(),
+        },
+        pendingDoc: Vector<Vector<u8>>.create(),
+    };
+    lexer.run(text, symbols, diagnostics)?;
+    return Ok(lexer.out);
+}

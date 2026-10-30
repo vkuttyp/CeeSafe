@@ -97,6 +97,12 @@ python3 tools/run_corpus.py --compiler ~/.nova/0.4.1/bin/novac --corpus tests/su
 python3 tools/fault_sweep.py --compiler ~/.nova/0.4.1/bin/novac tests/support/fault/alloc-sweep.nova src/support/*.nova
 python3 tools/oracles/support_models.py                                  # oracle summaries for tests/support
 python3 tools/inventory.py                                               # regenerate docs/reference-inventory.md
+python3 tools/gen_catalog.py --nova <Nova at the pinned tag>            # regenerate src/diagnostics/catalog.nova
+python3 tools/compare_tokens.py --ceesafec out/ceesafe --oracle <token-dump> --root <Nova> lib tests/corpus
+                                                                        # the lexer against the reference (docs/p2-frontend.md §3)
+python3 tools/compare_parse.py --ceesafec out/ceesafe --novac ~/.nova/0.4.1/bin/novac --root <Nova> lib tests/corpus
+                                                                        # trees and diagnostics against novac (§6)
+python3 tools/parser_fuzz.py <dir> 3000 <seed> <files>                  # broken variants for compare_parse.py
 ```
 
 Generated files say so in their first line (`tools/oracles/gen_*.py` writes them); edit the generator, never the
@@ -123,6 +129,8 @@ bootstrap/                              stage-0 pin and reference manifest
 tools/                                  run_corpus.py (corpus runner), inventory.py (reference inventory)
 probes/                                 P1 capability probes in corpus format, and regression probes for fixed novac bugs
 src/support/ src/host/                  the support library (P1) and host services
+src/syntax/ src/diagnostics/            the frontend (P2): tokens, lexer, AST, parser, dumps; diagnostics and their JSON
+tests/syntax/                           lexer edge cases (tools/lexer_fuzz.py --cases), and known differences
 tests/support/                          support-library tests (run-pass, fault/)
 tools/oracles/                          independent oracles and generators for tests
 out/                                    build output, never committed
