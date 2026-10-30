@@ -84,6 +84,18 @@ the markers, and never edit between them.
 - Small C adapters for host services are allowed only behind a documented contract (ownership, lengths, encoding,
   errors); compiler algorithms stay in Nova.
 
+## Tools
+
+```sh
+python3 tools/run_corpus.py --compiler ~/.nova/bin/novac                 # Nova's corpus against a compiler
+python3 tools/run_corpus.py --compiler out/ceesafe --reference ~/.nova/bin/novac --family parse-pass
+python3 tools/inventory.py                                               # regenerate docs/reference-inventory.md
+```
+
+`run_corpus.py` checks the corpus's own expectations (annotations, snapshots, expected output); `--reference`
+also requires identical observable outcomes. Its normalisations are listed in the script: never widen one to make a
+comparison pass. `docs/parity.md` is the ledger; `docs/reference-inventory.md` is generated, never edited by hand.
+
 ## Evidence discipline
 
 - Cite sources: `file:line` for code (`~/Nova/src/...` for the reference), sections for docs.
@@ -97,7 +109,8 @@ ROADMAP.md  AGENTS.md  nova.toml       (ceesafe.toml after P6R)
 src/                                    the compiler, in Nova
 docs/decisions/                         CeeSafe decisions
 bootstrap/                              stage-0 pin and reference manifest
-tests/ tools/                           fixtures and the black-box runner (P0)
+tools/                                  run_corpus.py (corpus runner), inventory.py (reference inventory)
+tests/                                  CeeSafe's own fixtures (planned)
 out/                                    build output, never committed
 ```
 

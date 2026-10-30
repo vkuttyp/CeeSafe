@@ -215,21 +215,33 @@ Dependencies: none. **In progress.**
   that handles `--version` and `--help` (2026-10-30).
 - [x] Decision 0001 covers identity, the bootstrap route, the upstream N track and Nova continuing. Pin novac 0.3.1 and
   the Nova reference in `bootstrap/reference.md` (2026-10-30).
-- [ ] Write the inventory ledger (`docs/parity.md`). It maps each C# file, CLI command and flag, diagnostic code,
-  runtime ABI symbol group, `lib/` builtin and test family to a phase and the evidence it needs. The reference-only
-  command list is the table in §2.3, plus each command's flags from `Program.cs:18-85`.
-- [ ] Diff 0.3.1 against `07d561f` and record the behavioural differences, so the oracle is unambiguous.
-- [ ] Write a black-box runner (`tools/`) that takes any compiler path. It captures argv, inputs, stdout, stderr,
-  status, emitted files and timeouts, and compares both corpus annotations (`// error[N…]`, expected output) and
-  reference outcomes, with no normalisation that hides diagnostics. A small Python orchestrator is acceptable; it is
-  replaced by Nova tooling in P9.
-- [ ] Export reference token, AST, HIR and NIR dumps with the pinned novac (`parse --dump-ast`, `check --dump-hir`,
-  `build --dump-nir`). If a token or literal dump is needed, record the separately built reference driver and its hash.
-- [ ] Run the reference test suite once and record counts, and which optional configurations (GCC, MSVC, TSan) were
-  unavailable.
+- [x] Inventory and ledger (2026-10-30). `tools/inventory.py` generates `docs/reference-inventory.md`
+  deterministically. It lists 59 C# files, 15 commands, 26 options and 126 diagnostic codes (with their emitting files
+  and corpus coverage), plus runtime, library and resource files and the 39 test classes, each with a phase.
+  `docs/parity.md` is the hand-kept ledger: evidence per phase, the corpus baseline and known gaps.
+- [x] Compare 0.3.1 with `07d561f` (2026-10-30). The only source difference in `src/`, `lib/` and `runtime/` is the
+  version string. Across all 457 corpus files the runner found no observable difference (`docs/parity.md` §2).
+- [x] Write the black-box runner (2026-10-30). `tools/run_corpus.py` takes any compiler path and covers all 13 corpus
+  families. It checks annotations, snapshots, expected output and panics, and in `--reference` mode compares status,
+  stdout, stderr and emitted files. It applies two named normalisations: the generated-by banner and the program name.
+  It was tested against a deliberately wrong compiler.
+- [ ] Close the runner's gaps (`docs/parity.md` §3):
+  - a C configuration matrix (clang -O0/-O2, the overflow fallback, ASan+UBSan, `--split`, TSan, GCC);
+  - freestanding symbol checks;
+  - CLI fixtures for the 20 codes the corpus does not annotate.
+
+  Most are needed by P5. The N0310–N0315 package fixtures are needed by P3.
+- [x] Reference dumps (2026-10-30). The corpus's AST (40) and HIR (27) snapshots are the reference, and the runner
+  reproduces them with 0.3.1. Exporting token and NIR dumps is deferred to P2 and P4, which decide how to compare them.
+- [x] Run the reference suite (2026-10-30). `dotnet test Nova.slnx` at `07d561f` on macOS arm64 passed 3,589 of 3,589
+  tests, with 0 skipped, in 12 min 24 s. No real GCC was available (`gcc` is Apple clang), and no MSVC (that needs the
+  Windows VM). Whether TSan ran is not shown at default verbosity. A configuration Nova's suite cannot find counts as
+  missing, not as passed.
+- [ ] Gate check from a second checkout or host (the Ryzen box): reconstruct the pin, run the runner, get identical
+  results.
 
 Gate: another checkout reconstructs the pin and runs a representative fixture set with identical results, and the
-ledger has no unmapped items.
+ledger has no unmapped items (inventory: 0 unmapped, 2026-10-30).
 
 ### N — Upstream Nova: self-hosting prerequisites (proposed Nova milestone M15)
 
@@ -518,8 +530,8 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
 
 ## 9. Immediate work queue
 
-1. P0: the parity ledger (`docs/parity.md`), and the 0.3.1-to-`07d561f` difference list.
-2. P0: the black-box fixture runner, then the reference dumps for parse fixtures.
+1. P0: finish the gate by rerunning the runner from a second host (the Ryzen box, which also has GCC).
+2. P0/P5: the runner's C configuration matrix and the package fixtures (`docs/parity.md` §3), alongside P1.
 3. P1: the probes, starting with an ID-table AST built by a hand-written lexer over a real `.nova` file. Its results
    finalise the N list.
 4. N6: draft Nova `docs/milestone-15.md` and the first ADR (strings and maps). This changes `~/Nova`, so it waits for the
@@ -543,4 +555,14 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 - No arguments: exit 2. An unknown command: exit 2.
 - `novac run --interp -- --version` printed the same version.
 
-These are skeleton checks only. Nothing in P0's ledger or runner, or in any later phase, has been run.
+| 2026-10-30 | P0 inventory, ledger and runner: `tools/inventory.py`, `docs/reference-inventory.md`, `docs/parity.md`, `tools/run_corpus.py`; novac built from `07d561f` into a scratch directory for comparison | done; findings in `docs/parity.md` §3 |
+
+**Tests run for P0** (2026-10-30, macOS arm64, Apple clang 21.0.0, Python 3.9.6):
+- `tools/run_corpus.py --compiler ~/.nova/bin/novac` (0.3.1), all 457 files: 454 passed, 0 failed, 3 partial
+  (freestanding: object builds only).
+- The same run with novac `07d561f` against `--reference` 0.3.1: 0 differences.
+- Against a deliberately wrong compiler: every affected file failed, as expected.
+- `tools/inventory.py` run twice gave byte-identical output, with no host paths.
+- Nova's `dotnet test Nova.slnx` at `07d561f`: 3,589 passed, 0 failed, 0 skipped.
+
+Nothing in P1 or any later phase has been run.
