@@ -1,0 +1,88 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "CeeSafe",
+  "scopeName": "source.ceesafe",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#characters" },
+    { "include": "#numbers" },
+    { "include": "#attributes" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#functions" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.documentation.ceesafe", "match": "///(?!/).*$" },
+        { "name": "comment.line.double-slash.ceesafe", "match": "//.*$" },
+        { "name": "comment.block.ceesafe", "begin": "/\\*", "end": "\\*/" }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.ceesafe",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.ceesafe",
+          "match": "\\\\(?:[nrt0\\\\'\"]|u\\{[0-9a-fA-F]{1,6}\\})"
+        }
+      ]
+    },
+    "characters": {
+      "name": "string.quoted.single.ceesafe",
+      "match": "'(?:[^'\\\\]|\\\\(?:[nrt0\\\\'\"]|u\\{[0-9a-fA-F]{1,6}\\}))'"
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.ceesafe",
+          "match": "\\b[0-9][0-9_]*(?:\\.[0-9][0-9_]*(?:[eE][+-]?[0-9_]+)?|[eE][+-]?[0-9_]+)(?:f32|f64)?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.ceesafe",
+          "match": "\\b(?:0x[0-9a-fA-F_]+|0b[01_]+|0o[0-7_]+|[0-9][0-9_]*)(?:[iu](?:8|16|32|64|size))?\\b"
+        }
+      ]
+    },
+    "attributes": {
+      "name": "meta.attribute.ceesafe",
+      "match": "@[A-Za-z_][A-Za-z0-9_]*",
+      "captures": { "0": { "name": "entity.name.function.decorator.ceesafe" } }
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.ceesafe",
+          "match": "\\b(async|await|break|continue|defer|else|for|if|in|loop|match|return|while|yield)\\b"
+        },
+        {
+          "name": "keyword.declaration.ceesafe",
+          "match": "\\b(class|const|enum|extern|fn|impl|import|interface|let|macro|namespace|struct|type|using|var|where)\\b"
+        },
+        {
+          "name": "storage.modifier.ceesafe",
+          "match": "\\b(borrow|drop|internal|move|mut|own|private|public|static|unsafe)\\b"
+        },
+        { "name": "keyword.operator.cast.ceesafe", "match": "\\b(as)\\b" },
+        { "name": "constant.language.ceesafe", "match": "\\b(true|false|null)\\b" },
+        { "name": "variable.language.ceesafe", "match": "\\b(this|Self)\\b" }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.primitive.ceesafe",
+          "match": "\\b(i8|i16|i32|i64|isize|u8|u16|u32|u64|usize|f32|f64|bool|void|str|CChar)\\b"
+        },
+        { "name": "entity.name.type.ceesafe", "match": "\\b[A-Z][A-Za-z0-9_]*\\b" }
+      ]
+    },
+    "functions": {
+      "name": "entity.name.function.ceesafe",
+      "match": "\\b[a-z_][A-Za-z0-9_]*(?=\\s*(?:<[^<>()]*>)?\\()"
+    }
+  }
+}

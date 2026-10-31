@@ -1,0 +1,61 @@
+{
+  "name": "ceesafe-language",
+  "displayName": "CeeSafe",
+  "version": "0.1.0",
+  "license": "GPL-2.0-only",
+  "description": "The CeeSafe language: syntax highlighting, and diagnostics, hover, go to definition, outline and formatting from ceesafec lsp.",
+  "categories": [
+    "Formatters",
+    "Programming Languages"
+  ],
+  "publisher": "ceesafe",
+  "main": "./dist/extension.cjs",
+  "scripts": {
+    "test": "vp test",
+    "check": "vp lint && vp fmt --check",
+    "bundle": "vp pack extension.js --format cjs --deps.never-bundle vscode --no-config",
+    "package": "vp run bundle && vpx @vscode/vsce package --no-dependencies --skip-license --allow-missing-repository"
+  },
+  "devDependencies": {
+    "vscode-jsonrpc": "8.2.0",
+    "vscode-languageclient": "9.0.1",
+    "vscode-oniguruma": "2.0.1",
+    "vscode-textmate": "9.2.0"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "ceesafe",
+        "aliases": [
+          "CeeSafe",
+          "ceesafe"
+        ],
+        "extensions": [
+          ".cee"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "ceesafe",
+        "scopeName": "source.ceesafe",
+        "path": "./syntaxes/ceesafe.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "CeeSafe",
+      "properties": {
+        "ceesafe.server.path": {
+          "type": "string",
+          "default": "ceesafec",
+          "description": "The ceesafec executable that serves the language server (ceesafec lsp)."
+        }
+      }
+    }
+  },
+  "activationEvents": [],
+  "engines": {
+    "vscode": "^1.85.0"
+  }
+}
