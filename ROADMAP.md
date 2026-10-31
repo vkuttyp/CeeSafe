@@ -1,6 +1,6 @@
 # CeeSafe roadmap: port the Nova compiler to Nova, as CeeSafe
 
-Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P7 complete (CeeSafe names since `8941c10`; P7 production C 2026-10-30; stage 0 novac 0.6.0 via the `3d6ac40` anchor); P8 in progress (S0–S6 done 2026-10-31)**.
+Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P7 complete (CeeSafe names since `8941c10`; P7 production C 2026-10-30; stage 0 novac 0.6.0 via the `3d6ac40` anchor); P8 complete (2026-10-31; the fork point taken at S7, `docs/fork-point.md`)**.
 The probes, `src/support/`, the limits, the fault sweep and the skeleton exist (`docs/p1-probes.md`). No compiler code has been ported.
 Repository: `~/dev/CeeSafe`. Reference: `vkuttyp/Nova` (C#/.NET 10), pinned in `bootstrap/reference.md`.
 
@@ -643,7 +643,9 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
    specialisation) byte for byte, and reaches the fixed point in that form. P8 is in progress (`docs/p8-plan.md`):
    `explain`, `fix`, `fmt`, `doc`, the package commands, `run --interp` and the `lsp` and `mcp` servers are identical to
    novac's (S0–S5); S6 adds the package-mode fixed point on macOS and Linux, Windows with MSVC and clang (the same
-   C), the debugger scripts and the VS Code extension. Next S7, the fork point, when the owner decides. The C prefix switch waits
+   C), the debugger scripts and the VS Code extension. S7 took the fork point: CeeSafe's C names and ABI version,
+   `.cee` only, its own corpus, novac 0.6.0 the frozen baseline (`docs/fork-point.md`). P8 is complete; next, CeeSafe's
+   own specification and P9. The C prefix switch waits
    for P8's fork point (Decision 0004).
 4. Upstream (Nova #6, filed 2026-10-30): novac 0.6.0's `offsetOf<T>(field)` is 0 unless `T`'s layout was computed before (CheckOffsetOf reads
    `member.Offset` without `TypeTable.LayoutOf(measured)`); ceesafec gives the true offset.
