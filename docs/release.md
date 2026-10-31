@@ -48,8 +48,11 @@ The macOS steps need the repository secrets `APPLE_CERTIFICATE_P12` (the Develop
 base64), `APPLE_CERTIFICATE_PASSWORD`, and for `notarytool` `ASC_P8` (the App Store Connect API key, base64),
 `ASC_KEY_ID` and `ASC_ISSUER` (the issuer UUID). They were set on 2026-10-31.
 
-The `stores` job needs `VSCE_PAT`, an Azure DevOps personal access token with the scope **Marketplace → Manage** for
-the Marketplace publisher `ceesafe` (marketplace.visualstudio.com/manage), and `OVSX_PAT`, an access token of the
+The `stores` job publishes to the Marketplace with no secret, by Trusted Publishing: the publisher `ceesafe`
+(marketplace.visualstudio.com/manage/publishers/ceesafe, **Trusted Publishing**) has the policy "Release workflow" for
+repository owner `vkuttyp`, repository `CeeSafe`, workflow `release.yml`, no environment, and the job, with
+`id-token: write`, runs `vsce publish --oidc`. Renaming the workflow file needs the policy changed too. For Open VSX it
+needs `OVSX_PAT`, an access token of the
 open-vsx.org account that owns the namespace `ceesafe`. The namespace exists (2026-10-31) and its ownership claim is
 EclipseFdn/open-vsx.org#15060; once it is approved, a trusted publisher for this workflow will replace the token. Until
 then `OVSX_PAT` is not set and the Open VSX step skips with a warning.

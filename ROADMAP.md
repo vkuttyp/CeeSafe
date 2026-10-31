@@ -778,7 +778,10 @@ builds and attaches it. Since this release the workflow runs only on a pushed `v
 logo; `ceesafe.ceesafe-language` 0.2.0 published by the owner with `vsce` 4.1.0 from the build with the icon and the
 store README, which also replaced the `.vsix` on the v0.2.0 release (its `SHA256SUMS` line updated); the gallery
 lists it public with its icon. The secret `VSCE_PAT` is an all-organizations token, which Azure DevOps retires on
-2026-12-01: before then the `stores` job moves to Microsoft Entra ID (`vsce publish --azure-credential`). Open VSX:
-not yet (`OVSX_PAT`).
+2026-12-01: so the `stores` job now publishes by Marketplace Trusted Publishing (`vsce publish --oidc`, the job with
+`id-token: write`), under the publisher's policy "Release workflow" (owner `vkuttyp` #146238, repository `CeeSafe`
+#1440301724, workflow `release.yml`; Active, created by the owner 2026-10-31), so no Marketplace secret is stored; it is
+first exercised by the next tag. Open VSX: the namespace `ceesafe` exists, its ownership claim is
+EclipseFdn/open-vsx.org#15060; until then its step skips.
 
 Not yet run: the rest of P9.

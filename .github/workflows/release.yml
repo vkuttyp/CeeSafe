@@ -288,11 +288,16 @@ jobs:
 
   stores:
     # The extension on the VS Code Marketplace and Open VSX, publisher (namespace) `ceesafe`, after the GitHub release,
-    # so a store's failure never holds the release back. Secrets: VSCE_PAT (Azure DevOps, Marketplace: Manage) and
-    # OVSX_PAT (open-vsx.org). --skip-duplicate makes a rerun harmless.
+    # so a store's failure never holds the release back. The Marketplace by Trusted Publishing: the publisher's policy
+    # "Release workflow" accepts this repository's release.yml, and vsce exchanges the job's GitHub OIDC token for a
+    # 15-minute Marketplace credential, so no secret is stored. Open VSX by OVSX_PAT until its trusted publisher exists.
+    # --skip-duplicate makes a rerun harmless.
     needs: [version, extension, publish]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write # the OIDC token for Marketplace Trusted Publishing
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -302,11 +307,7 @@ jobs:
         with:
           node-version: 22
       - name: VS Code Marketplace
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
-        run: |
-          if [ -z "$VSCE_PAT" ]; then echo "::error::the repository secret VSCE_PAT is not set; see docs/release.md"; exit 1; fi
-          npx --yes @vscode/vsce@4.1.0 publish --packagePath dist/ceesafe-language-*.vsix --skip-duplicate
+        run: npx --yes @vscode/vsce@4.1.0 publish --oidc --packagePath dist/ceesafe-language-*.vsix --skip-duplicate
       - name: Open VSX
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
