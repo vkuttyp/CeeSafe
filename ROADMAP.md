@@ -774,4 +774,11 @@ and builds and runs a program. The VS Code extension `ceesafe-language-0.2.0.vsi
 0.2.0) was attached by hand, with its line added to `SHA256SUMS`; from the next tag the workflow's `extension` job
 builds and attaches it. Since this release the workflow runs only on a pushed `v*` tag. `main` is 0.3.0-dev.
 
+**The VS Code extension on the Marketplace** (2026-10-31): the publisher `ceesafe` (created by the owner), with the
+logo; `ceesafe.ceesafe-language` 0.2.0 published by the owner with `vsce` 4.1.0 from the build with the icon and the
+store README, which also replaced the `.vsix` on the v0.2.0 release (its `SHA256SUMS` line updated); the gallery
+lists it public with its icon. The secret `VSCE_PAT` is an all-organizations token, which Azure DevOps retires on
+2026-12-01: before then the `stores` job moves to Microsoft Entra ID (`vsce publish --azure-credential`). Open VSX:
+not yet (`OVSX_PAT`).
+
 Not yet run: the rest of P9.

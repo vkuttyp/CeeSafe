@@ -5,14 +5,15 @@
 The extension in `editors/vscode` gives `.cee` files syntax highlighting, and through the language server: errors as
 you type, the type or signature on hover, go to definition (F12), the outline, and formatting (Shift+Alt+F).
 
-Every [release](https://github.com/vkuttyp/CeeSafe/releases) has the extension as `ceesafe-language-<version>.vsix`,
-built and tested with that release's `ceesafec` (its checksum is in `SHA256SUMS`). Download it and install it:
+Install it from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=ceesafe.ceesafe-language):
+search for **CeeSafe** in VS Code's Extensions view, or run
 
 ```sh
-code --install-extension ceesafe-language-0.2.0.vsix
+code --install-extension ceesafe.ceesafe-language
 ```
 
-or, in VS Code, run **Extensions: Install from VSIX…** from the command palette.
+Every [release](https://github.com/vkuttyp/CeeSafe/releases) also has it as `ceesafe-language-<version>.vsix`, built and
+tested with that release's `ceesafec` (its checksum is in `SHA256SUMS`), for **Extensions: Install from VSIX…**.
 
 To build it from the repository instead, with [Vite+](https://viteplus.dev/):
 
