@@ -1,0 +1,187 @@
+# Arrays, slices and collections
+
+## Arrays
+
+`[T; N]` is `N` values of `T`, inline: on the stack, or inside the struct that holds it. Arrays are values (copied
+when assigned) and their element type must be Copy.
+
+```ceesafe
+fn main() {
+    var squares = [0u32; 5];               // five zeros
+    for (i in 0..squares.length) {
+        squares[i] = truncate<u32>(i * i);    // usize to u32 could lose bits: say so
+    }
+    let primes = [2, 3, 5, 7];
+    var sum = 0;
+    for (p in primes) {
+        sum += p;
+    }
+    Console.writeLine(squares[4]);
+    Console.writeLine(sum);
+}
+```
+
+```text
+16
+17
+```
+
+Every index is checked: `a[i]` with `i >= a.length` stops the program. The compiler removes the check where it can
+prove the index is in range, as in both loops above.
+
+## Slices
+
+`Slice<T>` is a borrowed view of consecutive elements, and `SliceMut<T>` a borrowed view that can change them. They
+are a pointer and a length, they follow every rule for references, and they are how functions take "some elements":
+
+```ceesafe
+fn total(values: Slice<i64>) -> i64 {
+    var sum: i64 = 0;
+    for (v in values) {
+        sum += v;
+    }
+    return sum;
+}
+
+fn double(values: SliceMut<i64>) {
+    for (i in 0..values.length) {
+        values[i] *= 2;
+    }
+}
+
+fn main() {
+    var numbers = [1i64, 2, 3, 4, 5];
+    double(mut numbers[1..3]);              // elements 1 and 2
+    Console.writeLine(total(numbers[..]));
+    Console.writeLine(total(numbers[3..]));
+}
+```
+
+```text
+20
+9
+```
+
+`a[lo..hi]`, `a[lo..]`, `a[..hi]` and `a[..]` take elements `lo` up to `hi`; the range is checked. A slice borrows
+the whole array it came from, so the array cannot change while the slice is used.
+
+Slices also copy and fill in one checked operation (`d.copyFrom(s)`, `d.fill(v)`), swap elements, and sort and
+search with closures (see [Functions and closures](closures.md)).
+
+## Vectors
+
+`Vector<T>` owns a growable list on the heap. Pushing can fail, so `push` returns a `Result`.
+
+```ceesafe
+fn main() {
+    var v = Vector<i32>.create();          // allocates nothing yet
+    for (i in 0..5) {
+        v.push(i * 10)!;
+    }
+    Console.writeLine(v.length);
+    Console.writeLine(v[2]);
+    match (v.pop()) {                      // i32?: null when empty
+        Some(last) => { Console.writeLine(last); }
+        null => {}
+    }
+    v[0] = 99;
+    var sum = 0;
+    for (x in v) {
+        sum += x;
+    }
+    Console.writeLine(sum);
+}
+```
+
+```text
+5
+20
+40
+159
+```
+
+A vector can be passed where a `Slice<T>` is expected (it lends its elements), and `mut v` where a `SliceMut<T>` is.
+`v.view()` and `v.viewMut()` give the slices explicitly. Other members: `capacity`, `clear()`, `truncate(n)`,
+`swap(i, j)`, and `Vector<T>.withCapacity(n)`.
+
+**Invalidation is a compile error.** Growing a vector may move its elements, so while any element or view of it is
+borrowed, `push`, `pop`, `clear` and writes are rejected. This is the most common thing the borrow checker catches
+in code that would crash in C++.
+
+## Text: `StringView` and `String`
+
+`StringView` is a read-only view of UTF-8 text: string literals are views, and so are slices of strings. `String`
+owns growable text.
+
+```ceesafe
+fn greet(name: StringView) -> Result<String, AllocError> {
+    var s = String.withCapacity(name.length + 7)?;
+    s.append("Hello, ")?;
+    s.append(name)?;
+    s.append("! You are visitor ")?;
+    s.appendNumber(42)?;
+    return Ok(s);
+}
+
+fn main() {
+    let message = greet("Ada")!;
+    Console.writeLine(message);
+    let word: StringView = "CeeSafe language";
+    Console.writeLine(word[0..7]);
+    Console.writeLine(word.length);
+    Console.writeLine(word == "CeeSafe language");
+}
+```
+
+```text
+Hello, Ada! You are visitor 42
+CeeSafe
+16
+true
+```
+
+- `length` is in bytes; `s[i]` is a byte (`u8`); `s.bytes()` is a `Slice<u8>`.
+- Slicing (`s[lo..hi]`) checks that both ends fall on character boundaries.
+- A `String` can only receive valid UTF-8 (`append` takes a view, which always is), so its contents are always valid
+  text.
+- `==` compares bytes.
+
+## Stable references: `SlotMap` and `StableVector`
+
+Sometimes values must refer to each other, as in a graph. A reference stored in a value would borrow the collection
+for as long as the value lives. A `SlotMap` gives out **handles** instead: plain values that name an element, can be
+stored anywhere, and are checked on every use, so a handle to a removed element finds nothing instead of something
+else.
+
+```ceesafe
+struct Node {
+    value: i32;
+    next: Handle<Node>?;
+}
+
+fn main() {
+    var nodes = SlotMap<Node>.create();
+    let a = nodes.insert(Node { value: 1, next: null })!;
+    let b = nodes.insert(Node { value: 2, next: a })!;
+    match (nodes.get(b)) {
+        Some(node) => { Console.writeLine(node.value); }
+        null => {}
+    }
+    let removed = nodes.remove(a);
+    Console.writeLine(nodes.get(a) == null);             // the handle is stale now
+    Console.writeLine(nodes.length);
+}
+```
+
+```text
+2
+true
+1
+```
+
+`StableVector<T>` is a grow-only sequence whose elements never move, so an element can stay borrowed while more are
+pushed.
+
+## Next
+
+[Generics and interfaces](generics.md).

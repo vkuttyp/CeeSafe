@@ -621,7 +621,7 @@ fn checkMain(c: borrow mut Checker) -> Result<void, AllocError> {
         var message = Vector<u8>.create();
         appendText(
             mut message,
-            "a freestanding package has no 'main': nothing calls it; enter it through @export functions (cosmoos/profiles.md §4.1)",
+            "a freestanding package has no 'main': nothing calls it; enter it through @export functions (profiles.md §4.1)",
         )?;
         return c.error(hostedOnlyCode(), id.start, id.end, message);
     }

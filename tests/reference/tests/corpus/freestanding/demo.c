@@ -11,7 +11,7 @@ void demo_log(uint64_t value) {
     printf("log %llu\n", (unsigned long long)value);
 }
 
-/* The environment's panic hook (cosmoos/profiles.md §4.2): report like the hosted runtime, then stop. */
+/* The environment's panic hook (profiles.md §4.2): report like the hosted runtime, then stop. */
 _Noreturn void ceesafe_panic(cee_panic_kind kind, cee_loc loc) {
     fflush(stdout);
     fprintf(stderr, "ceesafe panic: %s at %s:%u:%u\n", kind == CEE_PANIC_OVERFLOW ? "integer overflow" : "other panic",

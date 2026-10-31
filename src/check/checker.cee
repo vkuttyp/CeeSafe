@@ -137,7 +137,7 @@ struct Checker {
     trackLibraryTypes: bool;                         // while checking: types made in library code are not the program's (§29.2)
     statics: Vector<StaticEntry>;
     staticLocals: Vector<StaticLocal>; // each function's static-address locals (§39.2)
-    freestanding: bool;                // --profile freestanding (cosmoos/profiles.md §4)
+    freestanding: bool;                // --profile freestanding (profiles.md §4)
     profileReports: Vector<LayoutUse>;
     reportedQualified: Vector<LayoutUse>;
     packages: Vector<PackageInfo>;    // the root first, then its dependencies (single-file mode: one, unnamed)

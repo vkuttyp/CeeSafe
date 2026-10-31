@@ -142,7 +142,7 @@ fn generateC(
         out.push(
             runtimeFile(
                 1,
-                "/* The core runtime for the freestanding profile (cosmoos/profiles.md §4.2). */\n#define CEE_FREESTANDING 1\n",
+                "/* The core runtime for the freestanding profile (profiles.md §4.2). */\n#define CEE_FREESTANDING 1\n",
             )?,
         )?;
     } else {

@@ -23,8 +23,11 @@ are now separate languages that started equal (Decision 0003 §3).
 | User-visible prose | "Nova" in messages, help, server texts, hover fences, the agent template | "CeeSafe" | owner, 2026-10-31 |
 | Runtime messages | `nova panic:`, `nova alloc:`, `nova interp:` | `ceesafe panic:`, `ceesafe alloc:`, `ceesafe interp:` | prose and runtime |
 
-Unchanged: the language, the diagnostic codes (N####), every algorithm, and the documents ceesafec embeds, which are
-Nova's specification and guide at `v0.6.0`, kept as reference material until CeeSafe writes its own.
+Unchanged: the language, the diagnostic codes (N####) and every algorithm. The documents ceesafec embeds were Nova's
+specification and guide at `v0.6.0` until Decision 0006 (2026-10-31) gave CeeSafe its own (`spec/`, `guide/`;
+`docs/spec-plan.md`). Since then `explain` and the MCP server serve CeeSafe's text: their algorithms are compared with
+novac's through a ceesafec built with novac's documents (`tools/reference_docs.py`), and the text is checked by
+`tools/spec_check.py` and `tools/guide_check.py`.
 
 How: the runtime, the libraries, the catalog and the agent template are generated from Nova's sources through
 `tools/names.py`'s forward map; the compiler's own string literals were rewritten by the same map once, by script, with
@@ -36,7 +39,9 @@ renamed prefixes were fixed by hand (`ceesafe_host_`, `ceesafe_atomic_`, `ceeF_`
 novac 0.6.0's output, which equalled ceesafec's at the fork, is the frozen baseline. novac 0.6.0 is pinned and
 deterministic, so it regenerates the baseline on demand instead of the repository storing hundreds of megabytes of it.
 
-- `tools/names.py` holds one list of rules between CeeSafe's names and Nova's. `map_back` turns ceesafec's output
+- `tools/names.py` holds one list of rules between CeeSafe's names and Nova's (since Decision 0006 also the
+  specification's paths that the compiler's messages cite: `docs/X.md`↔`spec/X.md`, `cosmoos/profiles.md`↔`profiles.md`,
+  `site/guide/`↔`guide/`). `map_back` turns ceesafec's output
   into Nova's names (and drops the ABI check, moving the `#line` directives after it back by its three lines);
   `map_forward` is its exact inverse, checked on Nova's 618 runtime, library, corpus, catalog and template files.
 - Every comparison tool runs novac in the Nova checkout and ceesafec in CeeSafe's corpus (`tests/reference/`, written

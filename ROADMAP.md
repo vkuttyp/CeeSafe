@@ -533,8 +533,8 @@ Dependencies: P7. Parser-only tools may start after P2, and semantic tools after
   ceesafec-built library (S7; `tools/link_collision.py`).
 - [x] The fork point (Decision 0003 §3): taken at S7 (`docs/fork-point.md`). CeeSafe's corpus starts there
   (`tests/reference/`), and the novac comparisons are regression tests against novac 0.6.0's output with CeeSafe's
-  names mapped back. CeeSafe's own specification does not exist yet: ceesafec embeds Nova's `v0.6.0` documents as
-  reference material, and writing CeeSafe's is the next task after P8.
+  names mapped back. CeeSafe's own specification followed P8 (Decision 0006, `docs/spec-plan.md`): Nova's `v0.6.0`
+  text forked into `spec/` and `guide/`, Nova's ADRs inherited, and ceesafec embeds it.
 
 Gate: every command and flag in the P0 ledger is implemented, or has an accepted decision. The contract suites pass.
 No C# fallback.
@@ -644,9 +644,8 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
    `explain`, `fix`, `fmt`, `doc`, the package commands, `run --interp` and the `lsp` and `mcp` servers are identical to
    novac's (S0–S5); S6 adds the package-mode fixed point on macOS and Linux, Windows with MSVC and clang (the same
    C), the debugger scripts and the VS Code extension. S7 took the fork point: CeeSafe's C names and ABI version,
-   `.cee` only, its own corpus, novac 0.6.0 the frozen baseline (`docs/fork-point.md`). P8 is complete; next, CeeSafe's
-   own specification and P9. The C prefix switch waits
-   for P8's fork point (Decision 0004).
+   `.cee` only, its own corpus, novac 0.6.0 the frozen baseline (`docs/fork-point.md`). P8 is complete. CeeSafe's
+   own specification is written (Decision 0006: `spec/`, `guide/`, `docs/spec-plan.md`); next, P9.
 4. Upstream (Nova #6, filed 2026-10-30): novac 0.6.0's `offsetOf<T>(field)` is 0 unless `T`'s layout was computed before (CheckOffsetOf reads
    `member.Offset` without `TypeTable.LayoutOf(measured)`); ceesafec gives the true offset.
 5. Owner's call: propose upstream that N0110 count `else if` links and `?` suffixes. novac's `--dump-ast` aborts on a

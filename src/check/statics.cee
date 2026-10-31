@@ -1,6 +1,6 @@
 // Statics, `here`, `layoutOf` and the freestanding profile's checks (the reference's StaticUse, DeclareStaticLocals,
 // CheckStaticInitializers, FoldStatics, ConstantBody, StaticFold, Operators, IsHere, CheckHere, CheckLayoutOf,
-// HasLayout, IsHostedOnly and HostedOnly): P3 S7c (type-system.md §39, §30.1; cosmoos/profiles.md §4.1).
+// HasLayout, IsHostedOnly and HostedOnly): P3 S7c (type-system.md §39, §30.1; profiles.md §4.1).
 
 fn hostedOnlyCode() -> u32 => 293;
 fn staticNotAllowed() -> u32 => 337;
@@ -828,7 +828,7 @@ fn layoutLiteral(c: borrow mut Checker, layout: u32, size: u64, align: u64, span
     return c.expr(HirExpr.StructLiteral(Range { start: start, count: 2 }), layout, span.start, span.end);
 }
 
-// ---- The freestanding profile (cosmoos/profiles.md §4.1) ----
+// ---- The freestanding profile (profiles.md §4.1) ----
 
 /// A type that needs the hosted runtime (IsHostedOnly): a heap allocator, or anything allocating from one; I/O.
 fn isHostedOnlyType(c: borrow Checker, typ: u32) -> bool {
@@ -866,7 +866,7 @@ fn hostedOnly(c: borrow mut Checker, span: Span, what: Slice<u8>) -> Result<void
     appendBytes(mut message, what)?;
     appendText(
         mut message,
-        " needs the hosted runtime and is not available with --profile freestanding (cosmoos/profiles.md §4.1)",
+        " needs the hosted runtime and is not available with --profile freestanding (profiles.md §4.1)",
     )?;
     return c.error(hostedOnlyCode(), span.start, span.end, message);
 }

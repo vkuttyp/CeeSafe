@@ -5,7 +5,8 @@ CeeSafe's names mapped back to Nova's, must equal it byte for byte. `map_back` d
 for the generators that take Nova's sources (the runtime, the libraries, the catalog, the agent template) and for
 CeeSafe's copy of the corpus. Both apply one list of rules in order, the more specific first.
 
-The rules cover the C names (Decision 0004: `nv`→`cee` at the start of a name (an identifier, or a part after `_`) before a capital or `_`,
+The rules cover the specification's paths (Decision 0006: `docs/X.md`→`spec/X.md`, `cosmoos/profiles.md`→`profiles.md`,
+`site/guide/`→`guide/`), the C names (Decision 0004: `nv`→`cee` at the start of a name (an identifier, or a part after `_`) before a capital or `_`,
 `nova_`→`ceesafe_`, `NV_`→`CEE_`, `NOVA_`→`CEESAFE_`, `nova/rt.h`→`ceesafe/rt.h`), the compiler, the file extension and
 the prose (`Nova`→`CeeSafe`). The ABI version lines ceesafec adds have no counterpart in novac's C and are dropped.
 
@@ -16,9 +17,21 @@ import re
 
 # (CeeSafe's form, Nova's form, Nova's form, CeeSafe's form) as regular expressions over bytes and replacements:
 # backward replaces the first by the second, forward the third by the fourth.
+# The documents of CeeSafe's spec/ that were Nova's docs/ (tools/fork_spec.py).
+_SPEC = (rb"architecture|c-backend|diagnostics|formatting|grammar|intermediate-representation|language-spec|lifetimes|"
+         rb"memory-model|optimisations|ownership|testing|tooling|type-system|unsafe")
+
 RULES = (
     (rb"https://github\.com/vkuttyp/CeeSafe-index", b"https://github.com/vkuttyp/nova-index",
      rb"https://github\.com/vkuttyp/nova-index", b"https://github.com/vkuttyp/CeeSafe-index"),
+    # The specification's paths (Decision 0006): Nova's docs/X.md is spec/X.md, docs/cosmoos/profiles.md is
+    # spec/profiles.md, site/guide/ is guide/, as the compiler's messages cite them.
+    (rb"(?<![A-Za-z0-9_/.-])spec/profiles\.md", b"docs/cosmoos/profiles.md", rb"docs/cosmoos/profiles\.md",
+     b"spec/profiles.md"),
+    (rb"(?<![A-Za-z0-9_/.-])profiles\.md", b"cosmoos/profiles.md", rb"cosmoos/profiles\.md", b"profiles.md"),
+    (rb"(?<![A-Za-z0-9_/.-])spec/(" + _SPEC + rb")\.md", rb"docs/\1.md",
+     rb"(?<![A-Za-z0-9_/.-])docs/(" + _SPEC + rb")\.md", rb"spec/\1.md"),
+    (rb"(?<![A-Za-z0-9_/.-])guide/", b"site/guide/", rb"(?<![A-Za-z0-9_/.-])site/guide/", b"guide/"),
     (rb"(?<![A-Za-z_])ceesafec\b", b"novac", rb"(?<![A-Za-z_])novac\b", b"ceesafec"),
     (rb"\.cee\b", b".nova", rb"\.nova\b", b".cee"),
     (rb"ceesafe/", b"nova/", rb"nova/", b"ceesafe/"),

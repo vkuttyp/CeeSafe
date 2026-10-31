@@ -55,7 +55,7 @@ fn agentPreamble(k: usize) -> StringView => match (k) {
 /// The section, from the start marker to the end marker and a newline.
 fn agentSection() -> Result<Vector<u8>, AllocError> {
     var text = Vector<u8>.create();
-    match (documentIndex("templates/AGENTS.md".bytes())) {
+    match (documentIndex(agentTemplateDocument().bytes())) {
         Some(k) => { appendDocumentText(mut text, k)?; }
         null => {}
     }

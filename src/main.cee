@@ -71,7 +71,7 @@ fn appendUsage(out: borrow mut Vector<u8>) -> Result<void, AllocError> {
         out,
         "  --emit c|exe|obj  (build) write C sources (to the -o directory), an executable (default), or one\n",
     )?;
-    appendText(out, "                    relocatable object (cosmoos/profiles.md §4.3)\n")?;
+    appendText(out, "                    relocatable object (profiles.md §4.3)\n")?;
     appendText(
         out,
         "  --kernel cosmoos  (build, check, with --profile freestanding) include lib/kernel, the library for a kernel\n",
@@ -85,7 +85,7 @@ fn appendUsage(out: borrow mut Vector<u8>) -> Result<void, AllocError> {
         out,
         "                    (build, check) the profile: hosted (default) or freestanding, with no C library\n",
     )?;
-    appendText(out, "                    and no operating system (cosmoos/profiles.md §4)\n")?;
+    appendText(out, "                    and no operating system (profiles.md §4)\n")?;
     appendText(
         out,
         "  --no-float        (build, check) reject every float type and literal, for code built without FP\n",
@@ -177,7 +177,7 @@ struct Options {
     dumpHir: bool;
     noFloat: bool;
     libraryDiagnostics: bool;    // report diagnostics in the libraries' files too (porting gaps there; novac has none)
-    freestanding: bool;          // --profile freestanding (cosmoos/profiles.md §4)
+    freestanding: bool;          // --profile freestanding (profiles.md §4)
     kernel: bool;                // --kernel cosmoos: lib/kernel, in the freestanding profile (ADR 0025)
     profileGiven: bool;          // --profile was given: package mode keeps it over the manifest's
     building: bool;              // `build`: until P5, only `--dump-nir`, which prints the NIR and stops

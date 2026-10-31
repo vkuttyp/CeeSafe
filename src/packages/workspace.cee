@@ -272,7 +272,7 @@ fn writeLockText(entries: borrow Vector<LockEntry>) -> Result<Vector<u8>, AllocE
         }
         order[at] = k;
     }
-    var text = copyBytes("# Written by ceesafec fetch (docs/tooling.md §4.3). Commit it with ceesafe.toml.\n".bytes())?;
+    var text = copyBytes("# Written by ceesafec fetch (spec/tooling.md §4.3). Commit it with ceesafe.toml.\n".bytes())?;
     for (k in order.view()) {
         let e = borrow entries[k];
         appendText(mut text, "\n[[package]]\n")?;

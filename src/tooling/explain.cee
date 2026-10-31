@@ -85,9 +85,9 @@ fn rowFor(text: Slice<u8>, code: Slice<u8>) -> Result<CatalogEntry?, AllocError>
     return Ok(null);
 }
 
-/// The code's entry: docs/diagnostics.md first, then the other documents under docs/ in path order.
+/// The code's entry: the diagnostics table first, then the specification's other documents in path order.
 fn catalogEntry(code: Slice<u8>) -> Result<CatalogEntry?, AllocError> {
-    let diagnostics = documentIndex("docs/diagnostics.md".bytes());
+    let diagnostics = documentIndex(diagnosticsDocument().bytes());
     match (diagnostics) {
         Some(k) => {
             var text = Vector<u8>.create();
@@ -101,8 +101,9 @@ fn catalogEntry(code: Slice<u8>) -> Result<CatalogEntry?, AllocError> {
     }
     for (k in 0..documentCount()) {
         let path = documentPath(k).bytes();
-        if (path.length < 5 || !sameBytes(path[0..5], "docs/".bytes()) ||
-            sameBytes(path, "docs/diagnostics.md".bytes())) {
+        let directory = specDirectory().bytes();
+        if (path.length < directory.length || !sameBytes(path[0..directory.length], directory) ||
+            sameBytes(path, diagnosticsDocument().bytes())) {
             continue;
         }
         var text = Vector<u8>.create();
@@ -127,11 +128,11 @@ fn containsSlice(text: Slice<u8>, part: Slice<u8>) -> bool {
     return false;
 }
 
-/// The paragraphs of docs/diagnostics.md (split at "\n\n") that mention `code` and are neither table rows nor headings,
+/// The paragraphs of the diagnostics table's document (split at "\n\n") that mention `code` and are neither table rows nor headings,
 /// trimmed (DiagnosticCatalog.Paragraphs).
 fn paragraphsOf(code: Slice<u8>, out: borrow mut Vector<Vector<u8>>) -> Result<void, AllocError> {
     var text = Vector<u8>.create();
-    match (documentIndex("docs/diagnostics.md".bytes())) {
+    match (documentIndex(diagnosticsDocument().bytes())) {
         Some(k) => { appendDocumentText(mut text, k)?; }
         null => { return Ok(); }
     }

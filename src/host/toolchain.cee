@@ -28,7 +28,7 @@ fn pushBytes(arguments: borrow mut Vector<Vector<u8>>, bytes: Slice<u8>) -> Resu
     arguments.push(copyBytes(bytes)?);
 
 /// The warnings, `-I` on the output directory, the semantic flags (SemanticFlags: no contraction, no errno from math
-/// builtins, §35.6, §35.8) and the profile's flags (ProfileFlags, cosmoos/profiles.md §4.3).
+/// builtins, §35.6, §35.8) and the profile's flags (ProfileFlags, profiles.md §4.3).
 fn pushCommonFlags(
     arguments: borrow mut Vector<Vector<u8>>,
     directory: Slice<u8>,
@@ -148,7 +148,7 @@ fn compileExecutable(
 }
 
 /// Compiles each C file with `-c` and joins the objects into one relocatable object with `-r` (CompileObject,
-/// cosmoos/profiles.md §4.3): by `linker` if given, else by the compiler with the target flag.
+/// profiles.md §4.3): by `linker` if given, else by the compiler with the target flag.
 fn compileObject(
     compiler: Slice<u8>,
     directory: Slice<u8>,

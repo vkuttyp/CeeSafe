@@ -696,7 +696,7 @@ fn writeInputSchema(json: borrow mut JsonWriter, k: usize) {
         typeSchema(
             json,
             "string",
-            "type-system, grammar, diagnostics, tooling, unsafe, … or a path such as site/guide/basics.md",
+            "type-system, grammar, diagnostics, tooling, unsafe, … or a path such as guide/basics.md",
         );
         json.name("section")!;
         typeSchema(json, "string", "a section number such as 31.2, or heading text; omit for the whole document");
@@ -1442,11 +1442,19 @@ fn sectionScore(section: borrow SpecSection, words: borrow Vector<Vector<u8>>) -
         let inHeading: usize = if (findIgnoringCase(section.heading.view(), word.view(), 0) != null) 20 else 0;
         score += count + inHeading;
     }
-    let path = documentPath(section.document);
-    if (path == "docs/type-system.md" || path == "docs/grammar.md" || path == "docs/diagnostics.md") {
+    let path = documentPath(section.document).bytes();
+    if (isSpecDocument(path, "type-system.md") || isSpecDocument(path, "grammar.md") ||
+        sameBytes(path, diagnosticsDocument().bytes())) {
         score += 5;
     }
     return score;
+}
+
+/// Whether `path` is the specification's document `name`.
+fn isSpecDocument(path: Slice<u8>, name: StringView) -> bool {
+    let directory = specDirectory().bytes();
+    return path.length == directory.length + name.length && sameBytes(path[0..directory.length], directory) &&
+        sameBytes(path[directory.length..], name.bytes());
 }
 
 /// The first line of the section's body with the first word, cut to 240 UTF-16 units (Snippet).
@@ -1617,8 +1625,8 @@ fn sectionTool(doc: borrow JsonDoc, arguments: u32) -> Result<ToolResult, McpFai
     let name = requiredString(doc, arguments, "document")?;
     var path = copyBytes(name.view())!;
     if (documentIndex(name.view()) == null) {
-        // $"docs/{name.Replace(".md", "")}.md"
-        path = copyBytes("docs/".bytes())!;
+        // $"docs/{name.Replace(".md", "")}.md", with the specification's directory
+        path = copyBytes(specDirectory().bytes())!;
         var k: usize = 0;
         while (k < name.length) {
             if (k + 3 <= name.length && sameText(name[k..k + 3], ".md")) {
@@ -1788,13 +1796,13 @@ fn getPrompt(doc: borrow JsonDoc, parameters: u32) -> Result<McpAnswer, McpFailu
     }
     var text = Vector<u8>.create();
     if (write) {
-        match (documentIndex("site/guide/for-agents.md".bytes())) {
+        match (documentIndex(agentGuideDocument().bytes())) {
             Some(k) => { appendDocumentText(mut text, k)!; }
             null => {
-                appendText(
-                    mut text,
-                    "CeeSafe is a memory-safe systems language compiled to C (ceesafe://docs/site/guide/introduction.md).",
-                )!;
+                appendText(mut text, "CeeSafe is a memory-safe systems language compiled to C (")!;
+                appendText(mut text, mcpResourcePrefix())!;
+                appendText(mut text, introductionDocument())!;
+                appendText(mut text, ").")!;
             }
         }
         appendText(mut text, "\n\n---\n\nTask: ")!;

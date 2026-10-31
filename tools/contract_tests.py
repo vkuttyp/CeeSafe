@@ -10,7 +10,9 @@ novac 0.6.0's output is the frozen baseline and ceesafec's is compared with CeeS
   under -Werror and ASan+UBSan with leak checks, and
   over the optimisation families and emit-c's snapshots, all in the default form;
 - the command line (usage, `explain`, `fix`), `fmt`, `doc`, the package commands, `run --interp`, the `lsp` and
-  `mcp` servers, debugging with editors/debug and the link-collision test (P8);
+  `mcp` servers, debugging with editors/debug and the link-collision test (P8); the command line and the servers
+  through a ceesafec with novac's documents (tools/reference_docs.py), since ceesafec serves CeeSafe's specification;
+- CeeSafe's specification and guide against ceesafec (tools/spec_check.py, tools/guide_check.py; Decision 0006);
 - the M2 mutation suite, the M3 fault sweep, the collection properties and the freestanding checks.
 
 Each step's last line is printed; the expected results are the P2–P7 gates' (docs/p*-plan.md).
@@ -19,6 +21,7 @@ usage: python3 tools/contract_tests.py --ceesafec PATH --novac PATH --root <Nova
 """
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -60,6 +63,11 @@ def main():
                   for x in ("--on", part)]
     py = [sys.executable, "-B"]
     common = ["--ceesafec", cee, "--novac", novac, "--root", root]
+    # explain and mcp serve CeeSafe's specification since Decision 0006: their algorithms are compared with novac's
+    # through a ceesafec that embeds novac's documents (tools/reference_docs.py), the text by spec_check.
+    refdocs_dir = tempfile.mkdtemp(prefix="refdocs-")
+    refdocs = os.path.join(refdocs_dir, "ceesafec-refdocs")
+    refdocs_common = ["--ceesafec", refdocs, "--novac", novac, "--root", root]
     run_families = ["--family", "run-pass", "--family", "run-fail", "--family", "ffi"]
     steps = [
         ("parse", py + [f"{HERE}/compare_parse.py"] + common + parse_families),
@@ -84,12 +92,14 @@ def main():
         ("self d. split", py + [f"{HERE}/compare_self.py", "--ceesafec", cee, "--novac", novac] + everything +
          ["--extra=--split", "--extra=-g"]),
         ("packages", py + [f"{HERE}/compare_packages.py", "--ceesafec", cee, "--novac", novac]),
-        ("cli", py + [f"{HERE}/compare_cli.py"] + common),
+        ("cli", py + [f"{HERE}/compare_cli.py"] + refdocs_common),
         ("fmt", py + [f"{HERE}/compare_fmt.py"] + common),
         ("doc", py + [f"{HERE}/compare_doc.py"] + common),
         ("package cmds", py + [f"{HERE}/compare_package_commands.py", "--ceesafec", cee, "--novac", novac]),
         ("interp", py + [f"{HERE}/compare_interp.py"] + common),
-        ("servers", py + [f"{HERE}/compare_servers.py"] + common),
+        ("servers", py + [f"{HERE}/compare_servers.py"] + refdocs_common),
+        ("spec", py + [f"{HERE}/spec_check.py", "--ceesafec", cee]),
+        ("guide", py + [f"{HERE}/guide_check.py", "--ceesafec", cee]),
         ("debugger", py + [f"{HERE}/debugger_check.py", "--ceesafec", cee]),
         ("link", py + [f"{HERE}/link_collision.py", "--ceesafec", cee, "--novac", novac]),
         ("run -Werror", py + [f"{HERE}/run_corpus.py", "--compiler", cee, "--corpus", own_corpus] + run_families +
@@ -106,6 +116,9 @@ def main():
         ("freestanding", py + [f"{HERE}/freestanding_check.py", "--compiler", cee, "--corpus", own_corpus]),
     ]
     failed = 0
+    sys.path.insert(0, HERE)
+    import reference_docs
+    reference_docs.build(cee, root, refdocs)
     with tempfile.TemporaryDirectory() as work:
         listing = os.path.join(work, "differ.txt")
         for name, argv in steps:
@@ -125,6 +138,7 @@ def main():
                 summary += " (the recorded divergences)" if ok else f" (unexpected: {sorted(differ ^ KNOWN_CHECK_DIFFERENCES)})"
             print(f"{name:17} {'ok  ' if ok else 'FAIL'} {summary}")
             failed += not ok
+    shutil.rmtree(refdocs_dir, ignore_errors=True)
     return 1 if failed else 0
 
 
