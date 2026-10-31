@@ -105,7 +105,7 @@ fn namesInExpr(c: borrow Checker, e: u32, parameters: borrow Vector<u32>) -> boo
             return namesInExpr(c, callee, parameters) || namesInList(c, arguments, parameters);
         }
         ExprNode.Member(target, _) => { return namesInExpr(c, target, parameters); }
-        ExprNode.Unsafe(block) => { return namesInStmt(c, block, parameters); }
+        ExprNode.Unsafe(inner) => { return namesInExpr(c, inner, parameters); } // `unsafe { e }` holds an expression
         ExprNode.If(condition, then, otherwise) => {
             return namesInExpr(c, condition, parameters) || namesInExpr(c, then, parameters) ||
                 namesIn(c, otherwise, parameters);

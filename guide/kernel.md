@@ -118,7 +118,7 @@ struct Uart {
 
 ## Kernel allocators, locks and objects
 
-The CosmoOS integration (Nova's `integrations/cosmoos/`, copied into CeeSafe's `tests/reference/integrations/`) builds the rest from these pieces:
+The CosmoOS integration (the repository's `integrations/cosmoos/`) builds the rest from these pieces:
 
 - `KernelHeap`, an allocator over `kmalloc`/`kfree`, so `Box.createIn(KernelHeap {}, value)` allocates kernel memory
   and returns `Err` when the kernel has none;

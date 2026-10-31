@@ -101,6 +101,7 @@ CeeSafe/
   guide/                       # the guide; every `ceesafe` example is checked (tools/guide_check.py)
   templates/AGENTS.md          # what `ceesafec new` and `ceesafec agents` write
   editors/                     # the VS Code extension; lldb and gdb scripts
+  integrations/cosmoos/        # ceesafec's C held to CosmoOS's build, tests and boots (C1–C9, K3)
   tests/reference/             # CeeSafe's corpus, benchmarks, programs and libraries at the fork
   tools/                       # generators, comparisons with the novac 0.6.0 baseline, the contract suite
   bootstrap/                   # the stage-0 pin and the fixed-point records

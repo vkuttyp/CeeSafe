@@ -751,4 +751,10 @@ CeeSafe's own C identical after mapping back, 535,154 lines and 623,749 with `--
 bootstrapped stage 0 in the default form and with `--split` (`bootstrap/fixed-point/2026-10-31-spec-*`). Linux and
 Windows not rerun for this commit.
 
+**CosmoOS integrations** (2026-10-31; `docs/cosmoos-integrations.md`, macOS arm64, QEMU, CosmoOS `9c0d0f84`): Nova's
+C1–C9 and K3 checks forked into `integrations/cosmoos/` and run with ceesafec: C1 (with the 199-program corpus in the
+guest), C2 (412 sweep runs), C3, C5, C7 and C8 booted on x86_64; C4 on both arches; C6, C9 and K3. All pass. C9 found
+a ceesafec bug (a closure with an `unsafe { e }` body crashed the capture scan), fixed with a regression program in
+`tests/check/`; the contract suite passes after the fix (36/36). Not run: aarch64 boots, C8 `--cycles`.
+
 Not yet run: P9.

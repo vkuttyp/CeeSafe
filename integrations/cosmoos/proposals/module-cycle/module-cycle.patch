@@ -1,0 +1,192 @@
+diff -ruN a/kernel/core/main.c b/kernel/core/main.c
+--- a/kernel/core/main.c	2026-10-25 01:24:07
++++ b/kernel/core/main.c	2026-10-25 01:24:30
+@@ -274,6 +274,7 @@
+     /* Boot-time kernel modules from the archive, before the self-tests
+      * (which load and unload their own fixtures) and before init. */
+     int failed = (int)module_load_boot();
++    module_cycle_boot();   /* debug builds: module.cycle=<entry>:<count> (kernel/module/modcycle.c) */
+     /* The disk drivers are in: partitions, then what root= names
+      * (kernel/core/bootfs.c). */
+     bootfs_disks_ready();
+diff -ruN a/kernel/include/kernel/module.h b/kernel/include/kernel/module.h
+--- a/kernel/include/kernel/module.h	2026-10-25 01:24:07
++++ b/kernel/include/kernel/module.h	2026-10-25 01:24:30
+@@ -159,6 +159,12 @@
+  * Returns the number of failures (each is logged). */
+ unsigned module_load_boot(void);
+ 
++/* Debug builds: with module.cycle=<archive entry>:<count> on the command
++ * line, load and unload that boot-archive module <count> times and log
++ * one result line (kernel/module/modcycle.c). A no-op otherwise, and in
++ * release builds. */
++void module_cycle_boot(void);
++
+ unsigned module_count(void);
+ void module_dump(void);
+ 
+diff -ruN a/kernel/kernel.mk b/kernel/kernel.mk
+--- a/kernel/kernel.mk	2026-10-25 01:24:07
++++ b/kernel/kernel.mk	2026-10-25 01:24:30
+@@ -123,6 +123,7 @@
+ 	kernel/module/modelf.c \
+ 	kernel/module/module.c \
+ 	kernel/module/modtest.c \
++	kernel/module/modcycle.c \
+ 	kernel/device/device.c \
+ 	kernel/device/dma.c \
+ 	kernel/device/devtest.c \
+diff -ruN a/kernel/module/modcycle.c b/kernel/module/modcycle.c
+--- a/kernel/module/modcycle.c	1970-01-01 03:00:00
++++ b/kernel/module/modcycle.c	2026-10-25 01:57:10
+@@ -0,0 +1,150 @@
++/*
++ * modcycle.c - Debug-build test hook: load and unload one boot-archive
++ * module many times, through the real loader (module_load/module_unload),
++ * and check that nothing is left behind.
++ *
++ * With `module.cycle=<archive entry>:<count>[:<hold ms>]` on the kernel
++ * command line (e.g. module.cycle=tests/nova_c8.ko:1000), module_cycle_boot,
++ * called after module_load_boot, runs <count> cycles, holding the module
++ * loaded for <hold ms> (default 0) between its load and its unload. Each load must return 0 and
++ * each unload must return 0 (not -EBUSY: no zombie). Before and after, it
++ * records the module count, kmalloc's live objects, the VM's regions and
++ * anonymous pages after the first cycle and at the end, and they must be
++ * equal (the first load may create what later loads reuse). lockdep's
++ * class count is reported too, not judged (see below). One line:
++ *
++ *   modcycle: tests/nova_c8.ko: 1000 cycles: PASS (...)
++ *
++ * The loader API stays unexported: this is built-in code, compiled into
++ * CONFIG_DEBUG builds only (AGENTS.md: test seams under CONFIG_DEBUG).
++ */
++
++#include <kernel/bootarchive.h>
++#include <kernel/cmdline.h>
++#include <kernel/kmalloc.h>
++#include <kernel/lockdep.h>
++#include <kernel/log.h>
++#include <kernel/module.h>
++#include <kernel/string.h>
++#include <kernel/vmm.h>
++#include <kernel/wait.h>
++
++#if CONFIG_DEBUG
++
++/* Digits to a number (at most 1,000,000); false if there are none or anything else. */
++static bool parse_number(const char *p, uint64_t *out)
++{
++    uint64_t n = 0;
++    if (*p == '\0')
++        return false;
++    for (; *p; p++) {
++        if (*p < '0' || *p > '9' || n > 1000000)
++            return false;
++        n = n * 10 + (uint64_t)(*p - '0');
++    }
++    *out = n;
++    return true;
++}
++
++/* "<entry>:<count>[:<hold ms>]" -> entry (NUL-terminated in place), count, hold; false if malformed. */
++static bool parse(char *spec, uint64_t *count, uint64_t *hold_ms)
++{
++    char *fields[3] = { spec, NULL, NULL };
++    unsigned n = 1;
++    for (char *p = spec; *p; p++) {
++        if (*p == ':') {
++            if (n == 3)
++                return false;
++            *p = '\0';
++            fields[n++] = p + 1;
++        }
++    }
++    *hold_ms = 0;
++    return n >= 2 && fields[0][0] != '\0' && parse_number(fields[1], count) && *count > 0 &&
++           (n == 2 || parse_number(fields[2], hold_ms));
++}
++
++void module_cycle_boot(void)
++{
++    char spec[128];
++    if (cmdline_get("module.cycle", spec, sizeof(spec)) <= 0)
++        return;
++    uint64_t count, hold_ms;
++    if (!parse(spec, &count, &hold_ms)) {
++        kerror("modcycle: module.cycle wants <archive entry>:<count>[:<hold ms>]");
++        return;
++    }
++    const void *file;
++    size_t size;
++    if (!bootarchive_find(spec, &file, &size)) {
++        kerror("modcycle: %s: not in the boot archive", spec);
++        return;
++    }
++
++    uint64_t load_failures = 0, unload_failures = 0, done = 0;
++    int first_error = 0;
++    struct vm_stats vm_before, vm_after;
++    struct kmalloc_stats heap_before, heap_after;
++    struct lockdep_stats locks_before, locks_after;
++    unsigned modules_before = 0;
++    for (uint64_t i = 0; i < count; i++) {
++        if (i == 1) {
++            /* After one cycle: anything the first load creates once (lockdep classes, which later loads reuse by
++             * name) is not a leak. Every later cycle must leave these exactly as they are. */
++            modules_before = module_count();
++            vm_get_stats(&vm_before);
++            kmalloc_get_stats(&heap_before);
++            lockdep_get_stats(&locks_before);
++        }
++        struct module *m = NULL;
++        int rc = module_load(file, size, spec, &m);
++        if (rc != 0) {
++            load_failures++;
++            first_error = first_error ? first_error : rc;
++            continue;
++        }
++        char name[MODULE_NAME_MAX];
++        strlcpy(name, m->name, sizeof(name));   /* `m` is borrowed until the unload */
++        if (hold_ms != 0)
++            thread_sleep_ns(hold_ms * 1000000ULL);   /* the module is live: what it does now is attributed to it */
++        rc = module_unload(name);
++        if (rc != 0) {
++            unload_failures++;   /* -EBUSY: a zombie */
++            first_error = first_error ? first_error : rc;
++        }
++        done++;
++    }
++    if (count == 1) {
++        modules_before = module_count();
++        vm_get_stats(&vm_before);
++        kmalloc_get_stats(&heap_before);
++        lockdep_get_stats(&locks_before);
++    }
++    vm_get_stats(&vm_after);
++    kmalloc_get_stats(&heap_after);
++    lockdep_get_stats(&locks_after);
++    unsigned modules_after = module_count();
++
++    bool passed = load_failures == 0 && unload_failures == 0 && modules_after == modules_before &&
++                  vm_after.regions == vm_before.regions && vm_after.anon_pages == vm_before.anon_pages &&
++                  heap_after.live_objects == heap_before.live_objects;
++    /* lockdep's classes are reported, not judged: a callback's class is named after its address ("callback %p",
++     * kernel/core/lockdep.c), so a module whose text lands somewhere new adds one that stays, whatever the module
++     * does. That is lockdep's to fix, not the module's. */
++    kinfo("modcycle: %s: %llu cycles (hold %llu ms): %s (load failures %llu, unload failures %llu, first error %d; modules %u -> %u; "
++          "kmalloc live %llu -> %llu; vm regions %llu -> %llu, anon pages %llu -> %llu; lockdep classes %u -> %u)",
++          spec, (unsigned long long)done, (unsigned long long)hold_ms, passed ? "PASS" : "FAIL", (unsigned long long)load_failures,
++          (unsigned long long)unload_failures, first_error, modules_before, modules_after,
++          (unsigned long long)heap_before.live_objects, (unsigned long long)heap_after.live_objects,
++          (unsigned long long)vm_before.regions, (unsigned long long)vm_after.regions,
++          (unsigned long long)vm_before.anon_pages, (unsigned long long)vm_after.anon_pages, locks_before.classes,
++          locks_after.classes);
++}
++
++#else
++
++void module_cycle_boot(void)
++{
++}
++
++#endif

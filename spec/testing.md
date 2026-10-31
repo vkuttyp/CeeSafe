@@ -19,6 +19,7 @@ Sanitizer results are supporting evidence, never proof of the language's safety.
 | Freestanding | `tools/freestanding_check.py` | the freestanding programs build with `-ffreestanding -nostdinc` for `x86_64-` and `aarch64-unknown-none-elf` and run against their C harnesses |
 | Debugging | `tools/debugger_check.py` | a `-g` build under lldb or gdb with `editors/debug`'s commands (`tooling.md` §3) |
 | Linking with Nova | `tools/link_collision.py` | a novac-built and a ceesafec-built library link into one program; two novac-built ones do not |
+| CosmoOS (Nova's C1–C9, K3) | `integrations/cosmoos/c*.py`, `k3.py` | ceesafec's C under CosmoOS's own flags, host tests, fuzz targets and module loader rules, and in its QEMU boots; CosmoOS's tree is only read |
 | Same C on another host | `tools/host_c_check.py` | ceesafec built on Windows (MSVC, clang) emits the same C as on macOS and Linux |
 | Specification (§4) | `tools/spec_check.py`, `tools/guide_check.py` | every diagnostic code is explained; the guide's examples do what the pages say; links resolve |
 
