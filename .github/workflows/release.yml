@@ -1,0 +1,247 @@
+name: release
+
+# A tag v<version> publishes ceesafec's prebuilt binaries as a GitHub release (docs/release.md). One C seed for every
+# platform: a Linux job bootstraps ceesafec from novac 0.6.0 (tools/bootstrap.sh) and writes ceesafec's own C, checking
+# the fixed point; each platform compiles the seed with its C compiler, lets that ceesafec rebuild itself with its own
+# `build`, and checks that the result emits the seed byte for byte. The macOS binaries are signed with the project's
+# Developer ID and notarized; SHA256SUMS covers every archive.
+
+on:
+  push:
+    tags: ["v*"]
+  # A dry run (gh workflow run release.yml): every build, check, signature and notarization of a release, without the
+  # tag check and without publishing.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SIGNING_IDENTITY: "Developer ID Application: Veeran Puthumkara (68PG74DU2D)"
+  NOVAC_URL: https://github.com/vkuttyp/Nova/releases/download/v0.6.0/novac-linux-x64.tar.gz
+  NOVAC_SHA256: 977472da73d96eea4a43230aa083820da6c85872690960960cf8eaf9882c193c # bootstrap/reference.md
+
+jobs:
+  version:
+    # The tag must name the version ceesafec reports, a constant (src/backend/c_program.cee) for reproducibility.
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          constant=$(sed -n 's/^fn ceesafeVersion() -> StringView => "\(.*\)";$/\1/p' src/backend/c_program.cee)
+          banner=$(sed -n 's/^fn compilerBanner() -> StringView => "ceesafec \(.*\)";$/\1/p' src/backend/c_program.cee)
+          if [ -z "$constant" ] || [ "$constant" != "$banner" ]; then
+            echo "::error::ceesafeVersion ($constant) and compilerBanner ($banner) disagree; see docs/release.md"
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            echo "dry run: version $constant, nothing will be published"
+          elif [ "${GITHUB_REF_NAME#v}" != "$constant" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match ceesafec's version ($constant); see docs/release.md"
+            exit 1
+          fi
+          echo "version=$constant" >> "$GITHUB_OUTPUT"
+
+  seed:
+    needs: version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tools/bootstrap.sh builds the last legacy-named commit first
+      - name: novac 0.6.0 (the stage-0 compiler)
+        run: |
+          curl -fsSL "$NOVAC_URL" -o novac.tar.gz
+          echo "$NOVAC_SHA256  novac.tar.gz" | sha256sum -c -
+          mkdir -p stage0 && tar -xzf novac.tar.gz -C stage0
+          stage0/novac --version
+      - name: Bootstrap ceesafec
+        run: sh tools/bootstrap.sh "$PWD/stage0/novac" HEAD out/ceesafec
+      - name: The seed, and the fixed point
+        run: |
+          out/ceesafec build -o out/gen2
+          out/ceesafec build --emit c -o c1
+          out/gen2 build --emit c -o seed
+          diff -r c1 seed
+          out/gen2 --version | grep -Fx "ceesafec ${{ needs.version.outputs.version }}"
+          (cd seed && sha256sum *) | tee seed.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seed
+          path: seed
+          if-no-files-found: error
+
+  build:
+    needs: [version, seed]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04, so the binaries need only glibc 2.35.
+          - { rid: linux-x64, os: ubuntu-22.04, exe: ceesafec }
+          - { rid: linux-arm64, os: ubuntu-22.04-arm, exe: ceesafec }
+          - { rid: win-x64, os: windows-latest, exe: ceesafec.exe, msvc: x64 }
+          - { rid: win-arm64, os: windows-11-arm, exe: ceesafec.exe, msvc: arm64 }
+          - { rid: osx-arm64, os: macos-latest, exe: ceesafec }
+          # Built on arm64 by ceesafec's own driver for x86_64; run under Rosetta when the runner has it.
+          - { rid: osx-x64, os: macos-latest, exe: ceesafec, cross: "--cflag -arch --cflag x86_64" }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: seed
+          path: seed
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: matrix.msvc
+        with:
+          arch: ${{ matrix.msvc }}
+      - name: Generation 1 from the seed (Windows, cl)
+        if: matrix.msvc
+        shell: cmd
+        run: cl /nologo /std:c11 /O2 /MP /I seed seed\*.c /Fo:seed\ /Fe:gen1.exe /link /STACK:8388608
+      - name: Generation 1 from the seed (cc)
+        if: ${{ !matrix.msvc }}
+        run: cc -std=c11 -O2 -ffp-contract=off -fno-math-errno -I seed seed/*.c -o gen1
+      - name: Generation 2, built by generation 1
+        run: |
+          gen1=./gen1; [ -f gen1.exe ] && gen1=./gen1.exe
+          mkdir -p stage
+          "$gen1" build ${{ matrix.cross }} -o "stage/${{ matrix.exe }}"
+          "$gen1" build --emit c -o c1
+          diff -r seed c1
+          ls -la stage
+      - name: Generation 2 emits the seed
+        id: run
+        run: |
+          exe="stage/${{ matrix.exe }}"
+          if [ -n "${{ matrix.cross }}" ]; then
+            file "$exe" | grep -F x86_64
+            if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+              echo "no Rosetta on this runner: the x86_64 binary is not run"
+              echo "runnable=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            run() { arch -x86_64 "$exe" "$@"; }
+          else
+            run() { "$exe" "$@"; }
+          fi
+          echo "runnable=true" >> "$GITHUB_OUTPUT"
+          run build --emit c -o c2
+          diff -r seed c2
+
+      - name: Import the signing certificate
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE_P12" ]; then
+            echo "::error::the APPLE_CERTIFICATE_P12 secret is not set; see docs/release.md"
+            exit 1
+          fi
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          password=$(uuidgen)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+      - name: Sign
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --timestamp --options runtime --keychain "$KEYCHAIN" --sign "$SIGNING_IDENTITY" stage/ceesafec
+          codesign --verify --strict --verbose=2 stage/ceesafec
+      - name: Notarize
+        if: runner.os == 'macOS'
+        env:
+          ASC_P8: ${{ secrets.ASC_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER: ${{ secrets.ASC_ISSUER }}
+        run: |
+          if [ -z "$ASC_P8" ] || [ -z "$ASC_KEY_ID" ] || [ -z "$ASC_ISSUER" ]; then
+            echo "::error::the ASC_P8, ASC_KEY_ID and ASC_ISSUER secrets are needed; see docs/release.md"
+            exit 1
+          fi
+          # A value pasted at gh secret set's prompt can carry a newline or quotes: notarytool wants the bare ID and UUID.
+          ASC_KEY_ID=$(printf '%s' "$ASC_KEY_ID" | tr -d "[:space:]\"'")
+          ASC_ISSUER=$(printf '%s' "$ASC_ISSUER" | tr -d "[:space:]\"'")
+          if ! printf '%s' "$ASC_ISSUER" | grep -Eq '^[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$'; then
+            echo "::error::ASC_ISSUER is not a UUID (${#ASC_ISSUER} characters after trimming); it is the Issuer ID above the keys list in App Store Connect, not the key ID"
+            exit 1
+          fi
+          key="$RUNNER_TEMP/AuthKey.p8"
+          echo "$ASC_P8" | base64 --decode > "$key"
+          ditto -c -k --keepParent stage/ceesafec "$RUNNER_TEMP/ceesafec.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/ceesafec.zip" --key "$key" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER" \
+            --wait --output-format json > "$RUNNER_TEMP/notary.json"
+          rm "$key"
+          cat "$RUNNER_TEMP/notary.json"
+          status=$(plutil -extract status raw "$RUNNER_TEMP/notary.json")
+          if [ "$status" != "Accepted" ]; then
+            echo "::error::notarization: $status"
+            exit 1
+          fi
+      - name: Remove the keychain
+        if: always() && runner.os == 'macOS'
+        run: security delete-keychain "$RUNNER_TEMP/release.keychain-db" || true
+
+      - name: Smoke test
+        if: steps.run.outputs.runnable == 'true'
+        run: |
+          exe="stage/${{ matrix.exe }}"
+          if [ -n "${{ matrix.cross }}" ]; then run() { arch -x86_64 "$exe" "$@"; }; else run() { "$exe" "$@"; }; fi
+          run --version | grep -Fx "ceesafec ${{ needs.version.outputs.version }}"
+          printf 'fn main() {\n    Console.writeLine(40 + 2);\n}\n' > hello.cee
+          test "$(run run --interp hello.cee | tr -d '\r')" = 42
+          if [ -z "${{ matrix.cross }}" ]; then
+            run build hello.cee -o hello-native
+            hello=./hello-native; [ -f hello-native.exe ] && hello=./hello-native.exe
+            test "$("$hello" | tr -d '\r')" = 42
+          fi
+          echo '{"jsonrpc":"2.0","id":1,"method":"ping"}' | run mcp | grep -F '"result":{}'
+      - name: Package
+        run: |
+          cp COPYING COPYING.RUNTIME stage/
+          mkdir -p dist
+          case "${{ matrix.rid }}" in
+            win-*) (cd stage && 7z a -tzip -bso0 "../dist/ceesafec-${{ matrix.rid }}.zip" ceesafec.exe COPYING COPYING.RUNTIME) ;;
+            *) tar -czf "dist/ceesafec-${{ matrix.rid }}.tar.gz" -C stage ceesafec COPYING COPYING.RUNTIME ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceesafec-${{ matrix.rid }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ceesafec-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum ceesafec-* > SHA256SUMS && cat SHA256SUMS
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "ceesafec ${{ needs.version.outputs.version }}" --generate-notes

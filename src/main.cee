@@ -1199,7 +1199,7 @@ fn main() -> i32 {
     }
     let command = argument!;
     if (command == "--version") {
-        Console.writeLine("ceesafec 0.0.0-dev");
+        Console.writeLine(compilerBanner());
         return 0;
     }
     if (command == "-h" || command == "--help") {
