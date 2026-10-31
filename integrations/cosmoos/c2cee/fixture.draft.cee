@@ -1,0 +1,86 @@
+// DRAFT by c2cee (spec/tooling.md §9.4) from fixture.c: unsafe CeeSafe that mirrors the C. Finish
+// every TODO(c2cee), review each line beside the C, then run `c2cee.py verify`.
+
+@header("fixture_deps.h")
+extern "C" {
+    struct fx_entry {
+        next: *mut fx_entry;
+    }
+    fn fx_hook(a0: usize);
+    fn fx_inline(a0: i32) -> i32;
+    fn fx_plain(a0: i32);
+}
+
+// Without a header (each would include the port's header back), and the floor's (fixture_floor.c).
+extern "C" {
+    fn fx_cycle_note(a0: *mut fx_thing);
+    fn fixture_floor_assert_1();
+    fn fixture_floor_fence_5();
+    fn fixture_floor_fx_panic_6(a0: *CChar);
+}
+
+@repr(C)
+struct fx_lock {
+    taken: u32;
+}
+
+@repr(C)
+struct fx_thing {
+    lock: fx_lock;
+    name: *CChar;
+    lock_class: u16; // was `class` (a CeeSafe keyword): rename the C member
+    done: bool;
+    count: u64;
+    callback: extern "C" fn(i32); // was `fn` (a CeeSafe keyword): rename the C member
+    bytes: [u8; 4];
+}
+
+/// An atomic view of a word only ever accessed atomically.
+/// Safety: `p` is such a word.
+unsafe fn atomic_u64(p: *mut u64) -> borrow(static) AtomicU64 => Ptr.toBorrow(p as *AtomicU64);
+
+/// Safety: TODO(c2cee): what the caller guarantees
+unsafe fn helper(x: i32) -> i32 {
+    unsafe {
+        return fx_inline(x);
+    }
+}
+
+/// Safety: TODO(c2cee): what the caller guarantees
+@export("fx_thing_init")
+unsafe fn fx_thing_init(t: *mut fx_thing, name: *CChar) {
+    unsafe {
+        if (!(!(name).isNull())) {
+            fixture_floor_assert_1(); // KASSERT(name != 0)
+        }
+        let r2 = Ptr.toBorrowMut(t);
+        r2.name = name;
+        let r3 = Ptr.toBorrowMut(t);
+        r3.lock_class = 0;
+        /* TODO(c2cee): __atomic_store_n on a bool (a bool needs a u32) */;
+        atomic_u64(borrow mut Ptr.toBorrowMut(t).count as *mut u64).storeWith(0, StoreOrdering.Relaxed);
+        fx_plain(helper(1));
+        fx_hook(callerAddress());
+        fx_cycle_note(t);
+    }
+}
+
+/// Safety: TODO(c2cee): what the caller guarantees
+@export("fx_thing_count")
+unsafe fn fx_thing_count(t: *mut fx_thing) -> u64 {
+    unsafe {
+        // TODO(c2cee): a local local of C type fx_entry: CeeSafe locals cannot hold C state (a floor helper)
+        local.next = 0 as *mut fx_entry;
+        if (!(Ptr.toBorrow(t as *fx_thing).callback).isNull()) {
+            let f4 = Ptr.toBorrow(t as *fx_thing).callback;
+            f4(1);
+        }
+        fixture_floor_fence_5();
+        if (/* TODO(c2cee): __atomic_load_n on a bool (a bool needs a u32) */) {
+            fixture_floor_fx_panic_6(Ptr.toBorrow(t as *fx_thing).name);
+        }
+        return atomic_u64(borrow mut Ptr.toBorrowMut(t).count as *mut u64).loadWith(LoadOrdering.Acquire) + (if ((!(local.next).isNull())) 1 else 0);
+    }
+}
+
+// 6 TODO(c2cee) in this draft.

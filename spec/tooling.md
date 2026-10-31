@@ -576,3 +576,106 @@ A compiler is MSVC when its file name is `cl` or `cl.exe`. `--emit obj` (one rel
 
 The executable is `out/<name>` in a package, or `-o <path>`. On Windows, a path without an extension gets `.exe`, so
 `ceesafec build` makes `out\hello.exe`. The output's directory is created if it does not exist.
+
+## 9. Porting C to CeeSafe: `c2cee`
+
+CosmoOS's roadmap 2.0 moves kernel C into Nova, the language CeeSafe forked from, one file at a time (SA2, SA3), and
+every port repeats the same mechanical steps: map the C types, declare each function the file calls, choose `@header`s
+that do not include the port's own header back, find what must stay in a C floor, rename members that are keywords,
+wire the build, and run the same checks. `integrations/cosmoos/c2cee.py` does the analysis and the checks, and drafts
+the `.cee` file, the floor and the build lines (§9.4). It is Nova's `c2nova` (written after the fork, at Nova
+`3ba382b`) for CeeSafe: its drafts equal `c2nova`'s under CeeSafe's names. CosmoOS keeps its ports as Nova and builds
+them with novac (CeeSafe's Decision 0003), so a finished port is checked with ceesafec and lands in CosmoOS's tree as a
+`.nova` file, the same language at the fork. It reads C through clang's own front end (`-Xclang -ast-dump=json`), so
+it needs nothing but clang and Python 3, and never edits a file.
+
+### 9.1 `c2cee.py analyse <file.c> [--header <h>] [--cosmoos <tree>] [--arch x86_64|aarch64] [--json]`
+
+Parses `<file.c>` twice, as a debug build and as a release one (`CONFIG_DEBUG=1`, `0`), with CosmoOS's include paths
+for `--arch` (default x86_64), and reports:
+
+- **Functions** the file defines: their C and CeeSafe signatures, and whether a module export (`EXPORT_SYMBOL`) names them.
+- **Calls**, each callee with the header that declares it and what that means for the port:
+  - a function: an `extern "C"` declaration;
+  - `static inline` in a header: callable through that header (type-system §28.2);
+  - an ordinary function in one build and `static inline` in the other (lockdep's hooks): it **must** be declared
+    through its header, or the build where it is inline fails to link (CosmoOS #499);
+  - variadic (`panic`, `klog`): a C floor;
+  - through a function pointer: a C floor when the pointer is a member of an imported struct (§31.1).
+- **Builtins**: `__builtin_return_address` (CeeSafe's `callerAddress()` in an export), `__atomic_*` (an atomic view of the
+  field; a `bool` field needs a `u32`, since lib/core's `AtomicBool` is four bytes), `__atomic_thread_fence` (a floor:
+  CeeSafe has no fence).
+- **Macros** expanded in the file's functions, from their expansion locations: `wait_event*` (wait_floor.c's helpers),
+  `list_for_each_entry*` (a loop over lib/kernel's `List` or `offsetOf`), `might_sleep` (`wait_floor_check_sleep`),
+  `KASSERT`, `WARN`, `EXPORT_SYMBOL` (a floor).
+- **Locals of struct type** that hold C state (a wait entry, a timer): a CeeSafe local cannot (§33.1), so a floor helper.
+- With `--header <h>`, the **structs it defines**, field by field: the CeeSafe type, members whose names are CeeSafe keywords
+  (renamed, or `@cname` on an imported struct), `const` pointer members (a `@repr(C)` struct's carry no `const`),
+  fields used atomically, and every other file in the tree that names a member.
+- **`@header` candidates**: the headers that declare what the file uses, each marked unusable when it includes `<h>`,
+  directly or not, since the generated types' header is included from `<h>` (ADR 0030; `thread.h` → `completion.h` →
+  `wait.h`).
+
+The report is text, or JSON with `--json`. It exits 0 unless clang fails.
+
+### 9.2 `c2cee.py verify [--cosmoos <tree>] [--arch x86_64|aarch64|both] [--no-boot] [--max-load <n>] [--novac <path>]`
+
+Runs a port's checks in a CosmoOS tree, in order, with `NOVAC` set to `--novac` (default `~/.nova/bin/novac`, the
+release CosmoOS pins; its Make builds the tree's Nova with it), and prints one line per step and a summary:
+1. `make nova-check` (the generated files match their sources under the pinned novac);
+2. `make host-test`, with every recorded trace digest it prints;
+3. `make check-docs`;
+4. per architecture: the debug and the release build, `make analyze` (and, for the first architecture, `make
+   fuzz-build`, whose shims define some of a port's functions over its types), and unless `--no-boot` a debug and a release boot
+   (`make test`). Before each boot it waits until the one-minute load average is under `--max-load` (default 8),
+   since the boot tests' time bounds fail on a loaded host. A boot that fails after the load average reached the
+   bound at any point during it (another job started meanwhile; it is sampled every five seconds) is run once more
+   on a quiet host: both lines are printed, and the second
+   decides.
+
+It exits 1 if any step failed, naming the first.
+
+### 9.3 Checks of the tool
+
+`c2cee.py selftest` analyses `integrations/cosmoos/c2cee/fixture.c` with `fixture.h` and compares the report with
+`fixture.expected.json`, and drafts its port (§9.4) and compares that with `fixture.draft.cee` and
+`fixture_floor.draft.c`. The fixture holds one of each case of §9.1.
+
+### 9.4 `c2cee.py port <file.c> --header <h> --out <dir> [--cosmoos <tree>] [--arch …]`
+
+Writes a **draft** of the port into `<dir>`, never into the tree: `<name>.cee`, `<name>_floor.c` and `BUILD.md` (the
+`ceesafec check` of the finished port, CosmoOS's `nova-gen.py`, `kernel.mk` and `host.mk` lines, and what to change in
+`<h>`). The draft is unsafe CeeSafe that mirrors the
+C, statement by statement, for a person to finish and review; every place it could not translate, or translated with a
+decision someone must check, carries `TODO(c2cee)` with the reason, and it never drops a construct silently.
+
+- **Names** stay C's (functions, parameters, locals, statics), so the draft reads beside the original; a name that is a
+  CeeSafe keyword gets `_` appended. Each function's body is one `unsafe` block, and its doc comment has a `Safety:` line
+  marked `TODO(c2cee)`. A function `EXPORT_SYMBOL` names, or that the header declares, is `@export("name")`; one the
+  file passes as a function pointer is `@callback`.
+- **Types**: `<h>`'s structs become `@repr(C)` structs (a keyword member renamed, `fn` to `callback`, `class` to
+  `lock_class`, otherwise with `_` appended, and listed in `BUILD.md`); every other struct the file uses is imported,
+  with the fields it reads; typedefs of integers are their CeeSafe integer, of structs `@ctype` imports.
+- **Declarations**: an `extern "C"` block per kind: callees whose headers may be `@header`s (§9.1), and the rest without
+  a header; the floor's functions; `@constant` macros used in static initialisers.
+- **Statics**: integer, `bool`, pointer and array statics, and those initialised by a C constant macro (`SPINLOCK_INIT`),
+  are CeeSafe `static mut`s; a static of a C struct type, or one whose initialiser names the static itself
+  (`WAITQUEUE_INIT(name)`), stays in the floor, and the draft reaches it through a floor function that returns its
+  address.
+- **Statements and expressions**: blocks, declarations, `if`, `while`, `for` (as a `while`, unless its body has a
+  `continue`), `do` (as a `loop`), `return`, `break`, `continue`, assignments and compound assignments, `++`/`--` as
+  statements, calls, `?:` (an `if` expression), casts (`as` when it cannot lose information, else `truncate`), pointer
+  comparisons with null (`isNull()`), `*p` (`read`/`write`), `p->f` (`Ptr.toBorrow`, and for a write a `let` of
+  `Ptr.toBorrowMut` first), `&x` (`borrow mut … as *mut T`), `sizeof` (`layoutOf`), string literals, the `__atomic`
+  builtins on integers and pointers (an atomic view), `__builtin_return_address` (`callerAddress()`). Anything else,
+  `switch`, `goto` and `continue` in a `for` among them, is a `TODO(c2cee)` with the C text.
+- **Macros**: `KASSERT(c)` becomes `if (!(c))` and a floor call that panics with the condition's text; `might_sleep()`
+  `wait_floor_check_sleep`; `wait_event(q, c)` and `wait_event_timeout(q, c, t)` `wait_floor_until(_timeout)` with the
+  condition as a `@callback` over a context struct of the locals it reads; other macros are translated from their
+  expansion.
+- **The floor**: one C function per call of a variadic function (`panic`, `klog`, `kwarn`), with the format fixed and
+  the other arguments as parameters; the statics that stay in C, with their accessors; file-scope `STATIC_ASSERT`s; the
+  `EXPORT_SYMBOL` lines.
+- **Builds**: a function that differs between the debug and the release build (an `#if CONFIG_DEBUG` inside it, or
+  present in one build only) is drafted from the debug build with a `TODO(c2cee)` naming the difference: a draft from
+  one build alone would change the other.

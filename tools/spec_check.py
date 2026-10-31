@@ -32,7 +32,9 @@ URL = re.compile(r"https?://[^\s)>`\"']+")
 ALLOWED = (("spec/c-backend.md", "Nova's runtime and generated names"),
            ("spec/c-backend.md", "In Nova before M7d, top-level functions were `nv_<name>`"),
            ("spec/c-backend.md", "the runtime's `nv_add_i32`"),
-           ("guide/installation.md", "~/.nova/0.6.0/bin/novac"))
+           ("guide/installation.md", "~/.nova/0.6.0/bin/novac"),
+           ("spec/tooling.md", "`.nova` file, the same language at the fork"),  # §9: CosmoOS keeps its ports as Nova
+           ("spec/tooling.md", "(default `~/.nova/bin/novac`"))
 
 
 def documents():

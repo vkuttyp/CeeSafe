@@ -1,0 +1,246 @@
+{
+  "file": "fixture.c",
+  "floor": [
+    "fx_thing_count: a fence",
+    "fx_thing_count: calls through fn",
+    "fx_thing_count: calls variadic fx_panic",
+    "fx_thing_count: holds a struct fx_entry local",
+    "fx_thing_init: calls variadic fx_panic",
+    "fx_thing_init: uses KASSERT"
+  ],
+  "functions": [
+    {
+      "atomics": [],
+      "builtins": [],
+      "c": "int (int)",
+      "c_state_locals": [],
+      "calls": [
+        {
+          "header": "fixture_deps.h",
+          "name": "fx_inline",
+          "notes": [
+            "static inline: callable through its header"
+          ]
+        }
+      ],
+      "ceesafe": "fn helper(x: i32) -> i32",
+      "exported": false,
+      "macros": [],
+      "name": "helper",
+      "pointer_calls": [],
+      "static": true
+    },
+    {
+      "atomics": [
+        {
+          "field": "done",
+          "op": "__atomic_store_n",
+          "type": "_Bool"
+        },
+        {
+          "field": "count",
+          "op": "__atomic_store_n",
+          "type": "uint64_t"
+        }
+      ],
+      "builtins": [
+        {
+          "name": "__atomic_store_n",
+          "note": "an atomic view of the field (lib/core's AtomicU32/U64/USize; a bool field needs a u32)"
+        },
+        {
+          "name": "__builtin_return_address",
+          "note": "callerAddress() in an @export function (ADR 0030)"
+        }
+      ],
+      "c": "void (struct fx_thing *, const char *)",
+      "c_state_locals": [],
+      "calls": [
+        {
+          "header": "fixture_cycle.h",
+          "name": "fx_cycle_note",
+          "notes": [
+            "includes the port's header: not a @header (declare without one, or through a floor)"
+          ]
+        },
+        {
+          "header": "fixture_deps.h",
+          "name": "fx_hook",
+          "notes": [
+            "function in debug, inline in release: declare it through its header"
+          ]
+        },
+        {
+          "header": "fixture_deps.h",
+          "name": "fx_panic",
+          "notes": [
+            "variadic: a floor"
+          ]
+        },
+        {
+          "header": "fixture_deps.h",
+          "name": "fx_plain",
+          "notes": []
+        },
+        {
+          "header": "fixture.c",
+          "name": "helper",
+          "notes": [
+            "the file's own function: a CeeSafe function of the port"
+          ]
+        }
+      ],
+      "ceesafe": "fn fx_thing_init(t: *mut fx_thing, name: *CChar)",
+      "exported": true,
+      "macros": [
+        {
+          "name": "KASSERT",
+          "note": "a floor (panic's message)"
+        }
+      ],
+      "name": "fx_thing_init",
+      "pointer_calls": [],
+      "static": false
+    },
+    {
+      "atomics": [
+        {
+          "field": "done",
+          "op": "__atomic_load_n",
+          "type": "_Bool"
+        },
+        {
+          "field": "count",
+          "op": "__atomic_load_n",
+          "type": "uint64_t"
+        }
+      ],
+      "builtins": [
+        {
+          "name": "__atomic_load_n",
+          "note": "an atomic view of the field (lib/core's AtomicU32/U64/USize; a bool field needs a u32)"
+        },
+        {
+          "name": "__atomic_thread_fence",
+          "note": "a floor: CeeSafe has no fence"
+        }
+      ],
+      "c": "uint64_t (struct fx_thing *)",
+      "c_state_locals": [
+        {
+          "name": "local",
+          "note": "a local of struct type: if it holds C state, a floor helper (\u00a733.1)",
+          "type": "struct fx_entry"
+        }
+      ],
+      "calls": [
+        {
+          "header": "fixture_deps.h",
+          "name": "fx_panic",
+          "notes": [
+            "variadic: a floor"
+          ]
+        }
+      ],
+      "ceesafe": "fn fx_thing_count(t: *mut fx_thing) -> u64",
+      "exported": false,
+      "macros": [],
+      "name": "fx_thing_count",
+      "pointer_calls": [
+        {
+          "member": "fn",
+          "note": "a call through a function pointer: a floor if the member is an imported struct's (\u00a731.1)"
+        }
+      ],
+      "static": false
+    }
+  ],
+  "header": "fixture.h",
+  "headers": [
+    {
+      "header": "fixture_cycle.h",
+      "note": "includes the port's header: not a @header (declare without one, or through a floor)"
+    },
+    {
+      "header": "fixture_deps.h",
+      "note": null
+    }
+  ],
+  "structs": [
+    {
+      "fields": [
+        {
+          "c": "uint32_t",
+          "ceesafe": "u32",
+          "name": "taken",
+          "notes": []
+        }
+      ],
+      "name": "fx_lock"
+    },
+    {
+      "fields": [
+        {
+          "c": "struct fx_lock",
+          "ceesafe": "fx_lock",
+          "name": "lock",
+          "notes": [
+            "set by the header's initialiser macro FX_THING_INIT"
+          ]
+        },
+        {
+          "c": "const char *",
+          "ceesafe": "*CChar",
+          "name": "name",
+          "notes": [
+            "a const pointer: the generated member has no const; a C initialiser storing a literal needs a cast",
+            "set by the header's initialiser macro FX_THING_INIT"
+          ]
+        },
+        {
+          "c": "uint16_t",
+          "ceesafe": "u16",
+          "name": "class",
+          "notes": [
+            "'class' is a CeeSafe keyword: rename the C member (no @cname on @repr(C) fields)",
+            "set by the header's initialiser macro FX_THING_INIT"
+          ]
+        },
+        {
+          "c": "_Bool",
+          "ceesafe": "bool",
+          "name": "done",
+          "notes": [
+            "used atomically and a bool: make it a u32 (lib/core's AtomicBool is four bytes)",
+            "set by the header's initialiser macro FX_THING_INIT"
+          ]
+        },
+        {
+          "c": "uint64_t",
+          "ceesafe": "u64",
+          "name": "count",
+          "notes": [
+            "used atomically: an atomic view of the field",
+            "set by the header's initialiser macro FX_THING_INIT"
+          ]
+        },
+        {
+          "c": "fx_callback",
+          "ceesafe": "extern \"C\" fn(i32)",
+          "name": "fn",
+          "notes": [
+            "'fn' is a CeeSafe keyword: rename the C member (no @cname on @repr(C) fields)",
+            "set by the header's initialiser macro FX_THING_INIT"
+          ]
+        },
+        {
+          "c": "uint8_t[4]",
+          "ceesafe": "[u8; 4]",
+          "name": "bytes",
+          "notes": []
+        }
+      ],
+      "name": "fx_thing"
+    }
+  ]
+}

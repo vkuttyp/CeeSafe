@@ -15,6 +15,21 @@ novac (Decision 0003); these checks only read its tree and hold ceesafec's C to 
 | C9: CosmoOS's own names restored (`kernel/block/gpt.nova`, `kernel/nova/nova_rt_core.c`, `tests/host/nova_panic.c`, `make nova`); `c6.check_component` compiles a `.cee` copy of a `.nova` port | CosmoOS's files are Nova's; ceesafec reads only `.cee` (Decision 0005) |
 | C2: a panic is found anywhere in a serial line | standard error shares the console line with a partial line of output (`run-pass/host-services`, which joined Nova's corpus after C2's last run) |
 
+## c2cee
+
+`c2cee.py`, `c2cee_port.py` and `c2cee/` are Nova's `c2nova` tool (on Nova's main after the fork, `3ba382b`), renamed
+(`c2nova` → `c2cee` first, then `tools/names.py`'s forward map). Kept as Nova's: CosmoOS's own names (`make nova`,
+`nova-check`, `scripts/nova-gen.py`, `kernel/nova/nova_rt_core.c`, `tests/host/nova_panic.c`) and `verify`'s `--novac`,
+since a port lands in CosmoOS as Nova, built by its pinned novac. Changed: the keywords come from CeeSafe's lexer
+(`src/syntax/token.cee`); a draft's `BUILD.md` first checks the port with ceesafec and copies it into the tree as
+`.nova`. Documented in `spec/tooling.md` §9.
+
+Run 2026-10-31: `selftest` passes (the fixture's drafts identical to Nova's snapshots under CeeSafe's names, the
+analysis equal as data; its JSON re-blessed for the key order `"ceesafe"` takes); `port` of CosmoOS's
+`kernel/scheduler/semaphore.c` and `kernel/ipc/pipe.c` gives `.cee` and floor files byte-identical to `c2nova`'s
+mapped forward, `BUILD.md` differing only as intended. `verify` was not run (it builds and boots a CosmoOS tree with a
+port in it).
+
 ## A compiler bug it found
 
 C9 compiles CosmoOS's `gpt.nova`, which has a closure whose body is an `unsafe { e }` expression. ceesafec crashed
