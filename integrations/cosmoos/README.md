@@ -26,6 +26,7 @@ The compiler under test is `$CEESAFEC`, or the tree's `out/ceesafec` (build it f
 | `c9.py`, `c9/` | C9: CosmoOS's GPT parser and writer, which CosmoOS keeps in Nova (`kernel/block/gpt.nova`): ceesafec compiles a `.cee` copy (the same language at the fork), held to CosmoOS's `test_gpt` and `fuzz_gpt`, a differential test against the C original, and C4's checks. No QEMU |
 | `k3.py`, `k3/` | K3: `lib/kernel` (`--kernel cosmoos`) compiled against CosmoOS's own headers with its kernel flags. Compile only |
 | `c2cee.py`, `c2cee_port.py`, `c2cee/` | Porting CosmoOS's C: `analyse` a C file's port needs, `port` drafts its `.cee` file, floor and build lines out of the tree, `verify` runs CosmoOS's own checks of a landed port (with its pinned novac), `selftest` checks the tool against `c2cee/fixture.c` (`spec/tooling.md` §9). Nova's `c2nova` (Nova `3ba382b`, after the fork) under CeeSafe's names |
+| `ports.py` | CosmoOS's Nova ports through ceesafec: each port compiled from a `.cee` copy with `scripts/nova-gen.py`'s flags must give the C, exports headers and runtime CosmoOS checks in (novac 0.6.0's) byte for byte after mapping CeeSafe's names back; the negative sources must give exactly their errors. Reads a commit with `git archive`; needs the tree to pin novac 0.6.0 |
 | `proposals/` | Changes Nova proposed to CosmoOS (`module-cycle/`, merged into CosmoOS as #457); kept as the record |
 
 The milestone reports these scripts cite (`docs/cosmoos/c*-report.md`) are Nova's, in

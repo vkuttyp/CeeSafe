@@ -27,8 +27,14 @@ since a port lands in CosmoOS as Nova, built by its pinned novac. Changed: the k
 Run 2026-10-31: `selftest` passes (the fixture's drafts identical to Nova's snapshots under CeeSafe's names, the
 analysis equal as data; its JSON re-blessed for the key order `"ceesafe"` takes); `port` of CosmoOS's
 `kernel/scheduler/semaphore.c` and `kernel/ipc/pipe.c` gives `.cee` and floor files byte-identical to `c2nova`'s
-mapped forward, `BUILD.md` differing only as intended. `verify` was not run (it builds and boots a CosmoOS tree with a
-port in it).
+mapped forward, `BUILD.md` differing only as intended. `verify` ran on CosmoOS `f17a90f3` (main, #506; 17 Nova ports, novac 0.6.0 pinned) in a worktree: 14 of 14 steps pass
+(`nova-check`; `host-test` with the handles trace `0xfd5772457a0ad4a1` and the sync trace `0xc4ef20be17b35afa`;
+`check-docs`; the debug and release builds and `analyze` on x86_64 and aarch64; `fuzz-build`; the debug and release
+boots on both arches, `boot-test: PASS`).
+
+`ports.py` is the CeeSafe side: at `f17a90f3`, ceesafec compiles the 16 ports nova-gen.py generates from `.cee` copies,
+and all 27 generated files (16 ports' C, 9 exports headers, the runtime's two files) equal the checked-in ones after
+mapping CeeSafe's names back, the banner's version aside; the one negative source gives exactly its errors.
 
 ## A compiler bug it found
 
