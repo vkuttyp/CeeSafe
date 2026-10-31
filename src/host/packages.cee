@@ -76,7 +76,12 @@ fn sourceFilesUnder(directory: Slice<u8>, out: borrow mut Vector<Vector<u8>>) ->
         if (sameText(name, ".") || sameText(name, "..")) {
             continue;
         }
-        let path = joinPath(directory, name)?;
+        // `directory/name` as written (Path.Combine): a relative directory stays relative.
+        var path = copyBytes(directory)?;
+        if (path.length == 0 || path[path.length - 1] != '/') {
+            path.push('/')?;
+        }
+        appendBytes(mut path, name)?;
         if (isDirectory(path.view())) {
             sourceFilesUnder(path.view(), out)?;
         } else if (hasSourceExtension(name)) {

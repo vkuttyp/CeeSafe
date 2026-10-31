@@ -346,6 +346,17 @@ fn ioBuiltin(
     if (b == bfConsoleRead()) {
         let slice = argument(it, c, n, frame, arguments, 0)?;
         var buffer = readBuffer(it, slice)?;
+        if (it.options.capture) {
+            // The given input (a MemoryStream in the reference).
+            let left = it.options.input.length - it.inputRead;
+            let count = if (buffer.length < left) buffer.length else left;
+            for (k in 0..count) {
+                buffer[k] = it.options.input[it.inputRead + k];
+            }
+            it.inputRead += count;
+            storeRead(it, slice, buffer, count)?;
+            return Ok(interpIoResult(c, resultType, truncate<i64>(count), 0)?);
+        }
         match (Console.read(mut buffer[..])) {
             Ok(count) => {
                 storeRead(it, slice, buffer, count)?;

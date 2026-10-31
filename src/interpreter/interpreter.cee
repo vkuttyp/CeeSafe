@@ -18,6 +18,9 @@ struct InterpreterOptions {
     memoryLimit: i64;
     sandboxed: bool;
     workingDirectory: Vector<u8>;
+    capture: bool;     // the program's output kept (CappedStream), its input given (ceesafe_run, tooling.md §6.3)
+    outputLimit: u64;  // with capture: bytes of each output kept
+    input: Vector<u8>; // with capture: standard input
 }
 
 /// One call's frame: its locals' allocations, and each placed site's latest slot.
@@ -49,6 +52,11 @@ struct Interp {
     hasChecks: bool;
     checks: CheckResults;
     stdout: Vector<u8>; // buffered, flushed before stderr is written and at the end
+    // With capture: what each output kept, whether either was cut, and how much of the input was read.
+    capturedOutput: Vector<u8>;
+    capturedError: Vector<u8>;
+    truncated: bool;
+    inputRead: usize;
     // nova_rt_core.c: allocation accounting, fault injection, the scratch stack.
     emptyVector: u64;
     attempts: u64;
@@ -67,13 +75,31 @@ struct Interp {
 // ---- Output ----
 
 fn flushOutput(it: borrow mut Interp) {
+    if (it.options.capture) {
+        return;
+    }
     if (it.stdout.length > 0) {
         Console.writeBytes(it.stdout.view());
         it.stdout.clear();
     }
 }
 
+/// Keeps what fits of `bytes` under the output limit (CappedStream.Write).
+fn capOutput(kept: borrow mut Vector<u8>, truncated: borrow mut bool, limit: u64, bytes: Slice<u8>) {
+    let used = kept.length as u64;
+    let room = if (used >= limit) 0 else limit - used;
+    let take = if ((bytes.length as u64) < room) bytes.length else truncate<usize>(room);
+    appendBytes(kept, bytes[0..take])!;
+    if (take < bytes.length) {
+        truncated = true;
+    }
+}
+
 fn writeOutput(it: borrow mut Interp, bytes: Slice<u8>) {
+    if (it.options.capture) {
+        capOutput(mut it.capturedOutput, mut it.truncated, it.options.outputLimit, bytes);
+        return;
+    }
     appendBytes(mut it.stdout, bytes)!;
     if (it.stdout.length > 65536) {
         flushOutput(it);
@@ -82,6 +108,10 @@ fn writeOutput(it: borrow mut Interp, bytes: Slice<u8>) {
 
 /// nova_platform_write_stderr: standard output is flushed first.
 fn writeError(it: borrow mut Interp, bytes: Slice<u8>) {
+    if (it.options.capture) {
+        capOutput(mut it.capturedError, mut it.truncated, it.options.outputLimit, bytes);
+        return;
+    }
     flushOutput(it);
     match (StringView.fromUtf8(bytes)) {
         Some(text) => { Console.writeError(text); }
@@ -1706,6 +1736,10 @@ fn newInterp(
             ascii: Vector<bool>.create(),
         },
         stdout: Vector<u8>.create(),
+        capturedOutput: Vector<u8>.create(),
+        capturedError: Vector<u8>.create(),
+        truncated: false,
+        inputRead: 0,
         emptyVector: 0,
         attempts: 0,
         liveAllocations: 0,
@@ -1747,6 +1781,64 @@ fn interpretProgram(
     let status = runMain(mut it, c, n, main);
     flushOutput(mut it);
     return Ok(status);
+}
+
+/// A run with its output kept (ceesafe_run): the exit status, each output as UTF-8 text (an invalid sequence, or one
+/// cut at the limit, becomes U+FFFD, as Encoding.UTF8.GetString makes it), and whether either was cut.
+struct CapturedRun {
+    status: i32;
+    stdout: Vector<u8>;
+    stderr: Vector<u8>;
+    truncated: bool;
+}
+
+fn interpretCaptured(
+    c: borrow Checker,
+    n: borrow NirProgram,
+    sources: borrow Vector<SourceText>,
+    options: InterpreterOptions,
+) -> Result<CapturedRun, AllocError> {
+    var it = newInterp(c, n, sources, options);
+    if (it.options.placement) {
+        it.placement = analyzePlacement(c, n, sources)?;
+        it.hasPlacement = true;
+    }
+    if (it.options.bce || it.options.oce) {
+        it.checks = analyzeChecks(c, n)?;
+        it.hasChecks = true;
+    }
+    var main = none();
+    for (k in 0..n.functions.length) {
+        let hir = borrow c.hir.functions[n.functions[k].source as usize];
+        if (main == none() && hir.owner == none() && sameText(c.name(hir.name), "main")) {
+            main = n.functions[k].source;
+        }
+    }
+    let status = runMain(mut it, c, n, main);
+    return Ok(
+        CapturedRun {
+            status: status,
+            stdout: validUtf8(it.capturedOutput.view())?,
+            stderr: validUtf8(it.capturedError.view())?,
+            truncated: it.truncated,
+        },
+    );
+}
+
+/// `bytes` with each invalid sequence replaced by U+FFFD.
+fn validUtf8(bytes: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var fixed = Vector<u8>.create();
+    var i: usize = 0;
+    while (i < bytes.length) {
+        let d = decodeUtf8(bytes, i);
+        if (d.valid) {
+            appendBytes(mut fixed, bytes[i..i + (d.length as usize)])?;
+        } else {
+            appendUtf8(mut fixed, 0xFFFD)?;
+        }
+        i += d.length as usize;
+    }
+    return Ok(fixed);
 }
 
 fn runMain(it: borrow mut Interp, c: borrow Checker, n: borrow NirProgram, main: u32) -> i32 {

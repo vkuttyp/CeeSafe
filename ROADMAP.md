@@ -1,6 +1,6 @@
 # CeeSafe roadmap: port the Nova compiler to Nova, as CeeSafe
 
-Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P7 complete (CeeSafe names since `8941c10`; P7 production C 2026-10-30; stage 0 novac 0.6.0 via the `3d6ac40` anchor); P8 in progress (S0–S4 done 2026-10-31)**.
+Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P7 complete (CeeSafe names since `8941c10`; P7 production C 2026-10-30; stage 0 novac 0.6.0 via the `3d6ac40` anchor); P8 in progress (S0–S5 done 2026-10-31)**.
 The probes, `src/support/`, the limits, the fault sweep and the skeleton exist (`docs/p1-probes.md`). No compiler code has been ported.
 Repository: `~/dev/CeeSafe`. Reference: `vkuttyp/Nova` (C#/.NET 10), pinned in `bootstrap/reference.md`.
 
@@ -200,7 +200,7 @@ Subdirectories under `src/` are only for organisation, since every `.nova` file 
 | Generated C | `nv_`, `nvMk_`, `NOVA_PROGRAM_*_H`, `nova_exports.h` | `cee_`, `cee<X>_`, `ceesafe_exports.h` (Decision 0004) | P8, at the fork point |
 | Runtime | `nova_*` (~374), `nv*` (~424), `NOVA_*` (10), `runtime/include/nova/rt.h` | `ceesafe_*`, `CEE_*`, `ceesafe/rt.h`, ABI version (Decision 0004) | P8, at the fork point |
 | Diagnostics | 126 `N####` codes (`Diagnostics/Diagnostic.cs:14`), used by 159 corpus files | letter open, with a mapping | P6R |
-| MCP/LSP | server `novac`, tools `nova_*` | `ceesafec`, `ceesafe_*` | P8 |
+| MCP/LSP | server `novac`, tools `nova_*` | `ceesafec`, `ceesafe_*` | done (P8 S5) |
 | Agent files | `<!--NOVA START/END-->`, `nova.mdc` | `<!--CEESAFE START/END-->`, `ceesafe.mdc` | done (P8 S3) |
 | Editor | `nova-language`, language id `nova` | CeeSafe extension | P8 |
 | CosmoOS | `.nova`, pinned novac | stays on Nova (Decision 0003); a migration is the owner's option | — |
@@ -520,8 +520,8 @@ Dependencies: P7. Parser-only tools may start after P2, and semantic tools after
 - [x] Docs and resources: `doc`, `explain`, the embedded specs and guide (S0, S2), and `new`/`agents` with CeeSafe
   templates and markers (S3).
 - [x] Fixes and JSON: the exact schema, `fix --dry-run`, and every corpus fix applied (`FixTests`) (S0).
-- [ ] LSP: framing, UTF-16 edits, hover, definition, symbols, formatting, actions. Explicit walkers replace reflection.
-- [ ] MCP: lifecycle, tools (`ceesafe_*`), resources and prompts, the sandbox.
+- [x] LSP: framing, UTF-16 edits, hover, definition, symbols, formatting, actions. Explicit walkers replace reflection (S5).
+- [x] MCP: lifecycle, tools (`ceesafe_*`), resources and prompts, the sandbox (S5).
 - [ ] Host parity: Windows/MSVC, debugger scripts, the VS Code extension.
 - [ ] The normal self-build uses package mode, and P6 is rerun through it.
 
@@ -637,8 +637,8 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
    legacy `.nova` packages still build, codes keep N, and `tools/bootstrap.sh` builds from novac. P7 is done
    (`docs/p7-plan.md`): ceesafec emits novac's production C (structured, placement, check elimination, closure
    specialisation) byte for byte, and reaches the fixed point in that form. P8 is in progress (`docs/p8-plan.md`):
-   `explain`, `fix`, `fmt`, `doc` and the package commands and `run --interp` are identical to novac's (S0–S4); next S5,
-   `lsp` and `mcp`. The C prefix switch waits
+   `explain`, `fix`, `fmt`, `doc`, the package commands, `run --interp` and the `lsp` and `mcp` servers are identical to
+   novac's (S0–S5); next S6, host parity and the package-mode self-build. The C prefix switch waits
    for P8's fork point (Decision 0004).
 4. Upstream (Nova #6, filed 2026-10-30): novac 0.6.0's `offsetOf<T>(field)` is 0 unless `T`'s layout was computed before (CheckOffsetOf reads
    `member.Offset` without `TypeTable.LayoutOf(measured)`); ceesafec gives the true offset.

@@ -1,0 +1,930 @@
+// `ceesafec lsp` (the reference's Tooling/LanguageServer.cs; tooling.md §2): the Language Server Protocol over JSON-RPC
+// 2.0 with Content-Length framing. Single-threaded: each message is handled before the next is read. Each open
+// document is checked as a package of its own, or with its package when it is one's source (§2.1). Responses are
+// written as JsonNode.ToJsonString writes them (JavaScriptEncoder.Default's escaping).
+
+fn lspParseError() -> i64 => -32700;
+fn lspMethodNotFound() -> i64 => -32601;
+fn lspInternalError() -> i64 => -32603;
+
+/// Standard input, read in chunks.
+struct InputReader {
+    buffer: Vector<u8>;
+    position: usize;
+    ended: bool;
+
+    fn create() -> InputReader => InputReader { buffer: Vector<u8>.create(), position: 0, ended: false };
+
+    /// The next byte, or null at the end of the input.
+    fn next(borrow mut this) -> u8? {
+        if (this.position >= this.buffer.length) {
+            if (this.ended) {
+                return null;
+            }
+            this.buffer.clear();
+            this.position = 0;
+            for (k in 0..65536) {
+                this.buffer.push(0)!;
+            }
+            let count = match (Console.read(mut this.buffer[..])) {
+                Ok(n) => n,
+                Err(_) => 0,
+            };
+            this.buffer.truncate(count);
+            if (count == 0) {
+                this.ended = true;
+                return null;
+            }
+        }
+        let b = this.buffer[this.position];
+        this.position += 1;
+        return b;
+    }
+}
+
+/// Writes bytes to standard output and flushes it (Console.writeError flushes standard output first).
+fn writeAndFlush(bytes: Slice<u8>) {
+    Console.writeBytes(bytes);
+    Console.writeError("");
+}
+
+struct LspDocument {
+    uri: Vector<u8>;
+    compiled: Compiled;
+    file: u32; // the document's source in the compilation
+    hasIndex: bool;
+    index: SemanticIndex;
+}
+
+struct LanguageServer {
+    input: InputReader;
+    documents: Vector<LspDocument>;
+    shutdown: bool;
+}
+
+fn compiledAst(compiled: borrow Compiled) -> borrow Frontend {
+    match (borrow compiled.checker) {
+        Some(checker) => { return borrow checker.front; }
+        null => { return borrow compiled.front; }
+    }
+}
+
+fn compiledDiagnostics(compiled: borrow Compiled) -> borrow Diagnostics {
+    match (borrow compiled.checker) {
+        Some(checker) => { return borrow checker.front.diagnostics; }
+        null => { return borrow compiled.front.diagnostics; }
+    }
+}
+
+// ---- Framing ----
+
+/// One header line without its CR LF, or null at the end of the input (a partial last line is a line).
+fn readHeaderLine(server: borrow mut LanguageServer) -> Vector<u8>? {
+    var bytes = Vector<u8>.create();
+    loop {
+        match (server.input.next()) {
+            Some(b) => {
+                if (b == '\n') {
+                    if (bytes.length > 0 && bytes[bytes.length - 1] == '\r') {
+                        bytes.truncate(bytes.length - 1);
+                    }
+                    return bytes;
+                }
+                bytes.push(b)!;
+            }
+            null => {
+                if (bytes.length == 0) {
+                    return null;
+                }
+                return bytes;
+            }
+        }
+    }
+}
+
+/// The next message's body, or null at the end of the input.
+fn readMessage(server: borrow mut LanguageServer) -> Vector<u8>? {
+    var length: i64 = -1;
+    loop {
+        let line = match (readHeaderLine(server)) {
+            Some(l) => l,
+            null => { return null; }
+        };
+        if (line.length == 0) {
+            break;
+        }
+        var colon: usize = 0;
+        while (colon < line.length && line[colon] != ':') {
+            colon += 1;
+        }
+        if (colon > 0 && colon < line.length) {
+            let name = trimAscii(line[0..colon]);
+            var lower = Vector<u8>.create();
+            for (c in name) {
+                lower.push(if (c >= 'A' && c <= 'Z') c + 32 else c)!;
+            }
+            if (sameText(lower.view(), "content-length")) {
+                let value = trimAscii(line[colon + 1..]);
+                var parsed: i64 = 0;
+                for (c in value) {
+                    if (c >= '0' && c <= '9') {
+                        parsed = parsed * 10 + ((c - '0') as i64);
+                    }
+                }
+                length = parsed;
+            }
+        }
+    }
+    if (length < 0) {
+        return Vector<u8>.create();
+    }
+    var body = Vector<u8>.create();
+    while (truncate<i64>(body.length) < length) {
+        match (server.input.next()) {
+            Some(b) => { body.push(b)!; }
+            null => { return null; }
+        }
+    }
+    return body;
+}
+
+fn writeLspMessage(json: borrow JsonWriter) {
+    var message = copyBytes("Content-Length: ".bytes())!;
+    appendDecimal(mut message, json.out.length as u64)!;
+    appendText(mut message, "\r\n\r\n")!;
+    appendBytes(mut message, json.out.view())!;
+    writeAndFlush(message.view());
+}
+
+/// {"jsonrpc":"2.0","id":…,"result":…} with the result already written as JSON.
+fn respond(doc: borrow JsonDoc, id: u32, hasId: bool, result: Slice<u8>) {
+    var json = JsonWriter.createStrict();
+    json.startObject()!;
+    json.name("jsonrpc")!;
+    json.string("2.0")!;
+    json.name("id")!;
+    if (hasId) {
+        writeJsonNode(mut json, doc, id)!;
+    } else {
+        json.nothing()!;
+    }
+    json.name("result")!;
+    json.raw(result)!;
+    json.endObject()!;
+    writeLspMessage(json);
+}
+
+fn respondError(doc: borrow JsonDoc, id: u32, hasId: bool, code: i64, message: Slice<u8>) {
+    var json = JsonWriter.createStrict();
+    json.startObject()!;
+    json.name("jsonrpc")!;
+    json.string("2.0")!;
+    json.name("id")!;
+    if (hasId) {
+        writeJsonNode(mut json, doc, id)!;
+    } else {
+        json.nothing()!;
+    }
+    json.name("error")!;
+    json.startObject()!;
+    json.name("code")!;
+    json.number(code)!;
+    json.name("message")!;
+    json.stringBytes(message)!;
+    json.endObject()!;
+    json.endObject()!;
+    writeLspMessage(json);
+}
+
+// ---- Positions: LSP lines and characters are zero-based, characters in UTF-16 code units ----
+
+fn lspPosition(json: borrow mut JsonWriter, line: u32, character: u32) {
+    json.startObject()!;
+    json.name("line")!;
+    json.number(line as i64)!;
+    json.name("character")!;
+    json.number(character as i64)!;
+    json.endObject()!;
+}
+
+fn lspPositionOf(json: borrow mut JsonWriter, source: borrow SourceText, offset: u32) {
+    let at = if ((offset as usize) > source.text.length) source.text.length else offset as usize;
+    let p = source.position(at);
+    lspPosition(json, p.line - 1, p.column - 1);
+}
+
+fn lspRange(json: borrow mut JsonWriter, source: borrow SourceText, start: u32, end: u32) {
+    json.startObject()!;
+    json.name("start")!;
+    lspPositionOf(json, source, start);
+    json.name("end")!;
+    lspPositionOf(json, source, end);
+    json.endObject()!;
+}
+
+/// The byte offset of a zero-based line and character (OffsetOf): the line's start plus that many UTF-16 code units,
+/// running on past the line's end, clamped to the text.
+fn offsetOfPosition(source: borrow SourceText, line: i64, character: i64) -> u32 {
+    let text = source.text.view();
+    var start: usize = 0;
+    var l: i64 = 0;
+    while (l < line && start < text.length) {
+        var next = start;
+        while (next < text.length && text[next] != '\n') {
+            next += 1;
+        }
+        start = if (next >= text.length) text.length else next + 1;
+        l += 1;
+    }
+    var units: i64 = 0;
+    var at = start;
+    while (units < character && at < text.length) {
+        let d = decodeUtf8(text, at);
+        units += d.utf16Units() as i64;
+        at += d.length as usize;
+    }
+    return truncate<u32>(at);
+}
+
+// ---- Documents ----
+
+/// The path a document's diagnostics name: the file's path for a file URI, else the URI (Uri.LocalPath).
+fn pathOfUri(uri: Slice<u8>) -> Vector<u8> {
+    if (uri.length >= 7 && sameText(uri[0..7], "file://")) {
+        // file://host/path: the host is dropped.
+        var from: usize = 7;
+        if (uri.length > 7 && uri[7] != '/') {
+            while (from < uri.length && uri[from] != '/') {
+                from += 1;
+            }
+        }
+        let rest = uri[from..];
+        var out = Vector<u8>.create();
+        var k: usize = 0;
+        while (k < rest.length) {
+            if (rest[k] == '%' && k + 2 < rest.length && hexDigit(rest[k + 1]) < 16 && hexDigit(rest[k + 2]) < 16) {
+                out.push(truncate<u8>(hexDigit(rest[k + 1]) * 16 + hexDigit(rest[k + 2])))!;
+                k += 3;
+            } else {
+                out.push(rest[k])!;
+                k += 1;
+            }
+        }
+        return out;
+    }
+    return copyBytes(uri)!;
+}
+
+fn startsWithBytesText(text: Slice<u8>, prefix: StringView) -> bool =>
+    text.length >= prefix.bytes().length && sameBytes(text[0..prefix.bytes().length], prefix.bytes());
+
+/// A document alone (CheckAlone): freestanding if it says so on its first line.
+fn checkAlone(path: Slice<u8>, text: Slice<u8>) -> Result<Compiled, AllocError> {
+    var files = Vector<InputFile>.create();
+    files.push(InputFile { path: copyBytes(path)?, text: copyBytes(text)?, package: 0 })?;
+    let freestanding = startsWithBytesText(text, "// profile: freestanding");
+    return compileInMemory(files, alonePackages()?, freestanding, false, false);
+}
+
+/// A document that is a source of a package (CheckInPackage): checked with the package, its other files from disk and
+/// its locked dependencies, never fetching. Null when the document is not in a package that resolves.
+fn checkInPackage(path: Slice<u8>, text: Slice<u8>, file: borrow mut u32) -> Result<Compiled?, AllocError> {
+    if (path.length == 0 || path[0] != '/') {
+        return Ok(null);
+    }
+    let parent = joinPath(path, "..".bytes())?;
+    let directory = match (findManifestDirectory(parent.view())?) {
+        Some(d) => d,
+        null => { return Ok(null); }
+    };
+    var report = PackageReport.create();
+    let noUpdate = Vector<Vector<u8>>.create();
+    let workspace = match (resolveWorkspace(directory.view(), mut report, false, true, false, noUpdate)?) {
+        Some(w) => w,
+        null => { return Ok(null); }
+    };
+    let full = joinPath("/".bytes(), path)?;
+    var rootFiles = Vector<Vector<u8>>.create();
+    manifestSourceFiles(workspace.root, mut rootFiles)?;
+    var found = false;
+    for (f in rootFiles.view()) {
+        found = found || sameBytes(f.view(), full.view());
+    }
+    if (!found) {
+        return Ok(null);
+    }
+    var packages = Vector<PackageInfo>.create();
+    var files = Vector<InputFile>.create();
+    for (p in 0..workspace.resolved.length + 1) {
+        let manifest = workspace.dependentManifest(if (p == 0) none() else truncate<u32>(p - 1));
+        var dependencies = Vector<Vector<u8>>.create();
+        for (d in manifest.dependencies.view()) {
+            dependencies.push(copyBytes(d.name.view())?)?;
+        }
+        packages.push(
+            PackageInfo {
+                name: copyBytes(manifest.name.view())?,
+                dependencies: dependencies,
+                trusted: manifest.trusted,
+            },
+        )?;
+        var paths = Vector<Vector<u8>>.create();
+        manifestSourceFiles(manifest, mut paths)?;
+        for (f in paths.view()) {
+            if (sameBytes(f.view(), full.view())) {
+                file = truncate<u32>(files.length);
+                files.push(
+                    InputFile { path: copyBytes(f.view())?, text: copyBytes(text)?, package: truncate<u32>(p) },
+                )?;
+            } else {
+                let bytes = match (readFile(StringView.fromUtf8(f.view())!)) {
+                    Ok(b) => b,
+                    Err(_) => Vector<u8>.create(),
+                };
+                files.push(InputFile { path: copyBytes(f.view())?, text: bytes, package: truncate<u32>(p) })?;
+            }
+        }
+    }
+    let compiled = compileInMemory(
+        files,
+        packages,
+        workspace.root.freestanding,
+        !workspace.root.floatAllowed,
+        workspace.root.kernel,
+    )?;
+    file = file + truncate<u32>(compiled.firstUser);
+    return Ok(compiled);
+}
+
+fn writeDiagnostic(json: borrow mut JsonWriter, uri: Slice<u8>, d: borrow Diagnostic, source: borrow SourceText) {
+    json.startObject()!;
+    json.name("range")!;
+    lspRange(json, source, d.start, d.end);
+    json.name("severity")!;
+    json.number(if (d.isError) 1 else 2)!;
+    json.name("code")!;
+    var code = Vector<u8>.create();
+    appendCode(mut code, d.code)!;
+    json.stringBytes(code.view())!;
+    json.name("source")!;
+    json.string("ceesafec")!;
+    json.name("message")!;
+    json.stringBytes(d.message.view())!;
+    if (d.notes.length > 0) {
+        json.name("relatedInformation")!;
+        json.startArray()!;
+        for (note in d.notes.view()) {
+            json.startObject()!;
+            json.name("location")!;
+            json.startObject()!;
+            json.name("uri")!;
+            json.stringBytes(uri)!;
+            json.name("range")!;
+            lspRange(json, source, note.start, note.end);
+            json.endObject()!;
+            json.name("message")!;
+            json.stringBytes(note.message.view())!;
+            json.endObject()!;
+        }
+        json.endArray()!;
+    }
+    json.endObject()!;
+}
+
+/// Re-checks a document (§2.1) and publishes its diagnostics.
+fn updateDocument(server: borrow mut LanguageServer, uri: Slice<u8>, text: Slice<u8>) {
+    let path = pathOfUri(uri);
+    var file: u32 = 0;
+    let inPackage = checkInPackage(path.view(), text, mut file)!;
+    let alone = inPackage == null;
+    let compiled = match (inPackage) {
+        Some(c) => c,
+        null => checkAlone(path.view(), text)!,
+    };
+    if (alone) {
+        file = truncate<u32>(compiled.firstUser);
+    }
+    var hasIndex = false;
+    var index = SemanticIndex { file: file, entries: Vector<SemanticEntry>.create() };
+    match (borrow compiled.checker) {
+        Some(checker) => {
+            // A document that does not parse has no typed tree; hover and definition then answer null (§2.2).
+            index = buildSemanticIndex(checker, compiled.sources, file)!;
+            hasIndex = true;
+        }
+        null => {}
+    }
+    let document = LspDocument {
+        uri: copyBytes(uri)!,
+        compiled: compiled,
+        file: file,
+        hasIndex: hasIndex,
+        index: index,
+    };
+    var k: usize = 0;
+    while (k < server.documents.length && !sameBytes(server.documents[k].uri.view(), uri)) {
+        k += 1;
+    }
+    if (k < server.documents.length) {
+        server.documents[k] = document;
+    } else {
+        server.documents.push(document)!;
+    }
+    publishOf(server, k, uri);
+}
+
+/// Publishes the diagnostics of document `k` in its file; none when there is no such document (didClose).
+fn publishOf(server: borrow LanguageServer, k: usize, uri: Slice<u8>) {
+    var json = JsonWriter.createStrict();
+    json.startObject()!;
+    json.name("jsonrpc")!;
+    json.string("2.0")!;
+    json.name("method")!;
+    json.string("textDocument/publishDiagnostics")!;
+    json.name("params")!;
+    json.startObject()!;
+    json.name("uri")!;
+    json.stringBytes(uri)!;
+    json.name("diagnostics")!;
+    json.startArray()!;
+    if (k < server.documents.length) {
+        let d = borrow server.documents[k];
+        let diagnostics = compiledDiagnostics(d.compiled);
+        for (item in diagnostics.items.view()) {
+            if (item.file == d.file) {
+                writeDiagnostic(mut json, uri, item, d.compiled.sources[d.file as usize]);
+            }
+        }
+    }
+    json.endArray()!;
+    json.endObject()!;
+    json.endObject()!;
+    writeLspMessage(json);
+}
+
+fn findDocument(server: borrow LanguageServer, uri: Slice<u8>) -> usize? {
+    for (k in 0..server.documents.length) {
+        if (sameBytes(server.documents[k].uri.view(), uri)) {
+            return k;
+        }
+    }
+    return null;
+}
+
+// ---- Requests ----
+
+/// An answer: the result as JSON, an error, or nothing for a notification.
+struct LspAnswer {
+    known: bool;
+    failed: bool; // an internal error (the reference's exception)
+    message: Vector<u8>;
+    result: Vector<u8>;
+}
+
+fn answer(result: StringView) -> LspAnswer =>
+    LspAnswer { known: true, failed: false, message: Vector<u8>.create(), result: copyBytes(result.bytes())! };
+
+fn answerJson(json: JsonWriter) -> LspAnswer =>
+    LspAnswer { known: true, failed: false, message: Vector<u8>.create(), result: json.out };
+
+/// What .NET says when a member the request needs is missing (a NullReferenceException's message).
+fn missingMember() -> LspAnswer => LspAnswer {
+    known: true,
+    failed: true,
+    message: copyBytes("Object reference not set to an instance of an object.".bytes())!,
+    result: Vector<u8>.create(),
+};
+
+fn documentUri(doc: borrow JsonDoc, parameters: u32) -> Vector<u8>? =>
+    doc.stringOf(doc.member(doc.member(parameters, "textDocument"), "uri"));
+
+fn handleLsp(server: borrow mut LanguageServer, doc: borrow JsonDoc, method: Slice<u8>, parameters: u32) -> LspAnswer {
+    if (sameText(method, "initialize")) {
+        var json = JsonWriter.createStrict();
+        json.startObject()!;
+        json.name("capabilities")!;
+        json.startObject()!;
+        json.name("textDocumentSync")!;
+        json.number(1)!; // full text on every change
+        json.name("hoverProvider")!;
+        json.boolean(true)!;
+        json.name("definitionProvider")!;
+        json.boolean(true)!;
+        json.name("documentSymbolProvider")!;
+        json.boolean(true)!;
+        json.name("documentFormattingProvider")!;
+        json.boolean(true)!;
+        json.name("codeActionProvider")!;
+        json.startObject()!;
+        json.name("codeActionKinds")!;
+        json.startArray()!;
+        json.string("quickfix")!;
+        json.endArray()!;
+        json.endObject()!;
+        json.endObject()!;
+        json.name("serverInfo")!;
+        json.startObject()!;
+        json.name("name")!;
+        json.string("ceesafec")!;
+        json.name("version")!;
+        json.string(ceesafeVersion())!;
+        json.endObject()!;
+        json.endObject()!;
+        return answerJson(json);
+    }
+    if (sameText(method, "initialized") || sameText(method, "$/cancelRequest") || sameText(method, "$/setTrace") ||
+        sameText(method, "workspace/didChangeConfiguration")) {
+        return answer("null");
+    }
+    if (sameText(method, "shutdown")) {
+        server.shutdown = true;
+        return answer("null");
+    }
+    if (sameText(method, "textDocument/didOpen")) {
+        let item = doc.member(parameters, "textDocument");
+        let uri = match (doc.stringOf(doc.member(item, "uri"))) {
+            Some(u) => u,
+            null => { return missingMember(); }
+        };
+        let text = match (doc.stringOf(doc.member(item, "text"))) {
+            Some(t) => t,
+            null => { return missingMember(); }
+        };
+        updateDocument(server, uri.view(), text.view());
+        return answer("null");
+    }
+    if (sameText(method, "textDocument/didChange")) {
+        let changes = doc.member(parameters, "contentChanges");
+        if (doc.kind(changes) != jsonArray()) {
+            return missingMember();
+        }
+        let count = doc.childCount(changes);
+        if (count > 0) {
+            let uri = match (documentUri(doc, parameters)) {
+                Some(u) => u,
+                null => { return missingMember(); }
+            };
+            let text = match (doc.stringOf(doc.member(doc.child(changes, count - 1), "text"))) {
+                Some(t) => t,
+                null => { return missingMember(); }
+            };
+            updateDocument(server, uri.view(), text.view());
+        }
+        return answer("null");
+    }
+    if (sameText(method, "textDocument/didClose")) {
+        let uri = match (documentUri(doc, parameters)) {
+            Some(u) => u,
+            null => { return missingMember(); }
+        };
+        match (findDocument(server, uri.view())) {
+            Some(k) => {
+                for (m in k..server.documents.length - 1) {
+                    server.documents.swap(m, m + 1);
+                }
+                server.documents.truncate(server.documents.length - 1);
+            }
+            null => {}
+        }
+        publishOf(server, server.documents.length, uri.view());
+        return answer("null");
+    }
+    if (sameText(method, "textDocument/hover") || sameText(method, "textDocument/definition")) {
+        let uri = match (documentUri(doc, parameters)) {
+            Some(u) => u,
+            null => { return missingMember(); }
+        };
+        let k = match (findDocument(server, uri.view())) {
+            Some(k) => k,
+            null => { return answer("null"); }
+        };
+        let document = borrow server.documents[k];
+        if (!document.hasIndex) {
+            return answer("null");
+        }
+        let position = doc.member(parameters, "position");
+        let line = doc.integerOf(doc.member(position, "line"));
+        let character = doc.integerOf(doc.member(position, "character"));
+        if (line == null || character == null) {
+            return missingMember();
+        }
+        let source = borrow document.compiled.sources[document.file as usize];
+        let offset = offsetOfPosition(source, line!, character!);
+        let found = match (semanticAt(document.index, offset)) {
+            Some(e) => e,
+            null => { return answer("null"); }
+        };
+        let entry = borrow document.index.entries[found];
+        var json = JsonWriter.createStrict();
+        if (sameText(method, "textDocument/hover")) {
+            json.startObject()!;
+            json.name("contents")!;
+            json.startObject()!;
+            json.name("kind")!;
+            json.string("markdown")!;
+            json.name("value")!;
+            json.stringBytes(entry.hover.view())!;
+            json.endObject()!;
+            json.endObject()!;
+            return answerJson(json);
+        }
+        if (!entry.hasDefinition) {
+            return answer("null");
+        }
+        json.startObject()!;
+        json.name("uri")!;
+        json.stringBytes(document.uri.view())!;
+        json.name("range")!;
+        lspRange(mut json, source, entry.definitionStart, entry.definitionEnd);
+        json.endObject()!;
+        return answerJson(json);
+    }
+    if (sameText(method, "textDocument/documentSymbol")) {
+        let uri = match (documentUri(doc, parameters)) {
+            Some(u) => u,
+            null => { return missingMember(); }
+        };
+        return match (findDocument(server, uri.view())) {
+            Some(k) => answerJson(documentSymbols(server.documents[k])),
+            null => answer("[]"),
+        };
+    }
+    if (sameText(method, "textDocument/codeAction")) {
+        let uri = match (documentUri(doc, parameters)) {
+            Some(u) => u,
+            null => { return missingMember(); }
+        };
+        return match (findDocument(server, uri.view())) {
+            Some(k) => codeActions(server.documents[k], doc, parameters),
+            null => answer("[]"),
+        };
+    }
+    if (sameText(method, "textDocument/formatting")) {
+        let uri = match (documentUri(doc, parameters)) {
+            Some(u) => u,
+            null => { return missingMember(); }
+        };
+        let k = match (findDocument(server, uri.view())) {
+            Some(k) => k,
+            null => { return answer("[]"); }
+        };
+        let document = borrow server.documents[k];
+        let source = borrow document.compiled.sources[document.file as usize];
+        var ignored = Diagnostics.create();
+        let formatted = formatSource(source, 0, mut ignored)!;
+        let text = match (formatted.text) {
+            Some(t) => t,
+            null => { return answer("[]"); }
+        };
+        if (sameBytes(text.view(), source.text.view())) {
+            return answer("[]");
+        }
+        var json = JsonWriter.createStrict();
+        json.startArray()!;
+        json.startObject()!;
+        json.name("range")!;
+        json.startObject()!;
+        json.name("start")!;
+        lspPosition(mut json, 0, 0);
+        json.name("end")!;
+        lspPositionOf(mut json, source, truncate<u32>(source.text.length));
+        json.endObject()!;
+        json.name("newText")!;
+        json.stringBytes(text.view())!;
+        json.endObject()!;
+        json.endArray()!;
+        return answerJson(json);
+    }
+    return LspAnswer { known: false, failed: false, message: Vector<u8>.create(), result: Vector<u8>.create() };
+}
+
+/// The fixes of the document's diagnostics that touch the requested range, as quickfix actions (§5.5).
+fn codeActions(document: borrow LspDocument, doc: borrow JsonDoc, parameters: u32) -> LspAnswer {
+    let range = doc.member(parameters, "range");
+    let startLine = doc.integerOf(doc.member(doc.member(range, "start"), "line"));
+    let startCharacter = doc.integerOf(doc.member(doc.member(range, "start"), "character"));
+    let endLine = doc.integerOf(doc.member(doc.member(range, "end"), "line"));
+    let endCharacter = doc.integerOf(doc.member(doc.member(range, "end"), "character"));
+    if (startLine == null || startCharacter == null || endLine == null || endCharacter == null) {
+        return missingMember();
+    }
+    let source = borrow document.compiled.sources[document.file as usize];
+    let start = offsetOfPosition(source, startLine!, startCharacter!);
+    let end = offsetOfPosition(source, endLine!, endCharacter!);
+    var json = JsonWriter.createStrict();
+    json.startArray()!;
+    let diagnostics = compiledDiagnostics(document.compiled);
+    for (d in diagnostics.items.view()) {
+        if (d.file != document.file || d.start > end || d.end < start || !d.hasFix) {
+            continue;
+        }
+        json.startObject()!;
+        json.name("title")!;
+        json.stringBytes(d.fixTitle.view())!;
+        json.name("kind")!;
+        json.string("quickfix")!;
+        json.name("diagnostics")!;
+        json.startArray()!;
+        writeDiagnostic(mut json, document.uri.view(), d, source);
+        json.endArray()!;
+        json.name("isPreferred")!;
+        json.boolean(true)!;
+        json.name("edit")!;
+        json.startObject()!;
+        json.name("changes")!;
+        json.startObject()!;
+        json.nameBytes(document.uri.view())!;
+        json.startArray()!;
+        json.startObject()!;
+        json.name("range")!;
+        lspRange(mut json, source, d.fixStart, d.fixEnd);
+        json.name("newText")!;
+        json.stringBytes(d.fixText.view())!;
+        json.endObject()!;
+        if (d.hasSecondEdit) {
+            json.startObject()!;
+            json.name("range")!;
+            lspRange(mut json, source, d.secondStart, d.secondEnd);
+            json.name("newText")!;
+            json.stringBytes(d.secondText.view())!;
+            json.endObject()!;
+        }
+        json.endArray()!;
+        json.endObject()!;
+        json.endObject()!;
+        json.endObject()!;
+    }
+    json.endArray()!;
+    return answerJson(json);
+}
+
+/// One document symbol; `children` starts the list of its children, which the caller closes.
+fn startSymbol(
+    json: borrow mut JsonWriter,
+    c: borrow Frontend,
+    source: borrow SourceText,
+    name: u32,
+    kind: i64,
+    start: u32,
+    end: u32,
+) {
+    let ident = c.ast.idents[name as usize];
+    json.startObject()!;
+    json.name("name")!;
+    json.stringBytes(c.symbols.name(Symbol { id: ident.symbol }))!;
+    json.name("kind")!;
+    json.number(kind)!;
+    json.name("range")!;
+    lspRange(json, source, start, end);
+    json.name("selectionRange")!;
+    lspRange(json, source, ident.start, ident.end);
+}
+
+fn leafSymbol(
+    json: borrow mut JsonWriter,
+    c: borrow Frontend,
+    source: borrow SourceText,
+    name: u32,
+    kind: i64,
+    start: u32,
+    end: u32,
+) {
+    startSymbol(json, c, source, name, kind, start, end);
+    json.endObject()!;
+}
+
+/// The document's symbols (Symbols): LSP SymbolKind Method 6, Field 8, Enum 10, Interface 11, Function 12, Variable 13,
+/// Constant 14, EnumMember 22, Struct 23.
+fn documentSymbols(document: borrow LspDocument) -> JsonWriter {
+    var json = JsonWriter.createStrict();
+    json.startArray()!;
+    let front = compiledAst(document.compiled);
+    let source = borrow document.compiled.sources[document.file as usize];
+    let ast = borrow front.ast;
+    for (u in ast.units.view()) {
+        if (u.file != document.file) {
+            continue;
+        }
+        for (k in 0..u.items.count) {
+            let item = borrow ast.items[ast.at(u.items, k) as usize];
+            match (item.kind) {
+                ItemKind.Function(f) => {
+                    let function = borrow ast.functions[f as usize];
+                    leafSymbol(mut json, front, source, function.name, 12, function.start, function.end);
+                }
+                ItemKind.Struct(s) => {
+                    startSymbol(mut json, front, source, item.name, 23, item.start, item.end);
+                    json.name("children")!;
+                    json.startArray()!;
+                    let structure = borrow ast.structs[s as usize];
+                    // Fields and methods in source order.
+                    var f: u32 = 0;
+                    var m: u32 = 0;
+                    while (f < structure.fields.count || m < structure.functions.count) {
+                        let fieldNext = m >= structure.functions.count || (f < structure.fields.count &&
+                            ast.fields[ast.at(
+                                structure.fields,
+                                f,
+                            ) as usize].start <= ast.functions[ast.at(structure.functions, m) as usize].start);
+                        if (fieldNext) {
+                            let field = borrow ast.fields[ast.at(structure.fields, f) as usize];
+                            leafSymbol(mut json, front, source, field.name, 8, field.start, field.end);
+                            f += 1;
+                        } else {
+                            let method = borrow ast.functions[ast.at(structure.functions, m) as usize];
+                            leafSymbol(mut json, front, source, method.name, 6, method.start, method.end);
+                            m += 1;
+                        }
+                    }
+                    json.endArray()!;
+                    json.endObject()!;
+                }
+                ItemKind.Enum(variants, _, _) => {
+                    startSymbol(mut json, front, source, item.name, 10, item.start, item.end);
+                    json.name("children")!;
+                    json.startArray()!;
+                    for (v in 0..variants.count) {
+                        let variant = borrow ast.variants[ast.at(variants, v) as usize];
+                        leafSymbol(mut json, front, source, variant.name, 22, variant.start, variant.end);
+                    }
+                    json.endArray()!;
+                    json.endObject()!;
+                }
+                ItemKind.Interface(methods, _) => {
+                    startSymbol(mut json, front, source, item.name, 11, item.start, item.end);
+                    json.name("children")!;
+                    json.startArray()!;
+                    for (v in 0..methods.count) {
+                        let method = borrow ast.functions[ast.at(methods, v) as usize];
+                        leafSymbol(mut json, front, source, method.name, 6, method.start, method.end);
+                    }
+                    json.endArray()!;
+                    json.endObject()!;
+                }
+                ItemKind.Const(_, _) => { leafSymbol(mut json, front, source, item.name, 14, item.start, item.end); }
+                ItemKind.Static(_, _, _) => {
+                    leafSymbol(mut json, front, source, item.name, 13, item.start, item.end);
+                }
+                _ => {}
+            }
+        }
+    }
+    json.endArray()!;
+    return json;
+}
+
+/// Serves until `exit` or the end of the input; the process's exit code: 0 after `shutdown` (LanguageServer.Run).
+fn lspCommand() -> i32 {
+    var server = LanguageServer {
+        input: InputReader.create(),
+        documents: Vector<LspDocument>.create(),
+        shutdown: false,
+    };
+    let empty = JsonDoc { nodes: Vector<JsonNodeData>.create() };
+    loop {
+        let body = match (readMessage(mut server)) {
+            Some(b) => b,
+            null => { break; }
+        };
+        let doc = match (parseJson(body.view())) {
+            Some(d) => d,
+            null => {
+                respondError(empty, none(), false, lspParseError(), "the message is not JSON".bytes());
+                continue;
+            }
+        };
+        if (doc.kind(0) != jsonObject()) {
+            continue;
+        }
+        let method = match (doc.stringOf(doc.member(0, "method"))) {
+            Some(m) => m,
+            null => { continue; } // a response to a request of ours: the server sends none
+        };
+        let id = doc.member(0, "id");
+        let hasId = id != none() && doc.kind(id) != jsonNull();
+        if (sameText(method.view(), "exit")) {
+            return if (server.shutdown) 0 else 1;
+        }
+        let parameters = doc.member(0, "params");
+        let result = handleLsp(
+            mut server,
+            doc,
+            method.view(),
+            if (doc.kind(parameters) == jsonObject()) parameters else none(),
+        );
+        if (!hasId) {
+            continue;
+        }
+        if (result.failed) {
+            respondError(doc, id, true, lspInternalError(), result.message.view());
+        } else if (!result.known) {
+            var message = copyBytes("'".bytes())!;
+            appendBytes(mut message, method.view())!;
+            appendText(mut message, "' is not supported")!;
+            respondError(doc, id, true, lspMethodNotFound(), message.view());
+        } else {
+            respond(doc, id, true, result.result.view());
+        }
+    }
+    return if (server.shutdown) 0 else 1;
+}

@@ -127,9 +127,9 @@ fn containsSlice(text: Slice<u8>, part: Slice<u8>) -> bool {
     return false;
 }
 
-/// Appends to `out`, each after an empty line, the paragraphs of docs/diagnostics.md (split at "\n\n") that mention
-/// `code` and are neither table rows nor headings (DiagnosticCatalog.Paragraphs).
-fn appendParagraphs(out: borrow mut Vector<u8>, code: Slice<u8>) -> Result<void, AllocError> {
+/// The paragraphs of docs/diagnostics.md (split at "\n\n") that mention `code` and are neither table rows nor headings,
+/// trimmed (DiagnosticCatalog.Paragraphs).
+fn paragraphsOf(code: Slice<u8>, out: borrow mut Vector<Vector<u8>>) -> Result<void, AllocError> {
     var text = Vector<u8>.create();
     match (documentIndex("docs/diagnostics.md".bytes())) {
         Some(k) => { appendDocumentText(mut text, k)?; }
@@ -148,10 +148,20 @@ fn appendParagraphs(out: borrow mut Vector<u8>, code: Slice<u8>) -> Result<void,
         start = end + 2;
         let lead = trimmedStart(paragraph);
         if (containsSlice(paragraph, code) && !(lead.length > 0 && (lead[0] == '|' || lead[0] == '#'))) {
-            out.push('\n')?;
-            appendBytes(out, trimmed(paragraph))?;
-            out.push('\n')?;
+            out.push(copyBytes(trimmed(paragraph))?)?;
         }
+    }
+    return Ok();
+}
+
+/// Appends each of the code's paragraphs to `out` after an empty line.
+fn appendParagraphs(out: borrow mut Vector<u8>, code: Slice<u8>) -> Result<void, AllocError> {
+    var paragraphs = Vector<Vector<u8>>.create();
+    paragraphsOf(code, mut paragraphs)?;
+    for (p in paragraphs.view()) {
+        out.push('\n')?;
+        appendBytes(out, p.view())?;
+        out.push('\n')?;
     }
     return Ok();
 }

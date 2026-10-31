@@ -4,6 +4,9 @@
 /// The compiler named in the generated C's banners.
 fn compilerBanner() -> StringView => "ceesafec 0.0.0-dev";
 
+/// The version the servers report (NovaVersion.Text).
+fn ceesafeVersion() -> StringView => "0.0.0-dev";
+
 fn isLibraryFunction(c: borrow Checker, function: u32) -> bool => c.hir.functions[function as usize].library;
 
 /// A (function, variant) pair as one key: the HIR function above, its variant (optimisations.md §5) below.

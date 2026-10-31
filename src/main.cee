@@ -819,6 +819,9 @@ fn interpretChecked(
         memoryLimit: 0,
         sandboxed: false,
         workingDirectory: Vector<u8>.create(),
+        capture: false,
+        outputLimit: 0,
+        input: Vector<u8>.create(),
     };
     return interpretProgram(checker, nir, sources, interpreterOptions)!;
 }
@@ -1240,6 +1243,12 @@ fn main() -> i32 {
             return status;
         }
         return docCommand(arguments, json);
+    }
+    if (command == "lsp") {
+        return lspCommand();
+    }
+    if (command == "mcp") {
+        return mcpCommand();
     }
     if (command == "explain") {
         var arguments = Vector<Vector<u8>>.create();

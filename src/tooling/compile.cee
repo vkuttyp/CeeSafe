@@ -1,0 +1,129 @@
+// Compiling in memory for the servers (the reference's Compilation.Create as LanguageServer and McpServer call it):
+// the libraries, then the given files, parsed, and checked if they parse; nothing is printed.
+
+/// What a compilation leaves: every source (the libraries first), and either the parse (with its errors) or the
+/// checker, with the NIR when checking found no error.
+struct Compiled {
+    sources: Vector<SourceText>;
+    fileIsLibrary: Vector<bool>;
+    firstUser: usize; // the first source that is not a library's
+    checked: bool;
+    front: Frontend;   // the parse, when it failed
+    checker: Checker?; // when it parsed
+    analyzed: bool;    // the NIR was made (no error after checking)
+    nir: NirProgram;
+}
+
+/// The files of one package: paths as diagnostics name them, and their texts.
+struct InputFile {
+    path: Vector<u8>;
+    text: Vector<u8>;
+    package: u32;
+}
+
+fn compileInMemory(
+    files: borrow Vector<InputFile>,
+    packages: Vector<PackageInfo>,
+    freestanding: bool,
+    noFloat: bool,
+    kernel: bool,
+) -> Result<Compiled, AllocError> {
+    var sources = Vector<SourceText>.create();
+    var fileIsLibrary = Vector<bool>.create();
+    var filePackage = Vector<u32>.create();
+    for (k in 0..libraryFileCount()) {
+        let group = libraryGroup(k);
+        if (group == 0 || (group == 1 && !freestanding) || (group == 2 && freestanding && kernel)) {
+            let text = libraryText(k)?;
+            sources.push(SourceText.create(libraryPath(k).bytes(), text.view())?)?;
+            fileIsLibrary.push(true)?;
+            filePackage.push(0xFFFFFFFF)?;
+        }
+    }
+    let firstUser = sources.length;
+    for (f in files.view()) {
+        sources.push(SourceText.create(f.path.view(), f.text.view())?)?;
+        fileIsLibrary.push(false)?;
+        filePackage.push(f.package)?;
+    }
+    var front = Frontend.create();
+    for (i in 0..sources.length) {
+        let source = borrow sources[i];
+        let file = truncate<u32>(i);
+        let lexed = lex(source.text.view(), file, mut front.symbols, mut front.diagnostics)?;
+        let marks = astMarks(front);
+        front = parseFile(file, lexed, front)?;
+        if (!fileIsLibrary[i] && !front.diagnostics.hasErrors()) {
+            let unit = truncate<u32>(front.ast.units.length - 1);
+            rewritePackageNames(mut front, unit, packages[filePackage[i] as usize].dependencies, marks)?;
+        }
+    }
+    if (front.diagnostics.hasErrors()) {
+        return Ok(
+            Compiled {
+                sources: sources,
+                fileIsLibrary: fileIsLibrary,
+                firstUser: firstUser,
+                checked: false,
+                front: front,
+                checker: null,
+                analyzed: false,
+                nir: NirProgram.create(),
+            },
+        );
+    }
+    var texts = Vector<Vector<u8>>.create();
+    var paths = Vector<Vector<u8>>.create();
+    for (s in sources.view()) {
+        texts.push(copyBytes(s.text.view())?)?;
+        paths.push(copyBytes(s.path.view())?)?;
+    }
+    var libraries = Vector<bool>.create();
+    for (b in fileIsLibrary.view()) {
+        libraries.push(b)?;
+    }
+    var checker = checkProgram(front, libraries, texts, paths, noFloat, freestanding, packages, filePackage)?;
+    checker.front.diagnostics.removeFiles(checker.fileIsLibrary.view());
+    var nir = NirProgram.create();
+    var analyzed = false;
+    if (!checker.front.diagnostics.hasErrors()) {
+        nir = analyzeProgram(mut checker)?;
+        analyzed = !checker.front.diagnostics.hasErrors();
+    }
+    return Ok(
+        Compiled {
+            sources: sources,
+            fileIsLibrary: fileIsLibrary,
+            firstUser: firstUser,
+            checked: true,
+            front: Frontend.create(),
+            checker: checker,
+            analyzed: analyzed,
+            nir: nir,
+        },
+    );
+}
+
+/// The files as one package of their own (the servers' single-package compilations).
+fn alonePackages() -> Result<Vector<PackageInfo>, AllocError> {
+    var packages = Vector<PackageInfo>.create();
+    packages.push(
+        PackageInfo { name: Vector<u8>.create(), dependencies: Vector<Vector<u8>>.create(), trusted: false },
+    )?;
+    return Ok(packages);
+}
+
+/// The compilation's diagnostics, as text-free JSON (DiagnosticJson.Serialize).
+fn compiledDiagnosticsJson(compiled: borrow Compiled) -> Result<Vector<u8>, AllocError> {
+    match (borrow compiled.checker) {
+        Some(checker) => { return diagnosticsJson(checker.front.diagnostics, compiled.sources); }
+        null => { return diagnosticsJson(compiled.front.diagnostics, compiled.sources); }
+    }
+}
+
+fn compiledHasErrors(compiled: borrow Compiled) -> bool {
+    match (borrow compiled.checker) {
+        Some(checker) => { return checker.front.diagnostics.hasErrors(); }
+        null => { return compiled.front.diagnostics.hasErrors(); }
+    }
+}

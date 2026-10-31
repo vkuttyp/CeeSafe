@@ -1,0 +1,619 @@
+// Hover and definition for one checked document (the reference's Tooling/SemanticIndex.cs; tooling.md §2.2): every
+// declaration, use and expression of the document as an entry with its span, the Markdown a hover shows, and where
+// it is declared. The reference walks the HIR by reflection, through each record's properties in declaration order;
+// this walk visits the same children in the same order (a place's projections and a closure's captures are not
+// visited, a static's address leads to its initialiser).
+
+struct SemanticEntry {
+    start: u32;
+    end: u32;
+    units: u32; // the span's length in UTF-16 code units, which the reference orders by
+    hover: Vector<u8>;
+    hasDefinition: bool;
+    definitionStart: u32;
+    definitionEnd: u32;
+}
+
+struct SemanticIndex {
+    file: u32;
+    entries: Vector<SemanticEntry>;
+}
+
+/// Whitespace runs as one space, then trimmed (the reference's Spaces regex and Trim).
+fn oneLine(text: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    var space = false;
+    for (b in text) {
+        if (b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == 0x0B || b == 0x0C) {
+            space = true;
+        } else {
+            if (space && out.length > 0) {
+                out.push(' ')?;
+            }
+            space = false;
+            out.push(b)?;
+        }
+    }
+    return Ok(out);
+}
+
+fn trimEndAny(text: borrow mut Vector<u8>, chars: StringView) {
+    loop {
+        if (text.length == 0) {
+            return;
+        }
+        var found = false;
+        for (c in chars.bytes()) {
+            found = found || text[text.length - 1] == c;
+        }
+        if (!found) {
+            return;
+        }
+        text.truncate(text.length - 1);
+    }
+}
+
+fn codeBlock(text: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var out = copyBytes("```nova\n".bytes())?;
+    appendBytes(mut out, text)?;
+    appendText(mut out, "\n```")?;
+    return Ok(out);
+}
+
+fn addEntry(
+    index: borrow mut SemanticIndex,
+    source: borrow SourceText,
+    start: u32,
+    end: u32,
+    hover: Vector<u8>,
+    hasDefinition: bool,
+    definitionStart: u32,
+    definitionEnd: u32,
+) -> Result<void, AllocError> {
+    let units = if (end >= start && (end as usize) <= source.text.length) source.utf16Length(
+        start as usize,
+        end as usize,
+    ) else end - start;
+    index.entries.push(
+        SemanticEntry {
+            start: start,
+            end: end,
+            units: units,
+            hover: hover,
+            hasDefinition: hasDefinition,
+            definitionStart: definitionStart,
+            definitionEnd: definitionEnd,
+        },
+    )?;
+    return Ok();
+}
+
+/// A declaration's text on one line without its ';' (Signature).
+fn signatureOf(source: borrow SourceText, start: u32, end: u32) -> Result<Vector<u8>, AllocError> {
+    var text = oneLine(source.text[start as usize..end as usize])?;
+    trimEndAny(mut text, ";");
+    return Ok(text);
+}
+
+/// A function's declaration up to its body, on one line (FunctionSignature).
+fn functionSignatureOf(
+    c: borrow Checker,
+    sources: borrow Vector<SourceText>,
+    file: u32,
+    syntax: u32,
+) -> Result<Vector<u8>, AllocError> {
+    let f = borrow c.front.ast.functions[syntax as usize];
+    var end = f.end;
+    if (f.body != none()) {
+        end = c.front.ast.stmtSpans[f.body as usize].start;
+    } else if (f.expressionBody != none()) {
+        end = c.front.ast.exprSpans[f.expressionBody as usize].start;
+    }
+    var text = oneLine(sources[file as usize].text[f.start as usize..end as usize])?;
+    trimEndAny(mut text, "; ");
+    if (f.expressionBody != none()) {
+        trimEndAny(mut text, "=> ");
+    }
+    return Ok(text);
+}
+
+fn typeText(c: borrow Checker, t: u32) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    c.types.appendName(mut out, t)?;
+    return Ok(out);
+}
+
+fn localInfo(c: borrow Checker, local: u32) -> Result<Vector<u8>, AllocError> {
+    let l = borrow c.hir.locals[local as usize];
+    var text = copyBytes(if (l.mutable) "var ".bytes() else "let ".bytes())?;
+    appendBytes(mut text, c.name(l.name))?;
+    appendText(mut text, ": ")?;
+    c.types.appendName(mut text, l.typ)?;
+    return codeBlock(text.view());
+}
+
+fn semanticIdentName(c: borrow Checker, ident: u32) -> Slice<u8> =>
+    c.front.symbols.name(Symbol { id: c.front.ast.idents[ident as usize].symbol });
+
+fn addFunctionName(
+    index: borrow mut SemanticIndex,
+    c: borrow Checker,
+    sources: borrow Vector<SourceText>,
+    syntax: u32,
+) -> Result<void, AllocError> {
+    let name = c.front.ast.functions[syntax as usize].name;
+    let ident = c.front.ast.idents[name as usize];
+    let signature = functionSignatureOf(c, sources, index.file, syntax)?;
+    let indexFile = index.file;
+    return addEntry(
+        index,
+        sources[indexFile as usize],
+        ident.start,
+        ident.end,
+        codeBlock(signature.view())?,
+        true,
+        ident.start,
+        ident.end,
+    );
+}
+
+fn addDeclared(
+    index: borrow mut SemanticIndex,
+    c: borrow Checker,
+    source: borrow SourceText,
+    kind: StringView,
+    name: u32,
+) -> Result<void, AllocError> {
+    let ident = c.front.ast.idents[name as usize];
+    var text = copyBytes(kind.bytes())?;
+    text.push(' ')?;
+    appendBytes(mut text, semanticIdentName(c, name))?;
+    return addEntry(index, source, ident.start, ident.end, codeBlock(text.view())?, true, ident.start, ident.end);
+}
+
+/// Declarations, from the syntax (IndexSyntax).
+fn indexSyntax(
+    index: borrow mut SemanticIndex,
+    c: borrow Checker,
+    sources: borrow Vector<SourceText>,
+    unit: borrow Unit,
+) -> Result<void, AllocError> {
+    let source = borrow sources[index.file as usize];
+    let ast = borrow c.front.ast;
+    for (k in 0..unit.items.count) {
+        let id = ast.at(unit.items, k);
+        let item = borrow ast.items[id as usize];
+        match (item.kind) {
+            ItemKind.Function(f) => { addFunctionName(index, c, sources, f)?; }
+            ItemKind.Struct(s) => {
+                addDeclared(index, c, source, "struct", item.name)?;
+                let structure = borrow ast.structs[s as usize];
+                for (m in 0..structure.fields.count) {
+                    let field = borrow ast.fields[ast.at(structure.fields, m) as usize];
+                    let ident = ast.idents[field.name as usize];
+                    let text = signatureOf(source, field.start, field.end)?;
+                    addEntry(
+                        index,
+                        source,
+                        ident.start,
+                        ident.end,
+                        codeBlock(text.view())?,
+                        true,
+                        ident.start,
+                        ident.end,
+                    )?;
+                }
+                for (m in 0..structure.functions.count) {
+                    addFunctionName(index, c, sources, ast.at(structure.functions, m))?;
+                }
+            }
+            ItemKind.Enum(variants, _, _) => {
+                addDeclared(index, c, source, "enum", item.name)?;
+                for (m in 0..variants.count) {
+                    let variant = borrow ast.variants[ast.at(variants, m) as usize];
+                    let ident = ast.idents[variant.name as usize];
+                    let text = signatureOf(source, variant.start, variant.end)?;
+                    addEntry(
+                        index,
+                        source,
+                        ident.start,
+                        ident.end,
+                        codeBlock(text.view())?,
+                        true,
+                        ident.start,
+                        ident.end,
+                    )?;
+                }
+            }
+            ItemKind.Interface(_, _) => { addDeclared(index, c, source, "interface", item.name)?; }
+            ItemKind.Impl(_, _, functions) => {
+                for (m in 0..functions.count) {
+                    addFunctionName(index, c, sources, ast.at(functions, m))?;
+                }
+            }
+            ItemKind.Const(_, _) => {
+                let ident = ast.idents[item.name as usize];
+                let text = signatureOf(source, item.start, item.end)?;
+                addEntry(index, source, ident.start, ident.end, codeBlock(text.view())?, true, ident.start, ident.end)?;
+            }
+            ItemKind.Static(_, _, _) => {
+                let ident = ast.idents[item.name as usize];
+                let text = signatureOf(source, item.start, item.end)?;
+                addEntry(index, source, ident.start, ident.end, codeBlock(text.view())?, true, ident.start, ident.end)?;
+            }
+            _ => {}
+        }
+    }
+    // Type names in signatures and bodies: a struct, enum or interface of the document (the first of a name).
+    var declaredNames = Vector<Vector<u8>>.create();
+    var declaredItems = Vector<u32>.create();
+    for (k in 0..unit.items.count) {
+        let id = ast.at(unit.items, k);
+        let isType = match (ast.items[id as usize].kind) {
+            ItemKind.Struct(_) => true,
+            ItemKind.Enum(_, _, _) => true,
+            ItemKind.Interface(_, _) => true,
+            _ => false,
+        };
+        if (!isType) {
+            continue;
+        }
+        let name = semanticIdentName(c, ast.items[id as usize].name);
+        var known = false;
+        for (d in declaredNames.view()) {
+            known = known || sameBytes(d.view(), name);
+        }
+        if (!known) {
+            declaredNames.push(copyBytes(name)?)?;
+            declaredItems.push(id)?;
+        }
+    }
+    for (i in unit.identStart..unit.identEnd) {
+        let ident = ast.idents[i as usize];
+        var replaced = false;
+        for (r in ast.replacedIdents.view()) {
+            replaced = replaced || r == i;
+        }
+        if (replaced || ident.missing) {
+            continue;
+        }
+        let name = c.front.symbols.name(Symbol { id: ident.symbol });
+        for (d in 0..declaredNames.length) {
+            if (!sameBytes(declaredNames[d].view(), name)) {
+                continue;
+            }
+            let item = borrow ast.items[declaredItems[d] as usize];
+            let declared = ast.idents[item.name as usize];
+            if (declared.start == ident.start && declared.end == ident.end) {
+                continue;
+            }
+            let kind: StringView = match (item.kind) {
+                ItemKind.Struct(_) => "struct",
+                ItemKind.Enum(_, _, _) => "enum",
+                _ => "interface",
+            };
+            var text = copyBytes(kind.bytes())?;
+            text.push(' ')?;
+            appendBytes(mut text, name)?;
+            let indexFile = index.file;
+            addEntry(
+                index,
+                sources[indexFile as usize],
+                ident.start,
+                ident.end,
+                codeBlock(text.view())?,
+                true,
+                declared.start,
+                declared.end,
+            )?;
+        }
+    }
+    return Ok();
+}
+
+// ---- Uses, from the typed tree ----
+
+fn indexFunction(
+    index: borrow mut SemanticIndex,
+    c: borrow Checker,
+    sources: borrow Vector<SourceText>,
+    f: u32,
+) -> Result<void, AllocError> {
+    let source = borrow sources[index.file as usize];
+    let function = borrow c.hir.functions[f as usize];
+    for (local in function.locals.view()) {
+        let l = borrow c.hir.locals[local as usize];
+        if (l.end > l.start && (l.end as usize) <= source.text.length) {
+            addEntry(index, source, l.start, l.end, localInfo(c, local)?, true, l.start, l.end)?;
+        }
+    }
+    if (function.body != none()) {
+        walkStatement(index, c, sources, function.body)?;
+    }
+    return Ok();
+}
+
+fn walkStatement(
+    index: borrow mut SemanticIndex,
+    c: borrow Checker,
+    sources: borrow Vector<SourceText>,
+    s: u32,
+) -> Result<void, AllocError> {
+    match (c.hir.stmts[s as usize]) {
+        HirStmt.Block(statements) => {
+            for (k in 0..statements.count) {
+                walkStatement(index, c, sources, c.hir.at(statements, k))?;
+            }
+        }
+        HirStmt.LocalDecl(_, initializer) => { walkExpression(index, c, sources, initializer)?; }
+        HirStmt.Assign(_, _, value) => { walkExpression(index, c, sources, value)?; }
+        HirStmt.If(condition, thenBlock, elseBranch) => {
+            walkExpression(index, c, sources, condition)?;
+            walkStatement(index, c, sources, thenBlock)?;
+            if (elseBranch != none()) {
+                walkStatement(index, c, sources, elseBranch)?;
+            }
+        }
+        HirStmt.While(condition, body) => {
+            walkExpression(index, c, sources, condition)?;
+            walkStatement(index, c, sources, body)?;
+        }
+        HirStmt.Loop(body) => { walkStatement(index, c, sources, body)?; }
+        HirStmt.For(_, start, end, body) => {
+            walkExpression(index, c, sources, start)?;
+            walkExpression(index, c, sources, end)?;
+            walkStatement(index, c, sources, body)?;
+        }
+        HirStmt.Return(value) => { walkExpression(index, c, sources, value)?; }
+        HirStmt.Expression(e) => { walkExpression(index, c, sources, e)?; }
+        HirStmt.Yield(e) => { walkExpression(index, c, sources, e)?; }
+        HirStmt.Defer(body) => { walkStatement(index, c, sources, body)?; }
+        HirStmt.Match(scrutinee, arms, _, _) => {
+            walkExpression(index, c, sources, scrutinee)?;
+            for (k in 0..arms.count) {
+                walkStatement(index, c, sources, c.hir.arms[c.hir.at(arms, k) as usize].body)?;
+            }
+        }
+        _ => {}
+    }
+    return Ok();
+}
+
+fn walkExpressions(
+    index: borrow mut SemanticIndex,
+    c: borrow Checker,
+    sources: borrow Vector<SourceText>,
+    list: Range,
+) -> Result<void, AllocError> {
+    for (k in 0..list.count) {
+        walkExpression(index, c, sources, c.hir.at(list, k))?;
+    }
+    return Ok();
+}
+
+fn walkExpression(
+    index: borrow mut SemanticIndex,
+    c: borrow Checker,
+    sources: borrow Vector<SourceText>,
+    e: u32,
+) -> Result<void, AllocError> {
+    if (e == none()) {
+        return Ok();
+    }
+    match (c.hir.exprs[e as usize]) {
+        HirExpr.Closure(function, _) => {
+            indexExpression(index, c, sources, e)?;
+            return indexFunction(index, c, sources, function);
+        }
+        _ => {}
+    }
+    indexExpression(index, c, sources, e)?;
+    match (c.hir.exprs[e as usize]) {
+        HirExpr.Unary(_, operand) => { walkExpression(index, c, sources, operand)?; }
+        HirExpr.Binary(_, left, right) => {
+            walkExpression(index, c, sources, left)?;
+            walkExpression(index, c, sources, right)?;
+        }
+        HirExpr.Cast(operand) => { walkExpression(index, c, sources, operand)?; }
+        HirExpr.Truncate(operand) => { walkExpression(index, c, sources, operand)?; }
+        HirExpr.Call(_, arguments) => { walkExpressions(index, c, sources, arguments)?; }
+        HirExpr.BuiltinCall(_, arguments) => { walkExpressions(index, c, sources, arguments)?; }
+        HirExpr.FieldAccess(target, _) => { walkExpression(index, c, sources, target)?; }
+        HirExpr.EnumValue(_, payload) => { walkExpressions(index, c, sources, payload)?; }
+        HirExpr.StructLiteral(fields) => {
+            for (k in 0..fields.count) {
+                walkExpression(index, c, sources, c.hir.fieldValues[(fields.start + k) as usize].value)?;
+            }
+        }
+        HirExpr.BorrowTemp(_, value) => { walkExpression(index, c, sources, value)?; }
+        HirExpr.BorrowPath(_, path) => { walkExpression(index, c, sources, path)?; }
+        HirExpr.Reborrow(_, reference) => { walkExpression(index, c, sources, reference)?; }
+        HirExpr.StaticAddress(s) => { walkExpression(index, c, sources, c.hir.statics[s as usize].value)?; }
+        HirExpr.Deref(reference) => { walkExpression(index, c, sources, reference)?; }
+        HirExpr.ArrayLiteral(elements) => { walkExpressions(index, c, sources, elements)?; }
+        HirExpr.ArrayRepeat(value) => { walkExpression(index, c, sources, value)?; }
+        HirExpr.Index(target, position) => {
+            walkExpression(index, c, sources, target)?;
+            walkExpression(index, c, sources, position)?;
+        }
+        HirExpr.Slice(_, _, low, high) => {
+            walkExpression(index, c, sources, low)?;
+            walkExpression(index, c, sources, high)?;
+        }
+        HirExpr.SliceLength(slice) => { walkExpression(index, c, sources, slice)?; }
+        HirExpr.Try(operand) => { walkExpression(index, c, sources, operand)?; }
+        HirExpr.Unwrap(operand) => { walkExpression(index, c, sources, operand)?; }
+        HirExpr.IsNull(reference, _) => { walkExpression(index, c, sources, reference)?; }
+        HirExpr.StmtValue(statement) => { walkStatement(index, c, sources, statement)?; }
+        HirExpr.FloatToInt(operand, _) => { walkExpression(index, c, sources, operand)?; }
+        _ => {}
+    }
+    return Ok();
+}
+
+/// The struct field a document declares at the field's span (FieldDeclaration), as its name's span.
+fn fieldDeclaration(
+    c: borrow Checker,
+    unit: borrow Unit,
+    field: u32,
+    start: borrow mut u32,
+    end: borrow mut u32,
+) -> bool {
+    let f = borrow c.types.fields[field as usize];
+    let ast = borrow c.front.ast;
+    for (k in 0..unit.items.count) {
+        match (ast.items[ast.at(unit.items, k) as usize].kind) {
+            ItemKind.Struct(s) => {
+                let structure = borrow ast.structs[s as usize];
+                for (m in 0..structure.fields.count) {
+                    let ident = ast.idents[ast.fields[ast.at(structure.fields, m) as usize].name as usize];
+                    if (ident.start == f.start && ident.end == f.end) {
+                        start = ident.start;
+                        end = ident.end;
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    return false;
+}
+
+fn indexExpression(
+    index: borrow mut SemanticIndex,
+    c: borrow Checker,
+    sources: borrow Vector<SourceText>,
+    e: u32,
+) -> Result<void, AllocError> {
+    let span = c.hir.exprSpans[e as usize];
+    let t = c.hir.exprTypes[e as usize];
+    let source = borrow sources[index.file as usize];
+    // An expression the checker could not type has nothing to show.
+    if (span.end == span.start || (span.end as usize) > source.text.length || c.types.is(t, TypeKind.Error)) {
+        return Ok();
+    }
+    match (c.hir.exprs[e as usize]) {
+        HirExpr.LocalRef(local) => {
+            return addEntry(
+                index,
+                source,
+                span.start,
+                span.end,
+                localInfo(c, local)?,
+                true,
+                c.hir.locals[local as usize].start,
+                c.hir.locals[local as usize].end,
+            );
+        }
+        HirExpr.Call(callee, _) => { return addCallee(index, c, sources, span, callee); }
+        HirExpr.FunctionAddress(function) => { return addCallee(index, c, sources, span, function); }
+        HirExpr.FieldAccess(_, field) => {
+            // The member's name is at the end of the access: `target.name`.
+            let name = c.name(c.types.fields[field as usize].name);
+            let nameStart = span.end - truncate<u32>(name.length);
+            var text = copyBytes(name)?;
+            appendText(mut text, ": ")?;
+            c.types.appendName(mut text, c.types.fields[field as usize].typ)?;
+            var definitionStart: u32 = 0;
+            var definitionEnd: u32 = 0;
+            var defined = false;
+            for (u in c.front.ast.units.view()) {
+                if (u.file == index.file) {
+                    defined = fieldDeclaration(c, u, field, mut definitionStart, mut definitionEnd);
+                }
+            }
+            addEntry(
+                index,
+                source,
+                nameStart,
+                span.end,
+                codeBlock(text.view())?,
+                defined,
+                definitionStart,
+                definitionEnd,
+            )?;
+            let typeName = typeText(c, t)?;
+            return addEntry(index, source, span.start, span.end, codeBlock(typeName.view())?, false, 0, 0);
+        }
+        _ => {
+            let typeName = typeText(c, t)?;
+            return addEntry(index, source, span.start, span.end, codeBlock(typeName.view())?, false, 0, 0);
+        }
+    }
+}
+
+fn addCallee(
+    index: borrow mut SemanticIndex,
+    c: borrow Checker,
+    sources: borrow Vector<SourceText>,
+    span: Span,
+    callee: u32,
+) -> Result<void, AllocError> {
+    let function = borrow c.hir.functions[callee as usize];
+    let signature = functionSignatureOf(c, sources, function.file, function.syntax)?;
+    var defined = false;
+    var start: u32 = 0;
+    var end: u32 = 0;
+    if (sameBytes(sources[function.file as usize].path.view(), sources[index.file as usize].path.view())) {
+        let name = c.front.ast.idents[c.front.ast.functions[function.syntax as usize].name as usize];
+        defined = true;
+        start = name.start;
+        end = name.end;
+    }
+    let indexFile = index.file;
+    return addEntry(
+        index,
+        sources[indexFile as usize],
+        span.start,
+        span.end,
+        codeBlock(signature.view())?,
+        defined,
+        start,
+        end,
+    );
+}
+
+/// The index of a checked document (SemanticIndex's constructor).
+fn buildSemanticIndex(
+    c: borrow Checker,
+    sources: borrow Vector<SourceText>,
+    file: u32,
+) -> Result<SemanticIndex, AllocError> {
+    var index = SemanticIndex { file: file, entries: Vector<SemanticEntry>.create() };
+    for (u in c.front.ast.units.view()) {
+        if (u.file == file) {
+            indexSyntax(mut index, c, sources, u)?;
+        }
+    }
+    for (f in 0..c.hir.functions.length) {
+        let function = borrow c.hir.functions[f];
+        if (function.registered && function.syntax != none() &&
+            sameBytes(sources[function.file as usize].path.view(), sources[file as usize].path.view()) &&
+            !functionIsInstantiation(c, truncate<u32>(f))) {
+            indexFunction(mut index, c, sources, truncate<u32>(f))?;
+        }
+    }
+    return Ok(index);
+}
+
+/// The innermost entry containing the offset (At): the shortest, then the one starting last, then the first made.
+fn semanticAt(index: borrow SemanticIndex, offset: u32) -> usize? {
+    var best: usize? = null;
+    for (k in 0..index.entries.length) {
+        let e = borrow index.entries[k];
+        if (e.start > offset || offset > e.end || e.end == e.start) {
+            continue;
+        }
+        match (best) {
+            Some(b) => {
+                let current = borrow index.entries[b];
+                if (e.units < current.units || (e.units == current.units && e.start > current.start)) {
+                    best = k;
+                }
+            }
+            null => { best = k; }
+        }
+    }
+    return best;
+}

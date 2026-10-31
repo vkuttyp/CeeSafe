@@ -4,13 +4,33 @@
 // - other code points .NET escapes (json_escapes.nova) become \uXXXX with uppercase hex;
 // - code points above the BMP become an escaped surrogate pair;
 // - ill-formed UTF-8 is written as U+FFFD, raw, as .NET's decoded text holds it.
-// The reader (for LSP and MCP) comes with P8.
+// With `strict`, strings follow JavaScriptEncoder.Default instead (JsonNode.ToJsonString without options, the LSP's):
+// everything outside ASCII and the HTML-sensitive " & ' + < > ` are \uXXXX too. The reader is json_reader.cee.
 
 struct JsonWriter {
     out: Vector<u8>;
     needComma: bool; // inside a container, after a value
+    strict: bool;    // JavaScriptEncoder.Default's escaping
 
-    fn create() -> JsonWriter => JsonWriter { out: Vector<u8>.create(), needComma: false };
+    fn create() -> JsonWriter => JsonWriter { out: Vector<u8>.create(), needComma: false, strict: false };
+
+    fn createStrict() -> JsonWriter => JsonWriter { out: Vector<u8>.create(), needComma: false, strict: true };
+
+    /// A property name given as bytes; the value follows.
+    fn nameBytes(borrow mut this, key: Slice<u8>) -> Result<void, AllocError> {
+        this.separate()?;
+        this.quoted(key)?;
+        this.out.push(':')?;
+        return Ok();
+    }
+
+    /// A value already written as JSON.
+    fn raw(borrow mut this, json: Slice<u8>) -> Result<void, AllocError> {
+        this.separate()?;
+        appendBytes(mut this.out, json)?;
+        this.needComma = true;
+        return Ok();
+    }
 
     fn separate(borrow mut this) -> Result<void, AllocError> {
         if (this.needComma) {
@@ -113,7 +133,11 @@ struct JsonWriter {
             let d = decodeUtf8(text, i);
             let length = d.length as usize;
             let c = d.scalar;
-            if (c == '"' as u32 || c == '\\' as u32) {
+            if (this.strict &&
+                (c == '"' as u32 || c == '&' as u32 || c == '\'' as u32 || c == '+' as u32 || c == '<' as u32 ||
+                    c == '>' as u32 || c == '`' as u32 || c == 0x7F || (c >= 0x80 && c < 0x10000 && d.valid))) {
+                this.escape(c)?;
+            } else if (c == '"' as u32 || c == '\\' as u32) {
                 this.out.push('\\')?;
                 this.out.push(text[i])?;
             } else if (c == 0x08 || c == 0x0C || c == 0x0A || c == 0x0D || c == 0x09) {
@@ -125,6 +149,8 @@ struct JsonWriter {
                     0x0D => 'r',
                     _ => 't',
                 })?;
+            } else if (!d.valid && this.strict) {
+                this.escape(0xFFFD)?;
             } else if (!d.valid) {
                 // U+FFFD, raw.
                 this.out.push(0xEF)?;

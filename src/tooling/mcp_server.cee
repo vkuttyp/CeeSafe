@@ -1,0 +1,1892 @@
+// `ceesafec mcp` (the reference's Tooling/McpServer.cs; tooling.md §6): the Model Context Protocol over JSON-RPC 2.0,
+// one message per line, serving the checker, fixes, formatter, sandboxed interpreter, C generator, specification and
+// language index as tools, the embedded documents as resources, and two prompts. It reads nothing but its input and the
+// paths a tool names. Messages are written as ToJsonString writes them with UnsafeRelaxedJsonEscaping.
+
+fn mcpInvalidRequest() -> i64 => -32600;
+fn mcpInvalidParams() -> i64 => -32602;
+fn mcpResourceNotFound() -> i64 => -32002;
+
+/// ceesafe_run's defaults and its memory (§6.3).
+fn mcpDefaultSteps() -> u64 => 10000000;
+fn mcpDefaultOutputBytes() -> u64 => 65536;
+fn mcpMemoryLimit() -> i64 => 268435456;
+
+fn mcpResourcePrefix() -> StringView => "ceesafe://docs/";
+
+/// The protocol versions the server speaks, newest first (§6.1).
+fn mcpVersionCount() -> usize => 3;
+
+fn mcpVersion(k: usize) -> StringView => match (k) {
+    0 => "2025-06-18",
+    1 => "2025-03-26",
+    _ => "2024-11-05",
+};
+
+/// Why a request failed: a JSON-RPC error (McpError, or an exception's InternalError), or a tool's own failure
+/// (ToolFailure), which is a result with isError.
+struct McpFailure {
+    tool: bool;
+    code: i64;
+    message: Vector<u8>;
+}
+
+fn rpcFailure(code: i64, message: Vector<u8>) -> McpFailure => McpFailure { tool: false, code: code, message: message };
+
+fn invalidParams(message: Vector<u8>) -> McpFailure => rpcFailure(mcpInvalidParams(), message);
+
+fn internalFailure(message: Vector<u8>) -> McpFailure => rpcFailure(lspInternalError(), message);
+
+fn toolFailure(message: Vector<u8>) -> McpFailure => McpFailure { tool: true, code: 0, message: message };
+
+/// `a` `b` `c` as one text.
+fn textOf(a: StringView, b: Slice<u8>, c: StringView) -> Vector<u8> {
+    var out = copyBytes(a.bytes())!;
+    appendBytes(mut out, b)!;
+    appendText(mut out, c)!;
+    return out;
+}
+
+// ---- Reading arguments, with .NET's messages for values of the wrong kind ----
+
+/// GetValue<T> on a value of another kind (InvalidOperationException's message).
+fn wrongValue(doc: borrow JsonDoc, node: u32, target: StringView) -> McpFailure {
+    let kind = doc.kind(node);
+    if (kind == jsonArray() || kind == jsonObject()) {
+        return internalFailure(copyBytes("The node must be of type 'JsonValue'.".bytes())!);
+    }
+    let name =
+        if (kind ==
+            jsonNumber()) "Number" else if (kind ==
+            jsonString()) "String" else if (doc.nodes[node as usize].text[0] == 't') "True" else "False";
+    var message = textOf("An element of type '", name.bytes(), "' cannot be converted to a '");
+    appendText(mut message, target)!;
+    appendText(mut message, "'.")!;
+    return internalFailure(message);
+}
+
+/// json[name]?.GetValue<string>(): null when absent or null.
+fn optionalString(doc: borrow JsonDoc, object: u32, name: StringView) -> Result<Vector<u8>?, McpFailure> {
+    let node = doc.member(object, name);
+    let kind = doc.kind(node);
+    if (kind == jsonNull()) {
+        return Ok(null);
+    }
+    if (kind == jsonString()) {
+        return Ok(doc.stringOf(node));
+    }
+    return Err(wrongValue(doc, node, "System.String"));
+}
+
+/// An element's GetValue<string>(), "" for null (`p?.GetValue<string>() ?? ""`).
+fn elementString(doc: borrow JsonDoc, node: u32) -> Result<Vector<u8>, McpFailure> {
+    let kind = doc.kind(node);
+    if (kind == jsonNull()) {
+        return Ok(Vector<u8>.create());
+    }
+    return match (doc.stringOf(node)) {
+        Some(text) => Ok(text),
+        null => Err(wrongValue(doc, node, "System.String")),
+    };
+}
+
+fn optionalBool(doc: borrow JsonDoc, object: u32, name: StringView) -> Result<bool?, McpFailure> {
+    let node = doc.member(object, name);
+    let kind = doc.kind(node);
+    if (kind == jsonNull()) {
+        return Ok(null);
+    }
+    if (kind == jsonBool()) {
+        return Ok(doc.boolOf(node));
+    }
+    return Err(wrongValue(doc, node, "System.Boolean"));
+}
+
+/// String(json, name): the member, which must be a string.
+fn requiredString(doc: borrow JsonDoc, object: u32, name: StringView) -> Result<Vector<u8>, McpFailure> {
+    return match (doc.stringOf(doc.member(object, name))) {
+        Some(text) => Ok(text),
+        null => Err(invalidParams(textOf("'", name.bytes(), "' must be a string"))),
+    };
+}
+
+/// Integer(json, name, fallback): a whole number from 0 to i64's maximum, as a long or as a whole double.
+fn mcpInteger(doc: borrow JsonDoc, object: u32, name: StringView, fallback: u64) -> Result<u64, McpFailure> {
+    let node = doc.member(object, name);
+    let kind = doc.kind(node);
+    if (kind == jsonNull()) {
+        return Ok(fallback);
+    }
+    if (kind == jsonNumber()) {
+        match (wholeNumber(doc.nodes[node as usize].text.view())) {
+            Some(value) => { return Ok(value); }
+            null => {}
+        }
+    }
+    return Err(invalidParams(textOf("'", name.bytes(), "' must be a non-negative integer")));
+}
+
+/// A JSON number's value as Integer reads it: TryGetValue<long> if the text is an integer that fits, not negative;
+/// otherwise the nearest double (TryGetValue<double>, which refuses infinity), if it is whole, not negative and at most
+/// long.MaxValue as a double (2^63, which the conversion saturates).
+fn wholeNumber(text: Slice<u8>) -> u64? {
+    var integral = text.length > 0;
+    for (c in text) {
+        integral = integral && ((c >= '0' && c <= '9') || c == '-');
+    }
+    if (integral && text[0] != '-') {
+        var value: u64 = 0;
+        var fits = true;
+        for (c in text) {
+            match (value.checkedMul(10)) {
+                Some(v) => {
+                    match (v.checkedAdd((c - '0') as u64)) {
+                        Some(w) => { value = w; }
+                        null => { fits = false; }
+                    }
+                }
+                null => { fits = false; }
+            }
+        }
+        if (fits && value <= 0x7FFFFFFFFFFFFFFF) {
+            return value;
+        }
+    }
+    let negative = text.length > 0 && text[0] == '-';
+    let from: usize = if (negative) 1 else 0;
+    let real = parseDecimalFloat(text[from..], f64Format())!;
+    let bits = real.bits();
+    if (bits == 0) {
+        return 0; // 0, -0 and what rounds to them
+    }
+    if (negative || bits >= 0x7FF0000000000000 || real.floor() != real) {
+        return null;
+    }
+    if (bits >= 0x43E0000000000000) {
+        // 2^63 and above: only 2^63 itself is <= long.MaxValue once that is a double.
+        return if (bits == 0x43E0000000000000) 0x7FFFFFFFFFFFFFFF else null;
+    }
+    return truncate<u64>(real);
+}
+
+// ---- Framing ----
+
+struct McpServer {
+    input: InputReader;
+    version: usize; // the protocol version agreed, an index of mcpVersion
+    workingDirectory: Vector<u8>;
+}
+
+/// The next line (StreamReader.ReadLine: ended by LF, CR or CR LF), or null at the end of the input.
+fn readMcpLine(input: borrow mut InputReader) -> Vector<u8>? {
+    var bytes = Vector<u8>.create();
+    var any = false;
+    loop {
+        match (input.next()) {
+            Some(b) => {
+                any = true;
+                if (b == '\n') {
+                    return bytes;
+                }
+                if (b == '\r') {
+                    match (input.next()) {
+                        Some(after) => {
+                            if (after != '\n') {
+                                input.position -= 1;
+                            }
+                        }
+                        null => {}
+                    }
+                    return bytes;
+                }
+                bytes.push(b)!;
+            }
+            null => { return if (any) bytes else null; }
+        }
+    }
+}
+
+/// string.IsNullOrWhiteSpace.
+fn isBlankLine(text: Slice<u8>) -> bool {
+    var i: usize = 0;
+    while (i < text.length) {
+        let d = decodeUtf8(text, i);
+        let c = d.scalar;
+        let space = d.valid && (c == 0x20 || (c >= 0x09 && c <= 0x0D) || c == 0x85 || c == 0xA0 || c == 0x1680 ||
+            (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000);
+        if (!space) {
+            return false;
+        }
+        i += d.length as usize;
+    }
+    return true;
+}
+
+fn sendMcp(json: borrow mut JsonWriter) {
+    json.out.push('\n')!;
+    writeAndFlush(json.out.view());
+}
+
+fn sendMcpError(doc: borrow JsonDoc, id: u32, code: i64, message: Slice<u8>) {
+    var json = JsonWriter.create();
+    json.startObject()!;
+    json.name("jsonrpc")!;
+    json.string("2.0")!;
+    json.name("id")!;
+    writeJsonNode(mut json, doc, id)!;
+    json.name("error")!;
+    json.startObject()!;
+    json.name("code")!;
+    json.number(code)!;
+    json.name("message")!;
+    json.stringBytes(message)!;
+    json.endObject()!;
+    json.endObject()!;
+    sendMcp(mut json);
+}
+
+/// A method's answer: unknown, or its result as JSON (empty for none, which a request answers with {}).
+struct McpAnswer {
+    known: bool;
+    result: Vector<u8>;
+}
+
+fn mcpResult(json: JsonWriter) -> Result<McpAnswer, McpFailure> => Ok(McpAnswer { known: true, result: json.out });
+
+fn handleMcpLine(server: borrow mut McpServer, line: Slice<u8>) {
+    let text = validUtf8(line)!;
+    let empty = JsonDoc { nodes: Vector<JsonNodeData>.create() };
+    let doc = match (parseJson(text.view())) {
+        Some(d) => d,
+        null => {
+            sendMcpError(empty, none(), lspParseError(), "the message is not JSON".bytes());
+            return;
+        }
+    };
+    if (doc.kind(0) != jsonObject()) {
+        return;
+    }
+    let id = doc.member(0, "id");
+    let method = match (doc.stringOf(doc.member(0, "method"))) {
+        Some(m) => m,
+        null => {
+            if (id != none() && doc.member(0, "result") == none() && doc.member(0, "error") == none()) {
+                sendMcpError(doc, id, mcpInvalidRequest(), "a request needs a method".bytes());
+            }
+            return; // a response to a request of ours: the server sends none
+        }
+    };
+    let isRequest = id != none();
+    let given = doc.member(0, "params");
+    let parameters = if (doc.kind(given) == jsonObject()) given else none();
+    match (dispatchMcp(server, doc, method.view(), parameters)) {
+        Ok(answer) => {
+            if (!isRequest) {
+                return;
+            }
+            if (!answer.known) {
+                let message = textOf("unknown method '", method.view(), "'");
+                sendMcpError(doc, id, lspMethodNotFound(), message.view());
+                return;
+            }
+            var json = JsonWriter.create();
+            json.startObject()!;
+            json.name("jsonrpc")!;
+            json.string("2.0")!;
+            json.name("id")!;
+            writeJsonNode(mut json, doc, id)!;
+            json.name("result")!;
+            if (answer.result.length == 0) {
+                json.startObject()!;
+                json.endObject()!;
+            } else {
+                json.raw(answer.result.view())!;
+            }
+            json.endObject()!;
+            sendMcp(mut json);
+        }
+        Err(failure) => {
+            if (isRequest) {
+                sendMcpError(doc, id, failure.code, failure.message.view());
+            }
+        }
+    }
+}
+
+fn dispatchMcp(
+    server: borrow mut McpServer,
+    doc: borrow JsonDoc,
+    method: Slice<u8>,
+    parameters: u32,
+) -> Result<McpAnswer, McpFailure> {
+    if (sameText(method, "initialize")) {
+        server.version = 0;
+        match (optionalString(doc, parameters, "protocolVersion")?) {
+            Some(requested) => {
+                for (k in 0..mcpVersionCount()) {
+                    if (sameText(requested.view(), mcpVersion(k))) {
+                        server.version = k;
+                    }
+                }
+            }
+            null => {}
+        }
+        var json = JsonWriter.create();
+        json.startObject()!;
+        json.name("protocolVersion")!;
+        json.string(mcpVersion(server.version))!;
+        json.name("capabilities")!;
+        json.startObject()!;
+        json.name("tools")!;
+        json.startObject()!;
+        json.name("listChanged")!;
+        json.boolean(false)!;
+        json.endObject()!;
+        json.name("resources")!;
+        json.startObject()!;
+        json.name("listChanged")!;
+        json.boolean(false)!;
+        json.name("subscribe")!;
+        json.boolean(false)!;
+        json.endObject()!;
+        json.name("prompts")!;
+        json.startObject()!;
+        json.name("listChanged")!;
+        json.boolean(false)!;
+        json.endObject()!;
+        json.endObject()!;
+        json.name("serverInfo")!;
+        json.startObject()!;
+        json.name("name")!;
+        json.string("ceesafec")!;
+        json.name("title")!;
+        json.string("Nova")!;
+        json.name("version")!;
+        json.string(ceesafeVersion())!;
+        json.endObject()!;
+        json.name("instructions")!;
+        json.string(
+            "Nova is a memory-safe systems language compiled to C. Use ceesafe_check after every edit; apply ceesafe_fix for the fixes the compiler is sure of; read ceesafe_explain for a diagnostic code; ceesafe_spec_search and ceesafe_spec_section for the rules. ceesafe_run runs a program in a sandboxed interpreter. The prompt write-nova has the agent guide.",
+        )!;
+        json.endObject()!;
+        return mcpResult(json);
+    }
+    if (sameText(method, "ping")) {
+        return Ok(McpAnswer { known: true, result: copyBytes("{}".bytes())! });
+    }
+    if (sameText(method, "tools/list")) {
+        var json = JsonWriter.create();
+        json.startObject()!;
+        json.name("tools")!;
+        json.startArray()!;
+        for (k in 0..mcpToolCount()) {
+            writeTool(mut json, k, server.version == 0);
+        }
+        json.endArray()!;
+        json.endObject()!;
+        return mcpResult(json);
+    }
+    if (sameText(method, "tools/call")) {
+        return callTool(server, doc, parameters);
+    }
+    if (sameText(method, "resources/list")) {
+        var json = JsonWriter.create();
+        json.startObject()!;
+        json.name("resources")!;
+        json.startArray()!;
+        for (k in 0..documentCount()) {
+            let path = documentPath(k);
+            var text = Vector<u8>.create();
+            appendDocumentText(mut text, k)!;
+            json.startObject()!;
+            json.name("uri")!;
+            var uri = copyBytes(mcpResourcePrefix().bytes())!;
+            appendText(mut uri, path)!;
+            json.stringBytes(uri.view())!;
+            json.name("name")!;
+            json.string(path)!;
+            json.name("title")!;
+            match (documentTitle(text.view())) {
+                Some(title) => { json.stringBytes(title.view())!; }
+                null => { json.string(path)!; }
+            }
+            json.name("mimeType")!;
+            json.string("text/markdown")!;
+            json.endObject()!;
+        }
+        json.endArray()!;
+        json.endObject()!;
+        return mcpResult(json);
+    }
+    if (sameText(method, "resources/read")) {
+        let uri = requiredString(doc, parameters, "uri")?;
+        let prefix = mcpResourcePrefix().bytes();
+        var found: usize? = null;
+        if (uri.length >= prefix.length && sameBytes(uri[0..prefix.length], prefix)) {
+            found = documentIndex(uri[prefix.length..]);
+        }
+        let k = match (found) {
+            Some(k) => k,
+            null => { return Err(rpcFailure(mcpResourceNotFound(), textOf("no resource '", uri.view(), "'"))); }
+        };
+        var text = Vector<u8>.create();
+        appendDocumentText(mut text, k)!;
+        var json = JsonWriter.create();
+        json.startObject()!;
+        json.name("contents")!;
+        json.startArray()!;
+        json.startObject()!;
+        json.name("uri")!;
+        json.stringBytes(uri.view())!;
+        json.name("mimeType")!;
+        json.string("text/markdown")!;
+        json.name("text")!;
+        json.stringBytes(text.view())!;
+        json.endObject()!;
+        json.endArray()!;
+        json.endObject()!;
+        return mcpResult(json);
+    }
+    if (sameText(method, "prompts/list")) {
+        var json = JsonWriter.create();
+        json.startObject()!;
+        json.name("prompts")!;
+        json.startArray()!;
+        writePromptInfo(mut json, 0);
+        writePromptInfo(mut json, 1);
+        json.endArray()!;
+        json.endObject()!;
+        return mcpResult(json);
+    }
+    if (sameText(method, "prompts/get")) {
+        return getPrompt(doc, parameters);
+    }
+    if (method.length >= 14 && sameText(method[0..14], "notifications/")) {
+        return Ok(McpAnswer { known: true, result: Vector<u8>.create() }); // initialized, cancelled, …: nothing to do
+    }
+    return Ok(McpAnswer { known: false, result: Vector<u8>.create() });
+}
+
+/// The text of a document's first `# ` heading, trimmed.
+fn documentTitle(text: Slice<u8>) -> Vector<u8>? {
+    var start: usize = 0;
+    while (start <= text.length) {
+        var end = start;
+        while (end < text.length && text[end] != '\n') {
+            end += 1;
+        }
+        let line = text[start..end];
+        if (line.length >= 2 && line[0] == '#' && line[1] == ' ') {
+            return copyBytes(trimmed(line[2..]))!;
+        }
+        start = end + 1;
+    }
+    return null;
+}
+
+// ---- Tools (§6.3) ----
+
+/// Starts an object schema: {"type":"object","properties":{ — its properties follow, each a name and a schema.
+fn schemaStart(json: borrow mut JsonWriter) {
+    json.startObject()!;
+    json.name("type")!;
+    json.string("object")!;
+    json.name("properties")!;
+    json.startObject()!;
+}
+
+/// Ends an object schema with its required properties' names, separated by spaces.
+fn schemaEnd(json: borrow mut JsonWriter, required: StringView) {
+    json.endObject()!;
+    json.name("required")!;
+    json.startArray()!;
+    writeWords(json, required, ' ');
+    json.endArray()!;
+    json.endObject()!;
+}
+
+/// Each word of `words` as a string.
+fn writeWords(json: borrow mut JsonWriter, words: StringView, separator: u8) {
+    let bytes = words.bytes();
+    var start: usize = 0;
+    for (k in 0..bytes.length + 1) {
+        if (k == bytes.length || bytes[k] == separator) {
+            if (k > start) {
+                json.stringBytes(bytes[start..k])!;
+            }
+            start = k + 1;
+        }
+    }
+}
+
+fn typeSchema(json: borrow mut JsonWriter, kind: StringView, description: StringView) {
+    json.startObject()!;
+    json.name("type")!;
+    json.string(kind)!;
+    json.name("description")!;
+    json.string(description)!;
+    json.endObject()!;
+}
+
+fn objectSchema(json: borrow mut JsonWriter) {
+    json.startObject()!;
+    json.name("type")!;
+    json.string("object")!;
+    json.endObject()!;
+}
+
+/// {"type":"string","description":…,"enum":[…]}, the values separated by '|'.
+fn enumSchema(json: borrow mut JsonWriter, description: StringView, values: StringView) {
+    json.startObject()!;
+    json.name("type")!;
+    json.string("string")!;
+    json.name("description")!;
+    json.string(description)!;
+    json.name("enum")!;
+    json.startArray()!;
+    writeWords(json, values, '|');
+    json.endArray()!;
+    json.endObject()!;
+}
+
+/// Starts {"type":"array","items": — the items' schema follows, then arrayEnd.
+fn arrayStart(json: borrow mut JsonWriter) {
+    json.startObject()!;
+    json.name("type")!;
+    json.string("array")!;
+    json.name("items")!;
+}
+
+fn arrayEnd(json: borrow mut JsonWriter, description: StringView) {
+    json.name("description")!;
+    json.string(description)!;
+    json.endObject()!;
+}
+
+/// §6.2: `files` or `paths`, `profile` and `noFloat` (SourceProperties).
+fn sourceProperties(json: borrow mut JsonWriter) {
+    json.name("files")!;
+    arrayStart(json);
+    schemaStart(json);
+    json.name("path")!;
+    typeSchema(json, "string", "the file's name, as diagnostics will give it");
+    json.name("text")!;
+    typeSchema(json, "string", "the file's Nova source");
+    schemaEnd(json, "path text");
+    arrayEnd(json, "the program's files, compiled as one package (give files or paths)");
+    json.name("paths")!;
+    arrayStart(json);
+    typeSchema(json, "string", "a .cee file");
+    arrayEnd(json, "paths of .cee files on disk, relative to the server's working directory (give files or paths)");
+    json.name("profile")!;
+    enumSchema(json, "the compilation profile (default hosted)", "hosted|freestanding");
+    json.name("noFloat")!;
+    typeSchema(json, "boolean", "reject every float type and literal, as --no-float");
+}
+
+fn diagnosticsSchema(json: borrow mut JsonWriter) {
+    json.startObject()!;
+    json.name("type")!;
+    json.string("object")!;
+    json.name("description")!;
+    json.string("the diagnostics document of tooling.md §5.1")!;
+    json.name("properties")!;
+    json.startObject()!;
+    json.name("version")!;
+    json.raw("{\"type\":\"integer\"}".bytes())!;
+    json.name("errors")!;
+    json.raw("{\"type\":\"integer\"}".bytes())!;
+    json.name("warnings")!;
+    json.raw("{\"type\":\"integer\"}".bytes())!;
+    json.name("diagnostics")!;
+    json.raw("{\"type\":\"array\",\"items\":{\"type\":\"object\"}}".bytes())!;
+    json.endObject()!;
+    json.name("required")!;
+    json.startArray()!;
+    writeWords(json, "version errors warnings diagnostics", ' ');
+    json.endArray()!;
+    json.endObject()!;
+}
+
+fn mcpToolCount() -> usize => 9;
+
+fn toolName(k: usize) -> StringView => match (k) {
+    0 => "ceesafe_check",
+    1 => "ceesafe_fix",
+    2 => "ceesafe_format",
+    3 => "ceesafe_run",
+    4 => "ceesafe_emit_c",
+    5 => "ceesafe_explain",
+    6 => "ceesafe_spec_search",
+    7 => "ceesafe_spec_section",
+    _ => "ceesafe_symbol",
+};
+
+fn toolTitle(k: usize) -> StringView => match (k) {
+    0 => "Check Nova code",
+    1 => "Apply Nova's fixes",
+    2 => "Format Nova code",
+    3 => "Run a Nova program",
+    4 => "Generate C from Nova",
+    5 => "Explain a diagnostic code",
+    6 => "Search the Nova specification",
+    7 => "Read a specification section",
+    _ => "What is at a position",
+};
+
+fn toolDescription(k: usize) -> StringView => match (k) {
+    0 =>
+        "Type-check Nova source and return its diagnostics, with machine-applicable fixes where the compiler is sure of one.",
+    1 =>
+        "Apply every fix the compiler is sure of, in rounds until none applies, and return the fixed files and the diagnostics that remain. Writes nothing to disk.",
+    2 => "Format one Nova file in the canonical style (ceesafec fmt).",
+    3 =>
+        "Run a Nova program in the sandboxed interpreter: no files, sockets or processes, a step and memory budget. Returns its output and exit code.",
+    4 =>
+        "Compile Nova to C and return the generated C, optionally with the compiler's allocation, bounds-check or overflow-check decisions.",
+    5 => "What a Nova diagnostic code (N0249) means, an example, and what the diagnostics reference says about it.",
+    6 => "Find sections of Nova's specification and guide whose heading or text contain every word of a query.",
+    7 => "Read one section of a Nova document, with its subsections: for example type-system §31.2, or a heading.",
+    _ => "The type or signature of the name or expression at a 1-based line and column, and where it is declared.",
+};
+
+fn writeInputSchema(json: borrow mut JsonWriter, k: usize) {
+    schemaStart(json);
+    if (k == 0 || k == 1) {
+        sourceProperties(json);
+        schemaEnd(json, "");
+    } else if (k == 2) {
+        json.name("text")!;
+        typeSchema(json, "string", "the file's Nova source");
+        json.name("path")!;
+        typeSchema(json, "string", "its name, for diagnostics");
+        schemaEnd(json, "text");
+    } else if (k == 3) {
+        sourceProperties(json);
+        json.name("stdin")!;
+        typeSchema(json, "string", "standard input");
+        json.name("args")!;
+        arrayStart(json);
+        typeSchema(json, "string", "an argument");
+        arrayEnd(json, "the program's arguments");
+        json.name("maxSteps")!;
+        typeSchema(json, "integer", "statements to run at most (default 10000000)");
+        json.name("maxOutputBytes")!;
+        typeSchema(json, "integer", "bytes of each output to keep (default 65536)");
+        schemaEnd(json, "");
+    } else if (k == 4) {
+        sourceProperties(json);
+        json.name("explain")!;
+        arrayStart(json);
+        enumSchema(json, "a report", "allocations|bounds-checks|overflow-checks");
+        arrayEnd(json, "reports to include");
+        schemaEnd(json, "");
+    } else if (k == 5) {
+        json.name("code")!;
+        typeSchema(json, "string", "a code such as N0249");
+        schemaEnd(json, "code");
+    } else if (k == 6) {
+        json.name("query")!;
+        typeSchema(json, "string", "words to find");
+        json.name("limit")!;
+        typeSchema(json, "integer", "results at most (default 10)");
+        schemaEnd(json, "query");
+    } else if (k == 7) {
+        json.name("document")!;
+        typeSchema(
+            json,
+            "string",
+            "type-system, grammar, diagnostics, tooling, unsafe, … or a path such as site/guide/basics.md",
+        );
+        json.name("section")!;
+        typeSchema(json, "string", "a section number such as 31.2, or heading text; omit for the whole document");
+        schemaEnd(json, "document");
+    } else {
+        sourceProperties(json);
+        json.name("path")!;
+        typeSchema(json, "string", "the file");
+        json.name("line")!;
+        typeSchema(json, "integer", "1-based");
+        json.name("column")!;
+        typeSchema(json, "integer", "1-based, UTF-16");
+        schemaEnd(json, "path line column");
+    }
+}
+
+fn writeOutputSchema(json: borrow mut JsonWriter, k: usize) {
+    if (k == 0) {
+        diagnosticsSchema(json);
+        return;
+    }
+    schemaStart(json);
+    if (k == 1) {
+        json.name("files")!;
+        arrayStart(json);
+        objectSchema(json);
+        arrayEnd(json, "each file's fixed text");
+        json.name("applied")!;
+        typeSchema(json, "integer", "fixes applied");
+        json.name("diagnostics")!;
+        diagnosticsSchema(json);
+        schemaEnd(json, "files applied diagnostics");
+    } else if (k == 2) {
+        json.name("text")!;
+        typeSchema(json, "string", "the formatted source");
+        json.name("diagnostics")!;
+        diagnosticsSchema(json);
+        schemaEnd(json, "");
+    } else if (k == 3) {
+        json.name("outcome")!;
+        enumSchema(json, "how the run ended", "exited|panicked|fault|not-compiled");
+        json.name("exitCode")!;
+        typeSchema(json, "integer", "the exit status");
+        json.name("stdout")!;
+        typeSchema(json, "string", "standard output");
+        json.name("stderr")!;
+        typeSchema(json, "string", "standard error");
+        json.name("truncated")!;
+        typeSchema(json, "boolean", "whether output was cut at maxOutputBytes");
+        json.name("diagnostics")!;
+        diagnosticsSchema(json);
+        schemaEnd(json, "outcome");
+    } else if (k == 4) {
+        json.name("files")!;
+        arrayStart(json);
+        objectSchema(json);
+        arrayEnd(json, "main.c and nova_exports.h");
+        json.name("explanations")!;
+        typeSchema(json, "string", "the reports");
+        json.name("diagnostics")!;
+        diagnosticsSchema(json);
+        schemaEnd(json, "");
+    } else if (k == 5) {
+        json.name("code")!;
+        typeSchema(json, "string", "");
+        json.name("meaning")!;
+        typeSchema(json, "string", "");
+        json.name("example")!;
+        typeSchema(json, "string", "");
+        json.name("paragraphs")!;
+        arrayStart(json);
+        typeSchema(json, "string", "");
+        arrayEnd(json, "");
+        schemaEnd(json, "code meaning example paragraphs");
+    } else if (k == 6) {
+        json.name("results")!;
+        arrayStart(json);
+        objectSchema(json);
+        arrayEnd(json, "document, heading, snippet, uri");
+        schemaEnd(json, "results");
+    } else if (k == 7) {
+        json.name("document")!;
+        typeSchema(json, "string", "");
+        json.name("heading")!;
+        typeSchema(json, "string", "");
+        json.name("text")!;
+        typeSchema(json, "string", "");
+        schemaEnd(json, "document heading text");
+    } else {
+        json.name("hover")!;
+        typeSchema(json, "string", "type or signature, as Markdown");
+        json.name("definition")!;
+        objectSchema(json);
+        schemaEnd(json, "");
+    }
+}
+
+/// A tool in tools/list (ToolJson); output schemas came with protocol version 2025-06-18 (§6.1).
+fn writeTool(json: borrow mut JsonWriter, k: usize, structured: bool) {
+    json.startObject()!;
+    json.name("name")!;
+    json.string(toolName(k))!;
+    json.name("title")!;
+    json.string(toolTitle(k))!;
+    json.name("description")!;
+    json.string(toolDescription(k))!;
+    json.name("inputSchema")!;
+    writeInputSchema(json, k);
+    if (structured) {
+        json.name("outputSchema")!;
+        writeOutputSchema(json, k);
+    }
+    json.name("annotations")!;
+    json.startObject()!;
+    json.name("readOnlyHint")!;
+    json.boolean(true)!;
+    json.name("openWorldHint")!;
+    json.boolean(false)!;
+    json.endObject()!;
+    json.endObject()!;
+}
+
+/// What a tool returns: its structured content as JSON, and whether it failed (isError).
+struct ToolResult {
+    content: Vector<u8>;
+    isError: bool;
+}
+
+fn toolResult(json: JsonWriter, isError: bool) -> Result<ToolResult, McpFailure> =>
+    Ok(ToolResult { content: json.out, isError: isError });
+
+fn callTool(server: borrow mut McpServer, doc: borrow JsonDoc, parameters: u32) -> Result<McpAnswer, McpFailure> {
+    let name = requiredString(doc, parameters, "name")?;
+    var tool = mcpToolCount();
+    for (k in 0..mcpToolCount()) {
+        if (sameText(name.view(), toolName(k))) {
+            tool = k;
+        }
+    }
+    if (tool == mcpToolCount()) {
+        return Err(invalidParams(textOf("unknown tool '", name.view(), "'")));
+    }
+    let given = doc.member(parameters, "arguments");
+    let arguments = if (doc.kind(given) == jsonObject()) given else none();
+    let outcome = runMcpTool(server, doc, tool, arguments);
+    var isError = false;
+    var content = Vector<u8>.create();
+    match (outcome) {
+        Ok(result) => {
+            isError = result.isError;
+            content = result.content;
+        }
+        Err(failure) => {
+            if (!failure.tool) {
+                return Err(failure);
+            }
+            isError = true;
+            var json = JsonWriter.create();
+            json.startObject()!;
+            json.name("error")!;
+            json.stringBytes(failure.message.view())!;
+            json.endObject()!;
+            content = json.out;
+        }
+    }
+    var json = JsonWriter.create();
+    json.startObject()!;
+    json.name("content")!;
+    json.startArray()!;
+    json.startObject()!;
+    json.name("type")!;
+    json.string("text")!;
+    json.name("text")!;
+    json.stringBytes(content.view())!;
+    json.endObject()!;
+    json.endArray()!;
+    json.name("isError")!;
+    json.boolean(isError)!;
+    if (server.version == 0) {
+        json.name("structuredContent")!;
+        json.raw(content.view())!;
+    }
+    json.endObject()!;
+    return mcpResult(json);
+}
+
+fn runMcpTool(
+    server: borrow McpServer,
+    doc: borrow JsonDoc,
+    tool: usize,
+    arguments: u32,
+) -> Result<ToolResult, McpFailure> {
+    return match (tool) {
+        0 => checkTool(server, doc, arguments),
+        1 => fixTool(server, doc, arguments),
+        2 => formatTool(doc, arguments),
+        3 => runProgramTool(server, doc, arguments),
+        4 => emitCTool(server, doc, arguments),
+        5 => explainTool(doc, arguments),
+        6 => searchTool(doc, arguments),
+        7 => sectionTool(doc, arguments),
+        _ => symbolTool(server, doc, arguments),
+    };
+}
+
+/// The program's files (Sources): `files`, then `paths` read from the working directory.
+fn sourcesOf(server: borrow McpServer, doc: borrow JsonDoc, arguments: u32) -> Result<Vector<InputFile>, McpFailure> {
+    var files = Vector<InputFile>.create();
+    let given = doc.member(arguments, "files");
+    if (doc.kind(given) == jsonArray()) {
+        for (k in 0..doc.childCount(given)) {
+            let file = doc.child(given, k);
+            if (doc.kind(file) != jsonObject()) {
+                continue;
+            }
+            let path = requiredString(doc, file, "path")?;
+            let text = requiredString(doc, file, "text")?;
+            files.push(InputFile { path: path, text: text, package: 0 })!;
+        }
+    }
+    let paths = doc.member(arguments, "paths");
+    if (doc.kind(paths) == jsonArray()) {
+        for (k in 0..doc.childCount(paths)) {
+            let path = elementString(doc, doc.child(paths, k))?;
+            let text = readSource(server, path.view())?;
+            files.push(InputFile { path: path, text: text, package: 0 })!;
+        }
+    }
+    if (files.length == 0) {
+        return Err(invalidParams(copyBytes("give the program as 'files' ([{path, text}]) or 'paths'".bytes())!));
+    }
+    for (a in 0..files.length) {
+        for (b in a + 1..files.length) {
+            if (sameBytes(files[a].path.view(), files[b].path.view())) {
+                return Err(invalidParams(copyBytes("two files have the same path".bytes())!));
+            }
+        }
+    }
+    return Ok(files);
+}
+
+/// A file's text as File.ReadAllText reads it (a byte order mark dropped, an invalid sequence made U+FFFD), or the
+/// tool's failure with .NET's message.
+fn readSource(server: borrow McpServer, path: Slice<u8>) -> Result<Vector<u8>, McpFailure> {
+    var combined = Vector<u8>.create();
+    if (path.length == 0 || path[0] != '/') {
+        appendBytes(mut combined, server.workingDirectory.view())!;
+        if (path.length > 0) {
+            combined.push('/')!;
+        }
+    }
+    appendBytes(mut combined, path)!;
+    let full = joinPath("/".bytes(), combined.view())!;
+    var problem = Vector<u8>.create();
+    if (isDirectory(full.view())) {
+        problem = textOf("Access to the path '", full.view(), "' is denied.");
+    } else {
+        match (readFile(StringView.fromUtf8(full.view())!)) {
+            Ok(bytes) => {
+                let start: usize =
+                    if (bytes.length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) 3 else 0;
+                return Ok(validUtf8(bytes[start..])!);
+            }
+            Err(ReadError.Io(IoError.NotFound)) => {
+                let parent = joinPath(full.view(), "..".bytes())!;
+                problem = if (isDirectory(parent.view())) textOf(
+                    "Could not find file '",
+                    full.view(),
+                    "'.",
+                ) else textOf("Could not find a part of the path '", full.view(), "'.");
+            }
+            Err(ReadError.Io(IoError.NotDirectory)) => {
+                problem = textOf("Could not find a part of the path '", full.view(), "'.");
+            }
+            Err(ReadError.Io(IoError.PermissionDenied)) => {
+                problem = textOf("Access to the path '", full.view(), "' is denied.");
+            }
+            Err(ReadError.Io(IoError.IsDirectory)) => {
+                problem = textOf("Access to the path '", full.view(), "' is denied.");
+            }
+            Err(ReadError.Io(e)) => { problem = copyBytes(e.message().bytes())!; }
+            Err(ReadError.Memory) => { problem = copyBytes("out of memory".bytes())!; }
+        }
+    }
+    var message = textOf("cannot read '", path, "': ");
+    appendBytes(mut message, problem.view())!;
+    return Err(toolFailure(message));
+}
+
+/// The profile and --no-float (Settings).
+struct McpSettings {
+    freestanding: bool;
+    noFloat: bool;
+}
+
+fn settingsOf(doc: borrow JsonDoc, arguments: u32) -> Result<McpSettings, McpFailure> {
+    var freestanding = false;
+    match (optionalString(doc, arguments, "profile")?) {
+        Some(profile) => {
+            if (sameText(profile.view(), "freestanding")) {
+                freestanding = true;
+            } else if (!sameText(profile.view(), "hosted")) {
+                return Err(
+                    invalidParams(textOf("profile must be 'hosted' or 'freestanding', not '", profile.view(), "'")),
+                );
+            }
+        }
+        null => {}
+    }
+    let noFloat = match (optionalBool(doc, arguments, "noFloat")?) {
+        Some(b) => b,
+        null => false,
+    };
+    return Ok(McpSettings { freestanding: freestanding, noFloat: noFloat });
+}
+
+fn compileFilesWith(settings: McpSettings, files: borrow Vector<InputFile>) -> Compiled =>
+    compileInMemory(files, alonePackages()!, settings.freestanding, settings.noFloat, false)!;
+
+fn checkTool(server: borrow McpServer, doc: borrow JsonDoc, arguments: u32) -> Result<ToolResult, McpFailure> {
+    let settings = settingsOf(doc, arguments)?;
+    let files = sourcesOf(server, doc, arguments)?;
+    let compiled = compileFilesWith(settings, files);
+    return Ok(ToolResult { content: compiledDiagnosticsJson(compiled)!, isError: false });
+}
+
+/// Every fix the compiler is sure of, in rounds as `fix` takes them (tooling.md §5.3); nothing is written.
+fn fixTool(server: borrow McpServer, doc: borrow JsonDoc, arguments: u32) -> Result<ToolResult, McpFailure> {
+    var files = sourcesOf(server, doc, arguments)?;
+    var applied: usize = 0;
+    var remaining = Vector<u8>.create();
+    for (round in 0..8) {
+        let settings = settingsOf(doc, arguments)?;
+        let compiled = compileFilesWith(settings, files);
+        remaining = compiledDiagnosticsJson(compiled)!;
+        let diagnostics = compiledDiagnostics(compiled);
+        var fixable = Vector<bool>.create();
+        var any = false;
+        for (d in diagnostics.items.view()) {
+            let yes = d.hasFix && (d.file as usize) >= compiled.firstUser;
+            fixable.push(yes)!;
+            any = any || yes;
+        }
+        if (!any) {
+            break;
+        }
+        var taken = Vector<FixEdit>.create();
+        var appliedNow = Vector<usize>.create();
+        takeFixes(diagnostics, fixable, mut taken, mut appliedNow)!;
+        applied += appliedNow.length;
+        for (k in 0..files.length) {
+            let file = truncate<u32>(compiled.firstUser + k);
+            var touched = false;
+            for (e in taken.view()) {
+                touched = touched || e.file == file;
+            }
+            if (touched) {
+                files[k].text = fixedText(diagnostics, compiled.sources[file as usize], file, taken)!;
+            }
+        }
+    }
+    var json = JsonWriter.create();
+    json.startObject()!;
+    json.name("files")!;
+    json.startArray()!;
+    for (f in files.view()) {
+        json.startObject()!;
+        json.name("path")!;
+        json.stringBytes(f.path.view())!;
+        json.name("text")!;
+        json.stringBytes(f.text.view())!;
+        json.endObject()!;
+    }
+    json.endArray()!;
+    json.name("applied")!;
+    json.number(truncate<i64>(applied))!;
+    json.name("diagnostics")!;
+    json.raw(remaining.view())!;
+    json.endObject()!;
+    return toolResult(json, false);
+}
+
+fn formatTool(doc: borrow JsonDoc, arguments: u32) -> Result<ToolResult, McpFailure> {
+    let path = match (optionalString(doc, arguments, "path")?) {
+        Some(p) => p,
+        null => copyBytes("main.cee".bytes())!,
+    };
+    let text = requiredString(doc, arguments, "text")?;
+    var sources = Vector<SourceText>.create();
+    sources.push(SourceText.create(path.view(), text.view())!)!;
+    var diagnostics = Diagnostics.create();
+    let formatted = formatSource(sources[0], 0, mut diagnostics)!;
+    var json = JsonWriter.create();
+    json.startObject()!;
+    match (borrow formatted.text) {
+        Some(t) => {
+            json.name("text")!;
+            json.stringBytes(t.view())!;
+            json.endObject()!;
+            return toolResult(json, false);
+        }
+        null => {}
+    }
+    if (formatted.problem.length > 0) {
+        var message = textOf("ceesafec fmt: internal error in ", path.view(), ": ");
+        appendBytes(mut message, formatted.problem.view())!;
+        return Err(internalFailure(message));
+    }
+    json.name("diagnostics")!;
+    let document = diagnosticsJson(diagnostics, sources)!;
+    json.raw(document.view())!;
+    json.endObject()!;
+    return toolResult(json, true);
+}
+
+/// {"diagnostics": …} with the compilation's diagnostics.
+fn diagnosticsResult(compiled: borrow Compiled, isError: bool) -> Result<ToolResult, McpFailure> {
+    var json = JsonWriter.create();
+    json.startObject()!;
+    json.name("diagnostics")!;
+    let document = compiledDiagnosticsJson(compiled)!;
+    json.raw(document.view())!;
+    json.endObject()!;
+    return toolResult(json, isError);
+}
+
+/// The C of a compilation without errors (CBackend.Generate), or false with its diagnostics added.
+fn generateCompiled(
+    compiled: borrow mut Compiled,
+    requireMain: bool,
+    freestanding: bool,
+    out: borrow mut Vector<CFile>,
+) -> bool {
+    if (compiledHasErrors(compiled) || !compiled.analyzed) {
+        return false;
+    }
+    let build = CBuildOptions {
+        requireMain: requireMain,
+        freestanding: freestanding,
+        lineDirectives: false,
+        split: false,
+        programName: copyBytes("program".bytes())!,
+        exportsHeader: copyBytes("nova_exports.h".bytes())!,
+        closureSpecialisation: true,
+        placement: true,
+        bce: true,
+        oce: true,
+        structured: true,
+    };
+    match (borrow mut compiled.checker) {
+        Some(checker) => { return generateC(checker, mut compiled.nir, compiled.sources, build, out)!; }
+        null => { return false; }
+    }
+}
+
+fn runProgramTool(server: borrow McpServer, doc: borrow JsonDoc, arguments: u32) -> Result<ToolResult, McpFailure> {
+    let steps = mcpInteger(doc, arguments, "maxSteps", mcpDefaultSteps())?;
+    let outputBytes = mcpInteger(doc, arguments, "maxOutputBytes", mcpDefaultOutputBytes())?;
+    let files = sourcesOf(server, doc, arguments)?;
+    let settings = settingsOf(doc, arguments)?;
+    var compiled = compileFilesWith(settings, files);
+    var cFiles = Vector<CFile>.create();
+    if (!generateCompiled(mut compiled, true, settings.freestanding, mut cFiles)) {
+        var json = JsonWriter.create();
+        json.startObject()!;
+        json.name("outcome")!;
+        json.string("not-compiled")!;
+        json.name("diagnostics")!;
+        let document = compiledDiagnosticsJson(compiled)!;
+        json.raw(document.view())!;
+        json.endObject()!;
+        return toolResult(json, false);
+    }
+    var programArguments = Vector<Vector<u8>>.create();
+    programArguments.push(copyBytes(files[0].path.view())!)!;
+    let given = doc.member(arguments, "args");
+    if (doc.kind(given) == jsonArray()) {
+        for (k in 0..doc.childCount(given)) {
+            programArguments.push(elementString(doc, doc.child(given, k))?)!;
+        }
+    }
+    let input = match (optionalString(doc, arguments, "stdin")?) {
+        Some(s) => s,
+        null => Vector<u8>.create(),
+    };
+    let options = InterpreterOptions {
+        arguments: programArguments,
+        failAllocationAt: 0,
+        allocationReport: false,
+        placement: true,
+        bce: true,
+        oce: true,
+        stepLimit: steps,
+        memoryLimit: mcpMemoryLimit(),
+        sandboxed: true,
+        workingDirectory: copyBytes("/tmp/".bytes())!, // never used: the sandbox refuses files
+        capture: true,
+        outputLimit: outputBytes,
+        input: input,
+    };
+    let run = match (borrow compiled.checker) {
+        Some(checker) => interpretCaptured(checker, compiled.nir, compiled.sources, options)!,
+        null => { return Err(internalFailure(copyBytes("no checker".bytes())!)); }
+    };
+    var json = JsonWriter.create();
+    json.startObject()!;
+    json.name("outcome")!;
+    json.string(if (run.status == 70) "fault" else if (run.status == 134) "panicked" else "exited")!;
+    json.name("exitCode")!;
+    json.number(run.status as i64)!;
+    json.name("stdout")!;
+    json.stringBytes(run.stdout.view())!;
+    json.name("stderr")!;
+    json.stringBytes(run.stderr.view())!;
+    json.name("truncated")!;
+    json.boolean(run.truncated)!;
+    json.endObject()!;
+    return toolResult(json, false);
+}
+
+fn emitCTool(server: borrow McpServer, doc: borrow JsonDoc, arguments: u32) -> Result<ToolResult, McpFailure> {
+    let settings = settingsOf(doc, arguments)?;
+    let files = sourcesOf(server, doc, arguments)?;
+    var compiled = compileFilesWith(settings, files);
+    var cFiles = Vector<CFile>.create();
+    if (!generateCompiled(mut compiled, false, settings.freestanding, mut cFiles)) {
+        return diagnosticsResult(compiled, true);
+    }
+    var allocations = false;
+    var bounds = false;
+    var overflow = false;
+    let given = doc.member(arguments, "explain");
+    if (doc.kind(given) == jsonArray()) {
+        for (k in 0..doc.childCount(given)) {
+            let node = doc.child(given, k);
+            if (doc.kind(node) == jsonNull()) {
+                continue;
+            }
+            let report = elementString(doc, node)?;
+            allocations = allocations || sameText(report.view(), "allocations");
+            bounds = bounds || sameText(report.view(), "bounds-checks");
+            overflow = overflow || sameText(report.view(), "overflow-checks");
+        }
+    }
+    var text = Vector<u8>.create();
+    match (borrow compiled.checker) {
+        Some(checker) => {
+            if (allocations) {
+                let placement = analyzePlacement(checker, compiled.nir, compiled.sources)!;
+                explainAllocations(checker, compiled.sources, placement, mut text)!;
+            }
+            if (bounds) {
+                let checks = analyzeChecks(checker, compiled.nir)!;
+                explainChecks(checker, compiled.nir, compiled.sources, checks, false, mut text)!;
+            }
+            if (overflow) {
+                let checks = analyzeChecks(checker, compiled.nir)!;
+                explainChecks(checker, compiled.nir, compiled.sources, checks, true, mut text)!;
+            }
+        }
+        null => {}
+    }
+    var json = JsonWriter.create();
+    json.startObject()!;
+    json.name("files")!;
+    json.startArray()!;
+    for (f in cFiles.view()) {
+        if (sameText(f.name.view(), "main.c") || sameText(f.name.view(), "nova_exports.h")) {
+            json.startObject()!;
+            json.name("name")!;
+            json.stringBytes(f.name.view())!;
+            json.name("text")!;
+            json.stringBytes(f.text.view())!;
+            json.endObject()!;
+        }
+    }
+    json.endArray()!;
+    json.name("explanations")!;
+    json.stringBytes(text.view())!;
+    json.endObject()!;
+    return toolResult(json, false);
+}
+
+fn explainTool(doc: borrow JsonDoc, arguments: u32) -> Result<ToolResult, McpFailure> {
+    let given = requiredString(doc, arguments, "code")?;
+    var code = copyBytes(trimmed(given.view()))!;
+    for (k in 0..code.length) {
+        if (code[k] >= 'a' && code[k] <= 'z') {
+            code[k] = code[k] - 32;
+        }
+    }
+    let entry = match (catalogEntry(code.view())!) {
+        Some(e) => e,
+        null => { return Err(toolFailure(textOf("unknown diagnostic code '", code.view(), "'"))); }
+    };
+    var paragraphs = Vector<Vector<u8>>.create();
+    paragraphsOf(code.view(), mut paragraphs)!;
+    var json = JsonWriter.create();
+    json.startObject()!;
+    json.name("code")!;
+    json.stringBytes(code.view())!;
+    json.name("meaning")!;
+    json.stringBytes(entry.meaning.view())!;
+    json.name("example")!;
+    json.stringBytes(entry.example.view())!;
+    json.name("paragraphs")!;
+    json.startArray()!;
+    for (p in paragraphs.view()) {
+        json.stringBytes(p.view())!;
+    }
+    json.endArray()!;
+    json.endObject()!;
+    return toolResult(json, false);
+}
+
+// ---- The documents by section (SpecSections) ----
+
+/// One heading and the text up to the next heading of any level; `withSubsections` runs to the next of its level or
+/// above.
+struct SpecSection {
+    document: usize;
+    start: usize; // the heading's line
+    heading: Vector<u8>;
+    text: Vector<u8>;
+    withSubsections: Vector<u8>;
+}
+
+/// The lines of `text` (Split('\n')), as ranges.
+struct LineSpan {
+    start: usize;
+    end: usize;
+}
+
+fn linesOf(text: Slice<u8>, out: borrow mut Vector<LineSpan>) {
+    var start: usize = 0;
+    for (k in 0..text.length + 1) {
+        if (k == text.length || text[k] == '\n') {
+            out.push(LineSpan { start: start, end: k })!;
+            start = k + 1;
+        }
+    }
+}
+
+/// Lines `from..to` joined with '\n', trimmed.
+fn joinedLines(text: Slice<u8>, lines: borrow Vector<LineSpan>, from: usize, to: usize) -> Vector<u8> =>
+    copyBytes(trimmed(text[lines[from].start..lines[to - 1].end]))!;
+
+/// The sections of document `k`, appended to `out`.
+fn sectionsOf(k: usize, out: borrow mut Vector<SpecSection>) {
+    var text = Vector<u8>.create();
+    appendDocumentText(mut text, k)!;
+    var lines = Vector<LineSpan>.create();
+    linesOf(text.view(), mut lines);
+    var headingLines = Vector<usize>.create();
+    var levels = Vector<usize>.create();
+    var inCode = false;
+    for (i in 0..lines.length) {
+        let line = text[lines[i].start..lines[i].end];
+        if (line.length >= 3 && line[0] == '`' && line[1] == '`' && line[2] == '`') {
+            inCode = !inCode;
+        } else if (!inCode && line.length > 0 && line[0] == '#') {
+            var level: usize = 0;
+            while (level < line.length && line[level] == '#') {
+                level += 1;
+            }
+            if (level < line.length && line[level] == ' ') {
+                headingLines.push(i)!;
+                levels.push(level)!;
+            }
+        }
+    }
+    for (h in 0..headingLines.length) {
+        let line = headingLines[h];
+        let level = levels[h];
+        let next = if (h + 1 < headingLines.length) headingLines[h + 1] else lines.length;
+        var nextSameLevel = lines.length;
+        for (g in h + 1..headingLines.length) {
+            if (levels[g] <= level) {
+                nextSameLevel = headingLines[g];
+                break;
+            }
+        }
+        let headingLine = text[lines[line].start..lines[line].end];
+        out.push(
+            SpecSection {
+                document: k,
+                start: line,
+                heading: copyBytes(trimmed(headingLine[level + 1..]))!,
+                text: joinedLines(text.view(), lines, line, next),
+                withSubsections: joinedLines(text.view(), lines, line, nextSameLevel),
+            },
+        )!;
+    }
+}
+
+fn lowerAscii(c: u8) -> u8 => if (c >= 'A' && c <= 'Z') c + 32 else c;
+
+/// The first place at or after `from` where `word` is in `text`, ignoring ASCII case (OrdinalIgnoreCase).
+fn findIgnoringCase(text: Slice<u8>, word: Slice<u8>, from: usize) -> usize? {
+    if (word.length > text.length) {
+        return null;
+    }
+    var at = from;
+    while (at + word.length <= text.length) {
+        var same = true;
+        for (k in 0..word.length) {
+            if (lowerAscii(text[at + k]) != lowerAscii(word[k])) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            return at;
+        }
+        at += 1;
+    }
+    return null;
+}
+
+fn countIgnoringCase(text: Slice<u8>, word: Slice<u8>) -> usize {
+    var count: usize = 0;
+    var from: usize = 0;
+    loop {
+        match (findIgnoringCase(text, word, from)) {
+            Some(at) => {
+                count += 1;
+                from = at + word.length;
+            }
+            null => { return count; }
+        }
+    }
+}
+
+/// 0 unless the section contains every word (ignoring case); otherwise more for words in the heading and normative
+/// documents (Score).
+fn sectionScore(section: borrow SpecSection, words: borrow Vector<Vector<u8>>) -> usize {
+    var score: usize = 0;
+    for (word in words.view()) {
+        let count = countIgnoringCase(section.text.view(), word.view());
+        if (count == 0) {
+            return 0;
+        }
+        let inHeading: usize = if (findIgnoringCase(section.heading.view(), word.view(), 0) != null) 20 else 0;
+        score += count + inHeading;
+    }
+    let path = documentPath(section.document);
+    if (path == "docs/type-system.md" || path == "docs/grammar.md" || path == "docs/diagnostics.md") {
+        score += 5;
+    }
+    return score;
+}
+
+/// The first line of the section's body with the first word, cut to 240 UTF-16 units (Snippet).
+fn sectionSnippet(section: borrow SpecSection, word: Slice<u8>) -> Vector<u8> {
+    let text = section.text.view();
+    var lines = Vector<LineSpan>.create();
+    linesOf(text, mut lines);
+    var chosen: usize? = null;
+    for (k in 1..lines.length) {
+        if (chosen == null && findIgnoringCase(text[lines[k].start..lines[k].end], word, 0) != null) {
+            chosen = k;
+        }
+    }
+    if (chosen == null) {
+        for (k in 1..lines.length) {
+            if (chosen == null && trimmed(text[lines[k].start..lines[k].end]).length > 0) {
+                chosen = k;
+            }
+        }
+    }
+    let line = match (chosen) {
+        Some(k) => trimmed(text[lines[k].start..lines[k].end]),
+        null => text[0..0],
+    };
+    var units: usize = 0;
+    var at: usize = 0;
+    while (at < line.length && units < 240) {
+        let d = decodeUtf8(line, at);
+        units += d.utf16Units() as usize;
+        at += d.length as usize;
+    }
+    var out = copyBytes(line[0..at])!;
+    if (at < line.length) {
+        appendText(mut out, "…")!;
+    }
+    return out;
+}
+
+fn searchTool(doc: borrow JsonDoc, arguments: u32) -> Result<ToolResult, McpFailure> {
+    let query = requiredString(doc, arguments, "query")?;
+    var words = Vector<Vector<u8>>.create();
+    var start: usize = 0;
+    for (k in 0..query.length + 1) {
+        if (k == query.length || query[k] == ' ') {
+            let word = trimmed(query[start..k]);
+            if (word.length > 0) {
+                words.push(copyBytes(word)!)!;
+            }
+            start = k + 1;
+        }
+    }
+    if (words.length == 0) {
+        return Err(invalidParams(copyBytes("the query is empty".bytes())!));
+    }
+    let asked = mcpInteger(doc, arguments, "limit", 10)?;
+    let limit: usize = if (asked < 1) 1 else if (asked > 100) 100 else truncate<usize>(asked);
+    var sections = Vector<SpecSection>.create();
+    for (k in 0..documentCount()) {
+        sectionsOf(k, mut sections);
+    }
+    var scores = Vector<usize>.create();
+    for (s in sections.view()) {
+        scores.push(sectionScore(s, words))!;
+    }
+    var json = JsonWriter.create();
+    json.startObject()!;
+    json.name("results")!;
+    json.startArray()!;
+    // The best `limit` by score, then document path, then position.
+    var taken = Vector<bool>.create();
+    for (k in 0..sections.length) {
+        taken.push(false)!;
+    }
+    for (round in 0..limit) {
+        var best: usize? = null;
+        for (k in 0..sections.length) {
+            if (taken[k] || scores[k] == 0) {
+                continue;
+            }
+            let better = match (best) {
+                Some(b) => scores[k] > scores[b] || (scores[k] == scores[b] && sectionBefore(sections[k], sections[b])),
+                null => true,
+            };
+            if (better) {
+                best = k;
+            }
+        }
+        let b = match (best) {
+            Some(b) => b,
+            null => { break; }
+        };
+        taken[b] = true;
+        let section = borrow sections[b];
+        json.startObject()!;
+        json.name("document")!;
+        json.string(documentPath(section.document))!;
+        json.name("heading")!;
+        json.stringBytes(section.heading.view())!;
+        json.name("snippet")!;
+        let snippet = sectionSnippet(section, words[0].view());
+        json.stringBytes(snippet.view())!;
+        json.name("uri")!;
+        var uri = copyBytes(mcpResourcePrefix().bytes())!;
+        appendText(mut uri, documentPath(section.document))!;
+        json.stringBytes(uri.view())!;
+        json.endObject()!;
+    }
+    json.endArray()!;
+    json.endObject()!;
+    return toolResult(json, false);
+}
+
+/// Ordinal order of document paths, then position.
+fn sectionBefore(a: borrow SpecSection, b: borrow SpecSection) -> bool {
+    if (a.document == b.document) {
+        return a.start < b.start;
+    }
+    return lessBytes(documentPath(a.document).bytes(), documentPath(b.document).bytes());
+}
+
+/// A section of document `k` by number (31.2, §31.2) or by heading text (Find).
+fn findSection(k: usize, section: Slice<u8>) -> SpecSection? {
+    let key = trimmed(section);
+    // TrimStart('§'): the sign is two bytes in UTF-8.
+    var from: usize = 0;
+    while (from + 2 <= key.length && key[from] == 0xC2 && key[from + 1] == 0xA7) {
+        from += 2;
+    }
+    let name = copyBytes(trimmed(key[from..]))!;
+    var sections = Vector<SpecSection>.create();
+    sectionsOf(k, mut sections);
+    for (pass in 0..3) {
+        for (s in 0..sections.length) {
+            let heading = sections[s].heading.view();
+            let found = if (pass == 0) startsWithKey(
+                heading,
+                name.view(),
+            ) else if (pass == 1) heading.length == name.length && findIgnoringCase(
+                heading,
+                name.view(),
+                0,
+            ) != null else findIgnoringCase(heading, name.view(), 0) != null;
+            if (found) {
+                let f = borrow sections[s];
+                return SpecSection {
+                    document: f.document,
+                    start: f.start,
+                    heading: copyBytes(f.heading.view())!,
+                    text: copyBytes(f.text.view())!,
+                    withSubsections: copyBytes(f.withSubsections.view())!,
+                };
+            }
+        }
+    }
+    return null;
+}
+
+/// Whether `heading` starts with `key` and a space, or `key` and ". ".
+fn startsWithKey(heading: Slice<u8>, key: Slice<u8>) -> bool {
+    if (heading.length < key.length + 1 || !sameBytes(heading[0..key.length], key)) {
+        return false;
+    }
+    return heading[key.length] == ' ' ||
+        (heading.length >= key.length + 2 && heading[key.length] == '.' && heading[key.length + 1] == ' ');
+}
+
+fn sectionTool(doc: borrow JsonDoc, arguments: u32) -> Result<ToolResult, McpFailure> {
+    let name = requiredString(doc, arguments, "document")?;
+    var path = copyBytes(name.view())!;
+    if (documentIndex(name.view()) == null) {
+        // $"docs/{name.Replace(".md", "")}.md"
+        path = copyBytes("docs/".bytes())!;
+        var k: usize = 0;
+        while (k < name.length) {
+            if (k + 3 <= name.length && sameText(name[k..k + 3], ".md")) {
+                k += 3;
+            } else {
+                path.push(name[k])!;
+                k += 1;
+            }
+        }
+        appendText(mut path, ".md")!;
+    }
+    let index = match (documentIndex(path.view())) {
+        Some(k) => k,
+        null => {
+            var message = textOf("no document '", name.view(), "'; the documents are the resources ");
+            appendText(mut message, mcpResourcePrefix())!;
+            appendText(mut message, "…")!;
+            return Err(toolFailure(message));
+        }
+    };
+    let section = optionalString(doc, arguments, "section")?;
+    var json = JsonWriter.create();
+    json.startObject()!;
+    json.name("document")!;
+    json.stringBytes(path.view())!;
+    match (section) {
+        Some(s) => {
+            if (!isBlankLine(s.view())) {
+                let found = match (findSection(index, s.view())) {
+                    Some(f) => f,
+                    null => {
+                        var message = textOf("no section '", s.view(), "' in ");
+                        appendBytes(mut message, path.view())!;
+                        return Err(toolFailure(message));
+                    }
+                };
+                json.name("heading")!;
+                json.stringBytes(found.heading.view())!;
+                json.name("text")!;
+                json.stringBytes(found.withSubsections.view())!;
+                json.endObject()!;
+                return toolResult(json, false);
+            }
+        }
+        null => {}
+    }
+    var text = Vector<u8>.create();
+    appendDocumentText(mut text, index)!;
+    json.name("heading")!;
+    json.string("")!;
+    json.name("text")!;
+    json.stringBytes(text.view())!;
+    json.endObject()!;
+    return toolResult(json, false);
+}
+
+fn symbolTool(server: borrow McpServer, doc: borrow JsonDoc, arguments: u32) -> Result<ToolResult, McpFailure> {
+    let files = sourcesOf(server, doc, arguments)?;
+    let path = requiredString(doc, arguments, "path")?;
+    var which: usize? = null;
+    for (k in 0..files.length) {
+        if (which == null && sameBytes(files[k].path.view(), path.view())) {
+            which = k;
+        }
+    }
+    let k = match (which) {
+        Some(k) => k,
+        null => { return Err(toolFailure(textOf("'", path.view(), "' is not one of the files"))); }
+    };
+    let settings = settingsOf(doc, arguments)?;
+    let compiled = compileFilesWith(settings, files);
+    let checker = match (borrow compiled.checker) {
+        Some(c) => c,
+        null => { return diagnosticsResult(compiled, true); }
+    };
+    let line = mcpInteger(doc, arguments, "line", 0)?;
+    let column = mcpInteger(doc, arguments, "column", 0)?;
+    let file = truncate<u32>(compiled.firstUser + k);
+    let source = borrow compiled.sources[file as usize];
+    let offset = offsetOfPosition(source, truncate<i64>(line) - 1, (if (column < 1) 0 else truncate<i64>(column) - 1));
+    let index = buildSemanticIndex(checker, compiled.sources, file)!;
+    var json = JsonWriter.create();
+    json.startObject()!;
+    match (semanticAt(index, offset)) {
+        Some(found) => {
+            let entry = borrow index.entries[found];
+            json.name("hover")!;
+            json.stringBytes(entry.hover.view())!;
+            if (entry.hasDefinition) {
+                let p = source.position(entry.definitionStart as usize);
+                json.name("definition")!;
+                json.startObject()!;
+                json.name("file")!;
+                json.stringBytes(source.path.view())!;
+                json.name("line")!;
+                json.number(p.line as i64)!;
+                json.name("column")!;
+                json.number(p.column as i64)!;
+                json.endObject()!;
+            }
+        }
+        null => {}
+    }
+    json.endObject()!;
+    return toolResult(json, false);
+}
+
+// ---- Prompts (§6.5) ----
+
+fn writePromptInfo(json: borrow mut JsonWriter, k: usize) {
+    json.startObject()!;
+    json.name("name")!;
+    json.string(if (k == 0) "write-nova" else "port-c-to-nova")!;
+    json.name("title")!;
+    json.string(if (k == 0) "Write Nova" else "Port C to Nova")!;
+    json.name("description")!;
+    json.string(
+        if (k ==
+            0) "Write Nova code for a task, with the agent guide and the edit-check loop." else "Port a C file to Nova as CosmoOS's components were (C6, C9).",
+    )!;
+    json.name("arguments")!;
+    json.startArray()!;
+    if (k == 0) {
+        writePromptArgument(json, "task", "what to write", true);
+    } else {
+        writePromptArgument(json, "file", "the C file to port", true);
+        writePromptArgument(json, "api", "the header that declares its API", false);
+    }
+    json.endArray()!;
+    json.endObject()!;
+}
+
+fn writePromptArgument(json: borrow mut JsonWriter, name: StringView, description: StringView, required: bool) {
+    json.startObject()!;
+    json.name("name")!;
+    json.string(name)!;
+    json.name("description")!;
+    json.string(description)!;
+    json.name("required")!;
+    json.boolean(required)!;
+    json.endObject()!;
+}
+
+/// A prompt's argument, "" when absent (`given[a]?.GetValue<string>() ?? ""`).
+fn promptArgument(doc: borrow JsonDoc, given: u32, name: StringView) -> Result<Vector<u8>, McpFailure> {
+    return match (optionalString(doc, given, name)?) {
+        Some(s) => Ok(s),
+        null => Ok(Vector<u8>.create()),
+    };
+}
+
+fn getPrompt(doc: borrow JsonDoc, parameters: u32) -> Result<McpAnswer, McpFailure> {
+    let name = requiredString(doc, parameters, "name")?;
+    let write = sameText(name.view(), "write-nova");
+    if (!write && !sameText(name.view(), "port-c-to-nova")) {
+        return Err(invalidParams(textOf("unknown prompt '", name.view(), "'")));
+    }
+    let arguments = doc.member(parameters, "arguments");
+    let given = if (doc.kind(arguments) == jsonObject()) arguments else none();
+    let required = if (write) "task" else "file";
+    let value = promptArgument(doc, given, required)?;
+    if (value.length == 0) {
+        var message = textOf("prompt '", name.view(), "' needs the argument '");
+        appendText(mut message, required)!;
+        appendText(mut message, "'")!;
+        return Err(invalidParams(message));
+    }
+    var text = Vector<u8>.create();
+    if (write) {
+        match (documentIndex("site/guide/for-agents.md".bytes())) {
+            Some(k) => { appendDocumentText(mut text, k)!; }
+            null => {
+                appendText(
+                    mut text,
+                    "Nova is a memory-safe systems language compiled to C (ceesafe://docs/site/guide/introduction.md).",
+                )!;
+            }
+        }
+        appendText(mut text, "\n\n---\n\nTask: ")!;
+        appendBytes(mut text, value.view())!;
+        appendText(
+            mut text,
+            "\n\nWrite the code, then call ceesafe_check. Apply ceesafe_fix for the fixes it offers, and fix the rest by reading\nceesafe_explain and the sections the messages cite (ceesafe_spec_section). Repeat until ceesafe_check reports no\nerrors; then run it with ceesafe_run if it has a main.",
+        )!;
+    } else {
+        let api = promptArgument(doc, given, "api")?;
+        appendText(mut text, "Port ")!;
+        appendBytes(mut text, value.view())!;
+        appendText(mut text, " to Nova, keeping its C API")!;
+        if (api.length > 0) {
+            appendText(mut text, " (")!;
+            appendBytes(mut text, api.view())!;
+            appendText(mut text, ")")!;
+        }
+        appendText(
+            mut text,
+            " exactly, by the method of\nNova's C6 and C9 ports (docs/cosmoos/c9-report.md in Nova's repository):\n\n",
+        )!;
+        appendText(
+            mut text,
+            "1. Import the header's structs into an extern \"C\" block with @header, declaring only the fields used\n",
+        )!;
+        appendText(
+            mut text,
+            "   (ceesafe_spec_section type-system 31); C arrays are array fields, keyword members take @cname.\n",
+        )!;
+        appendText(
+            mut text,
+            "2. Write the logic as safe Nova over slices and references, with the C's checks in the C's order.\n",
+        )!;
+        appendText(
+            mut text,
+            "3. Export the C API with @export functions whose bodies only turn raw pointers into slices and\n",
+        )!;
+        appendText(
+            mut text,
+            "   references (Slice.fromRaw, Ptr.toBorrow) and call the safe code; each needs a /// Safety: line.\n",
+        )!;
+        appendText(
+            mut text,
+            "4. Check with ceesafe_check under --profile freestanding (and noFloat for kernel code) until it is clean.\n",
+        )!;
+        appendText(mut text, "5. Hold it to the C's own tests, a differential test against the C, and a benchmark.")!;
+    }
+    var json = JsonWriter.create();
+    json.startObject()!;
+    json.name("description")!;
+    json.string(
+        if (write) "Write Nova code for a task, with the agent guide and the edit-check loop." else "Port a C file to Nova as CosmoOS's components were (C6, C9).",
+    )!;
+    json.name("messages")!;
+    json.startArray()!;
+    json.startObject()!;
+    json.name("role")!;
+    json.string("user")!;
+    json.name("content")!;
+    json.startObject()!;
+    json.name("type")!;
+    json.string("text")!;
+    json.name("text")!;
+    json.stringBytes(text.view())!;
+    json.endObject()!;
+    json.endObject()!;
+    json.endArray()!;
+    json.endObject()!;
+    return mcpResult(json);
+}
+
+/// Serves until the end of the input; returns 0 (McpServer.Run).
+fn mcpCommand() -> i32 {
+    let directory = match (Directory.current()) {
+        Ok(d) => copyBytes(d.view().bytes())!,
+        Err(_) => copyBytes("/".bytes())!,
+    };
+    var server = McpServer { input: InputReader.create(), version: 0, workingDirectory: directory };
+    var first = true;
+    loop {
+        var line = match (readMcpLine(mut server.input)) {
+            Some(l) => l,
+            null => { break; }
+        };
+        if (first && line.length >= 3 && line[0] == 0xEF && line[1] == 0xBB && line[2] == 0xBF) {
+            line = copyBytes(line[3..])!; // a byte order mark at the start of the input
+        }
+        first = false;
+        if (!isBlankLine(line.view())) {
+            handleMcpLine(mut server, line.view());
+        }
+    }
+    return 0;
+}

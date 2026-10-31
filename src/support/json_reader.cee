@@ -1,0 +1,416 @@
+// Reading JSON (System.Text.Json's JsonNode.Parse with its default options: RFC 8259, no comments, no trailing
+// commas, at most 64 levels deep) into a tree whose nodes are named by index, and writing a node back.
+
+fn jsonNull() -> u32 => 0;
+fn jsonBool() -> u32 => 1;
+fn jsonNumber() -> u32 => 2;
+fn jsonString() -> u32 => 3;
+fn jsonArray() -> u32 => 4;
+fn jsonObject() -> u32 => 5;
+
+/// One node: its kind, its text (a string's value, UTF-8; a number's lexeme; "true"/"false"), its key in its object,
+/// and its children (an array's elements, an object's members, in order).
+struct JsonNodeData {
+    kind: u32;
+    text: Vector<u8>;
+    key: Vector<u8>;
+    children: Vector<u32>;
+}
+
+struct JsonDoc {
+    nodes: Vector<JsonNodeData>;
+
+    fn kind(borrow this, node: u32) -> u32 => if (node == none()) jsonNull() else this.nodes[node as usize].kind;
+
+    /// A member of an object node, or none (the last of that name, as JsonObject keeps one).
+    fn member(borrow this, node: u32, key: StringView) -> u32 {
+        if (node == none() || this.nodes[node as usize].kind != jsonObject()) {
+            return none();
+        }
+        var found = none();
+        for (child in this.nodes[node as usize].children.view()) {
+            if (sameText(this.nodes[child as usize].key.view(), key)) {
+                found = child;
+            }
+        }
+        return found;
+    }
+
+    /// A string node's value, or null for anything else.
+    fn stringOf(borrow this, node: u32) -> Vector<u8>? {
+        if (node == none() || this.nodes[node as usize].kind != jsonString()) {
+            return null;
+        }
+        return copyBytes(this.nodes[node as usize].text.view())!;
+    }
+
+    /// An integer node's value (GetValue<int>/<long>), or null if it is not a number without fraction or exponent.
+    fn integerOf(borrow this, node: u32) -> i64? {
+        if (node == none() || this.nodes[node as usize].kind != jsonNumber()) {
+            return null;
+        }
+        let text = this.nodes[node as usize].text.view();
+        var negative = false;
+        var start: usize = 0;
+        if (text.length > 0 && text[0] == '-') {
+            negative = true;
+            start = 1;
+        }
+        var value: i64 = 0;
+        for (k in start..text.length) {
+            let c = text[k];
+            if (c < '0' || c > '9') {
+                return null;
+            }
+            match (value.checkedMul(10)) {
+                Some(v) => {
+                    match (v.checkedAdd((c - '0') as i64)) {
+                        Some(w) => { value = w; }
+                        null => { return null; }
+                    }
+                }
+                null => { return null; }
+            }
+        }
+        return if (negative) 0 - value else value;
+    }
+
+    fn boolOf(borrow this, node: u32) -> bool? {
+        if (node == none() || this.nodes[node as usize].kind != jsonBool()) {
+            return null;
+        }
+        return this.nodes[node as usize].text[0] == 't';
+    }
+
+    fn childCount(borrow this, node: u32) -> usize =>
+        if (node == none()) 0 else this.nodes[node as usize].children.length;
+
+    fn child(borrow this, node: u32, k: usize) -> u32 => this.nodes[node as usize].children[k];
+}
+
+struct JsonParser {
+    position: usize;
+    depth: u32;
+    failed: bool;
+}
+
+fn isJsonSpace(c: u8) -> bool => c == ' ' || c == '\t' || c == '\n' || c == '\r';
+
+fn skipJsonSpace(p: borrow mut JsonParser, text: Slice<u8>) {
+    while (p.position < text.length && isJsonSpace(text[p.position])) {
+        p.position += 1;
+    }
+}
+
+fn addJsonNode(doc: borrow mut JsonDoc, kind: u32) -> u32 {
+    doc.nodes.push(
+        JsonNodeData {
+            kind: kind,
+            text: Vector<u8>.create(),
+            key: Vector<u8>.create(),
+            children: Vector<u32>.create(),
+        },
+    )!;
+    return truncate<u32>(doc.nodes.length - 1);
+}
+
+fn hexDigit(c: u8) -> u32 {
+    if (c >= '0' && c <= '9') {
+        return (c - '0') as u32;
+    }
+    if (c >= 'a' && c <= 'f') {
+        return (c - 'a') as u32 + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return (c - 'A') as u32 + 10;
+    }
+    return 16;
+}
+
+fn readHex4(p: borrow mut JsonParser, text: Slice<u8>) -> u32? {
+    if (p.position + 4 > text.length) {
+        return null;
+    }
+    var value: u32 = 0;
+    let count: usize = 4;
+    for (k in 0..count) {
+        let d = hexDigit(text[p.position + k]);
+        if (d == 16) {
+            return null;
+        }
+        value = value * 16 + d;
+    }
+    p.position += 4;
+    return value;
+}
+
+/// A string at its opening quote, decoded to UTF-8; null after an error (bad escape, control character, invalid
+/// UTF-8 or a lone surrogate escape, which System.Text.Json rejects).
+fn parseJsonString(p: borrow mut JsonParser, text: Slice<u8>) -> Vector<u8>? {
+    p.position += 1;
+    var out = Vector<u8>.create();
+    while (p.position < text.length) {
+        let c = text[p.position];
+        if (c == '"') {
+            p.position += 1;
+            return out;
+        }
+        if (c < 0x20) {
+            return null;
+        }
+        if (c == '\\') {
+            p.position += 1;
+            if (p.position >= text.length) {
+                return null;
+            }
+            let e = text[p.position];
+            p.position += 1;
+            if (e == '"' || e == '\\' || e == '/') {
+                out.push(e)!;
+            } else if (e == 'b') {
+                out.push(0x08)!;
+            } else if (e == 'f') {
+                out.push(0x0C)!;
+            } else if (e == 'n') {
+                out.push(0x0A)!;
+            } else if (e == 'r') {
+                out.push(0x0D)!;
+            } else if (e == 't') {
+                out.push(0x09)!;
+            } else if (e == 'u') {
+                let unit = match (readHex4(p, text)) {
+                    Some(u) => u,
+                    null => { return null; }
+                };
+                var scalar = unit;
+                if (unit >= 0xD800 && unit <= 0xDBFF) {
+                    if (p.position + 6 > text.length || text[p.position] != '\\' || text[p.position + 1] != 'u') {
+                        return null;
+                    }
+                    p.position += 2;
+                    let low = match (readHex4(p, text)) {
+                        Some(u) => u,
+                        null => { return null; }
+                    };
+                    if (low < 0xDC00 || low > 0xDFFF) {
+                        return null;
+                    }
+                    scalar = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+                } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
+                    return null;
+                }
+                appendUtf8(mut out, scalar)!;
+            } else {
+                return null;
+            }
+            continue;
+        }
+        let d = decodeUtf8(text, p.position);
+        if (!d.valid) {
+            return null;
+        }
+        appendBytes(mut out, text[p.position..p.position + (d.length as usize)])!;
+        p.position += d.length as usize;
+    }
+    return null;
+}
+
+fn parseJsonValue(p: borrow mut JsonParser, doc: borrow mut JsonDoc, text: Slice<u8>) -> u32 {
+    skipJsonSpace(p, text);
+    if (p.position >= text.length) {
+        p.failed = true;
+        return none();
+    }
+    let c = text[p.position];
+    if (c == '{' || c == '[') {
+        p.depth += 1;
+        if (p.depth > 64) {
+            p.failed = true;
+            return none();
+        }
+        let isObject = c == '{';
+        let node = addJsonNode(doc, if (isObject) jsonObject() else jsonArray());
+        p.position += 1;
+        skipJsonSpace(p, text);
+        let close: u8 = if (isObject) '}' else ']';
+        if (p.position < text.length && text[p.position] == close) {
+            p.position += 1;
+            p.depth -= 1;
+            return node;
+        }
+        loop {
+            skipJsonSpace(p, text);
+            var key = Vector<u8>.create();
+            if (isObject) {
+                if (p.position >= text.length || text[p.position] != '"') {
+                    p.failed = true;
+                    return none();
+                }
+                match (parseJsonString(p, text)) {
+                    Some(k) => { key = k; }
+                    null => {
+                        p.failed = true;
+                        return none();
+                    }
+                }
+                skipJsonSpace(p, text);
+                if (p.position >= text.length || text[p.position] != ':') {
+                    p.failed = true;
+                    return none();
+                }
+                p.position += 1;
+            }
+            let child = parseJsonValue(p, doc, text);
+            if (p.failed) {
+                return none();
+            }
+            doc.nodes[child as usize].key = key;
+            doc.nodes[node as usize].children.push(child)!;
+            skipJsonSpace(p, text);
+            if (p.position >= text.length) {
+                p.failed = true;
+                return none();
+            }
+            if (text[p.position] == ',') {
+                p.position += 1;
+                continue;
+            }
+            if (text[p.position] == close) {
+                p.position += 1;
+                p.depth -= 1;
+                return node;
+            }
+            p.failed = true;
+            return none();
+        }
+    }
+    if (c == '"') {
+        match (parseJsonString(p, text)) {
+            Some(s) => {
+                let node = addJsonNode(doc, jsonString());
+                doc.nodes[node as usize].text = s;
+                return node;
+            }
+            null => {
+                p.failed = true;
+                return none();
+            }
+        }
+    }
+    let start = p.position;
+    if (startsWithAt(text, start, "true") || startsWithAt(text, start, "false")) {
+        let length: usize = if (text[start] == 't') 4 else 5;
+        p.position += length;
+        let node = addJsonNode(doc, jsonBool());
+        doc.nodes[node as usize].text = copyBytes(text[start..start + length])!;
+        return node;
+    }
+    if (startsWithAt(text, start, "null")) {
+        p.position += 4;
+        return addJsonNode(doc, jsonNull());
+    }
+    // A number: -? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?
+    var i = start;
+    if (i < text.length && text[i] == '-') {
+        i += 1;
+    }
+    if (i >= text.length || text[i] < '0' || text[i] > '9') {
+        p.failed = true;
+        return none();
+    }
+    if (text[i] == '0') {
+        i += 1;
+    } else {
+        while (i < text.length && text[i] >= '0' && text[i] <= '9') {
+            i += 1;
+        }
+    }
+    if (i < text.length && text[i] == '.') {
+        i += 1;
+        let digits = i;
+        while (i < text.length && text[i] >= '0' && text[i] <= '9') {
+            i += 1;
+        }
+        if (i == digits) {
+            p.failed = true;
+            return none();
+        }
+    }
+    if (i < text.length && (text[i] == 'e' || text[i] == 'E')) {
+        i += 1;
+        if (i < text.length && (text[i] == '+' || text[i] == '-')) {
+            i += 1;
+        }
+        let digits = i;
+        while (i < text.length && text[i] >= '0' && text[i] <= '9') {
+            i += 1;
+        }
+        if (i == digits) {
+            p.failed = true;
+            return none();
+        }
+    }
+    p.position = i;
+    let node = addJsonNode(doc, jsonNumber());
+    doc.nodes[node as usize].text = copyBytes(text[start..i])!;
+    return node;
+}
+
+fn startsWithAt(text: Slice<u8>, at: usize, word: StringView) -> bool {
+    let w = word.bytes();
+    return at + w.length <= text.length && sameBytes(text[at..at + w.length], w);
+}
+
+/// The document's tree, its root the first node; null if the text is not one JSON value.
+fn parseJson(text: Slice<u8>) -> JsonDoc? {
+    var doc = JsonDoc { nodes: Vector<JsonNodeData>.create() };
+    var p = JsonParser { position: 0, depth: 0, failed: false };
+    // A UTF-8 byte-order mark is skipped, as JsonDocument does.
+    if (text.length >= 3 && text[0] == 0xEF && text[1] == 0xBB && text[2] == 0xBF) {
+        p.position = 3;
+    }
+    let root = parseJsonValue(mut p, mut doc, text);
+    if (p.failed) {
+        return null;
+    }
+    skipJsonSpace(mut p, text);
+    if (p.position != text.length || root != 0) {
+        return null;
+    }
+    return doc;
+}
+
+/// Writes a node of a parsed document (JsonNode.WriteTo): strings re-escaped by the writer's encoder, numbers as
+/// written.
+fn writeJsonNode(json: borrow mut JsonWriter, doc: borrow JsonDoc, node: u32) -> Result<void, AllocError> {
+    if (node == none()) {
+        return json.nothing();
+    }
+    let data = borrow doc.nodes[node as usize];
+    let kind = data.kind;
+    if (kind == jsonNull()) {
+        return json.nothing();
+    }
+    if (kind == jsonBool()) {
+        return json.boolean(data.text[0] == 't');
+    }
+    if (kind == jsonNumber()) {
+        return json.raw(data.text.view()); // as written
+    }
+    if (kind == jsonString()) {
+        return json.stringBytes(data.text.view());
+    }
+    if (kind == jsonArray()) {
+        json.startArray()?;
+        for (child in data.children.view()) {
+            writeJsonNode(json, doc, child)?;
+        }
+        return json.endArray();
+    }
+    json.startObject()?;
+    for (child in data.children.view()) {
+        json.nameBytes(doc.nodes[child as usize].key.view())?;
+        writeJsonNode(json, doc, child)?;
+    }
+    return json.endObject();
+}
