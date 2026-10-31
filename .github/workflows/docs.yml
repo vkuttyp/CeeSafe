@@ -1,0 +1,59 @@
+name: docs
+
+# The documentation site (site/README.md): VitePress, published to GitHub Pages at https://vkuttyp.github.io/CeeSafe/.
+# Its pages are spec/ and guide/; the guide's examples are checked by tools/guide_check.py in the contract suite.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "spec/**"
+      - "guide/**"
+      - "editors/vscode/syntaxes/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # "last updated" dates come from the git history
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: site/pnpm-lock.yaml
+      - name: Install
+        working-directory: site
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        working-directory: site
+        run: pnpm run build
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/.vitepress/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

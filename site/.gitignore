@@ -1,0 +1,9 @@
+node_modules/
+guide/
+reference/
+.vitepress/cache/
+.vitepress/dist/
+public/guide/
+public/reference/
+public/llms.txt
+public/llms-full.txt
