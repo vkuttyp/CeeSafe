@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -468,10 +469,13 @@ def print_report(r: dict):
 
 # ---- verify --------------------------------------------------------------------------------------------------------
 
-def verify(tree: Path, archs: list[str], boot: bool, max_load: float, novac: str) -> int:
-    # A port lands in CosmoOS as Nova, which CosmoOS builds with its pinned novac (CeeSafe's Decision 0003): these are
-    # the tree's own checks, run with that compiler.
-    env = dict(os.environ, NOVAC=novac)
+def verify(tree: Path, archs: list[str], boot: bool, max_load: float, ceesafec: str) -> int:
+    # A port lands in CosmoOS as a CeeSafe source, which its build compiles with the pinned ceesafec (CosmoOS's
+    # scripts/cee-gen.py, build/cee.mk): these are the tree's own checks, run with that compiler.
+    if not (tree / "scripts" / "cee-gen.py").is_file():
+        sys.exit(f"c2cee verify: {tree} has no scripts/cee-gen.py: a CosmoOS tree from before its move to CeeSafe "
+                 "(it built with novac); verify a tree at or after that change")
+    env = dict(os.environ, CEESAFEC=ceesafec)
     make = "gmake" if subprocess.run(["which", "gmake"], capture_output=True).returncode == 0 else "make"
     results = []
 
@@ -521,7 +525,7 @@ def verify(tree: Path, archs: list[str], boot: bool, max_load: float, novac: str
         """The host was busy at some point during the last step (a spike can be over by the time it fails)."""
         return max_load > 0 and peak[0] >= max_load
 
-    step("nova-check", [make, "nova-check"])
+    step("cee-check", [make, "cee-check"])
     step("host-test", [make, "host-test"], digests)
     step("check-docs", [make, "check-docs"])
     for arch in archs:
@@ -567,7 +571,10 @@ def port(source: Path, header: Path | None, includes: list[Path], target: str | 
 # ---- main ----------------------------------------------------------------------------------------------------------
 
 def cosmo_includes(tree: Path, arch: str, source: Path) -> list[Path]:
-    return [tree / "kernel" / "include", tree / "kernel" / "arch" / arch / "include", source.parent.resolve()]
+    """The kernel's own include path (CosmoOS's build/toolchain.mk, KERNEL_CFLAGS): the headers its build generates from
+    CeeSafe (out/cee/kernel/include, CEE_CFLAGS; `make cee` writes them), then the tree's."""
+    return [tree / "out" / "cee" / "kernel" / "include", tree / "kernel" / "include", tree / "drivers" / "include",
+            tree / "boot" / "protocol", tree / "kernel" / "arch" / arch / "include", source.parent.resolve()]
 
 
 def selftest(bless: bool) -> int:
@@ -610,7 +617,9 @@ def main() -> int:
     v.add_argument("--arch", choices=["x86_64", "aarch64", "both"], default="both")
     v.add_argument("--no-boot", action="store_true")
     v.add_argument("--max-load", type=float, default=8.0)
-    v.add_argument("--novac", default=str(Path.home() / ".nova" / "bin" / "novac"), help="the novac CosmoOS's Make runs")
+    v.add_argument("--ceesafec", default=os.environ.get("CEESAFEC") or shutil.which("ceesafec")
+                   or str(Path.home() / ".ceesafe" / "bin" / "ceesafec"),
+                   help="the ceesafec CosmoOS's Make runs: the version it pins (python3 scripts/cee-gen.py --pinned)")
     pt = sub.add_parser("port", help="draft a C file's CeeSafe port into a directory (stage 2)")
     pt.add_argument("file")
     pt.add_argument("--header", help="the header whose structs the port takes over")
@@ -652,7 +661,7 @@ def main() -> int:
     if args.command == "verify":
         archs = ["x86_64", "aarch64"] if args.arch == "both" else [args.arch]
         return verify(Path(args.cosmoos).expanduser().resolve(), archs, not args.no_boot, args.max_load,
-                      str(Path(args.novac).expanduser()))
+                      str(Path(args.ceesafec).expanduser()))
     return selftest(args.bless)
 
 

@@ -584,10 +584,11 @@ every port repeats the same mechanical steps: map the C types, declare each func
 that do not include the port's own header back, find what must stay in a C floor, rename members that are keywords,
 wire the build, and run the same checks. `integrations/cosmoos/c2cee.py` does the analysis and the checks, and drafts
 the `.cee` file, the floor and the build lines (§9.4). It is Nova's `c2nova` (written after the fork, at Nova
-`3ba382b`) for CeeSafe: its drafts equal `c2nova`'s under CeeSafe's names. CosmoOS keeps its ports as Nova and builds
-them with novac (CeeSafe's Decision 0003), so a finished port is checked with ceesafec and lands in CosmoOS's tree as a
-`.nova` file, the same language at the fork. It reads C through clang's own front end (`-Xclang -ast-dump=json`), so
-it needs nothing but clang and Python 3, and never edits a file.
+`3ba382b`) for CeeSafe: its drafts equal `c2nova`'s under CeeSafe's names. Since 2026-10-31 CosmoOS's kernel language
+is CeeSafe: a finished port lands in its tree as a `.cee` file, and its build generates the C with the ceesafec it pins
+(its `scripts/cee-gen.py` and `build/cee.mk`; the C is not committed). It reads C through clang's own front end (`-Xclang -ast-dump=json`), so
+it needs nothing but clang and Python 3, and never edits a file. It parses with the kernel's include path (CosmoOS's `KERNEL_CFLAGS`), the headers the build generates
+from CeeSafe (`out/cee/kernel/include`, written by `make cee`) first.
 
 ### 9.1 `c2cee.py analyse <file.c> [--header <h>] [--cosmoos <tree>] [--arch x86_64|aarch64] [--json]`
 
@@ -618,11 +619,14 @@ for `--arch` (default x86_64), and reports:
 
 The report is text, or JSON with `--json`. It exits 0 unless clang fails.
 
-### 9.2 `c2cee.py verify [--cosmoos <tree>] [--arch x86_64|aarch64|both] [--no-boot] [--max-load <n>] [--novac <path>]`
+### 9.2 `c2cee.py verify [--cosmoos <tree>] [--arch x86_64|aarch64|both] [--no-boot] [--max-load <n>] [--ceesafec <path>]`
 
-Runs a port's checks in a CosmoOS tree, in order, with `NOVAC` set to `--novac` (default `~/.nova/bin/novac`, the
-release CosmoOS pins; its Make builds the tree's Nova with it), and prints one line per step and a summary:
-1. `make nova-check` (the generated files match their sources under the pinned novac);
+Runs a port's checks in a CosmoOS tree, in order, with `CEESAFEC` set to `--ceesafec` (default `$CEESAFEC`, else
+`ceesafec` on `PATH`, else `~/.ceesafe/bin/ceesafec`: the release CosmoOS pins, which its Make runs on the tree's
+CeeSafe sources), and prints one line per step and a summary. A tree without `scripts/cee-gen.py` (from before
+CosmoOS's move to CeeSafe) is refused.
+1. `make cee-check` (every CeeSafe source compiles with the pinned ceesafec, and the negative sources are refused as
+   annotated);
 2. `make host-test`, with every recorded trace digest it prints;
 3. `make check-docs`;
 4. per architecture: the debug and the release build, `make analyze` (and, for the first architecture, `make
@@ -644,7 +648,8 @@ It exits 1 if any step failed, naming the first.
 ### 9.4 `c2cee.py port <file.c> --header <h> --out <dir> [--cosmoos <tree>] [--arch …]`
 
 Writes a **draft** of the port into `<dir>`, never into the tree: `<name>.cee`, `<name>_floor.c` and `BUILD.md` (the
-`ceesafec check` of the finished port, CosmoOS's `nova-gen.py`, `kernel.mk` and `host.mk` lines, and what to change in
+`ceesafec check` of the finished port, CosmoOS's `cee-gen.py`, `kernel.mk` and `host.mk` lines, where the `.cee` file goes
+and the C it replaces, and what to change in
 `<h>`). The draft is unsafe CeeSafe that mirrors the
 C, statement by statement, for a person to finish and review; every place it could not translate, or translated with a
 decision someone must check, carries `TODO(c2cee)` with the reason, and it never drops a construct silently.

@@ -944,7 +944,7 @@ class Port:
 
     def build_file(self, statics) -> str:
         src = str(self.source.relative_to(self.root)) if str(self.source).startswith(str(self.root)) else self.source.name
-        nova = src[:-2] + ".nova"  # CosmoOS keeps its ports as Nova (CeeSafe's Decision 0003)
+        cee = src[:-2] + ".cee"  # CosmoOS's ports are CeeSafe sources; its build generates the C (scripts/cee-gen.py)
         hdr = None
         if self.header:
             hdr = str(self.header).split("/kernel/include/")[-1] if "/kernel/include/" in str(self.header) else self.header.name
@@ -953,13 +953,13 @@ class Port:
                    for f, _, _ in self.records[s]["fields"] if self.field_name(s, f) != f]
         lines = [f"# Building the {self.stem} port (DRAFT by c2cee)", "",
                  f"- Check the finished port with ceesafec first: `ceesafec check --profile freestanding --kernel cosmoos --no-float {self.stem}.cee`.",
-                 f"- `scripts/nova-gen.py`, in `PORTS`:",
-                 f'  `("{nova}", "{src}", "TODO: title", ' + (f'"kernel/include/{types_h}"' if types_h else "None") + ", False),`",
-                 f"- `kernel/kernel.mk`: add `{src[:-2]}_floor.c` after `{src}`.",
+                 f"- `scripts/cee-gen.py`, in `PORTS`:",
+                 f'  `("{cee}", "{src}", "TODO: title", ' + (f'"kernel/include/{types_h}"' if types_h else "None") + ", False),`",
+                 f"- `kernel/kernel.mk`: add `{src[:-2]}_floor.c` after `{src}` (the build takes `{src}` from `out/cee`).",
                  f"- `tests/host/host.mk`: every test that links `{src}` also links `{src[:-2]}_floor.c`, "
-                 "`kernel/nova/nova_rt_core.c` and `tests/host/nova_panic.c`.",
-                 f"- Copy `{self.stem}.cee` to `{nova}` (the same language as Nova at the fork) and `{self.stem}_floor.c` to "
-                 f"`{src[:-2]}_floor.c`; `make nova` writes `{src}` with CosmoOS's pinned novac."]
+                 "`kernel/ceesafe/ceesafe_rt_core.c` and `tests/host/ceesafe_panic.c`.",
+                 f"- Move `{self.stem}.cee` to `{cee}` and `{self.stem}_floor.c` to `{src[:-2]}_floor.c`, and delete `{src}`: "
+                 f"the build generates it from `{cee}` with CosmoOS's pinned ceesafec (`make cee` to read it)."]
         if hdr:
             lines.append(f"- `{hdr}`: replace the definitions of {', '.join('`struct ' + s + '`' for s in self.records if self.owned(s)) or 'its structs'} "
                          f"with `#include <{types_h}>` (a comment naming the members keeps it readable).")
