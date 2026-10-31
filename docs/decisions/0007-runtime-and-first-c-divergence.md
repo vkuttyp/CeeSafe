@@ -41,9 +41,11 @@ generated C, measured by editing copies of ceesafec's C:
    ceesafec's C differs from it as intended: for every program with a region allocation or a zeroed box (13 of 249
    corpus, benchmark and program files), and for ceesafec itself. The `emit-c` snapshots in `tests/reference/` become
    CeeSafe's own: an intended change updates them by a reviewed edit recorded in its decision
-   (`tests/reference/README.md`); `emit-c/arena.c` is the first. `compare_c.py` and `compare_self.py` remain the
-   record of P7's parity at the fork; they are not part of CeeSafe's gates from this change on. Behaviour (every
-   run, check and parse family) is still compared with novac where the languages agree.
+   (`tests/reference/README.md`); `emit-c/arena.c` is the first. No test compares with novac any more ("Drop the suite's
+   comparisons with novac … We have migrated from Nova for good", the owner, 2026-10-31): `tools/contract_tests.py`
+   takes only `--ceesafec` and checks CeeSafe's own expectations (the fixed point, the corpus's annotations and
+   snapshots, the support library, the sweeps, the specification); `spec/testing.md` §3. The `tools/compare_*.py`
+   scripts remain only as the record of the port's parity with novac 0.6.0.
 
 ## Consequences
 

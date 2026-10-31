@@ -98,29 +98,24 @@ the markers, and never edit between them.
 ## Tools
 
 ```sh
-python3 tools/run_corpus.py --compiler ~/.nova/0.6.0/bin/novac                 # Nova's corpus against a compiler
-python3 tools/run_corpus.py --compiler out/ceesafec --reference ~/.nova/0.6.0/bin/novac --family parse-pass
-python3 tools/run_corpus.py --compiler ~/.nova/0.6.0/bin/novac --corpus probes --family run-pass --family check-fail \
-    --family parse-fail                                                  # the P1 probes
+python3 tools/contract_tests.py --ceesafec out/ceesafec                # every contract test, one command (spec/testing.md)
+python3 tools/run_corpus.py --compiler out/ceesafec --corpus tests/reference/tests/corpus      # CeeSafe's corpus
 W=""; for f in src/support/*.cee; do W="$W --with $f"; done                # zsh: then ${=W}
 python3 tools/run_corpus.py --compiler out/ceesafec --corpus tests/support --family run-pass $W --check-leaks
 python3 tools/fault_sweep.py --compiler out/ceesafec tests/support/fault/alloc-sweep.cee src/support/*.cee
 python3 tools/oracles/support_models.py                                  # oracle summaries for tests/support
-python3 tools/inventory.py                                               # regenerate docs/reference-inventory.md
-python3 tools/gen_catalog.py --nova <Nova at the pinned tag>            # regenerate src/diagnostics/catalog.cee
-python3 tools/compare_tokens.py --ceesafec out/ceesafec --oracle <token-dump> --root <Nova> lib tests/corpus
-                                                                        # the lexer against the reference (docs/p2-frontend.md §3)
-python3 tools/compare_parse.py --ceesafec out/ceesafec --novac ~/.nova/0.6.0/bin/novac --root <Nova> lib tests/corpus
-                                                                        # trees and diagnostics against novac (§6)
-python3 tools/parser_fuzz.py <dir> 3000 <seed> <files>                  # broken variants for compare_parse.py
-python3 tools/contract_tests.py --ceesafec out/ceesafec --novac ~/.nova/0.6.0/bin/novac --root <Nova at the tag>
-                                                                        # every contract test (P2–P6R), one command
 python3 tools/fixed_point.py --stage0 out/ceesafec --work <dir> --manifest <file>
                                                                         # the fixed point (docs/p6-fixed-point.md)
+python3 benchmarks/run.py                                                # CeeSafe against Rust and C (guide/performance.md)
+python3 tools/gen_runtime.py                                             # regenerate src/library/runtime.cee from runtime/
+python3 tools/gen_docs.py                                                # regenerate src/library/documents.cee
 ```
 
+No test runs novac or reads a Nova checkout (Decision 0007; `spec/testing.md` §3). The `tools/compare_*.py` scripts
+remain only as the record of the port's parity with novac 0.6.0.
+
 Generated files say so in their first line (`tools/oracles/gen_*.py` writes them); edit the generator, never the
-output. Expected values in `tests/support` come from oracles outside the code under test (Python, .NET, novac).
+output. Expected values in `tests/support` come from oracles outside the code under test (Python, .NET).
 Use `--check-leaks` for anything new: novac 0.3.1 skipped drops, and the probes keep a regression for it.
 
 `run_corpus.py` checks the corpus's own expectations (annotations, snapshots, expected output); `--reference`

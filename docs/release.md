@@ -30,7 +30,8 @@ One C seed for every platform, so every binary is built from the same C and chec
 1. Set the version in `src/backend/c_program.cee`: `ceesafeVersion()` and `compilerBanner()` (`ceesafec <version>`)
    must agree, and the tag must name it; the workflow checks both. The version is a constant so that the generated C
    is reproducible.
-2. Run the contract suite and the fixed point on the commit (`spec/testing.md`).
+2. Run the contract suite on the commit: `python3 tools/contract_tests.py --ceesafec out/ceesafec` (`spec/testing.md`;
+   it includes the fixed point).
 3. Dry run: `gh workflow run release.yml --ref main` builds, checks, signs and notarizes everything without
    publishing.
 4. Tag and push: `git tag v<version> && git push origin v<version>`.

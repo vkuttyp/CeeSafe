@@ -11,19 +11,19 @@ Sanitizer results are supporting evidence, never proof of the language's safety.
 | Kind | Where | Oracle |
 |---|---|---|
 | Corpus (§2) | `tests/reference/tests/corpus/*`, `tools/run_corpus.py` | the files' own annotations and snapshots |
-| Regression against the fork (§3) | `tools/compare_*.py`, `tools/run_corpus.py --reference` | novac 0.6.0's output, with ceesafec's names mapped back (`tools/names.py`) |
+| Support library | `tests/support`, `tools/fault_sweep.py` | independent oracles (Python, .NET) for each structure, and an allocation-failure sweep |
 | Fixed point | `tools/fixed_point.py`, `bootstrap/fixed-point/` | ceesafec built by itself emits byte-identical C, generation after generation |
 | Mutation suite (Nova M2) | `tools/mutation_suite.py` | mutants of seed programs; the expected (code, line) diagnostics come from an independent oracle, not from the checker |
 | Fault-injection sweep (Nova M3) | `tools/fault_injection.py` | every run-pass program that allocates, built with ASan+UBSan, run once per allocation attempt *k* with attempt *k* failing; each run returns from `main` with `live=0` or panics with "unwrapped an Err value", with no sanitizer report |
 | Collection properties (Nova M6) | `tools/collection_properties.py` | a model of each built-in collection predicts the exact output of random operation programs (values, lengths, the growth rule of `type-system.md` §23.1, stale handles, drop order), also under the fault sweep |
 | Freestanding | `tools/freestanding_check.py` | the freestanding programs build with `-ffreestanding -nostdinc` for `x86_64-` and `aarch64-unknown-none-elf` and run against their C harnesses |
 | Debugging | `tools/debugger_check.py` | a `-g` build under lldb or gdb with `editors/debug`'s commands (`tooling.md` §3) |
-| Linking with Nova | `tools/link_collision.py` | a novac-built and a ceesafec-built library link into one program; two novac-built ones do not |
 | CosmoOS (Nova's C1–C9, K3) | `integrations/cosmoos/c*.py`, `k3.py` | ceesafec's C under CosmoOS's own flags, host tests, fuzz targets and module loader rules, and in its QEMU boots; CosmoOS's tree is only read |
 | Same C on another host | `tools/host_c_check.py` | ceesafec built on Windows (MSVC, clang) emits the same C as on macOS and Linux |
 | Specification (§4) | `tools/spec_check.py`, `tools/guide_check.py` | every diagnostic code is explained; the guide's examples do what the pages say; links resolve |
 
-`tools/contract_tests.py` runs all of these but the fixed point and the host check, against one ceesafec.
+`tools/contract_tests.py --ceesafec PATH` runs all of these but CosmoOS and the host check, against one ceesafec. None
+of them runs novac or reads a Nova checkout (§3).
 
 ## 2. Corpus format
 
@@ -59,17 +59,13 @@ At the fork the corpus is Nova's at `v0.6.0` with `.cee` names (`tools/fork_corp
 Nova's: `run_corpus.py` compares ceesafec's output with them after mapping CeeSafe's names back (§3). A CeeSafe-only
 change to the language adds corpus files with CeeSafe's names and snapshots written by ceesafec.
 
-## 3. Regression against the fork
+## 3. No comparison with Nova
 
-novac 0.6.0's output, which equalled ceesafec's at the fork, is the frozen baseline (the repository's
-`docs/fork-point.md`). The comparison tools run novac in a Nova checkout at `v0.6.0` and ceesafec on CeeSafe's copy of
-the same files, and compare novac's output with ceesafec's mapped back by `tools/names.py`: diagnostics and JSON,
-the AST, HIR and NIR dumps, the C in eight forms and the reports, CeeSafe's own C, packages, the command line, `fmt`,
-`doc`, `run --interp`, and the `lsp` and `mcp` servers. A mapping could hide a name that was not renamed, so the C
-comparisons also fail on any Nova C name left in ceesafec's output.
-
-A deliberate difference from Nova is a change to this specification first, and then a recorded exception in the
-comparisons (as `names.FORK_DIVERGENCES` is).
+At the fork ceesafec's output equalled novac 0.6.0's, and the port was checked by comparing the two (the repository's
+`docs/fork-point.md`). Since CeeSafe's Decision 0007 CeeSafe has left Nova: its C differs from novac's on purpose, and
+no test runs novac or reads a Nova checkout. The corpus's snapshots are CeeSafe's own; an intended change to what
+ceesafec emits updates them by a reviewed edit, recorded with the change. The `tools/compare_*.py` scripts and
+`tools/run_corpus.py --reference` remain only as the record of that parity.
 
 ## 4. The specification's own checks
 

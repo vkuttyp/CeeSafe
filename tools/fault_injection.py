@@ -24,8 +24,8 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from names import dialect, for_compiler, map_back  # noqa: E402
 
-ALLOCATION_CALLS = ("nova_alloc(", "nova_region_alloc(", "nova_scratch_enter_root(", "nova_pool_take(", "nova_vec_grow(",
-                    "nova_svec_slot(")
+ALLOCATION_CALLS = ("nova_alloc(", "nova_alloc_zeroed(", "nova_region_alloc(", "nova_region_alloc_fast(",
+                    "nova_scratch_enter_root(", "nova_pool_take(", "nova_vec_grow(", "nova_svec_slot(")  # Decision 0007
 P5_SWITCHES = ["--flat-c", "--no-closure-specialisation", "--no-placement", "--no-bce", "--no-oce"]
 SWITCHES = []  # the default form; --flat sets P5_SWITCHES
 SANITIZERS = ["-O1", "-Werror", "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"]
@@ -130,7 +130,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--reference")
-    parser.add_argument("--corpus", default=os.path.expanduser("~/Nova/tests/corpus"))
+    parser.add_argument("--corpus", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests",
+                                                               "reference", "tests", "corpus"))
     parser.add_argument("--filter")
     parser.add_argument("--jobs", type=int, default=os.cpu_count())
     parser.add_argument("--flat", action="store_true", help="build in P5's form (everything off)")
@@ -140,7 +141,7 @@ def main():
     compiler = os.path.abspath(os.path.expanduser(args.compiler))
     reference = os.path.abspath(os.path.expanduser(args.reference)) if args.reference else None
     directory = os.path.join(args.corpus, "run-pass")
-    paths = ["run-pass/" + f for f in sorted(os.listdir(directory)) if f.endswith(".nova")]
+    paths = ["run-pass/" + f for f in sorted(os.listdir(directory)) if f.endswith((".nova", ".cee"))]
     if args.filter:
         paths = [p for p in paths if args.filter in p]
     work = [(compiler, reference, args.corpus, p) for p in paths]

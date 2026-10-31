@@ -63,11 +63,11 @@ out/ceesafec build -o out/ceesafec.new && mv out/ceesafec.new out/ceesafec
 `ceesafec` is one native executable: its runtime, its libraries and this specification are inside it, so it can be
 copied anywhere, for example onto your `PATH` as `~/.local/bin/ceesafec`.
 
-To check everything, run the contract suite (the repository's `spec/testing.md`; about an hour, since it compiles and
-runs the corpus many times and compares the results with novac 0.6.0's):
+To check everything, run the contract suite (the repository's `spec/testing.md`; it compiles and runs the corpus
+many times, checks the fixed point, and sweeps allocation failures):
 
 ```sh
-python3 tools/contract_tests.py --ceesafec out/ceesafec --novac ~/.nova/0.6.0/bin/novac --root <a Nova checkout at v0.6.0>
+python3 tools/contract_tests.py --ceesafec out/ceesafec
 ```
 
 ## Check that it works
