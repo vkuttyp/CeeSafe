@@ -67,7 +67,7 @@ At the fork the language is Nova `v0.6.0`'s; what differs is how it is named and
 - **CosmoOS.** The kernel profile, `lib/kernel` and the CosmoOS bindings were developed by Nova inside CosmoOS, and
   CosmoOS builds its Nova code with novac. Where this text reports what was run in CosmoOS, it was run with Nova.
 - **Paths.** `src/…` is `ceesafec`'s source. `lib/…` and `runtime/…` name the library and runtime sources ceesafec
-  embeds, generated at the fork from Nova's (`architecture.md` §6). `tests/corpus/…`, `benchmarks/…` and `programs/…`
+  embeds, CeeSafe's own since Decisions 0007 and 0008 (`architecture.md` §6). `tests/corpus/…`, `benchmarks/…` and `programs/…`
   are CeeSafe's copies under `tests/reference/` (Nova's at the fork, as `.cee` files). `integrations/cosmoos/…` is
   CeeSafe's own adaptation of Nova's CosmoOS checks (`testing.md` §1).
 - **Tests.** A test named like a C# class (`FixTests`, `PlacementTests`) is Nova's; where CeeSafe has its own check,

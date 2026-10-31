@@ -33,8 +33,8 @@ inherited and the guide forked with checked examples. This page records how it w
 
 ## Not done
 
-- `lib/` and `runtime/` are still generated from Nova `v0.6.0` (`tools/gen_library.py`, `tools/gen_runtime.py`); the
-  specification names them by those paths. Moving their sources into CeeSafe's repository is a separate step.
+- ~~`lib/` and `runtime/` are still generated from Nova `v0.6.0`.~~ Done: `runtime/` by Decision 0007, `lib/` by
+  Decision 0008 (2026-10-31).
 - No site: the guide and the specification are read in the repository and through `ceesafec` (`explain`, MCP).
 - The milestone tags and the history inside `ownership.md`, `memory-model.md`, `language-spec.md` and `type-system.md`
   are Nova's, kept as they are (`spec/README.md` §4).

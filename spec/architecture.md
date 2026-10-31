@@ -97,6 +97,8 @@ CeeSafe/
   ceesafe.toml                 # ceesafec is a CeeSafe package
   src/                         # the compiler (the directories named above)
     library/                   # GENERATED: the libraries, runtime and documents ceesafec embeds
+  lib/                         # the libraries: core, std, kernel (Decision 0008)
+  runtime/                     # the C runtime (Decision 0007)
   spec/                        # this specification; spec/decisions/ holds the ADRs
   guide/                       # the guide; every `ceesafe` example is checked (tools/guide_check.py)
   templates/AGENTS.md          # what `ceesafec new` and `ceesafec agents` write
@@ -109,7 +111,8 @@ CeeSafe/
 ```
 
 The compiler, the runtime C and the libraries are versioned together: the runtime ABI between them is internal, and
-`CEESAFE_ABI_VERSION` names it (`c-backend.md` §2). At the fork the libraries (`lib/core`, `lib/std`, `lib/kernel`) and
-the runtime (`runtime/`) are generated into `src/library/` from Nova `v0.6.0` under CeeSafe's names
-(`tools/gen_library.py`, `tools/gen_runtime.py`); `tests/reference/lib/` holds the libraries as `.cee` files. A path
-`lib/…` or `runtime/…` in this specification names one of those sources.
+`CEESAFE_ABI_VERSION` names it (`c-backend.md` §2). The libraries (`lib/core`, `lib/std`, `lib/kernel`) and the runtime
+(`runtime/`) are CeeSafe's sources, written at the fork from Nova `v0.6.0` under CeeSafe's names and edited here since
+(Decisions 0007, 0008); `tools/gen_library.py` and `tools/gen_runtime.py` embed them into `src/library/`.
+`tests/reference/lib/` keeps Nova's libraries as they were at the fork. A path `lib/…` or `runtime/…` in this
+specification names one of CeeSafe's sources.

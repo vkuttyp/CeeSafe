@@ -4,8 +4,8 @@
 - explain: every diagnostic code in the catalog (src/diagnostics/catalog.cee) has an entry `ceesafec explain` finds
   (Nova's FixTests rule), and the embedded documents are the tree's (src/library/documents.cee is up to date);
 - links: every relative link in spec/, guide/ and templates/ names a file that exists;
-- api: spec/api/core.md is what `ceesafec doc lib/core --title "lib/core"` writes for the embedded lib/core (CeeSafe's
-  copy in tests/reference/lib/core under CeeSafe's names, as tools/gen_library.py embeds it);
+- api: spec/api/core.md is what `ceesafec doc lib/core --title "lib/core"` writes for lib/core, the source
+  tools/gen_library.py embeds (Decision 0008);
 - names: no Nova C name, `.nova` file, `nova.toml` or `NOVA_HOME` outside URLs, the inherited ADRs and the places that
   name Nova's on purpose (ALLOWED).
 
@@ -18,8 +18,6 @@ import re
 import subprocess
 import sys
 import tempfile
-
-from names import map_forward
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, ".."))
@@ -81,9 +79,9 @@ def check_api(cee, problems):
     with tempfile.TemporaryDirectory() as work:
         core = os.path.join(work, "lib", "core")
         os.makedirs(core)
-        for source in sorted(glob.glob(os.path.join(ROOT, "tests", "reference", "lib", "core", "*.cee"))):
+        for source in sorted(glob.glob(os.path.join(ROOT, "lib", "core", "*.cee"))):
             with open(source, "rb") as f, open(os.path.join(core, os.path.basename(source)), "wb") as g:
-                g.write(map_forward(f.read()))
+                g.write(f.read())
         page = subprocess.run([cee, "doc", "lib/core", "--title", "lib/core"], cwd=work, capture_output=True)
     with open(os.path.join(ROOT, "spec", "api", "core.md"), "rb") as f:
         if page.returncode != 0 or page.stdout != f.read():

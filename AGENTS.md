@@ -89,9 +89,10 @@ the markers, and never edit between them.
   the command line may have any extension, so Nova's corpus stays `.nova`, compared with novac; CeeSafe's own tests
   (`tests/support`, `tests/reference`) are `.cee`. Since Decision 0007 ceesafec's C is CeeSafe's own, not novac's. CeeSafe
   tracks Nova (its specifications, releases and corpus) until P8. Diagnostic codes keep the letter N.
-- A missing language or library feature is an upstream Nova task (ROADMAP's N track: spec and ADR in `~/Nova`, then a
-  novac release and a re-pin). Pure library code (tables, interner, bignum, JSON) is written here in Nova. Never
-  work around a gap with `unsafe`, C, or a weaker check where a safe design exists.
+- A missing language or library feature is CeeSafe's own work since Nova stopped (Decisions 0006, 0007): spec and ADR
+  first (`spec/decisions/0031-…` onward), then the compiler, tests and guide. The libraries are `lib/` (Decision 0008;
+  `tools/gen_library.py` embeds them), the runtime `runtime/`. Never work around a gap with `unsafe`, C, or a weaker
+  check where a safe design exists.
 - Small C adapters for host services are allowed only behind a documented contract (ownership, lengths, encoding,
   errors); compiler algorithms stay in Nova.
 
@@ -143,6 +144,7 @@ tests/syntax/                           lexer edge cases (tools/lexer_fuzz.py --
 tests/support/                          support-library tests (run-pass, fault/)
 tools/oracles/                          independent oracles and generators for tests
 runtime/                                the C runtime ceesafec embeds (tools/gen_runtime.py; Decision 0007)
+lib/                                    the libraries ceesafec embeds: core, std, kernel (tools/gen_library.py; Decision 0008)
 benchmarks/                             CeeSafe against Rust and C (run.py; results in guide/performance.md)
 out/                                    build output, never committed
 ```
