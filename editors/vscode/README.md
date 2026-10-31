@@ -10,6 +10,6 @@ Build and install with [Vite+](https://viteplus.dev/) (`vp`); the extension need
 cd editors/vscode
 vp install
 vp test                 # grammar tests, and ceesafec lsp through vscode-jsonrpc
-vp run package          # makes ceesafe-language-0.1.0.vsix
-code --install-extension ceesafe-language-0.1.0.vsix
+vp run package          # makes ceesafe-language-<version>.vsix (also in every release)
+code --install-extension ceesafe-language-*.vsix
 ```

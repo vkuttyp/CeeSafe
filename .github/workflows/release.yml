@@ -224,8 +224,45 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  publish:
+  extension:
+    # The VS Code extension (editors/vscode, guide/editors.md): its tests, the language server's among them run against
+    # this release's linux-x64 ceesafec, then the .vsix, whose version must be the release's.
     needs: [version, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ceesafec-linux-x64
+          path: compiler
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Vite+
+        run: npm install --global vite-plus@1.1.0 && vp --version
+      - name: Test and package
+        working-directory: editors/vscode
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ "$version" != "${{ needs.version.outputs.version }}" ]; then
+            echo "::error::editors/vscode/package.json is $version, the release is ${{ needs.version.outputs.version }}; see docs/release.md"
+            exit 1
+          fi
+          tar -xzf ../../compiler/ceesafec-linux-x64.tar.gz -C ../../compiler
+          export CEESAFEC="$GITHUB_WORKSPACE/compiler/ceesafec"
+          "$CEESAFEC" --version
+          vp install
+          vp test
+          vp run package
+          mkdir -p ../../dist && mv "ceesafe-language-$version.vsix" ../../dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceesafe-language
+          path: dist/*.vsix
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build, extension]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
@@ -236,8 +273,12 @@ jobs:
           pattern: ceesafec-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: ceesafe-language
+          path: dist
       - name: Checksums
-        run: cd dist && sha256sum ceesafec-* > SHA256SUMS && cat SHA256SUMS
+        run: cd dist && sha256sum ceesafec-* ceesafe-language-*.vsix > SHA256SUMS && cat SHA256SUMS
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}

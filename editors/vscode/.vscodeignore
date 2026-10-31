@@ -1,0 +1,6 @@
+.gitignore
+extension.js
+pnpm-lock.yaml
+test/**
+node_modules/**
+*.vsix

@@ -17,19 +17,22 @@ One C seed for every platform, so every binary is built from the same C and chec
    the Developer ID and notarized. A smoke test runs `--version`, the interpreter, a native build and the MCP server.
    `osx-x64` is built on an arm64 runner by ceesafec's own driver (`--cflag -arch --cflag x86_64`) and run under
    Rosetta when the runner has it.
-3. **publish**: `SHA256SUMS` and the GitHub release.
+3. **extension**: the VS Code extension's tests (the language server's run against the linux-x64 `ceesafec` just
+   built) and its `.vsix`, `ceesafe-language-<version>.vsix`.
+4. **publish**: `SHA256SUMS` (the archives and the `.vsix`) and the GitHub release.
 
 | Archive | Built on | Contents |
 |---|---|---|
 | `ceesafec-linux-x64.tar.gz`, `ceesafec-linux-arm64.tar.gz` | Ubuntu 22.04 (glibc 2.35) | `ceesafec`, `COPYING`, `COPYING.RUNTIME` |
 | `ceesafec-osx-arm64.tar.gz`, `ceesafec-osx-x64.tar.gz` | macOS (arm64), signed and notarized | the same |
 | `ceesafec-win-x64.zip`, `ceesafec-win-arm64.zip` | Windows | `ceesafec.exe`, `COPYING`, `COPYING.RUNTIME` |
+| `ceesafe-language-<version>.vsix` | Ubuntu | the VS Code extension (`guide/editors.md`) |
 
 ## Making a release
 
 1. Set the version in `src/backend/c_program.cee`: `ceesafeVersion()` and `compilerBanner()` (`ceesafec <version>`)
    must agree, and the tag must name it; the workflow checks both. The version is a constant so that the generated C
-   is reproducible.
+   is reproducible. Set the same version in `editors/vscode/package.json`: the workflow checks it too.
 2. Run the contract suite on the commit: `python3 tools/contract_tests.py --ceesafec out/ceesafec` (`spec/testing.md`;
    it includes the fixed point).
 3. Tag and push: `git tag v<version> && git push origin v<version>`. Only such a tag runs the workflow (there is no

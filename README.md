@@ -118,7 +118,7 @@ Other commands: `ceesafec fix` applies the compiler's sure fixes, `ceesafec expl
 | [The guide](guide/) | the language from basics to ownership, memory, collections, generics, closures, threads, `unsafe` and kernel code; [coming from Rust, Zig, C, C#, Go](guide/coming-from/) |
 | [The specification](spec/) | the normative rules: grammar, type system, ownership, lifetimes, memory model, the C backend, diagnostics, tooling |
 | [For AI agents](guide/for-agents.md) | how an agent should write and check CeeSafe; `ceesafec new --agent claude` sets one up |
-| [Editors](guide/editors.md), [debugging](guide/debugging.md) | the VS Code extension and language server; lldb and gdb |
+| [Editors](guide/editors.md), [debugging](guide/debugging.md) | the VS Code extension (a `.vsix` in every release) and the language server; lldb and gdb |
 
 ## Building from source
 
