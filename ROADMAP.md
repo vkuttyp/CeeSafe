@@ -765,4 +765,13 @@ binary built from the Linux seed and emitting it byte for byte (osx-x64 checked 
 notarized (Accepted), published with SHA256SUMS at github.com/vkuttyp/CeeSafe/releases/tag/v0.1.0;
 `install.sh` from the site installs it and builds a program. `main` is 0.2.0-dev.
 
+**Release v0.2.0** (2026-10-31; `docs/release.md`; Decision 0007): the first CeeSafe-only release. The contract suite,
+now CeeSafe-only (13 steps), on the commit before the version change: every step ok but `spec`, which needed the
+embedded documents regenerated (then 0 problems); the fixed point at 0.2.0; one dry run of `release.yml`, then the tag:
+six platforms from one seed, macOS signed and notarized, published at github.com/vkuttyp/CeeSafe/releases/tag/v0.2.0.
+The released osx-arm64 archive matches `SHA256SUMS`, reports `ceesafec 0.2.0`, is accepted by Gatekeeper as notarized,
+and builds and runs a program. The VS Code extension `ceesafe-language-0.2.0.vsix` (tested with 20/20 tests against
+0.2.0) was attached by hand, with its line added to `SHA256SUMS`; from the next tag the workflow's `extension` job
+builds and attaches it. Since this release the workflow runs only on a pushed `v*` tag. `main` is 0.3.0-dev.
+
 Not yet run: the rest of P9.
