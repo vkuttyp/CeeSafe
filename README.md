@@ -1,3 +1,5 @@
+<p align="center"><img src="site/public/logo.svg" alt="CeeSafe" width="128" height="128"></p>
+
 # CeeSafe
 
 **Memory-safe systems programming, compiled to C.**

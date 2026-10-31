@@ -106,10 +106,12 @@ export default defineConfig({
   srcExclude: ["README.md", "public/**"],
   cleanUrls: true,
   lastUpdated: true,
+  head: [["link", { rel: "icon", type: "image/svg+xml", href: "/CeeSafe/logo.svg" }]],
   markdown: {
     languages: [{ ...ceesafe, name: "ceesafe", aliases: ["CeeSafe", "cee", "nova"] }],
   },
   themeConfig: {
+    logo: "/logo.svg",
     nav: [
       { text: "Guide", link: "/guide/introduction", activeMatch: "/guide/" },
       { text: "Specification", link: "/reference/", activeMatch: "/reference/(?!api/|decisions/)" },

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="CeeSafe">
+  <title>CeeSafe</title>
+  <defs>
+    <linearGradient id="shield" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#14A3A8"/>
+      <stop offset="1" stop-color="#0B3D63"/>
+    </linearGradient>
+  </defs>
+  <!-- The shield: safety. -->
+  <path d="M128 12 L226 48 V122 C226 186 186 226 128 246 C70 226 30 186 30 122 V48 Z" fill="url(#shield)"/>
+  <!-- The C: compiled to C. -->
+  <path d="M170.4 85.6 A60 60 0 1 0 170.4 170.4" fill="none" stroke="#FFFFFF" stroke-width="28" stroke-linecap="round"/>
+  <!-- The keyhole: a safe. -->
+  <circle cx="128" cy="116" r="15" fill="#FFFFFF"/>
+  <path d="M120 122 H136 L141 156 H115 Z" fill="#FFFFFF"/>
+</svg>
