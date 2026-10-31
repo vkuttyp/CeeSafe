@@ -50,4 +50,6 @@ base64), `APPLE_CERTIFICATE_PASSWORD`, and for `notarytool` `ASC_P8` (the App St
 
 The `stores` job needs `VSCE_PAT`, an Azure DevOps personal access token with the scope **Marketplace → Manage** for
 the Marketplace publisher `ceesafe` (marketplace.visualstudio.com/manage), and `OVSX_PAT`, an access token of the
-open-vsx.org account that owns the namespace `ceesafe` (`npx ovsx create-namespace ceesafe -p <token>` once).
+open-vsx.org account that owns the namespace `ceesafe`. The namespace exists (2026-10-31) and its ownership claim is
+EclipseFdn/open-vsx.org#15060; once it is approved, a trusted publisher for this workflow will replace the token. Until
+then `OVSX_PAT` is not set and the Open VSX step skips with a warning.
