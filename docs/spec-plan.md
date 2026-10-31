@@ -26,7 +26,10 @@ inherited and the guide forked with checked examples. This page records how it w
 - `tools/spec_check.py`: 75 documents, 132 codes explained, 100 links, `spec/api/core.md` equal to `ceesafec doc`'s
   page, no stray Nova names: 0 problems.
 - `tools/guide_check.py`: 92 examples (4 skipped by their pages, as in Nova): 0 problems.
-- The contract suite and the fixed point: see `ROADMAP.md` §10.
+- The contract suite at `e401024`: 36 steps, all ok. The fixed point at `e401024` on macOS in both forms
+  (`bootstrap/fixed-point/2026-10-31-spec-*`). Details in `ROADMAP.md` §10.
+- The documentation site (`site/`, VitePress): `pnpm run build` passes its dead-link check over the copies of
+  `spec/` and `guide/`.
 
 ## Not done
 

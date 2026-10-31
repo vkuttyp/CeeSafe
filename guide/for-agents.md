@@ -5,7 +5,10 @@ little of it: it will write C#, TypeScript or Rust that looks like CeeSafe and i
 that quickly. It says exactly what is wrong, fixes what it is sure of, and serves its own specification.
 
 The guide and the specification are inside `ceesafec`: an agent reads them through `ceesafec explain` and the MCP
-server's resources (`ceesafe://docs/…`, below), so it needs no network access to read the rules.
+server's resources (`ceesafe://docs/…`, below), so it needs no network access to read the rules. On the web they are
+also in machine-readable form: [llms.txt](https://vkuttyp.github.io/CeeSafe/llms.txt) (an index) and
+[llms-full.txt](https://vkuttyp.github.io/CeeSafe/llms-full.txt) (the guide and the specification in one file), and
+every page is available as Markdown at its address with `.md` added.
 
 ## In a new package
 

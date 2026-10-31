@@ -36,6 +36,7 @@ Descriptive: [`architecture.md`](architecture.md) (how `ceesafec` is built),
 [`testing.md`](testing.md) (how CeeSafe is tested).
 
 The [guide](../guide/introduction.md) teaches the language; every example in it is compiled by `tools/guide_check.py`.
+Both are published at [vkuttyp.github.io/CeeSafe](https://vkuttyp.github.io/CeeSafe/) (the repository's `site/`).
 
 ## 2. Decisions
 

@@ -741,4 +741,14 @@ CeeSafe itself, the four reports identical; the contract suite in the default fo
 point in the default form and with `--split` on both hosts, the same C on both. Decision 0004: the C prefix switches
 at P8.
 
-Not yet run: P8 or later.
+**P8 tools and the fork point** (2026-10-31; `docs/p8-plan.md`, `docs/fork-point.md`): recorded per slice in
+`docs/p8-plan.md`; the fixed point after the fork on macOS, Linux and Windows (`bootstrap/fixed-point/2026-10-31-p8s7-*`).
+
+**CeeSafe's specification** (2026-10-31; Decision 0006, `docs/spec-plan.md`, commit `e401024`, macOS, Apple clang 21):
+the contract suite, 36 steps, all ok (`spec_check`: 75 documents, 132 codes, 100 links, 0 problems; `guide_check`: 92
+examples, 0 problems; the CLI and servers through `tools/reference_docs.py`: `fix` 177/177, MCP 433/433, LSP 438/438;
+CeeSafe's own C identical after mapping back, 535,154 lines and 623,749 with `--split -g`); the fixed point from a
+bootstrapped stage 0 in the default form and with `--split` (`bootstrap/fixed-point/2026-10-31-spec-*`). Linux and
+Windows not rerun for this commit.
+
+Not yet run: P9.
