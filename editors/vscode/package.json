@@ -2,19 +2,28 @@
   "name": "ceesafe-language",
   "displayName": "CeeSafe",
   "version": "0.2.0",
-  "license": "GPL-2.0-only",
   "description": "The CeeSafe language: syntax highlighting, and diagnostics, hover, go to definition, outline and formatting from ceesafec lsp.",
   "categories": [
     "Formatters",
     "Programming Languages"
   ],
+  "homepage": "https://vkuttyp.github.io/CeeSafe/guide/editors",
+  "bugs": {
+    "url": "https://github.com/vkuttyp/CeeSafe/issues"
+  },
+  "license": "GPL-2.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vkuttyp/CeeSafe.git",
+    "directory": "editors/vscode"
+  },
   "publisher": "ceesafe",
   "main": "./dist/extension.cjs",
   "scripts": {
     "test": "vp test",
     "check": "vp lint && vp fmt --check",
     "bundle": "vp pack extension.js --format cjs --deps.never-bundle vscode --no-config",
-    "package": "vp run bundle && vpx @vscode/vsce package --no-dependencies --skip-license --allow-missing-repository"
+    "package": "vp run bundle && vpx @vscode/vsce package --no-dependencies --skip-license"
   },
   "devDependencies": {
     "vscode-jsonrpc": "8.2.0",

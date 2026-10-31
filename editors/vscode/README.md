@@ -1,15 +1,50 @@
 # CeeSafe for VS Code
 
-Syntax highlighting for `.cee` files, and, through `ceesafec lsp` (Nova's docs/tooling.md §2), diagnostics as you type, hover
-with types, go to definition, the outline, and formatting with `ceesafec fmt`'s style.
+Language support for [CeeSafe](https://github.com/vkuttyp/CeeSafe), the memory-safe systems programming language that
+compiles to C: syntax highlighting for `.cee` files, and, through the `ceesafec lsp` language server,
 
-Build and install with [Vite+](https://viteplus.dev/) (`vp`); the extension needs `ceesafec` on the `PATH` or in the
-`ceesafe.server.path` setting:
+- errors as you type, with their diagnostic codes;
+- the type of an expression, a variable or a field, and a function's signature, on hover;
+- go to definition (F12) for locals, parameters, functions, methods, fields and types;
+- the outline of a file;
+- formatting (Shift+Alt+F) in `ceesafec fmt`'s one canonical style.
+
+A file that belongs to a package (a `ceesafe.toml`) is checked with the package and its locked dependencies.
+
+## Requirements
+
+The extension starts `ceesafec`, the CeeSafe compiler. Install it on macOS or Linux with
 
 ```sh
-cd editors/vscode
+curl -fsSL https://vkuttyp.github.io/CeeSafe/install.sh | sh
+```
+
+or on Windows, in PowerShell, with `irm https://vkuttyp.github.io/CeeSafe/install.ps1 | iex`
+([installation](https://vkuttyp.github.io/CeeSafe/guide/installation)).
+
+## Settings
+
+| Setting               | Default    |                                                    |
+| --------------------- | ---------- | -------------------------------------------------- |
+| `ceesafe.server.path` | `ceesafec` | the `ceesafec` to run, if it is not on your `PATH` |
+
+## Links
+
+- [The CeeSafe guide](https://vkuttyp.github.io/CeeSafe/guide/introduction) and [editors](https://vkuttyp.github.io/CeeSafe/guide/editors)
+- [Releases](https://github.com/vkuttyp/CeeSafe/releases): `ceesafec` for six platforms, and this extension as a `.vsix`
+- [Issues](https://github.com/vkuttyp/CeeSafe/issues)
+
+## Building from the repository
+
+With [Vite+](https://viteplus.dev/) (`vp`), in `editors/vscode`:
+
+```sh
 vp install
 vp test                 # grammar tests, and ceesafec lsp through vscode-jsonrpc
-vp run package          # makes ceesafe-language-<version>.vsix (also in every release)
+vp run package          # makes ceesafe-language-<version>.vsix
 code --install-extension ceesafe-language-*.vsix
 ```
+
+## License
+
+GPL-2.0-only, as CeeSafe.

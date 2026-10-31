@@ -20,6 +20,9 @@ One C seed for every platform, so every binary is built from the same C and chec
 3. **extension**: the VS Code extension's tests (the language server's run against the linux-x64 `ceesafec` just
    built) and its `.vsix`, `ceesafe-language-<version>.vsix`.
 4. **publish**: `SHA256SUMS` (the archives and the `.vsix`) and the GitHub release.
+5. **stores**: the same `.vsix` on the VS Code Marketplace and on Open VSX, publisher (namespace) `ceesafe`. It runs
+   after the GitHub release, so a store's failure never holds a release back, and `--skip-duplicate` makes a rerun
+   harmless.
 
 | Archive | Built on | Contents |
 |---|---|---|
@@ -44,3 +47,7 @@ One C seed for every platform, so every binary is built from the same C and chec
 The macOS steps need the repository secrets `APPLE_CERTIFICATE_P12` (the Developer ID Application certificate and key,
 base64), `APPLE_CERTIFICATE_PASSWORD`, and for `notarytool` `ASC_P8` (the App Store Connect API key, base64),
 `ASC_KEY_ID` and `ASC_ISSUER` (the issuer UUID). They were set on 2026-10-31.
+
+The `stores` job needs `VSCE_PAT`, an Azure DevOps personal access token with the scope **Marketplace → Manage** for
+the Marketplace publisher `ceesafe` (marketplace.visualstudio.com/manage), and `OVSX_PAT`, an access token of the
+open-vsx.org account that owns the namespace `ceesafe` (`npx ovsx create-namespace ceesafe -p <token>` once).
