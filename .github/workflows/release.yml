@@ -106,7 +106,9 @@ jobs:
       - name: Generation 1 from the seed (Windows, cl)
         if: matrix.msvc
         shell: cmd
-        run: cl /nologo /std:c11 /O2 /MP /I seed seed\*.c /Fo:seed\ /Fe:gen1.exe /link /STACK:8388608
+        run: |
+          mkdir objects
+          cl /nologo /std:c11 /O2 /MP /I seed seed\*.c /Fo:objects\ /Fe:gen1.exe /link /STACK:8388608
       - name: Generation 1 from the seed (cc)
         if: ${{ !matrix.msvc }}
         run: cc -std=c11 -O2 -ffp-contract=off -fno-math-errno -I seed seed/*.c -o gen1
