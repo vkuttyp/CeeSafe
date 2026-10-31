@@ -1,0 +1,37 @@
+// `@effectsOf` (type-system.md §32.5, ADR 0020): a call has its closure arguments' effects, which atomic code may
+// still forbid; only calls through the parameter itself are exempt; and it names closure parameters only.
+@effectsOf(test)
+fn count(values: Slice<i32>, test: borrow fn(i32) -> bool) -> i32 {
+    var n = 0;
+    for (v in values) {
+        if (test(v)) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+fn noisy(v: i32) -> bool {
+    Console.writeLine(v);
+    return true;
+}
+
+fn plain(test: borrow fn(i32) -> bool) -> bool => test(1);
+
+// Handing the parameter to a function without the attribute counts that function's effects.
+@effectsOf(test)
+@effects()
+fn wrap(test: borrow fn(i32) -> bool) -> bool => plain(test); // error[N0295]
+
+@context(atomic)
+fn atomic(values: Slice<i32>, unknown: borrow fn(i32) -> bool) -> i32 {
+    var n = count(values, (v) => { Console.writeLine(v); return true; }); // error[N0295]
+    n += count(values, noisy); // error[N0295]
+    n += count(values, unknown); // error[N0295]
+    return n;
+}
+
+fn main() {
+    // As a value, its effects include its parameter's type list.
+    let quiet: @effects() fn(Slice<i32>, borrow fn(i32) -> bool) -> i32 = count; // error[N0295]
+}

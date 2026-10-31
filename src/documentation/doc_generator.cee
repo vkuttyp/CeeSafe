@@ -417,7 +417,7 @@ fn appendAnchor(
 }
 
 fn docBody(out: borrow mut Vector<u8>, entry: borrow DocItem) -> Result<void, AllocError> {
-    appendText(out, "```nova\n")?;
+    appendText(out, "```ceesafe\n")?;
     appendBytes(out, entry.signature.view())?;
     appendText(out, "\n```\n")?;
     if (entry.hasDoc) {
@@ -555,6 +555,10 @@ fn docCommand(arguments: borrow Vector<Vector<u8>>, json: bool) -> i32 {
         i += 1;
     }
     var files = Vector<Vector<u8>>.create();
+    let named = requireNamedSources(paths);
+    if (named != 0) {
+        return named;
+    }
     namedSourceFiles(paths, mut files)!;
     if (paths.length == 0) {
         let cwd = match (currentDirectory()) {
@@ -590,7 +594,7 @@ fn docCommand(arguments: borrow Vector<Vector<u8>>, json: bool) -> i32 {
         }
     }
     if (files.length == 0) {
-        return fail("no Nova input files");
+        return fail("no CeeSafe input files");
     }
     // Every file is parsed and formatted; any syntax error stops the page (DocGenerator.Collect).
     var sources = Vector<SourceText>.create();

@@ -1,0 +1,88 @@
+// C arrays (C9, ADR 0014): array members of imported C structs, read and written whole, indexed and sliced; a
+// member whose C name is a Nova keyword (`@cname`); an array of imported structs, indexed in place; pointer
+// arithmetic over a C array of structs; constant arrays; and constants exported as C data. The C half,
+// c-arrays.c, owns the objects and prints what Nova did to them.
+
+@header("c-arrays.types.h")
+extern "C" {
+    struct ca_part {
+        index: u32;
+        first: u64;
+        @cname("type")
+        kind: [u8; 16];
+        uuid: [u8; 16];
+    }
+    struct ca_table {
+        guid: [u8; 16];
+        nparts: u32;
+        parts: [ca_part; 4];
+    }
+    fn c_main() -> i32;
+}
+
+const HEX: [u8; 16] = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102];
+
+@export("ca_signature")
+const SIGNATURE: [u8; 8] = [69, 70, 73, 32, 80, 65, 82, 84]; // "EFI PART"
+
+@export("ca_zeros")
+const ZEROS: [u32; 3] = [0; 3];
+
+@export
+const ca_limit: u32 = 4;
+
+fn copyPart(to: borrow mut ca_part, from: borrow ca_part) {
+    to.index = from.index;
+    to.first = from.first;
+    to.kind = from.kind; // a whole array, by value
+    to.uuid[..].copyFrom(from.uuid[..]);
+}
+
+/// Copies up to `ca_limit` parts from `n` at `src` into `table`; the sum of the first part's type bytes.
+/// Safety: `table` is a live table nothing else uses; `src` points to `n` parts.
+@export("ca_fill")
+unsafe fn fill(table: *mut ca_table, src: *ca_part, n: u32) -> u32 {
+    let t = Ptr.toBorrowMut(table);
+    t.guid[0] = 7;
+    t.guid[15] = t.guid[0] + 1;
+    var i: u32 = 0;
+    while (i < n && i < ca_limit) {
+        copyPart(mut t.parts[i as usize], Ptr.toBorrow(src.add(i as usize)));
+        i += 1;
+    }
+    t.nparts = i;
+    var sum: u32 = 0;
+    for (b in t.parts[0].kind) { sum += b as u32; }
+    return sum;
+}
+
+/// Do two parts of `table` have the same unique GUID?
+/// Safety: `table` is a live table.
+@export("ca_same_uuid")
+unsafe fn sameUuid(table: *ca_table, a: u32, b: u32) -> bool {
+    let t = Ptr.toBorrow(table);
+    let x = t.parts[a as usize].uuid; // copies of C arrays
+    let y = t.parts[b as usize].uuid;
+    for (i in 0..x.length) {
+        if (x[i] != y[i]) { return false; }
+    }
+    return true;
+}
+
+/// Writes the GUID's first byte as two hex digits into `out`.
+/// Safety: `table` is a live table; `out` has two writable bytes.
+@export("ca_guid_hex")
+unsafe fn guidHex(table: *ca_table, out: *mut u8) {
+    let g = Ptr.toBorrow(table).guid[0];
+    let digits = SliceMut.fromRaw(out, 2);
+    digits[0] = HEX[(g >> 4) as usize];
+    digits[1] = HEX[(g & 15) as usize];
+}
+
+/// Safety: c_main only calls the exports above, with objects it owns.
+fn main() -> i32 => unsafe { c_main() };
+
+// expect-stdout: 48 4 7 8
+// expect-stdout: 300 4 5 17 99
+// expect-stdout: 0 1
+// expect-stdout: 07 EFI PART 0 4

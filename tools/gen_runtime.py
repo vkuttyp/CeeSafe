@@ -2,7 +2,9 @@
 """Writes src/library/runtime.cee: the C runtime novac embeds (the reference's CBackend: HostedRuntime, FloatRuntime,
 ThreadRuntime; Nova.Compiler.csproj's embedded resources).
 
-The files are read with `git show TAG:PATH` from a Nova repository, so its working tree may be anywhere; line endings
+The files are read with `git show TAG:PATH` from a Nova repository and given CeeSafe's names (tools/names.py, Decision
+0004; the files themselves become ceesafe/rt.h and ceesafe_rt_*.c), with CEESAFE_ABI_VERSION defined in rt.h. They are
+read so its working tree may be anywhere; line endings
 are made "\\n" as ReadResource does. Each file is split into string literals of at most 4,000 bytes (C11 §5.2.4.1).
 
 usage: python3 tools/gen_runtime.py [--nova PATH] [--tag TAG]   (default ~/Nova, v0.6.0; formats with $CEESAFEC, default out/ceesafec)
@@ -13,6 +15,7 @@ import os
 import subprocess
 
 from gen_library import literal
+from names import ABI_DEFINE, map_forward
 
 # (output path, source path): the order CBackend lists them in.
 FILES = (
@@ -36,7 +39,13 @@ def main():
                               check=True).stdout.decode("utf-8")
         if text.startswith("﻿"):
             text = text[1:]
-        files.append((name, text.replace("\r\n", "\n").replace("\r", "\n")))
+        text = map_forward(text.replace("\r\n", "\n").replace("\r", "\n"))
+        if name == "nova/rt.h":
+            # The ABI version (Decision 0004), which every generated unit checks.
+            guard = "#define CEESAFE_RT_H\n"
+            assert guard in text, "rt.h's include guard moved"
+            text = text.replace(guard, guard + ABI_DEFINE.decode(), 1)
+        files.append((map_forward(name), text))
     chunks = []
     for k, (_, t) in enumerate(files):
         current, size = [], 0

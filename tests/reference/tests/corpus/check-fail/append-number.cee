@@ -1,0 +1,13 @@
+// String.appendNumber (type-system.md §23.2, M11 G4c): the argument must be an integer; the receiver a mutable string.
+
+fn main() {
+    var s = String.create();
+    s.appendNumber(true)!; // error[N0207]
+    s.appendNumber("12")!; // error[N0207]
+    s.appendNumber()!; // error[N0209]
+    s.appendNumber(1, 2)!; // error[N0209]
+    let fixed = String.create();
+    fixed.appendNumber(1)!; // error[N0248]
+    s.appendNumber(s.length)!;
+    let n: u8 = s.appendNumber(1); // error[N0205]
+}

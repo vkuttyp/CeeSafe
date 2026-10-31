@@ -1,0 +1,72 @@
+// Effect lists on function and closure types (type-system.md §36.3, M11 G8b′): atomic and irq contexts call closures
+// and function values whose types allow no `sleep`; named functions, literals and adapters are held to the lists,
+// and a list converts to a larger one.
+struct Table { pick: @effects() fn(i64) -> i64; }
+
+fn isEven(v: i32) -> bool => v % 2 == 0;
+fn square(x: i64) -> i64 => x * x;
+fn identity<T>(x: T) -> T => x;
+
+@context(atomic)
+fn countIf(values: Slice<i32>, keep: borrow @effects() fn(i32) -> bool) -> i32 {
+    var n = 0;
+    for (v in values) { if (keep(v)) { n += 1; } }
+    return n;
+}
+
+@context(irq)
+fn applyAll(values: SliceMut<i64>, f: @effects() fn(i64) -> i64) {
+    for (i in 0..values.length) { values[i] = f(values[i]); }
+}
+
+@context(atomic)
+fn visit(values: Slice<i32>, visitor: borrow mut @effects(alloc) fn(i32)) {
+    for (v in values) { visitor(v); }
+}
+
+/// Bound to no effects, it may call through a value whose type allows none.
+@effects()
+fn twice(f: @effects() fn(i64) -> i64, x: i64) -> i64 => f(f(x));
+
+@context(irq)
+fn applyQuiet<T>(f: @effects() fn(T) -> T, x: T) -> T => f(x);
+
+fn main() {
+    let values = [3, 8, 1, 9, 4];
+    let limit = 4;
+    Console.writeLine(countIf(values[..], (v) => v > limit));
+    Console.writeLine(countIf(values[..], isEven));               // an adapter, held to @effects()
+    var squares: [i64; 3] = [1, 2, 3];
+    applyAll(mut squares[..], square);
+    Console.writeLine(squares[2]);
+    var seen = Vector<i32>.create();
+    visit(values[..], (v) => { if (v > 3) { seen.push(v)!; } });   // allocates: @effects(alloc) allows it
+    Console.writeLine(seen.length);
+    Console.writeLine(twice(square, 3));
+    Console.writeLine(twice(identity<i64>, 3));
+    Console.writeLine(twice((x) => x + 1, 3));                     // a literal capturing nothing
+    let quiet: @effects() fn(i64) -> i64 = square;
+    let loose: fn(i64) -> i64 = quiet;                             // a list converts to a larger one
+    Console.writeLine(loose(5));
+    let table = Table { pick: square };
+    Console.writeLine(table.pick(6));
+    let shared: borrow @effects() fn(i32) -> bool = (v) => v < limit;
+    let wider: borrow mut fn(i32) -> bool = shared;
+    Console.writeLine(wider(2));
+    Console.writeLine(countIf(values[..], shared));
+    Console.writeLine(applyQuiet(square, squares[0] + 6));
+    Console.writeLine(applyQuiet<i32>((x) => x - 4, 10));
+}
+// expect-stdout: 2
+// expect-stdout: 2
+// expect-stdout: 9
+// expect-stdout: 3
+// expect-stdout: 81
+// expect-stdout: 3
+// expect-stdout: 5
+// expect-stdout: 25
+// expect-stdout: 36
+// expect-stdout: true
+// expect-stdout: 2
+// expect-stdout: 49
+// expect-stdout: 6

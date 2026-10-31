@@ -1,0 +1,34 @@
+// Thread errors (type-system.md §38): a capture or result that is not Send (N0334), a spawn without a move literal
+// (N0333), a Send bound (N0334), and @threadSafe outside the library (N0290). A scoped capture is N0332 (§36.5).
+
+@threadSafe // error[N0290]
+struct Mine {
+    n: u64;
+}
+
+fn needsSend<T: Send>(x: T) {}
+
+interface Job {
+    fn run(borrow this) -> u64;
+}
+
+struct Pointing {
+    at: *u64;
+}
+
+impl Job for Pointing {
+    fn run(borrow this) -> u64 => 0;
+}
+
+fn main() {
+    let text = "shared";
+    let n = 5u64;
+    let pointer = borrow n as *u64;
+    let raw = Thread.spawn(move () => pointer.isNull())!; // error[N0334]
+    let back = Thread.spawn(move () => "static text")!; // error[N0334]
+    let notMove = Thread.spawn(() => 1u64)!; // error[N0333]
+    needsSend(text); // error[N0334]
+    let notSend: Box<dyn Job + Send> = Box.create(Pointing { at: pointer })!; // error[N0334]
+    let plain: Box<dyn Job> = Box.create(Pointing { at: pointer })!;
+    let t = Thread.spawn(move () => plain.run())!; // error[N0334]
+}

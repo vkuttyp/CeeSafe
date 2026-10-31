@@ -1,0 +1,46 @@
+// A @header that includes the program's own exports header (ADR 0030), as a kernel header includes the generated
+// definition of a type Nova owns: the generated C includes nova_exports.h instead of defining `ie_box` itself, so the
+// struct is defined once however many headers bring it in.
+
+@header("includes-exports.types.h")
+extern "C" {
+    @ctype("ie_lock_t")
+    struct ie_lock_t { taken: u32; }
+    fn ie_sum(b: *ie_box) -> u32;
+    fn c_main() -> i32;
+}
+
+@repr(C)
+struct ie_box {
+    lock: ie_lock_t;
+    values: [u32; 3];
+}
+
+/// Safety: `b` points to a box C owns.
+@export("ie_fill")
+unsafe fn fill(b: *mut ie_box, start: u32) {
+    let box = Ptr.toBorrowMut(b);
+    box.lock.taken = 1;
+    for (i in 0..box.values.length) {
+        box.values[i] = start + truncate<u32>(i);
+    }
+}
+
+/// The sum, through C's function declared in the header.
+/// Safety: `b` points to a box C owns.
+@export("ie_total")
+unsafe fn total(b: *ie_box) -> u32 => ie_sum(b) * 2;
+
+/// Where its C caller's call returns to (ADR 0030); 0 when Nova calls it.
+@export("ie_where")
+fn callSite() -> usize => callerAddress();
+
+/// Safety: c_main only calls the exports above, with a box it owns.
+fn main() -> i32 {
+    Console.writeLine(callSite()); // no C frame called it
+    return unsafe { c_main() };
+}
+
+// expect-stdout: 0
+// expect-stdout: 34 68
+// expect-stdout: callers 1 1 1

@@ -1,0 +1,30 @@
+// An example from the repository's README.md: keep its code identical to the README's (test annotations aside).
+
+extern "C" {
+    fn strlen(s: *CChar) -> usize;
+}
+
+/// The length of `text` up to its zero byte, or null if it has none.
+/// Safety: `strlen` is called only after finding a zero byte inside `text`, so it cannot read past the end.
+fn cLength(text: StringView) -> usize? {
+    for (i in 0..text.length) {
+        if (text.bytes()[i] == 0) {
+            return unsafe { strlen(text.ptr as *CChar) };
+        }
+    }
+    return null; // no terminator: refuse rather than overrun
+}
+
+fn main() {
+    match (cLength("nova\0")) {
+        Some(n) => { Console.writeLine(n); }
+        null => { Console.writeLine("not terminated"); }
+    }
+    match (cLength("nova")) {
+        Some(n) => { Console.writeLine(n); }
+        null => { Console.writeLine("not terminated"); }
+    }
+}
+
+// expect-stdout: 4
+// expect-stdout: not terminated

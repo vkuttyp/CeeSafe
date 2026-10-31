@@ -1,0 +1,11 @@
+// `@effectsOf` names parameters of a function or closure type, at least one (type-system.md §32.5; N0336).
+@effectsOf(n) // error[N0336]
+fn notClosure(n: i32) -> i32 => n;
+
+@effectsOf(missing) // error[N0336]
+fn notParameter(test: borrow fn(i32) -> bool) -> bool => test(0);
+
+@effectsOf() // error[N0336]
+fn noNames() {}
+
+fn main() {}

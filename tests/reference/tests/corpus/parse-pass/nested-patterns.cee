@@ -1,0 +1,13 @@
+// Nested patterns in payload positions (type-system.md §15.2, M11 G1): variants, literals, null, bindings and `_`.
+fn f(r: Result<Shape, u8>, o: bool??) {
+    match (r) {
+        Ok(Shape.Rect(1, var h)) => { }
+        Ok(Shape.Circle(-2)) => { }
+        Err(_) => { }
+    }
+    match (o) {
+        Some(Some(true)) => { }
+        Some(null) => { }
+        _ => { }
+    }
+}

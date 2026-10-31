@@ -1,0 +1,19 @@
+// Constant operations that would overflow, under a condition that is never true: the analysis's facts contradict
+// there, but the overflow checks stay (optimisations.md §3), so the C holds no overflowing constant expression,
+// which C compilers reject under -Werror (found by the G8c fuzz campaign, seed 9202817).
+fn f() -> i32 {
+    var y: i32 = 6;
+    if ((1u16 < 0u16)) {
+        y = 1i32 + 2147483647i32;
+        y = -2147483648i32 - 1i32;
+        y = 65536i32 * 65536i32;
+        let m = -2147483648i32;
+        y = -m;
+    }
+    return y;
+}
+
+fn main() {
+    Console.writeLine(f());
+}
+// expect-stdout: 6

@@ -1,0 +1,95 @@
+// Owning closures (type-system.md §36.5, ADR 0015): move literals boxed as Box<dyn fn…>, returned, stored in fields
+// and vectors, called through boxes and references, changing their own captures, and dropping what they own.
+
+struct Noisy {
+    id: u64;
+    drop {
+        Console.write("drop ");
+        Console.writeLine(this.id);
+    }
+}
+
+struct Button {
+    label: String;
+    onClick: Box<dyn mut fn() -> u64>;
+}
+
+fn adder(n: u64) -> Box<dyn fn(u64) -> u64> {
+    return Box.create(move (x: u64) => x + n)!;
+}
+
+fn counter(start: u64) -> Box<dyn mut fn() -> u64> {
+    var count = start;
+    return Box.create(move () => {
+        count += 1;
+        return count;
+    })!;
+}
+
+fn owner(id: u64) -> Box<dyn fn() -> u64> {
+    let held = Noisy { id: id };
+    return Box.create(move () => held.id * 10)!;
+}
+
+fn apply(f: borrow dyn fn(u64) -> u64, x: u64) -> u64 => f(x);
+
+fn twice(f: borrow mut Box<dyn mut fn() -> u64>) -> u64 {
+    f();
+    return f();
+}
+
+fn quiet() -> Box<dyn @effects() fn(u64) -> u64> {
+    return Box.create(move (x) => x * 3)!;
+}
+
+@effects()
+fn useQuiet(f: borrow dyn @effects() fn(u64) -> u64) -> u64 => f(5);
+
+fn main() {
+    let add2 = adder(2);
+    Console.writeLine(add2(3));         // 5
+    Console.writeLine(apply(add2, 10)); // 12
+
+    var next = counter(0);
+    next();
+    Console.writeLine(next());          // 2
+    Console.writeLine(twice(mut next)); // 4
+
+    var names = Vector<String>.create();
+    names.push(String.create())!;
+    names.push(String.create())!;
+    let size: Box<dyn fn() -> usize> = Box.create(move () => names.length)!;
+    Console.writeLine(size()); // 2
+
+    var adders = Vector<Box<dyn fn(u64) -> u64>>.create();
+    adders.push(adder(1))!;
+    adders.push(adder(100))!;
+    var sum: u64 = 0;
+    for (f in adders) {
+        sum += f(1);
+    }
+    Console.writeLine(sum); // 2 + 101
+
+    var button = Button { label: String.create(), onClick: counter(10) };
+    button.onClick();
+    Console.writeLine(button.onClick()); // 12
+
+    let q = quiet();
+    Console.writeLine(useQuiet(q)); // 15
+
+    let o = owner(7);
+    Console.writeLine(o()); // 70
+    Console.writeLine("end");
+}
+
+// expect-stdout: 5
+// expect-stdout: 12
+// expect-stdout: 2
+// expect-stdout: 4
+// expect-stdout: 2
+// expect-stdout: 103
+// expect-stdout: 12
+// expect-stdout: 15
+// expect-stdout: 70
+// expect-stdout: end
+// expect-stdout: drop 7

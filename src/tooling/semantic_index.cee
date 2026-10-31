@@ -54,7 +54,7 @@ fn trimEndAny(text: borrow mut Vector<u8>, chars: StringView) {
 }
 
 fn codeBlock(text: Slice<u8>) -> Result<Vector<u8>, AllocError> {
-    var out = copyBytes("```nova\n".bytes())?;
+    var out = copyBytes("```ceesafe\n".bytes())?;
     appendBytes(mut out, text)?;
     appendText(mut out, "\n```")?;
     return Ok(out);

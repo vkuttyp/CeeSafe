@@ -1,0 +1,4 @@
+// Function types (grammar.md §2, type-system.md §36.1, M11 G8a): parameters, results, nesting, references and optionals.
+fn a(f: fn(i32) -> i32, g: fn(), h: fn(borrow mut Vector<u8>, StringView) -> bool) { }
+fn b(make: fn() -> fn(i32) -> i32, maybe: (fn(i32))?) -> fn(i64, i64) -> i64 => make;
+struct Handler { run: fn(borrow Handler) -> i32; }

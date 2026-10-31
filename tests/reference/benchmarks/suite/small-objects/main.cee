@@ -1,0 +1,25 @@
+// small-objects (benchmarks/suite/README.md): heap objects replacing each other in a ring.
+struct Pair { a: u64; b: u64; }
+
+fn main() -> i32 {
+    var ring = Vector<Box<Pair>?>.withCapacity(1024)!;
+    for (s in 0..1024usize) { ring.push(null)!; }
+    var sum: u64 = 0;
+    for (i in 0..32000000u64) {
+        let p = Box.create(Pair { a: i, b: i % 7 })!;
+        let slot = truncate<usize>(i % 1024);
+        match (borrow ring[slot]) {
+            Some(old) => { sum += old.a + old.b; }
+            null => {}
+        }
+        ring[slot] = p; // drops the evicted object
+    }
+    for (s in 0..1024usize) {
+        match (borrow ring[s]) {
+            Some(old) => { sum += old.a + old.b; }
+            null => {}
+        }
+    }
+    Console.writeLine(sum);
+    return 0;
+}

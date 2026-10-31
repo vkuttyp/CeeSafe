@@ -1,0 +1,28 @@
+// profile: freestanding
+// option: kernel cosmoos
+// option: no-float
+// lib/kernel's guards are atomic contexts (type-system.md §32.3): nothing under a spin guard or with interrupts off
+// may sleep.
+@header("kernel/sched.h")
+extern "C" {
+    @effects(sleep)
+    fn thread_sleep_ns(ns: u64);
+}
+
+struct Table {
+    count: u64;
+}
+
+static TABLE: SpinLock<Table> = SpinLock<Table>.constant("nova.table\0".ptr as *CChar, Table { count: 0 });
+
+/// Safety: thread_sleep_ns only sleeps.
+fn sleepLocked() {
+    let guard = TABLE.lock();
+    unsafe { thread_sleep_ns(1000); } // error[N0295]
+}
+
+/// Safety: as sleepLocked.
+fn sleepWithIrqsOff() {
+    let irq = IrqGuard.enter();
+    unsafe { thread_sleep_ns(1000); } // error[N0295]
+}

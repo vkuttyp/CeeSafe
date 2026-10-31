@@ -1,0 +1,20 @@
+// profile: freestanding
+// option: kernel cosmoos
+// option: no-float
+// M14 K1's acceptance (type-system.md §32.3, ADR 0025): a per-CPU value is lent with interrupts off, so the thread
+// cannot leave its CPU; sleeping while it is lent (it could then migrate) is refused.
+@header("kernel/sched.h")
+extern "C" {
+    @effects(sleep)
+    fn thread_sleep_ns(ns: u64);
+}
+
+static TICKS: PerCpu<u64> = PerCpu<u64>.constant(0);
+
+/// Safety: thread_sleep_ns only sleeps.
+fn sleepWhileLent() {
+    var mine = TICKS.local(IrqGuard.enter());
+    unsafe { thread_sleep_ns(1000); } // error[N0295]
+    let value = mine.get();
+    value += 1;
+}

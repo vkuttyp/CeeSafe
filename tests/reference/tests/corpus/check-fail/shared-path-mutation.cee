@@ -1,0 +1,41 @@
+// Nothing reached through a shared reference may be changed, even through a `borrow mut` or `SliceMut` stored there
+// (type-system.md §13.2, §13.3; N0248). Found by an independent review (2026-10-29): a `borrow mut` field read through
+// a `borrow` parameter gave mutable access, so two shared references to one holder could invalidate each other's
+// views (a use after free), and two closures given to Thread.both could push to one vector at once (a data race).
+
+struct Holder<region r> {
+    v: borrow mut(r) Vector<i32>;
+}
+
+struct Halves<region r> {
+    left: SliceMut<r, u64>;
+}
+
+// A method needing `borrow mut this` through a shared path.
+fn push1(h: borrow Holder, i: i32) {
+    h.v.push(i)!; // error[N0248]
+}
+
+// The view of one holder, then a push through another reference to it.
+fn view(x: borrow Holder, y: borrow Holder) -> i32 {
+    let s = x.v.view();
+    y.v.push(1)!; // error[N0248]
+    return s[0];
+}
+
+// The field as a value of its own type: a reborrow of a path that is not mutable.
+fn copy(h: borrow Holder) {
+    let w = h.v; // error[N0248]
+}
+
+fn twice(p: borrow Halves, q: borrow Halves) {
+    let a = p.left; // error[N0248]
+    let b = q.left; // error[N0248]
+}
+
+// The same two pushes on two threads.
+fn fill(x: borrow Holder, y: borrow Holder) {
+    Thread.both(() => { x.v.push(1)!; }, () => { y.v.push(2)!; }); // error[N0248]@25 // error[N0334]@17 // error[N0248]@50 // error[N0334]@42
+}
+
+fn main() {}

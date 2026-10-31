@@ -1,0 +1,10 @@
+// copyFrom panics when the lengths differ, and writes nothing first (type-system.md §16.5).
+fn main() {
+    var a = [1u8, 2, 3, 4];
+    let b = [9u8; 3];
+    a[..3].copyFrom(b[..]);
+    Console.writeLine(a[0]);
+    a[1..].copyFrom(b[..2]); // expect-panic: slice lengths differ
+    Console.writeLine(a[1]);
+}
+// expect-stdout: 9

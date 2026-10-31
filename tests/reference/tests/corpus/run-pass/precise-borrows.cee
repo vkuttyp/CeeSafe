@@ -1,0 +1,70 @@
+// Borrow-checker precision (M13 G5): a closure borrows only the fields it names, also through `this`
+// (type-system.md §36.2), and elements
+// at different constant indices are different places (lifetimes.md §8).
+
+struct Settings {
+    width: u64;
+    height: u64;
+    scale: [u64; 3];
+    cursor: usize;
+}
+
+struct Doc {
+    count: u64;
+    width: u64;
+
+    // Through `this`: the closures borrow this.width and this.count, not all of `this`.
+    fn grow(borrow mut this) -> u64 {
+        let readWidth = () => this.width;
+        this.count += 1;
+        let bump = () => { this.count += readWidth(); };
+        bump();
+        return this.count;
+    }
+}
+
+fn main() {
+    var s = Settings { width: 4, height: 3, scale: [1, 2, 3], cursor: 1 };
+    let area = () => s.width * s.height; // borrows s.width and s.height only
+    s.cursor = 2;
+    Console.writeLine(area());          // 12
+    let grow = () => { s.width += 1; }; // a mutable borrow of s.width
+    s.height += 1;
+    grow();
+    Console.writeLine(s.width * s.height); // 20
+    let pick = () => s.scale[s.cursor];
+    Console.writeLine(pick()); // 3
+
+    var values = [10u64, 20, 30];
+    let first = borrow mut values[0];
+    let last = borrow mut values[2];
+    first += last;
+    last += 1;
+    Console.writeLine(values[0]); // 40
+    Console.writeLine(values[2]); // 31
+
+    // Disjoint parts of one slice, at a split known only at run time (type-system.md §16.5).
+    var row = [1u64, 2, 3, 4, 5];
+    let at: usize = 2;
+    let halves = row[..].splitAtMut(at);
+    halves.left[0] = halves.right[2];
+    halves.right[0] += halves.left[1];
+    Console.writeLine(row[0] + row[2]); // 5 + 5
+    var list = Vector<u64>.create();
+    list.push(10)!;
+    list.push(20)!;
+    let parts = list.splitAt(1);
+    Console.writeLine(parts.right[0]); // 20
+
+    var doc = Doc { count: 1, width: 3 };
+    Console.writeLine(doc.grow()); // 5
+}
+
+// expect-stdout: 12
+// expect-stdout: 20
+// expect-stdout: 3
+// expect-stdout: 40
+// expect-stdout: 31
+// expect-stdout: 10
+// expect-stdout: 20
+// expect-stdout: 5

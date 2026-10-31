@@ -1,0 +1,20 @@
+// M15 S5: the result still borrows `this`, so the table cannot change while it lives (type-system.md §25.6).
+
+struct Table<T, K> {
+    values: Vector<T>;
+
+    fn get(borrow this, key: borrow K) -> borrow(this) T? {
+        if (this.values.length == 0) {
+            return null;
+        }
+        return borrow this.values[0];
+    }
+}
+
+fn main() {
+    var t = Table<u64, u32> { values: Vector<u64>.create() };
+    t.values.push(7)!;
+    let found = t.get(1u32);
+    t.values.push(8)!; // error[N0241]
+    Console.writeLine(found!);
+}

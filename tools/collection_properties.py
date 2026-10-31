@@ -21,6 +21,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mutation_suite import DotNetRandom  # noqa: E402
 import fault_injection  # noqa: E402
+from names import cee_path, for_compiler, map_back  # noqa: E402
 
 OPERATIONS = 80
 KINDS = ("vector", "string", "slotmap", "stablevector", "views")
@@ -312,12 +313,13 @@ def main():
             for seed in range(1, 7):
                 program, stdout = generate(kind, seed)
                 relative = f"run-pass/property-{kind}-{seed}.nova"
-                with open(os.path.join(directory, relative), "w", encoding="utf-8") as f:
-                    f.write(program)
+                for name in (relative, cee_path(relative)):  # novac's and ceesafec's (Decision 0005)
+                    with open(os.path.join(directory, name), "w", encoding="utf-8") as f:
+                        f.write(program)
                 exe = os.path.join(temporary, f"property-{kind}-{seed}")
                 flags = [x for flag in args.cflag for x in ("--cflag", flag)]
-                built = subprocess.run([compiler, "build"] + flags + [relative, "-o", exe], cwd=directory,
-                                       capture_output=True, text=True)
+                cwd, argv = for_compiler(compiler, directory, ["build"] + flags + [relative, "-o", exe])
+                built = subprocess.run([compiler] + argv, cwd=cwd, capture_output=True, text=True)
                 if built.returncode != 0:
                     problems.append(f"{relative}: build failed: {built.stderr[:800]}")
                     continue
@@ -326,12 +328,12 @@ def main():
                     problems.append(f"{relative}: status {ran.returncode}, output differs from the model")
                 if reference:
                     c_ours, c_ref = os.path.join(temporary, "ours"), os.path.join(temporary, "ref")
-                    subprocess.run([compiler, "build", "--emit", "c", "-o", c_ours, relative], cwd=directory,
-                                   capture_output=True)
+                    cwd, argv = for_compiler(compiler, directory, ["build", "--emit", "c", "-o", c_ours, relative])
+                    subprocess.run([compiler] + argv, cwd=cwd, capture_output=True)
                     subprocess.run([reference, "build", "--emit", "c", "-o", c_ref] + fault_injection.SWITCHES +
                                    [relative], cwd=directory, capture_output=True)
                     with open(os.path.join(c_ours, "main.c"), "rb") as a, open(os.path.join(c_ref, "main.c"), "rb") as b:
-                        if a.read().split(b"\n", 1)[1] != b.read().split(b"\n", 1)[1]:
+                        if map_back(a.read()).split(b"\n", 1)[1] != b.read().split(b"\n", 1)[1]:
                             problems.append(f"{relative}: C differs from the reference's")
                     subprocess.run(["rm", "-rf", c_ours, c_ref])
                 if args.sweep:

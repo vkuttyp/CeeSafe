@@ -1,0 +1,11 @@
+// stack-alloc (benchmarks/suite/README.md): a local array per iteration.
+fn main() -> i32 {
+    var sum: u64 = 0;
+    for (i in 0..20000000u64) {
+        var a = [0u64; 32];
+        for (j in 0..32usize) { a[j] = (i + j as u64) % 1000; }
+        for (j in 0..32usize) { sum += a[j]; }
+    }
+    Console.writeLine(sum);
+    return 0;
+}

@@ -1,20 +1,20 @@
 """CeeSafe names for the C names ceesafec generates (Nova's docs/c-backend.md section 2.1, docs/tooling.md section 3.2).
 
-Shared by ceesafe_lldb.py and ceesafe_gdb.py; plain Python, no debugger API. The C names are still novac's (`nvF_`,
-`nvM_`, `v_`, `f_`) until the fork point switches the prefix (Decision 0004); this file switches with them.
+Shared by ceesafe_lldb.py and ceesafe_gdb.py; plain Python, no debugger API. The C names are CeeSafe's since the fork
+point (Decision 0004): functions `ceeF_`, methods `ceeM_`, locals `v_`, fields `f_`.
 """
 
 import os
 import re
 
-# Split C (Nova's ADR 0022): external names carry the program's name, `nvF_<program>_main`. Set CEESAFE_PROGRAM to
+# Split C (Nova's ADR 0022): external names carry the program's name, `ceeF_<program>_main`. Set CEESAFE_PROGRAM to
 # that name (ceesafec's --program, or the package's) to read them.
 _PROGRAM = os.environ.get("CEESAFE_PROGRAM", "")
 
 _LOCAL = re.compile(r"^v_(.+)_\d+$")
 _FIELD = re.compile(r"^f_(.+)$")
-_FUNCTION = re.compile(r"^nvF_(.+)$")
-_METHOD = re.compile(r"^nvM_(\d+)(.+)$")
+_FUNCTION = re.compile(r"^ceeF_(.+)$")
+_METHOD = re.compile(r"^ceeM_(\d+)(.+)$")
 
 
 def local(name):
@@ -30,10 +30,10 @@ def field(name):
 
 
 def function(name):
-    """The CeeSafe name of a C function: `nvF_length` is `length`, `nvM_7Counter_bump` is `Counter.bump`."""
+    """The CeeSafe name of a C function: `ceeF_length` is `length`, `ceeM_7Counter_bump` is `Counter.bump`."""
     name = name or "?"
     if _PROGRAM:
-        for family in ("nvF_", "nvM_"):
+        for family in ("ceeF_", "ceeM_"):
             if name.startswith(family + _PROGRAM + "_"):
                 name = family + name[len(family + _PROGRAM) + 1:]
     match = _FUNCTION.match(name)

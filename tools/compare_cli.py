@@ -21,7 +21,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-from names import map_back
+from names import FORK_DIVERGENCES, cee_path, map_back
 
 # The reference's FixTests programs (Missing_mut_is_inserted ... No_fix_where_the_repair_is_not_certain).
 FIX_PROGRAMS = (
@@ -46,8 +46,9 @@ FIX_PROGRAMS = (
 )
 
 
-def run(compiler, arguments, cwd=None):
-    p = subprocess.run([compiler] + arguments, cwd=cwd, capture_output=True)
+def run(compiler, arguments, cwd=None, cee=False):
+    """With `cee` (ceesafec since the fork, Decision 0005), a `.nova` file argument is named `.cee`."""
+    p = subprocess.run([compiler] + ([cee_path(a) for a in arguments] if cee else arguments), cwd=cwd, capture_output=True)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -81,13 +82,13 @@ def fix_case(cee, novac, name, text):
         for arguments in (["fix", "--dry-run", "main.nova"],
                           ["fix", "--diagnostics-format=json", "--dry-run", "main.nova"],
                           ["fix", "main.nova"]):
-            for d in (mine_dir, ref_dir):
-                with open(os.path.join(d, "main.nova"), "wb") as f:
+            for d, file in ((mine_dir, "main.cee"), (ref_dir, "main.nova")):
+                with open(os.path.join(d, file), "wb") as f:
                     f.write(text)
-            mine, ref = run(cee, arguments, mine_dir), run(novac, arguments, ref_dir)
+            mine, ref = run(cee, arguments, mine_dir, True), run(novac, arguments, ref_dir)
             if not same(mine, ref):
                 problems.append(f"{name}: {' '.join(arguments)}: output differs")
-            with open(os.path.join(mine_dir, "main.nova"), "rb") as a, open(os.path.join(ref_dir, "main.nova"), "rb") as b:
+            with open(os.path.join(mine_dir, "main.cee"), "rb") as a, open(os.path.join(ref_dir, "main.nova"), "rb") as b:
                 if a.read() != b.read():
                     problems.append(f"{name}: {' '.join(arguments)}: the fixed file differs")
     return problems
@@ -107,7 +108,7 @@ def main():
         for part, cases in (("usage", usage_cases()), ("explain", explain_cases())):
             if options.only not in (None, part):
                 continue
-            results = list(pool.map(lambda a: (a, run(cee, a), run(novac, a)), cases))
+            results = list(pool.map(lambda a: (a, run(cee, a, cee=True), run(novac, a)), cases))
             differ = [a for a, mine, ref in results if not same(mine, ref)]
             failures += [f"{part}: {' '.join(a) or '(no arguments)'}" for a in differ]
             print(f"compare_cli {part}: {len(cases)} runs, {len(cases) - len(differ)} identical, {len(differ)} differ")
@@ -116,7 +117,7 @@ def main():
             programs = []
             for family in ("check-fail", "parse-fail"):
                 for name in sorted(os.listdir(os.path.join(corpus, family))):
-                    if name.endswith(".nova"):
+                    if name.endswith(".nova") and f"tests/corpus/{family}/{name}" not in FORK_DIVERGENCES:
                         with open(os.path.join(corpus, family, name), "rb") as f:
                             programs.append((f"{family}/{name}", f.read()))
             programs += [(f"FixTests #{k}", t.encode()) for k, t in enumerate(FIX_PROGRAMS)]

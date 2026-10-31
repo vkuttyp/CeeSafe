@@ -1,0 +1,36 @@
+// An example from the repository's README.md: keep its code identical to the README's (test annotations aside).
+
+struct Account {
+    id: u64;
+    balance: i64;
+
+    public fn deposit(borrow mut this, amount: i64) {
+        this.balance += amount;
+    }
+
+    drop { // runs exactly once, when the owner goes away
+        Console.write("closing ");
+        Console.writeLine(this.id);
+    }
+}
+
+fn open(id: u64) -> Result<Box<Account>, AllocError> => Box.create(Account { id: id, balance: 0 });
+
+fn transfer(from: borrow mut Account, to: borrow mut Account, amount: i64) {
+    from.balance -= amount;
+    to.balance += amount;
+}
+
+fn main() {
+    var a = open(1)!; // `!`: panic if the allocation fails
+    var b = open(2)!;
+    a.deposit(100);
+    transfer(mut a, mut b, 30);
+    Console.writeLine(a.balance);
+    Console.writeLine(b.balance);
+} // b, then a: each Account dropped, each box freed
+
+// expect-stdout: 70
+// expect-stdout: 30
+// expect-stdout: closing 2
+// expect-stdout: closing 1

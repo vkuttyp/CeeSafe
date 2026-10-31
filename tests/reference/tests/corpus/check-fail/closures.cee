@@ -1,0 +1,38 @@
+// Closures (type-system.md §36.2, M11 G8b): the kind a literal must have, types it cannot infer, and what its body
+// cannot do. Captures and loans: closure-loans.nova.
+fn run(f: borrow fn(i32) -> bool) -> bool => f(1);
+fn runMut(f: borrow mut fn(i32)) { f(1); }
+fn plain(f: fn(i32) -> i32) -> i32 => f(1);
+
+
+
+fn kinds() {
+    var total = 0;
+    let k = 3;
+    let r = run((v) => { total += v; return true; }); // error[N0299]
+    let p = plain((x) => x + k); // error[N0299]
+    let q = (x) => x + 1; // error[N0236]
+    let b = (x: i32) => { return x; }; // error[N0236]
+}
+
+
+fn breaks() {
+    loop {
+        let f = () => { break; }; // error[N0214]
+        f();
+    }
+}
+
+fn assignThrough() {
+    let k = 1;
+    let f = (x: i32) => x + k;
+    let g = (x: i32) => x - k;
+    f = g; // error[N0211]
+}
+
+fn outlives() {
+    let k = 2;
+    let n = run((v) => v > k);
+}
+
+fn main() { }

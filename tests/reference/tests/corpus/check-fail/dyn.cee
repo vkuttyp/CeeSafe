@@ -1,0 +1,57 @@
+// Dynamic dispatch errors (type-system.md §37): `dyn I` not behind a pointer (N0330), an interface that is not
+// dyn-compatible (N0331), a type that does not implement the interface (N0268), a mutating method through a shared
+// reference, a method the interface lacks, and an impl's effect list wider than its interface's (N0295).
+
+interface Shape {
+    fn area(borrow this) -> u64;
+    fn grow(borrow mut this, by: u64);
+}
+
+interface Sink {
+    fn close(this);
+}
+
+struct Square {
+    side: u64;
+    fn perimeter(borrow this) -> u64 => 4 * this.side;
+}
+
+impl Shape for Square {
+    fn area(borrow this) -> u64 => this.side * this.side;
+    fn grow(borrow mut this, by: u64) { this.side += by; }
+}
+
+interface Quiet {
+    @effects() fn ping(borrow this);
+}
+
+struct Loud {
+    n: u64;
+}
+
+impl Quiet for Loud {
+    @effects(alloc) fn ping(borrow this) {} // error[N0295]
+}
+
+struct Circle {
+    r: u64;
+}
+
+fn byValue(s: dyn Shape) {} // error[N0330]
+
+fn inVector(v: Vector<dyn Shape>) {} // error[N0330]
+
+fn sink(s: borrow dyn Sink) {} // error[N0331]
+
+struct Holder {
+    shape: dyn Shape; // error[N0330]
+}
+
+fn main() {
+    var sq = Square { side: 2 };
+    let c = Circle { r: 1 };
+    let notShape: borrow dyn Shape = borrow c; // error[N0268]
+    let shared: borrow dyn Shape = borrow sq;
+    shared.grow(1); // error[N0248]
+    Console.writeLine(shared.perimeter()); // error[N0234]
+}

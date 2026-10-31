@@ -360,13 +360,13 @@ fn dispatchMcp(
         json.name("name")!;
         json.string("ceesafec")!;
         json.name("title")!;
-        json.string("Nova")!;
+        json.string("CeeSafe")!;
         json.name("version")!;
         json.string(ceesafeVersion())!;
         json.endObject()!;
         json.name("instructions")!;
         json.string(
-            "Nova is a memory-safe systems language compiled to C. Use ceesafe_check after every edit; apply ceesafe_fix for the fixes the compiler is sure of; read ceesafe_explain for a diagnostic code; ceesafe_spec_search and ceesafe_spec_section for the rules. ceesafe_run runs a program in a sandboxed interpreter. The prompt write-nova has the agent guide.",
+            "CeeSafe is a memory-safe systems language compiled to C. Use ceesafe_check after every edit; apply ceesafe_fix for the fixes the compiler is sure of; read ceesafe_explain for a diagnostic code; ceesafe_spec_search and ceesafe_spec_section for the rules. ceesafe_run runs a program in a sandboxed interpreter. The prompt write-ceesafe has the agent guide.",
         )!;
         json.endObject()!;
         return mcpResult(json);
@@ -571,7 +571,7 @@ fn sourceProperties(json: borrow mut JsonWriter) {
     json.name("path")!;
     typeSchema(json, "string", "the file's name, as diagnostics will give it");
     json.name("text")!;
-    typeSchema(json, "string", "the file's Nova source");
+    typeSchema(json, "string", "the file's CeeSafe source");
     schemaEnd(json, "path text");
     arrayEnd(json, "the program's files, compiled as one package (give files or paths)");
     json.name("paths")!;
@@ -623,30 +623,30 @@ fn toolName(k: usize) -> StringView => match (k) {
 };
 
 fn toolTitle(k: usize) -> StringView => match (k) {
-    0 => "Check Nova code",
-    1 => "Apply Nova's fixes",
-    2 => "Format Nova code",
-    3 => "Run a Nova program",
-    4 => "Generate C from Nova",
+    0 => "Check CeeSafe code",
+    1 => "Apply CeeSafe's fixes",
+    2 => "Format CeeSafe code",
+    3 => "Run a CeeSafe program",
+    4 => "Generate C from CeeSafe",
     5 => "Explain a diagnostic code",
-    6 => "Search the Nova specification",
+    6 => "Search the CeeSafe specification",
     7 => "Read a specification section",
     _ => "What is at a position",
 };
 
 fn toolDescription(k: usize) -> StringView => match (k) {
     0 =>
-        "Type-check Nova source and return its diagnostics, with machine-applicable fixes where the compiler is sure of one.",
+        "Type-check CeeSafe source and return its diagnostics, with machine-applicable fixes where the compiler is sure of one.",
     1 =>
         "Apply every fix the compiler is sure of, in rounds until none applies, and return the fixed files and the diagnostics that remain. Writes nothing to disk.",
-    2 => "Format one Nova file in the canonical style (ceesafec fmt).",
+    2 => "Format one CeeSafe file in the canonical style (ceesafec fmt).",
     3 =>
-        "Run a Nova program in the sandboxed interpreter: no files, sockets or processes, a step and memory budget. Returns its output and exit code.",
+        "Run a CeeSafe program in the sandboxed interpreter: no files, sockets or processes, a step and memory budget. Returns its output and exit code.",
     4 =>
-        "Compile Nova to C and return the generated C, optionally with the compiler's allocation, bounds-check or overflow-check decisions.",
-    5 => "What a Nova diagnostic code (N0249) means, an example, and what the diagnostics reference says about it.",
-    6 => "Find sections of Nova's specification and guide whose heading or text contain every word of a query.",
-    7 => "Read one section of a Nova document, with its subsections: for example type-system §31.2, or a heading.",
+        "Compile CeeSafe to C and return the generated C, optionally with the compiler's allocation, bounds-check or overflow-check decisions.",
+    5 => "What a CeeSafe diagnostic code (N0249) means, an example, and what the diagnostics reference says about it.",
+    6 => "Find sections of CeeSafe's specification and guide whose heading or text contain every word of a query.",
+    7 => "Read one section of a CeeSafe document, with its subsections: for example type-system §31.2, or a heading.",
     _ => "The type or signature of the name or expression at a 1-based line and column, and where it is declared.",
 };
 
@@ -657,7 +657,7 @@ fn writeInputSchema(json: borrow mut JsonWriter, k: usize) {
         schemaEnd(json, "");
     } else if (k == 2) {
         json.name("text")!;
-        typeSchema(json, "string", "the file's Nova source");
+        typeSchema(json, "string", "the file's CeeSafe source");
         json.name("path")!;
         typeSchema(json, "string", "its name, for diagnostics");
         schemaEnd(json, "text");
@@ -753,7 +753,7 @@ fn writeOutputSchema(json: borrow mut JsonWriter, k: usize) {
         json.name("files")!;
         arrayStart(json);
         objectSchema(json);
-        arrayEnd(json, "main.c and nova_exports.h");
+        arrayEnd(json, "main.c and ceesafe_exports.h");
         json.name("explanations")!;
         typeSchema(json, "string", "the reports");
         json.name("diagnostics")!;
@@ -1139,7 +1139,7 @@ fn generateCompiled(
         lineDirectives: false,
         split: false,
         programName: copyBytes("program".bytes())!,
-        exportsHeader: copyBytes("nova_exports.h".bytes())!,
+        exportsHeader: copyBytes("ceesafe_exports.h".bytes())!,
         closureSpecialisation: true,
         placement: true,
         bce: true,
@@ -1264,7 +1264,7 @@ fn emitCTool(server: borrow McpServer, doc: borrow JsonDoc, arguments: u32) -> R
     json.name("files")!;
     json.startArray()!;
     for (f in cFiles.view()) {
-        if (sameText(f.name.view(), "main.c") || sameText(f.name.view(), "nova_exports.h")) {
+        if (sameText(f.name.view(), "main.c") || sameText(f.name.view(), "ceesafe_exports.h")) {
             json.startObject()!;
             json.name("name")!;
             json.stringBytes(f.name.view())!;
@@ -1731,13 +1731,13 @@ fn symbolTool(server: borrow McpServer, doc: borrow JsonDoc, arguments: u32) -> 
 fn writePromptInfo(json: borrow mut JsonWriter, k: usize) {
     json.startObject()!;
     json.name("name")!;
-    json.string(if (k == 0) "write-nova" else "port-c-to-nova")!;
+    json.string(if (k == 0) "write-ceesafe" else "port-c-to-ceesafe")!;
     json.name("title")!;
-    json.string(if (k == 0) "Write Nova" else "Port C to Nova")!;
+    json.string(if (k == 0) "Write CeeSafe" else "Port C to CeeSafe")!;
     json.name("description")!;
     json.string(
         if (k ==
-            0) "Write Nova code for a task, with the agent guide and the edit-check loop." else "Port a C file to Nova as CosmoOS's components were (C6, C9).",
+            0) "Write CeeSafe code for a task, with the agent guide and the edit-check loop." else "Port a C file to CeeSafe as CosmoOS's components were (C6, C9).",
     )!;
     json.name("arguments")!;
     json.startArray()!;
@@ -1772,8 +1772,8 @@ fn promptArgument(doc: borrow JsonDoc, given: u32, name: StringView) -> Result<V
 
 fn getPrompt(doc: borrow JsonDoc, parameters: u32) -> Result<McpAnswer, McpFailure> {
     let name = requiredString(doc, parameters, "name")?;
-    let write = sameText(name.view(), "write-nova");
-    if (!write && !sameText(name.view(), "port-c-to-nova")) {
+    let write = sameText(name.view(), "write-ceesafe");
+    if (!write && !sameText(name.view(), "port-c-to-ceesafe")) {
         return Err(invalidParams(textOf("unknown prompt '", name.view(), "'")));
     }
     let arguments = doc.member(parameters, "arguments");
@@ -1793,7 +1793,7 @@ fn getPrompt(doc: borrow JsonDoc, parameters: u32) -> Result<McpAnswer, McpFailu
             null => {
                 appendText(
                     mut text,
-                    "Nova is a memory-safe systems language compiled to C (ceesafe://docs/site/guide/introduction.md).",
+                    "CeeSafe is a memory-safe systems language compiled to C (ceesafe://docs/site/guide/introduction.md).",
                 )!;
             }
         }
@@ -1807,7 +1807,7 @@ fn getPrompt(doc: borrow JsonDoc, parameters: u32) -> Result<McpAnswer, McpFailu
         let api = promptArgument(doc, given, "api")?;
         appendText(mut text, "Port ")!;
         appendBytes(mut text, value.view())!;
-        appendText(mut text, " to Nova, keeping its C API")!;
+        appendText(mut text, " to CeeSafe, keeping its C API")!;
         if (api.length > 0) {
             appendText(mut text, " (")!;
             appendBytes(mut text, api.view())!;
@@ -1827,7 +1827,7 @@ fn getPrompt(doc: borrow JsonDoc, parameters: u32) -> Result<McpAnswer, McpFailu
         )!;
         appendText(
             mut text,
-            "2. Write the logic as safe Nova over slices and references, with the C's checks in the C's order.\n",
+            "2. Write the logic as safe CeeSafe over slices and references, with the C's checks in the C's order.\n",
         )!;
         appendText(
             mut text,
@@ -1847,7 +1847,7 @@ fn getPrompt(doc: borrow JsonDoc, parameters: u32) -> Result<McpAnswer, McpFailu
     json.startObject()!;
     json.name("description")!;
     json.string(
-        if (write) "Write Nova code for a task, with the agent guide and the edit-check loop." else "Port a C file to Nova as CosmoOS's components were (C6, C9).",
+        if (write) "Write CeeSafe code for a task, with the agent guide and the edit-check loop." else "Port a C file to CeeSafe as CosmoOS's components were (C6, C9).",
     )!;
     json.name("messages")!;
     json.startArray()!;

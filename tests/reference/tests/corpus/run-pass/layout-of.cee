@@ -1,0 +1,24 @@
+// layoutOf<T>() (type-system.md §30.1, ADR 0027): a type's size and alignment as a Layout, from the target's layout,
+// in code, in a static initialiser and in a generic function (each instance measures its own T).
+
+struct Pair {
+    a: u8;
+    b: u64;
+}
+
+static PAIR: Layout = layoutOf<Pair>();
+
+fn sizeOfBox<T>() -> usize => layoutOf<T>().size;
+
+fn main() {
+    let l = layoutOf<Pair>();
+    Console.writeLine(l.size);
+    Console.writeLine(l.align);
+    Console.writeLine(PAIR.size + layoutOf<u16>().align);
+    Console.writeLine(sizeOfBox<[u32; 3]>());
+}
+
+// expect-stdout: 16
+// expect-stdout: 8
+// expect-stdout: 18
+// expect-stdout: 12

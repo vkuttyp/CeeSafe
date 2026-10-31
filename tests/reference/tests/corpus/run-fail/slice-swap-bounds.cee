@@ -1,0 +1,9 @@
+// swap checks both indices first and changes nothing when either is out of range (type-system.md §16.5).
+fn main() {
+    var a = [1, 2, 3];
+    a[..].swap(0, 2);
+    Console.writeLine(a[0]);
+    a[..].swap(1, 3); // expect-panic: index out of bounds
+    Console.writeLine(a[1]);
+}
+// expect-stdout: 3

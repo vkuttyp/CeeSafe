@@ -1,0 +1,21 @@
+// Owning closure errors (type-system.md §36.5): a move literal outside Box.create (N0333), a scoped capture (N0332),
+// a changing body where a dyn fn is expected (N0299), a dyn mut fn called through a shared place (N0248), and dyn fn
+// by value (N0330). Moves: move-closures-moves.nova.
+
+fn byValue(f: dyn fn(u64) -> u64) {} // error[N0330]
+
+fn main() {
+    let loose = move (x: u64) => x; // error[N0333]
+    let s = "text";
+    let view: Box<dyn fn() -> usize> = Box.create(move () => s.length)!; // error[N0332]
+    var count: u64 = 0;
+    let shared: Box<dyn fn() -> u64> = Box.create(move () => { // error[N0299]
+        count += 1;
+        return count;
+    })!;
+    let fixed: Box<dyn mut fn() -> u64> = Box.create(move () => {
+        count += 1;
+        return count;
+    })!;
+    fixed(); // error[N0248]
+}

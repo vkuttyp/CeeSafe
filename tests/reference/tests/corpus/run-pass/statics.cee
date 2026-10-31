@@ -1,0 +1,87 @@
+// Static items (type-system.md §39, ADR 0024): thread-safe statics built at compile time, used by name, borrowed with
+// the static region and changed only through their own synchronisation; a `static mut` used in unsafe code; a
+// `@constant` constructor that sets private fields.
+
+static OPENED: AtomicU64 = AtomicU64.constant(5);
+static LIMIT: u32 = 3 * 4;
+static FLAG: AtomicBool = AtomicBool.constant(true);
+static NAME: StringView = "nova";
+
+struct Point {
+    x: i32;
+    y: i32;
+}
+
+static ORIGIN: Point = Point { x: 1, y: -2 };
+static TABLE: [u16; 4] = [1, 2, 3, 4];
+static ZEROES: [u8; 3] = [0; 3];
+
+/// A counter whose fields only its own functions may set.
+struct Counter {
+    private hits: AtomicUSize;
+    private step: usize;
+
+    @constant
+    public fn starting(at: usize, step: usize) -> Counter => Counter { hits: AtomicUSize.constant(at * 10), step: step + 1 };
+
+    public fn hit(borrow this) -> usize => this.hits.fetchAdd(this.step) + this.step;
+}
+
+static HITS: Counter = Counter.starting(1, 1);
+
+static mut COUNTER: u64 = 10;
+
+fn openOne() -> u64 => OPENED.fetchAdd(1) + 1;
+
+fn opened() -> borrow(static) AtomicU64 => borrow OPENED;
+
+fn origin() -> borrow(static) Point => borrow ORIGIN;
+
+/// Safety: only main's thread uses COUNTER.
+fn bump() -> u64 {
+    unsafe {
+        COUNTER += 1;
+        return COUNTER;
+    }
+}
+
+fn spin(n: u64) {
+    for (i in 0..n) {
+        OPENED.fetchAdd(1);
+    }
+}
+
+fn main() {
+    Console.writeLine(openOne());
+    Console.writeLine(openOne());
+    Console.writeLine(opened().load());
+    Console.writeLine(LIMIT);
+    Console.writeLine(FLAG.load());
+    FLAG.store(false);
+    Console.writeLine(FLAG.load());
+    Console.writeLine(NAME);
+    Console.writeLine(ORIGIN.x + origin().y);
+    Console.writeLine(TABLE[2] + ZEROES[1] as u16);
+    Console.writeLine(HITS.hit());
+    Console.writeLine(HITS.hit());
+    Console.writeLine(bump());
+    Console.writeLine(bump());
+    // Two threads change one static atomic at once.
+    Thread.both(() => { spin(1000); }, () => { spin(1000); });
+    Console.writeLine(OPENED.load());
+}
+
+// expect-stdout: 6
+// expect-stdout: 7
+// expect-stdout: 7
+// expect-stdout: 12
+// expect-stdout: true
+// expect-stdout: false
+// expect-stdout: nova
+// expect-stdout: -1
+// expect-stdout: 3
+// expect-stdout: 12
+// expect-stdout: 14
+// expect-stdout: 11
+// expect-stdout: 12
+// expect-stdout: 2007

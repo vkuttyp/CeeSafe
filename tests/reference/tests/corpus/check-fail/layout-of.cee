@@ -1,0 +1,5 @@
+// layoutOf<T>() takes one type argument and no arguments (type-system.md §30.1, ADR 0027).
+fn main() {
+    let a = layoutOf<u8>(1); // error[N0209]
+    let b = layoutOf(); // error[N0209]
+}

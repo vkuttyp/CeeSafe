@@ -309,7 +309,7 @@ fn borrowPlace(c: borrow mut Checker, value: u32, mutable: bool, span: Span) -> 
                 appendQuotedType(mut message, c, fieldType)?;
                 appendText(
                     mut message,
-                    " field of an imported C type can be read and assigned, but not borrowed: its C type ('const', 'size_t') may differ from Nova's (type-system.md §31.2)",
+                    " field of an imported C type can be read and assigned, but not borrowed: its C type ('const', 'size_t') may differ from CeeSafe's (type-system.md §31.2)",
                 )?;
                 c.error(importedTypeByValue(), span.start, span.end, message)?;
                 return c.errorResult(span.start, span.end);

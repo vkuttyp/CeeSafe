@@ -19,7 +19,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-from names import map_back
+from names import FORK_DIVERGENCES, cee_path, for_compiler, map_back
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -38,14 +38,14 @@ def compare(cee, novac, path, cwd):
     """Problems with one file, or an empty list."""
     problems = []
     for arguments in (["fmt", "--stdout", path], ["fmt", "--diagnostics-format=json", "--stdout", path]):
-        mine, ref = run(cee, arguments, cwd), run(novac, arguments, cwd)
+        mine, ref = run(cee, *reversed(for_compiler(cee, cwd, arguments))), run(novac, arguments, cwd)
         if not same(mine, ref):
             problems.append(f"{path}: {' '.join(arguments[:-1])}: differs (status {mine[0]} vs {ref[0]})")
             return problems
-    status, formatted, _ = run(cee, ["fmt", "--stdout", path], cwd)
+    status, formatted, _ = run(cee, *reversed(for_compiler(cee, cwd, ["fmt", "--stdout", path])))
     if status == 0:
         with tempfile.TemporaryDirectory() as work:
-            again = os.path.join(work, os.path.basename(path))
+            again = os.path.join(work, os.path.basename(cee_path(path)))
             with open(again, "wb") as f:
                 f.write(formatted)
             status, twice, _ = run(cee, ["fmt", "--stdout", again], work)
@@ -74,9 +74,10 @@ def compare_squashed(cee, novac, path, root):
     if text is None:
         return None
     with tempfile.TemporaryDirectory() as work:
-        with open(os.path.join(work, "squashed.nova"), "w", encoding="utf-8") as f:
-            f.write(text)
-        mine, ref = run(cee, ["fmt", "--stdout", "squashed.nova"], work), run(novac, ["fmt", "--stdout", "squashed.nova"], work)
+        for name in ("squashed.cee", "squashed.nova"):
+            with open(os.path.join(work, name), "w", encoding="utf-8") as f:
+                f.write(text)
+        mine, ref = run(cee, ["fmt", "--stdout", "squashed.cee"], work), run(novac, ["fmt", "--stdout", "squashed.nova"], work)
         return [] if same(mine, ref) else [f"{path} squashed: differs"]
 
 
@@ -85,18 +86,19 @@ def in_place(cee, novac, files, root):
     problems = []
     with tempfile.TemporaryDirectory() as work:
         trees = {}
-        for who in ("c", "n"):
+        for who, name in (("c", cee_path), ("n", lambda f: f)):
             tree = os.path.join(work, who)
             for f in files:
                 os.makedirs(os.path.dirname(os.path.join(tree, f)), exist_ok=True)
-                shutil.copy(os.path.join(root, f), os.path.join(tree, f))
+                shutil.copy(os.path.join(root, f), os.path.join(tree, name(f)))
             trees[who] = tree
-        for arguments in (["fmt", "--check"] + files, ["fmt"] + files):
-            mine, ref = run(cee, arguments, trees["c"]), run(novac, arguments, trees["n"])
+        for arguments in (["fmt", "--check"], ["fmt"]):
+            mine = run(cee, arguments + [cee_path(f) for f in files], trees["c"])
+            ref = run(novac, arguments + files, trees["n"])
             if not same(mine, ref):
                 problems.append(f"in place: {arguments[1] if len(arguments) > 1 else ''}: output differs")
         for f in files:
-            with open(os.path.join(trees["c"], f), "rb") as a, open(os.path.join(trees["n"], f), "rb") as b:
+            with open(os.path.join(trees["c"], cee_path(f)), "rb") as a, open(os.path.join(trees["n"], f), "rb") as b:
                 if a.read() != b.read():
                     problems.append(f"in place: {f}: rewritten differently")
     return problems
@@ -116,6 +118,7 @@ def main():
     for base, directories, names in os.walk(root):
         directories[:] = sorted(d for d in directories if d not in (".git", "bin", "obj", "node_modules", "out"))
         files += sorted(os.path.relpath(os.path.join(base, n), root) for n in names if n.endswith(".nova"))
+    files = [f for f in files if f.replace(os.sep, "/") not in FORK_DIVERGENCES]
     own_root = os.path.normpath(os.path.join(HERE, ".."))
     own = sorted(subprocess.run(["git", "-C", own_root, "ls-files", "*.cee"], capture_output=True, text=True,
                                 check=True).stdout.split())

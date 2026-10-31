@@ -1,0 +1,9 @@
+// A call through a function value may sleep or allocate (type-system.md §32.1, §36.1): not in an atomic context.
+fn step(x: i32) -> i32 => x + 1;
+
+@context(atomic)
+fn tick(f: fn(i32) -> i32) -> i32 => f(1); // error[N0295]
+
+fn main() {
+    Console.writeLine(step(1));
+}

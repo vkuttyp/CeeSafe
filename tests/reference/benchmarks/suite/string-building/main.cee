@@ -1,0 +1,30 @@
+// string-building (benchmarks/suite/README.md): digits appended one byte at a time.
+fn main() -> i32 {
+    var total: u64 = 0;
+    let digitText = "0123456789";
+    for (round in 0..30u64) {
+        var s = String.create();
+        for (i in 0..1000000u64) {
+            var digits = [0u8; 20];
+            var n: usize = 0;
+            var v = i + round;
+            loop {
+                digits[n] = truncate<u8>(v % 10);
+                n += 1;
+                v = v / 10;
+                if (v == 0) { break; }
+            }
+            while (n > 0) {
+                n -= 1;
+                let d = digits[n] as usize;
+                s.append(digitText[d..d + 1])!;
+            }
+            s.append(",")!;
+        }
+        var bytes: u64 = 0;
+        for (b in s.bytes()) { bytes += b as u64; }
+        total += s.length as u64 * 1000 + bytes % 1000;
+    }
+    Console.writeLine(total);
+    return 0;
+}

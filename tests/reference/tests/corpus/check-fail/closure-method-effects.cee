@@ -1,0 +1,21 @@
+// The library methods have the effects of the closure they are given (type-system.md §36.4, §32.5), and destroying a
+// vector's elements has their drops' effects (§32.1).
+struct Noisy { id: i32; drop { Console.writeLine(this.id); } }
+
+@context(atomic)
+fn sortQuietly(values: SliceMut<i32>) {
+    values.sortBy((a, b) => { Console.writeLine(a); return a - b; }); // error[N0295]
+}
+
+@context(atomic)
+fn shrink(items: borrow mut Vector<Noisy>) {
+    items.truncate(1); // error[N0295]
+    items.clear(); // error[N0295]
+}
+
+fn main() {
+    var values = [2, 1];
+    sortQuietly(mut values[..]);
+    var items = Vector<Noisy>.create();
+    shrink(mut items);
+}

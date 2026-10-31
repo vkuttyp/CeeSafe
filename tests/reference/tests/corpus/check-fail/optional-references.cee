@@ -1,0 +1,20 @@
+// References to optionals and optional references are different types (type-system.md §22.1, M11 G6).
+fn optionalReference(o: borrow i32?) { }
+fn referenceToOptional(o: borrow (i32?)) { }
+fn grouped(o: (borrow i32)?) { }
+
+fn main() {
+    var x: i32? = 5;
+    let r = borrow x;
+    optionalReference(r); // error[N0205]
+    let y = 3;
+    let p: borrow i32? = borrow y;
+    referenceToOptional(p); // error[N0205]
+    grouped(p);
+    let bad: borrow (i32?) = r!; // error[N0262]
+    clear(r);
+}
+
+fn clear(o: borrow (i32?)) {
+    o = null; // error[N0211]
+}

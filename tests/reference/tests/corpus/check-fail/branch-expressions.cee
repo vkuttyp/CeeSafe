@@ -1,0 +1,30 @@
+// `if` and `match` expressions (type-system.md §15.3, M11 G5): branch types, conditions, block branches, and the
+// rules of `match` they share, and a `break` in a branch that leaves its loop. Moves and loans:
+// branch-expression-ownership.nova.
+enum E { A, B(i32), C }
+
+fn exits(c: bool) -> i32 { // error[N0213]
+    loop {
+        let x = if (c) 1 else { break; };
+    }
+}
+
+fn neverExits(c: bool) -> i32 {
+    loop {
+        let x = if (c) 1 else { continue; };
+    }
+}
+
+fn main() {
+    let c = true;
+    let a = if (c) { Console.writeLine(1); } else 2; // error[N0235]
+    let b = if (c) 1 else "two"; // error[N0205]
+    let d = if (1) 1 else 2; // error[N0205]
+    let e = match (E.A) { E.A => 1, E.B(x) => x }; // error[N0256]
+    let f = if (c) null else null; // error[N0260]
+    let g: u8 = if (c) 300 else 1; // error[N0206]
+    let h = match (E.C) { E.A => 1, _ => 2, E.C => 3 }; // error[N0257]
+    let k: bool = match (E.A) { E.B(v) => v, _ => false }; // error[N0205]
+    let m = if (c) Process.exit(1) else 4;
+    let n: u8 = m; // error[N0205]
+}

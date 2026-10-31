@@ -14,7 +14,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-from names import map_back
+from names import FORK_DIVERGENCES, for_compiler, map_back
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -30,16 +30,17 @@ def same(mine, ref):
 
 def compare(cee, novac, files, cwd):
     for arguments in (["doc"] + files, ["doc", "--missing"] + files):
-        if not same(run(cee, arguments, cwd), run(novac, arguments, cwd)):
+        if not same(run(cee, *reversed(for_compiler(cee, cwd, arguments))), run(novac, arguments, cwd)):
             return [f"{' '.join(arguments[:2])} {files[0]}{' …' if len(files) > 1 else ''}: differs"]
     with tempfile.TemporaryDirectory() as work:
         pages = []
         for compiler, name in ((cee, "c.md"), (novac, "n.md")):
-            run(compiler, ["doc", "-o", os.path.join(work, name), "--title", "A title"] + files, cwd)
+            arguments = ["doc", "-o", os.path.join(work, name), "--title", "A title"] + files
+            run(compiler, *reversed(for_compiler(compiler, cwd, arguments)))
             page = os.path.join(work, name)
             if os.path.exists(page):  # no page after a syntax error
                 with open(page, "rb") as f:
-                    pages.append(f.read())
+                    pages.append(map_back(f.read()) if compiler == cee else f.read())
             else:
                 pages.append(None)
         if pages[0] != pages[1]:
@@ -60,6 +61,7 @@ def main():
     for base, directories, names in os.walk(root):
         directories[:] = sorted(d for d in directories if d not in (".git", "bin", "obj", "node_modules", "out"))
         files += sorted(os.path.relpath(os.path.join(base, n), root) for n in names if n.endswith(".nova"))
+    files = [f for f in files if f.replace(os.sep, "/") not in FORK_DIVERGENCES]
     jobs = [([f], root) for f in files]
     for library in ("lib/core", "lib/std", "lib/kernel"):
         jobs.append((sorted(f for f in files if f.startswith(library + "/")), root))

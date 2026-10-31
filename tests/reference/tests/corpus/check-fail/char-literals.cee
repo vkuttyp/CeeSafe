@@ -1,0 +1,7 @@
+// Character literals in types too small for them (type-system.md §4, M11 G4a).
+fn main() {
+    let a: u8 = 'é'; // error[N0206]
+    let b: i8 = 'ÿ'; // error[N0206]
+    let c: u16 = '\u{1F600}'; // error[N0206]
+    let d: u8 = 'k';
+}

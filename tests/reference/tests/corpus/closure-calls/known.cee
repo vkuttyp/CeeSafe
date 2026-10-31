@@ -1,0 +1,55 @@
+// Closure-call specialisation (optimisations.md §5, ADR 0019): which calls through closures become direct. A literal
+// called where it is made; a library method (sortBy) and a user function that passes its closure on and recurses, each
+// given two literals (two variants); an fn value through its adapter; a closure chosen by a branch, which stays
+// indirect; and a closure handed to Thread.both, which is called through the runtime.
+
+fn twice(f: borrow mut fn(i32) -> i32, x: i32) -> i32 {
+    let once = f(x);
+    return f(once);
+}
+
+fn apply(f: borrow mut fn(i32) -> i32, x: i32, depth: i32) -> i32 {
+    if (depth == 0) {
+        return twice(f, x);
+    }
+    let next = f(x);
+    return apply(f, next, depth - 1);
+}
+
+fn negate(x: i32) -> i32 => 0 - x;
+
+fn main() {
+    let add = (x: i32) => x + 1;
+    Console.writeLine(add(41));
+
+    var values: [i32; 5] = [5, 3, 9, 1, 7];
+    values[..].sortBy((a, b) => a - b);
+    Console.writeLine(values[0]);
+    values[..].sortBy((a, b) => b - a);
+    Console.writeLine(values[0]);
+
+    Console.writeLine(apply((x) => x * 2, 1, 2));
+    Console.writeLine(apply((x) => x + 3, 1, 2));
+    Console.writeLine(apply(negate, 5, 1));
+
+    let up = true;
+    let step: i32 = 100;
+    let plus = (x: i32) => x + step;
+    let minus = (x: i32) => x - step;
+    let chosen = if (up) plus else minus;
+    Console.writeLine(chosen(1));
+
+    var a: i32 = 0;
+    var b: i32 = 0;
+    Thread.both(() => { a = twice((x) => x + 1, 0); }, () => { b = 2; });
+    Console.writeLine(a + b);
+}
+
+// expect-stdout: 42
+// expect-stdout: 1
+// expect-stdout: 9
+// expect-stdout: 16
+// expect-stdout: 13
+// expect-stdout: -5
+// expect-stdout: 101
+// expect-stdout: 4

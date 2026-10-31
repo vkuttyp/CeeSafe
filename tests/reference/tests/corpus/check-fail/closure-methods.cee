@@ -1,0 +1,18 @@
+// Misused library methods taking closures (type-system.md §36.4) and swap/truncate (§16.5, §23.1).
+fn main() {
+    let fixed = [3, 1, 2];
+    fixed[..].sortBy((a, b) => a - b); // error[N0248]
+    var values = [3, 1, 2];
+    let view: Slice<i32> = values[..];
+    view.sortBy((a, b) => a - b); // error[N0211]
+    view.swap(0, 1); // error[N0211]
+    values[..].sortBy((a, b) => a < b); // error[N0205]
+    values[..].forEach((a, b) => { }); // error[N0209]
+    values[..].any(7); // error[N0205]
+    values[..].swap(0); // error[N0209]
+    var v = Vector<i32>.create();
+    v.truncate(-1); // error[N0207]
+    var s = String.create();
+    s.retain((b) => true); // error[N0200]
+    let words = ["kiwi", "fig"]; // error[N0246]
+}

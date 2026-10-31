@@ -1,0 +1,42 @@
+// A Box<dyn I, A> with a user allocator (type-system.md §37.3–§37.4): allocated with the value's own layout, and freed
+// through the table with that layout, after the value's drop.
+
+extern "C" {
+    fn malloc(size: usize) -> *mut void;
+    fn free(p: *mut void);
+}
+
+struct CHeap {}
+
+impl Allocator for CHeap {
+    /// Safety: malloc returns null or a block of layout.size bytes.
+    fn allocate(borrow this, layout: Layout) -> Result<*mut u8, AllocError> {
+        Console.write("alloc ");
+        Console.writeLine(layout.size);
+        let p = unsafe { malloc(layout.size) } as *mut u8;
+        if (p.isNull()) { return Err(AllocError.OutOfMemory); }
+        return Ok(p);
+    }
+
+    /// Safety: Box passes back blocks from allocate, once each.
+    unsafe fn deallocate(borrow this, p: *mut u8, layout: Layout) {
+        Console.write("free ");
+        Console.writeLine(layout.size);
+        free(p as *mut void);
+    }
+}
+
+interface Speak { fn say(borrow this); }
+
+struct Dog { id: u64; legs: u64; drop { Console.writeLine("drop dog"); } }
+impl Speak for Dog { fn say(borrow this) { Console.writeLine(this.id); } }
+
+fn main() {
+    let d: Box<dyn Speak, CHeap> = Box.createIn(CHeap {}, Dog { id: 7, legs: 4 })!;
+    d.say();
+}
+
+// expect-stdout: alloc 16
+// expect-stdout: 7
+// expect-stdout: drop dog
+// expect-stdout: free 16

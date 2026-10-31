@@ -1,0 +1,59 @@
+// A function whose effects are its closure arguments' (type-system.md §32.5, ADR 0020): calls through an
+// `@effectsOf` parameter are its callers' effects, so atomic code may pass it closures that neither sleep nor allocate.
+@effectsOf(test)
+fn count(values: Slice<i32>, test: borrow fn(i32) -> bool) -> i32 {
+    var n = 0;
+    for (v in values) {
+        if (test(v)) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+// Passing the parameter on to another `@effectsOf` function adds nothing; so does a copy of it.
+@effectsOf(test)
+@effects()
+fn countTwice(values: Slice<i32>, test: borrow fn(i32) -> bool) -> i32 {
+    let again = test;
+    return count(values, test) + count(values, again);
+}
+
+struct Table {
+    values: [i32; 4];
+
+    @effectsOf(keep)
+    fn countWhere(borrow this, keep: borrow fn(i32) -> bool) -> i32 => count(this.values[..], keep);
+}
+
+fn isEven(v: i32) -> bool => v % 2 == 0;
+
+@context(atomic)
+fn underLock(values: SliceMut<i32>, limit: i32) -> i32 {
+    var n = count(values, (v) => v > limit) + count(values, isEven) + countTwice(values, isEven);
+    let small = (v: i32) => v < limit;
+    n += count(values, small);
+    let table = Table { values: [1, 2, 3, 4] };
+    n += table.countWhere((v) => v > 1);
+    values.sortBy((a, b) => a - b);
+    values.forEach((v) => { n += v; });
+    if (values.any((v) => v == limit) && values.all((v) => v > 0)) {
+        n += 1;
+    }
+    return n;
+}
+
+@context(irq)
+fn inInterrupt(values: Vector<i32>) -> usize {
+    var kept = values;
+    kept.retain((v) => v > 2);
+    return kept.length;
+}
+
+fn main() {
+    var values = [5, 3, 9, 1];
+    Console.writeLine(underLock(mut values[..], 4));
+    Console.writeLine(inInterrupt(Vector<i32>.create()));
+    let f: fn(Slice<i32>, borrow fn(i32) -> bool) -> i32 = count;
+    Console.writeLine(f(values[..], (v) => v > 0));
+}

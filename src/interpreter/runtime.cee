@@ -10,7 +10,7 @@ fn stableVectorChunks() -> u64 => 32;
 /// nova_rt_finish: the NOVA_ALLOC_REPORT line.
 fn finishRuntime(it: borrow mut Interp) {
     if (it.options.allocationReport) {
-        var m = copyBytes("nova alloc: attempts=".bytes())!;
+        var m = copyBytes("ceesafe alloc: attempts=".bytes())!;
         appendDecimal(mut m, it.attempts)!;
         appendText(mut m, " live=")!;
         appendDecimal(mut m, it.liveAllocations)!;

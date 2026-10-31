@@ -1,0 +1,10 @@
+(unit
+  (fn default f (params (x i32) (shape Shape)) (returns i32)
+    (block
+      (let sign = (if-expr (< x 0) (neg 1) (if-expr (== x 0) 0 1)))
+      (let name = (match-expr shape (arm (Shape.Circle _) "circle") (arm (Shape.Square side) (if-expr (> side 10) "big square" "square")) (arm Shape.None (block (return 0)))))
+      (let y = (+ (paren (if-expr (> x 0) 1 2)) 3))
+      (return (if-expr (> x 0) 1 (+ 2 3)))
+    )
+  )
+)

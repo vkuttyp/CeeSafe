@@ -1,0 +1,15 @@
+// --no-float (type-system.md §35.9, M11 G7c): every float type, literal and fromBits is N0297; integers are untouched.
+// option: no-float
+
+struct Sample { value: f64; } // error[N0297]
+
+fn half(x: f32) // error[N0297]
+    -> f32 => x; // error[N0297]
+
+fn main() {
+    let a = 1.5; // error[N0297]
+    let b = f64.fromBits(0); // error[N0297]
+    let c = round<f64>(3); // error[N0297]
+    let d: i32 = 7;
+    let e = d * 2;
+}

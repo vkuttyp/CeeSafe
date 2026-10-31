@@ -29,15 +29,15 @@ fn emitDynTypedefs(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Al
     for (k in distinct.view()) {
         let dyn = c.dynSignatures[k as usize].dynType;
         let m = mangled(c, dyn)?;
-        e.t("typedef struct nvDT_")?;
+        e.t("typedef struct ceeDT_")?;
         e.b(m.view())?;
-        e.t(" nvDT_")?;
+        e.t(" ceeDT_")?;
         e.b(m.view())?;
         e.t(";")?;
         e.emit()?;
-        e.t("typedef struct { void *data; const nvDT_")?;
+        e.t("typedef struct { void *data; const ceeDT_")?;
         e.b(m.view())?;
-        e.t(" *vt; } nvDR_")?;
+        e.t(" *vt; } ceeDR_")?;
         e.b(m.view())?;
         e.t("; /* ")?;
         e.b(c.types.name(dyn))?;
@@ -51,9 +51,9 @@ fn emitDynTypedefs(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Al
         }
         threads = true;
         let m = mangled(c, c.types.info(thread).element)?;
-        e.t("typedef struct nvTB_")?;
+        e.t("typedef struct ceeTB_")?;
         e.b(m.view())?;
-        e.t(" nvTB_")?;
+        e.t(" ceeTB_")?;
         e.b(m.view())?;
         e.t("; /* ")?;
         e.b(c.types.name(thread))?;
@@ -97,7 +97,7 @@ fn emitDynTableTypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, 
     distinctDynSignatures(c, mut distinct)?;
     for (k in distinct.view()) {
         let signature = c.dynSignatures[k as usize];
-        e.t("struct nvDT_")?;
+        e.t("struct ceeDT_")?;
         appendMangle(c, mut e.buf, signature.dynType)?;
         e.t(" {")?;
         e.emit()?;
@@ -127,7 +127,7 @@ fn appendDynTableName(
     implementation: u32,
     dyn: u32,
 ) -> Result<void, AllocError> {
-    appendText(out, "nvVT_")?;
+    appendText(out, "ceeVT_")?;
     appendMangle(c, out, implementation)?;
     out.push('_')?;
     return appendMangle(c, out, dyn);
@@ -154,7 +154,7 @@ fn emitDynTables(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Allo
         if (c.types.needsDrop(table.implementation)) {
             dropName = copyBytes(name.view())?;
             appendText(mut dropName, "_drop")?;
-            e.t("static NV_UNUSED void ")?;
+            e.t("static CEE_UNUSED void ")?;
             e.b(dropName.view())?;
             e.t("(void *self) {")?;
             e.emit()?;
@@ -169,7 +169,7 @@ fn emitDynTables(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Allo
         for (slot in 0..table.methods.count) {
             let method = c.hir.at(table.methods, slot);
             let returnType = c.hir.functions[method as usize].returnType;
-            e.t("static NV_UNUSED ")?;
+            e.t("static CEE_UNUSED ")?;
             appendCTypeName(c, mut e.buf, returnType)?;
             e.t(" ")?;
             e.b(name.view())?;
@@ -200,7 +200,7 @@ fn emitDynTables(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Allo
             e.emit()?;
             e.line("}")?;
         }
-        e.t("static NV_UNUSED const nvDT_")?;
+        e.t("static CEE_UNUSED const ceeDT_")?;
         appendMangle(c, mut e.buf, table.dynType)?;
         e.t(" ")?;
         e.b(name.view())?;
@@ -244,11 +244,11 @@ fn emitThreadRecords(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, 
         any = true;
         let result = c.types.info(thread).element;
         let m = mangled(c, result)?;
-        e.t("struct nvTB_")?;
+        e.t("struct ceeTB_")?;
         e.b(m.view())?;
         e.t(" {")?;
         e.emit()?;
-        e.line("    nv_thread *thread;")?;
+        e.line("    cee_thread *thread;")?;
         e.line("    void *data;")?;
         e.line("    const void *vt;")?;
         if (!c.types.is(result, TypeKind.Void)) {
@@ -258,11 +258,11 @@ fn emitThreadRecords(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, 
             e.emit()?;
         }
         e.line("};")?;
-        e.t("static NV_UNUSED ")?;
+        e.t("static CEE_UNUSED ")?;
         appendCTypeName(c, mut e.buf, result)?;
-        e.t(" nvTJ_")?;
+        e.t(" ceeTJ_")?;
         e.b(m.view())?;
-        e.t("(nvTB_")?;
+        e.t("(ceeTB_")?;
         e.b(m.view())?;
         e.t(" *);")?;
         e.emit()?;
@@ -380,7 +380,7 @@ fn emitForkHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirProgr
     }
     for (closure in firsts.view()) {
         let name = cTypeName(c, closure)?;
-        e.t("static NV_UNUSED void *nvTF_")?;
+        e.t("static CEE_UNUSED void *ceeTF_")?;
         appendMangle(c, mut e.buf, closure)?;
         e.t("(void *p) {")?;
         e.emit()?;
@@ -397,7 +397,7 @@ fn emitForkHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirProgr
     for (fork in forks.view()) {
         let a = truncate<u32>(fork.a);
         let b = truncate<u32>(fork.b);
-        e.t("static NV_UNUSED void nvBOTH_")?;
+        e.t("static CEE_UNUSED void ceeBOTH_")?;
         appendMangle(c, mut e.buf, a)?;
         e.t("_")?;
         appendMangle(c, mut e.buf, b)?;
@@ -407,7 +407,7 @@ fn emitForkHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirProgr
         appendCTypeName(c, mut e.buf, b)?;
         e.t(" b) {")?;
         e.emit()?;
-        e.t("    nv_thread *t = nova_thread_start(nvTF_")?;
+        e.t("    cee_thread *t = ceesafe_thread_start(ceeTF_")?;
         appendMangle(c, mut e.buf, a)?;
         e.t(", (void *)a);")?;
         e.emit()?;
@@ -416,7 +416,7 @@ fn emitForkHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirProgr
         e.line("    }")?;
         e.line("    (*b)(b);")?;
         e.line("    if (t != NULL) {")?;
-        e.line("        nova_thread_join(t);")?;
+        e.line("        ceesafe_thread_join(t);")?;
         e.line("    }")?;
         e.line("}")?;
     }
@@ -466,17 +466,17 @@ fn emitThreadHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirPro
         let result = c.types.info(thread).element;
         let m = mangled(c, result)?;
         let void = c.types.is(result, TypeKind.Void);
-        var table = copyBytes("nvDT_".bytes())?;
+        var table = copyBytes("ceeDT_".bytes())?;
         appendThreadBodyMangle(c, mut table, result)?;
         let hasTable = hasDynSignature(c, threadBodyDyn(c, result));
         if (hasTable) {
-            e.t("static NV_UNUSED void *nvTR_")?;
+            e.t("static CEE_UNUSED void *ceeTR_")?;
             e.b(m.view())?;
             e.t("(void *p) {")?;
             e.emit()?;
-            e.t("    nvTB_")?;
+            e.t("    ceeTB_")?;
             e.b(m.view())?;
-            e.t(" *b = (nvTB_")?;
+            e.t(" *b = (ceeTB_")?;
             e.b(m.view())?;
             e.t(" *)p;")?;
             e.emit()?;
@@ -490,15 +490,15 @@ fn emitThreadHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirPro
             e.line("    return NULL;")?;
             e.line("}")?;
         }
-        e.t("static NV_UNUSED ")?;
+        e.t("static CEE_UNUSED ")?;
         appendCTypeName(c, mut e.buf, result)?;
-        e.t(" nvTJ_")?;
+        e.t(" ceeTJ_")?;
         e.b(m.view())?;
-        e.t("(nvTB_")?;
+        e.t("(ceeTB_")?;
         e.b(m.view())?;
         e.t(" *b) {")?;
         e.emit()?;
-        e.line("    nova_thread_join(b->thread);")?;
+        e.line("    ceesafe_thread_join(b->thread);")?;
         if (!void) {
             e.t("    ")?;
             appendCTypeName(c, mut e.buf, result)?;
@@ -514,27 +514,27 @@ fn emitThreadHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirPro
             e.emit()?;
             e.line("    if (vt->drop != NULL) vt->drop(b->data);")?;
         }
-        e.line("    nova_free(b->data, NV_ALLOC_SYSTEM);")?;
-        e.line("    nova_free(b, NV_ALLOC_SYSTEM);")?;
+        e.line("    ceesafe_free(b->data, CEE_ALLOC_SYSTEM);")?;
+        e.line("    ceesafe_free(b, CEE_ALLOC_SYSTEM);")?;
         if (!void) {
             e.line("    return r;")?;
         }
         e.line("}")?;
-        e.t("static NV_UNUSED void ")?;
+        e.t("static CEE_UNUSED void ")?;
         appendDropGlueName(c, mut e.buf, thread)?;
         e.t("(")?;
         appendCTypeName(c, mut e.buf, thread)?;
         e.t(" *p) {")?;
         e.emit()?;
         if (void) {
-            e.t("    nvTJ_")?;
+            e.t("    ceeTJ_")?;
             e.b(m.view())?;
             e.t("(*p);")?;
             e.emit()?;
         } else {
             e.t("    ")?;
             appendCTypeName(c, mut e.buf, result)?;
-            e.t(" r = nvTJ_")?;
+            e.t(" r = ceeTJ_")?;
             e.b(m.view())?;
             e.t("(*p);")?;
             e.emit()?;
@@ -569,19 +569,19 @@ fn emitThreadHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirPro
         let name = cTypeName(c, resultType)?;
         var error = Vector<u8>.create();
         appendAllocErrorResult(e, c, mut error, resultType)?;
-        e.t("static NV_UNUSED ")?;
+        e.t("static CEE_UNUSED ")?;
         e.b(name.view())?;
-        e.t(" nvTSB_")?;
+        e.t(" ceeTSB_")?;
         e.b(m.view())?;
         e.t("(")?;
         appendCTypeName(c, mut e.buf, box)?;
         e.t(" f) {")?;
         e.emit()?;
-        e.t("    nvTB_")?;
+        e.t("    ceeTB_")?;
         e.b(m.view())?;
-        e.t(" *b = (nvTB_")?;
+        e.t(" *b = (ceeTB_")?;
         e.b(m.view())?;
-        e.t(" *)nova_alloc(sizeof *b, NV_ALLOC_SYSTEM);")?;
+        e.t(" *)ceesafe_alloc(sizeof *b, CEE_ALLOC_SYSTEM);")?;
         e.emit()?;
         e.line("    if (b == NULL) {")?;
         e.t("        ")?;
@@ -592,12 +592,12 @@ fn emitThreadHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirPro
         e.line("    }")?;
         e.line("    b->data = f.data;")?;
         e.line("    b->vt = f.vt;")?;
-        e.t("    b->thread = nova_thread_start(nvTR_")?;
+        e.t("    b->thread = ceesafe_thread_start(ceeTR_")?;
         e.b(m.view())?;
         e.t(", b);")?;
         e.emit()?;
         e.line("    if (b->thread == NULL) {")?;
-        e.line("        nova_free(b, NV_ALLOC_SYSTEM);")?;
+        e.line("        ceesafe_free(b, CEE_ALLOC_SYSTEM);")?;
         e.t("        ")?;
         appendDropGlueName(c, mut e.buf, box)?;
         e.t("(&f);")?;
@@ -626,19 +626,19 @@ fn emitThreadHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirPro
         appendAllocErrorResult(e, c, mut error, resultType)?;
         let env = cTypeName(c, environment)?;
         let drops = c.types.needsDrop(environment);
-        e.t("static NV_UNUSED ")?;
+        e.t("static CEE_UNUSED ")?;
         e.b(name.view())?;
-        e.t(" nvTS_")?;
+        e.t(" ceeTS_")?;
         appendMangle(c, mut e.buf, environment)?;
         e.t("(")?;
         e.b(env.view())?;
         e.t(" v) {")?;
         e.emit()?;
-        e.t("    nvTB_")?;
+        e.t("    ceeTB_")?;
         e.b(m.view())?;
-        e.t(" *b = (nvTB_")?;
+        e.t(" *b = (ceeTB_")?;
         e.b(m.view())?;
-        e.t(" *)nova_alloc(sizeof *b, NV_ALLOC_SYSTEM);")?;
+        e.t(" *)ceesafe_alloc(sizeof *b, CEE_ALLOC_SYSTEM);")?;
         e.emit()?;
         e.line("    if (b == NULL) {")?;
         emitDropOrVoid(e, c, environment, drops, "&v")?;
@@ -648,22 +648,22 @@ fn emitThreadHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirPro
         e.b(env.view())?;
         e.t(" *e = (")?;
         e.b(env.view())?;
-        e.t(" *)nova_alloc(sizeof(*e), NV_ALLOC_SYSTEM);")?;
+        e.t(" *)ceesafe_alloc(sizeof(*e), CEE_ALLOC_SYSTEM);")?;
         e.emit()?;
         e.line("    if (e == NULL) {")?;
-        e.line("        nova_free(b, NV_ALLOC_SYSTEM);")?;
+        e.line("        ceesafe_free(b, CEE_ALLOC_SYSTEM);")?;
         emitDropOrVoid(e, c, environment, drops, "&v")?;
         emitThreadError(e, error.view(), "        ")?;
         e.line("    }")?;
         e.line("    *e = v;")?;
         e.line("    b->data = e;")?;
-        e.t("    b->vt = &nvVT_")?;
+        e.t("    b->vt = &ceeVT_")?;
         appendMangle(c, mut e.buf, environment)?;
         e.t("_")?;
         appendThreadBodyMangle(c, mut e.buf, element)?;
         e.t(";")?;
         e.emit()?;
-        e.t("    b->thread = nova_thread_start(nvTR_")?;
+        e.t("    b->thread = ceesafe_thread_start(ceeTR_")?;
         e.b(m.view())?;
         e.t(", b);")?;
         e.emit()?;
@@ -674,8 +674,8 @@ fn emitThreadHelpers(e: borrow mut CEmitter, c: borrow Checker, n: borrow NirPro
             e.t("(e);")?;
             e.emit()?;
         }
-        e.line("        nova_free(e, NV_ALLOC_SYSTEM);")?;
-        e.line("        nova_free(b, NV_ALLOC_SYSTEM);")?;
+        e.line("        ceesafe_free(e, CEE_ALLOC_SYSTEM);")?;
+        e.line("        ceesafe_free(b, CEE_ALLOC_SYSTEM);")?;
         emitThreadError(e, error.view(), "        ")?;
         e.line("    }")?;
         var ok = Vector<u8>.create();

@@ -1,0 +1,30 @@
+// Attributes and extern blocks (grammar.md §2, type-system.md §28).
+extern "C" {
+    fn strlen(s: *CChar) -> usize;
+    @effects(sleep)
+    public fn write(fd: i32, buffer: *u8, count: usize) -> isize;
+}
+
+@repr(C)
+struct Point { x: i32; y: i32; }
+
+@repr(u8)
+enum Color { Red, Green }
+
+/// Exported.
+@export("geo_length")
+public fn length(p: Point) -> i32 => p.x + p.y;
+
+@export
+@effects()
+fn plain() {}
+
+// Imported C types (type-system.md §31).
+@header("dev.h", "kernel/types.h")
+extern "C" {
+    struct dev { base: u64; next: *mut dev; }
+    struct opaque_t;
+    @ctype("cell_t")
+    public struct cell { v: i32; }
+    fn dev_open(d: *mut dev) -> i32;
+}

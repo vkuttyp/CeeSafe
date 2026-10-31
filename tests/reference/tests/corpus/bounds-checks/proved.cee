@@ -1,0 +1,138 @@
+// Index checks that bounds-check elimination must remove (optimisations.md §2.4); the .bce snapshot lists each one.
+
+fn counted(s: Slice<u32>) -> u32 {
+    var t: u32 = 0;
+    for (i in 0..s.length) { t += s[i]; }
+    return t;
+}
+
+fn whileLoop() -> u32 {
+    var a = [3u32; 16];
+    var j: usize = 0;
+    var t: u32 = 0;
+    while (j < a.length) {
+        t += a[j];
+        j += 1;
+    }
+    return t;
+}
+
+fn vectorLoop(n: u32) -> u32 {
+    var v = Vector<u32>.create();
+    for (k in 0..n) { v.push(k)!; }
+    var t: u32 = 0;
+    for (i in 0..v.length) { t += v[i]; }
+    return t;
+}
+
+fn remainder(s: Slice<u8>, h: usize) -> u8 => s[h % s.length];
+
+fn mask(s: Slice<u8>, h: usize) -> u8 {
+    let m = s.length - 1;
+    return s[h & m];
+}
+
+/// An offset plus an index below the remaining length (the LZ4 shape).
+fn offsetCopy(out: SliceMut<u8>, to: usize, n: usize) -> bool {
+    if (n > out.length - to) { return false; }
+    for (i in 0..n) { out[to + i] = 7; }
+    return true;
+}
+
+fn repeated(s: Slice<u8>, i: usize) -> u32 => s[i] as u32 + s[i] as u32;
+
+fn shortCircuit(s: Slice<u8>) -> usize {
+    var i: usize = 0;
+    while (i < s.length && s[i] != 0) { i += 1; }
+    return i;
+}
+
+fn subslice(s: Slice<u8>) -> u32 {
+    let w = s[2..];
+    var t: u32 = 0;
+    for (i in 0..w.length) { t += w[i] as u32; }
+    return t;
+}
+
+fn lastBelow(s: Slice<u8>) -> u32 {
+    let last = s.length - 1;
+    var i: usize = 0;
+    var t: u32 = 0;
+    while (i <= last) {
+        t += s[i] as u32;
+        i += 1;
+    }
+    return t;
+}
+
+fn negated(s: Slice<u8>, i: usize) -> u8 {
+    if (!(i < s.length)) { return 0; }
+    return s[i];
+}
+
+/// `i = i + 1` after `i + 1 < length`: the new `i` equals the `i + 1` that was compared.
+fn reassigned(s: Slice<u8>) -> u32 {
+    var i: usize = 0;
+    var t: u32 = 0;
+    while (i + 1 < s.length) {
+        i += 1;
+        t += s[i] as u32;
+    }
+    return t;
+}
+
+/// `&&` in a loop condition: the body runs only when both tests passed.
+fn guardedLoop(s: Slice<u8>) -> u32 {
+    var i: usize = 0;
+    var t: u32 = 0;
+    while (t < 100 && i < s.length) {
+        t += s[i] as u32;
+        i += 1;
+    }
+    return t;
+}
+
+/// `||` in an early return: past it, neither test held, and `n - k` was computed (so `k ≤ n`).
+fn pastGuard(s: Slice<u8>, k: usize) -> u8 {
+    let n = s.length;
+    if (k == 0 || n - k < 1) { return 0; }
+    return s[k];
+}
+
+fn main() {
+    let words = [1u32, 2, 3, 4];
+    var bytes = [5u8, 4, 3, 0, 1, 2];
+    Console.writeLine(counted(words[..]));
+    Console.writeLine(whileLoop());
+    Console.writeLine(vectorLoop(10));
+    Console.writeLine(remainder(bytes[..], 13));
+    Console.writeLine(mask(bytes[..4], 6));
+    Console.writeLine(offsetCopy(mut bytes[..], 2, 4));
+    Console.writeLine(offsetCopy(mut bytes[..], 3, 4));
+    Console.writeLine(repeated(bytes[..], 1));
+    Console.writeLine(shortCircuit(bytes[..]));
+    Console.writeLine(subslice(bytes[..]));
+    Console.writeLine(lastBelow(bytes[..]));
+    Console.writeLine(negated(bytes[..], 9));
+    Console.writeLine(reassigned(bytes[..]));
+    Console.writeLine(guardedLoop(bytes[..]));
+    Console.writeLine(pastGuard(bytes[..], 2));
+    Console.writeLine(pastGuard(bytes[..], 6));
+}
+
+// expect-stdout: 10
+// expect-stdout: 48
+// expect-stdout: 45
+// expect-stdout: 4
+// expect-stdout: 3
+// expect-stdout: true
+// expect-stdout: false
+// expect-stdout: 8
+// expect-stdout: 6
+// expect-stdout: 28
+// expect-stdout: 37
+// expect-stdout: 0
+// expect-stdout: 32
+// expect-stdout: 37
+// expect-stdout: 7
+// expect-stdout: 0

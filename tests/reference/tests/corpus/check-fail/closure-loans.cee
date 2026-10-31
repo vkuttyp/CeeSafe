@@ -1,0 +1,40 @@
+// Closures' captures follow the reference rules (type-system.md §36.2, M11 G8b): a captured variable cannot be changed
+// while a closure reading it is live, nor used while one changing it is; a capture cannot be moved out; a closure
+// cannot be returned. `ok` shows the same code accepted once each closure's last use comes first.
+fn take(s: String) { }
+fn run(f: borrow fn(i32) -> bool) -> bool => f(1);
+fn make(k: borrow i32) -> borrow fn(i32) -> i32 => (x) => x + k; // error[N0244]
+
+fn changed() {
+    var limit = 4;
+    let above = (v: i32) => v > limit;
+    limit = 5; // error[N0240]
+    Console.writeLine(above(1));
+}
+
+fn readWhileMut() {
+    var total = 0;
+    let add = (v: i32) => { total += v; };
+    Console.writeLine(total); // error[N0242]
+    add(1);
+}
+
+fn moves() {
+    let s = String.create();
+    let f = () => { take(s); }; // error[N0251]
+    f();
+}
+
+fn ok() {
+    var limit = 4;
+    let above = (v: i32) => v > limit;
+    Console.writeLine(above(1));
+    limit = 5;
+    var total = 0;
+    let add = (v: i32) => { total += v; };
+    add(1);
+    add(2);
+    Console.writeLine(total);
+}
+
+fn main() { }

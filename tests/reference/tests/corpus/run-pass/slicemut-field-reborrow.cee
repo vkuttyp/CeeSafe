@@ -1,0 +1,27 @@
+// A `SliceMut` field is reborrowed by each use, like a `SliceMut` variable (type-system.md §13.3, §16): passing
+// `halves.left` lends it and leaves it usable, and a closure that passes it captures `halves` mutably.
+
+fn double(values: SliceMut<u64>) {
+    for (i in 0..values.length) {
+        values[i] = values[i] * 2;
+    }
+}
+
+fn run(f: borrow mut fn()) {
+    f();
+}
+
+fn main() {
+    var values: [u64; 4] = [1, 2, 3, 4];
+    let halves = values[..].splitAtMut(2);
+    double(halves.left);
+    double(halves.left); // still there: the first call reborrowed it
+    run(() => { double(halves.right); });
+    var total: u64 = 0;
+    for (v in values[..]) {
+        total = total + v;
+    }
+    Console.writeLine(total);
+}
+
+// expect-stdout: 26

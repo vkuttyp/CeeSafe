@@ -1,0 +1,76 @@
+// Boxes created in a loop (memory-model.md §5.1, M9e): placed on the stack when every local that may hold the box
+// ends before the site runs again, so one slot per site suffices; kept on the heap when one may outlive its iteration.
+
+struct Pair { a: u64; b: u64; drop { } }
+struct Name { id: u64; label: Vector<u8>; }
+
+/// The shape of heap-alloc: created, used and dropped in each iteration.
+fn sumArrays() -> u64 {
+    var sum: u64 = 0;
+    for (i in 0..4u64) {
+        var a = Box.create([0u64; 8])!;                  // stack
+        for (j in 0..8usize) { a[j] = i + j as u64; }
+        for (j in 0..8usize) { sum += a[j]; }
+    }
+    return sum;
+}
+
+/// Early exits: `continue` and `break` end the box too.
+fn exits() -> u64 {
+    var total: u64 = 0;
+    for (i in 0..10u64) {
+        let p = Box.create(Pair { a: i, b: i * 2 })!;    // stack
+        if (i % 3 == 0) { continue; }
+        if (i == 8) { break; }
+        total += p.a + p.b;
+    }
+    return total;
+}
+
+/// Nested loops: the inner box dies within each inner iteration, the outer one within each outer iteration.
+fn nested() -> u64 {
+    var total: u64 = 0;
+    for (i in 0..3u64) {
+        let outer = Box.create(Pair { a: i, b: 1 })!;    // stack
+        for (j in 0..3u64) {
+            let inner = Box.create(Pair { a: j, b: outer.a })!;   // stack
+            total += inner.a * inner.b + outer.b;
+        }
+    }
+    return total;
+}
+
+/// The contents moved out: the box's memory is released by BoxFree, not by a drop of the whole box.
+fn movedOut() -> u64 {
+    var total: u64 = 0;
+    for (i in 0..3u64) {
+        let b = Box.create(Name { id: i + 1, label: Vector<u8>.create() })!;   // stack
+        let label = b.label;                              // moves a field out; the rest is destroyed in place
+        total += b.id + label.length as u64;
+    }
+    return total;
+}
+
+/// Near miss: `last` is declared outside the loop, so it still holds the previous box when the site runs again.
+fn keepLast() -> u64 {
+    var total: u64 = 0;
+    var last: Box<Pair>;
+    for (i in 0..3u64) {
+        last = Box.create(Pair { a: i, b: i })!;         // heap: may outlive its iteration
+        total += last.a;
+    }
+    return total;
+}
+
+fn main() {
+    Console.writeLine(sumArrays());
+    Console.writeLine(exits());
+    Console.writeLine(nested());
+    Console.writeLine(movedOut());
+    Console.writeLine(keepLast());
+}
+// expect-stdout: 160
+// expect-stdout: 57
+// expect-stdout: 18
+// expect-stdout: 6
+// expect-stdout: 3

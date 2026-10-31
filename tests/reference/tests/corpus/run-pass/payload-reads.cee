@@ -1,0 +1,20 @@
+// An enum local that only ever holds one variant, matched against all of them (found by the M9d fuzz campaign).
+// The arm for V0 reads bytes that V2 does not cover; it never runs, but gcc -O0's -Wmaybe-uninitialized cannot tell,
+// so the local keeps its zero initializer (c-backend.md §5) and the C stays warning-clean under -Werror.
+
+enum E0 { V0(bool, u16), V1, V2(u8, u32) }
+
+fn pick(k: u32) -> u32 {
+    let e0 = E0.V2(1, k);
+    match (e0) {
+        E0.V0(_, m) => { return m as u32; }
+        E0.V1 => { return 0; }
+        E0.V2(_, n) => { return n; }
+    }
+}
+
+fn main() {
+    Console.writeLine(pick(5));
+}
+
+// expect-stdout: 5

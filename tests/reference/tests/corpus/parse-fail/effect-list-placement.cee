@@ -1,0 +1,2 @@
+// An effect list goes only before `fn` in a type (type-system.md §36.3): not before a C function pointer type.
+fn f(p: @effects() extern "C" fn(i32)) { } // error[N0100]

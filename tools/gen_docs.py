@@ -16,16 +16,14 @@ import re
 import subprocess
 
 from gen_library import literal
+from names import map_forward
 
 # (directory, whether every .md directly in it is embedded, or the one file embedded from it)
 PATTERNS = (("docs", None), ("docs/api", None), ("docs/decisions", None), ("docs/cosmoos", "profiles.md"),
             ("site/guide", None), ("site/guide/coming-from", None), ("templates", "AGENTS.md"))
 
-# templates/AGENTS.md under CeeSafe's names (ROADMAP §3.4): its markers, commands, files and MCP server and tools. The
-# prose still says Nova until the fork point (docs/p8-plan.md S7); tools/names.py maps these back.
-TEMPLATE_NAMES = (("<!--NOVA START-->", "<!--CEESAFE START-->"), ("<!--NOVA END-->", "<!--CEESAFE END-->"),
-                  ("nova.toml", "ceesafe.toml"), ("nova.lock", "ceesafe.lock"), ("`.nova`", "`.cee`"),
-                  ("`nova` MCP server", "`ceesafe` MCP server"), ("nova_", "ceesafe_"), ("novac", "ceesafec"))
+# templates/AGENTS.md is written under CeeSafe's names, prose included (tools/names.py); the other documents are
+# Nova's, kept as reference material (docs/fork-point.md).
 
 # .NET's String.ReplaceLineEndings: CR LF, then any of CR, LF, FF, NEL, LS, PS.
 LINE_ENDINGS = re.compile("\r\n|[\r\n\f\u0085  ]")
@@ -56,8 +54,7 @@ def main():
             text = text[1:]
         text = LINE_ENDINGS.sub("\n", text)
         if path == "templates/AGENTS.md":
-            for old, new in TEMPLATE_NAMES:
-                text = text.replace(old, new)
+            text = map_forward(text)
         files.append((path, text))
     chunks = []
     for k, (_, t) in enumerate(files):

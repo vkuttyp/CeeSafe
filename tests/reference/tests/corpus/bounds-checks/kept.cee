@@ -1,0 +1,105 @@
+// Index checks that stay (optimisations.md §2.3–§2.4); the .bce snapshot lists each one as kept. Most are near
+// misses, which would be wrong to remove. One is marked as missed: removing it would be sound, but the analysis
+// does not prove it.
+
+fn bump(i: borrow mut usize) { i += 1; }
+
+/// The vector shrinks inside the loop, so the length read before it is stale.
+fn popped(n: u32) -> u32 {
+    var v = Vector<u32>.create();
+    for (k in 0..n) { v.push(k)!; }
+    let count = v.length;
+    var t: u32 = 0;
+    for (i in 0..count / 2) {
+        t += v[i];
+        let gone = v.pop();
+    }
+    return t;
+}
+
+/// The index is borrowed, so something else may change it.
+fn borrowed(s: Slice<u8>) -> u32 {
+    var i: usize = 0;
+    var t: u32 = 0;
+    while (i < s.length) {
+        bump(mut i);
+        if (i < s.length) { t += 1; }
+        t += s[i - 1] as u32;
+    }
+    return t;
+}
+
+/// A loop bounded by another slice's length.
+fn otherLength(a: Slice<u8>, b: Slice<u8>) -> u32 {
+    var t: u32 = 0;
+    for (i in 0..b.length) { t += a[i] as u32; }
+    return t;
+}
+
+/// `<=` against the length itself.
+fn inclusive(s: Slice<u8>, n: usize) -> u32 {
+    var i: usize = 0;
+    var t: u32 = 0;
+    while (i <= n) {
+        t += s[i] as u32;
+        i += 1;
+    }
+    return t;
+}
+
+/// A stable vector's length grows through a shared borrow (type-system.md §24.2), so it is not tracked.
+fn stable() -> u32 {
+    var sv = StableVector<u32>.create();
+    sv.push(4)!;
+    sv.push(5)!;
+    var t: u32 = 0;
+    for (i in 0..sv.length) { t += sv[i]; }
+    return t;
+}
+
+/// Missed: a vector behind a reference; its length is not a local's, so it is not tracked.
+fn throughReference(v: borrow Vector<u32>) -> u32 {
+    var t: u32 = 0;
+    for (i in 0..v.length) { t += v[i]; }
+    return t;
+}
+
+/// An offset loop without the remaining-length test.
+fn unguarded(out: SliceMut<u8>, to: usize, n: usize) {
+    for (i in 0..n) { out[to + i] = 1; }
+}
+
+/// `||` in a loop condition: the body may run with `i` past the end.
+fn eitherLoop(s: Slice<u8>, limit: u32) -> u32 {
+    var i: usize = 0;
+    var t: u32 = 0;
+    while (t < limit || i < s.length) {
+        t += s[i] as u32;
+        i += 1;
+    }
+    return t;
+}
+
+fn main() {
+    var bytes = [1u8, 2, 3, 4];
+    Console.writeLine(popped(6));
+    Console.writeLine(borrowed(bytes[..]));
+    Console.writeLine(otherLength(bytes[..], bytes[..2]));
+    Console.writeLine(inclusive(bytes[..], 2));
+    Console.writeLine(stable());
+    var v = Vector<u32>.create();
+    v.push(7)!;
+    Console.writeLine(throughReference(borrow v));
+    unguarded(mut bytes[..], 1, 3);
+    Console.writeLine(bytes[3]);
+    Console.writeLine(eitherLoop(bytes[..], 0));
+}
+
+// expect-stdout: 3
+// expect-stdout: 13
+// expect-stdout: 3
+// expect-stdout: 6
+// expect-stdout: 9
+// expect-stdout: 7
+// expect-stdout: 1
+// expect-stdout: 4

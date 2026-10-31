@@ -1,0 +1,33 @@
+// benchmarks/dispatch (README.md): the same work over a closed set of shapes, an enum and a match per element.
+enum Shape {
+    Square(u64),
+    Rect(u64, u64),
+}
+
+fn area(s: borrow Shape) -> u64 {
+    match (s) {
+        Shape.Square(side) => { return side * side; }
+        Shape.Rect(w, h) => { return w * h; }
+    }
+}
+
+fn main() -> i32 {
+    var shapes = Vector<Box<Shape>>.create();
+    var seed: u64 = 12345;
+    for (i in 0..1000000u64) {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        if (seed % 2 == 0) {
+            shapes.push(Box.create(Shape.Square(i % 100))!)!;
+        } else {
+            shapes.push(Box.create(Shape.Rect(i % 100, seed % 50))!)!;
+        }
+    }
+    var total: u64 = 0;
+    for (round in 0..100u64) {
+        for (s in shapes) {
+            total += area(s) % 1000 + round;
+        }
+    }
+    Console.writeLine(total);
+    return 0;
+}

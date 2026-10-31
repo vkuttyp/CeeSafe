@@ -1,0 +1,37 @@
+// arena (benchmarks/suite/README.md): linked nodes bump-allocated from an arena, reset each round.
+// The allocation is in its own function: `last = Some(arena.alloc(...)!)` in the loop was rejected by the borrow
+// checker until M11 (finding F1, fixed in G3, docs/milestone-11.md); the helper stays so timings remain comparable.
+struct Node<region r> {
+    value: u64;
+    previous: borrow(r) Node<r>?;
+}
+
+fn push<region r>(arena: borrow(r) Arena, value: u64, previous: borrow(r) Node<r>?) -> borrow(r) Node<r> =>
+    arena.alloc(Node { value: value, previous: previous })!;
+
+fn build<region r>(arena: borrow(r) Arena, round: u64) -> borrow(r) Node<r>? {
+    var last: borrow(r) Node<r>? = null;
+    for (i in 0..200000u64) { last = Some(push(arena, (i + round) % 1000, last)); }
+    return last;
+}
+
+fn total<region r>(start: borrow(r) Node<r>?) -> u64 {
+    var sum: u64 = 0;
+    var at = start;
+    while (at != null) {
+        let node = at!;
+        sum += node.value;
+        at = node.previous;
+    }
+    return sum;
+}
+
+fn main() -> i32 {
+    var sum: u64 = 0;
+    for (round in 0..400u64) {
+        var arena = Arena.create(SystemHeap {}, 65536u64);
+        sum += total(build(borrow arena, round));
+    }
+    Console.writeLine(sum);
+    return 0;
+}

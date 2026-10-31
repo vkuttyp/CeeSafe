@@ -1,0 +1,153 @@
+// Dynamic dispatch (type-system.md §37, ADR 0015): borrow dyn, borrow mut dyn, Box<dyn> in vectors, fields,
+// optionals and results, generic interfaces, drop through the table, and calls with effect lists.
+
+interface Shape {
+    fn area(borrow this) -> u64;
+    fn grow(borrow mut this, by: u64);
+    fn name(borrow this) -> StringView;
+}
+
+struct Square {
+    side: u64;
+}
+
+impl Shape for Square {
+    fn area(borrow this) -> u64 => this.side * this.side;
+    fn grow(borrow mut this, by: u64) { this.side += by; }
+    fn name(borrow this) -> StringView => "square";
+}
+
+struct Rect {
+    w: u64;
+    h: u64;
+}
+
+impl Shape for Rect {
+    fn area(borrow this) -> u64 => this.w * this.h;
+    fn grow(borrow mut this, by: u64) { this.w += by; }
+    fn name(borrow this) -> StringView => "rect";
+}
+
+// A shape that owns a string and says when it is destroyed.
+struct Label {
+    text: String;
+    drop { Console.writeLine("drop label"); }
+}
+
+impl Shape for Label {
+    fn area(borrow this) -> u64 => this.text.length as u64;
+    fn grow(borrow mut this, by: u64) {
+        for (i in 0..by) { this.text.append("+")!; }
+    }
+    fn name(borrow this) -> StringView => this.text.view();
+}
+
+interface Scaled<T> {
+    fn scale(borrow this, by: T) -> T;
+}
+
+impl Scaled<i32> for Square {
+    fn scale(borrow this, by: i32) -> i32 => truncate<i32>(this.side) * by;
+}
+
+interface Visitor {
+    @effects() fn visit(borrow mut this, value: u64);
+}
+
+struct Sum {
+    total: u64;
+}
+
+impl Visitor for Sum {
+    fn visit(borrow mut this, value: u64) { this.total += value; }
+}
+
+struct Holder {
+    shape: Box<dyn Shape>;
+    spare: Box<dyn Shape>?;
+}
+
+fn total(shapes: borrow Vector<Box<dyn Shape>>) -> u64 {
+    var t: u64 = 0;
+    for (s in shapes) { t += s.area(); }
+    return t;
+}
+
+fn areaOf(s: borrow dyn Shape) -> u64 => s.area();
+
+fn growAll(shapes: borrow mut Vector<Box<dyn Shape>>, by: u64) {
+    for (i in 0..shapes.length) { shapes[i].grow(by); }
+}
+
+fn make(square: bool) -> Box<dyn Shape> {
+    if (square) {
+        return Box.create(Square { side: 4 })!;
+    }
+    return Box.create(Rect { w: 1, h: 7 })!;
+}
+
+fn tryMake() -> Result<Box<dyn Shape>, AllocError> {
+    let b: Box<dyn Shape> = Box.create(Rect { w: 3, h: 3 })?;
+    return Ok(b);
+}
+
+@effects()
+fn visitAll(v: borrow mut dyn Visitor, values: Slice<u64>) {
+    for (x in values) { v.visit(x); }
+}
+
+fn main() {
+    var shapes = Vector<Box<dyn Shape>>.create();
+    shapes.push(Box.create(Square { side: 3 })!)!;
+    shapes.push(Box.create(Rect { w: 2, h: 5 })!)!;
+    shapes.push(make(true))!;
+    Console.writeLine(total(shapes)); // 9 + 10 + 16
+    growAll(mut shapes, 1);
+    Console.writeLine(total(shapes)); // 16 + 15 + 25
+    for (s in shapes) { Console.writeLine(s.name()); }
+
+    var sq = Square { side: 1 };
+    let r: borrow mut dyn Shape = borrow mut sq;
+    r.grow(2);
+    Console.writeLine(r.area());   // 9
+    Console.writeLine(sq.side);    // 3
+    Console.writeLine(areaOf(sq)); // a Square argument, borrowed then coerced
+    let boxed = Box.create(Rect { w: 2, h: 2 })!;
+    Console.writeLine(areaOf(boxed));       // a box argument lends its contents
+    Console.writeLine(areaOf(make(false))); // 7
+
+    let scaled: borrow dyn Scaled<i32> = borrow sq;
+    Console.writeLine(scaled.scale(-2)); // -6
+
+    var holder = Holder { shape: Box.create(Label { text: String.create() })!, spare: null };
+    holder.shape.grow(3);
+    Console.writeLine(holder.shape.name()); // +++
+    holder.spare = tryMake()!;
+    match (holder.spare) {
+        Some(s) => { Console.writeLine(s.area()); } // 9
+        null => { Console.writeLine("none"); }
+    }
+
+    var sum = Sum { total: 0 };
+    let values = [1u64, 2, 3];
+    visitAll(mut sum, values[..]);
+    Console.writeLine(sum.total); // 6
+    Console.writeLine("end");
+}
+
+// expect-stdout: 35
+// expect-stdout: 56
+// expect-stdout: square
+// expect-stdout: rect
+// expect-stdout: square
+// expect-stdout: 9
+// expect-stdout: 3
+// expect-stdout: 9
+// expect-stdout: 4
+// expect-stdout: 7
+// expect-stdout: -6
+// expect-stdout: +++
+// expect-stdout: 9
+// expect-stdout: 6
+// expect-stdout: end
+// expect-stdout: drop label

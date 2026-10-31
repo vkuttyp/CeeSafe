@@ -1,0 +1,63 @@
+// M15 S6: `StringView.fromUtf8(bytes)` is a view of the same bytes if they are well-formed UTF-8 (the Unicode
+// Standard's Table 3-7), otherwise null (type-system.md §22.2). Native code uses the runtime's nova_utf8_valid, and the
+// interpreter uses .NET's validator, so this run compares the two.
+// expect-stdout: ascii: name
+// expect-stdout: two-byte: é
+// expect-stdout: four-byte: 😀
+// expect-stdout: empty: 0 bytes
+// expect-stdout: lone continuation: null
+// expect-stdout: truncated: null
+// expect-stdout: overlong: null
+// expect-stdout: surrogate: null
+// expect-stdout: above U+10FFFF: null
+// expect-stdout: FF: null
+// expect-stdout: built: hello, name!
+
+fn show(label: StringView, bytes: Slice<u8>) {
+    Console.write(label);
+    Console.write(": ");
+    match (StringView.fromUtf8(bytes)) {
+        Some(text) => {
+            if (text.length == 0) {
+                Console.writeLine("0 bytes");
+            } else {
+                Console.writeLine(text);
+            }
+        }
+        null => { Console.writeLine("null"); }
+    }
+}
+
+fn main() {
+    let ascii = [0x6Eu8, 0x61, 0x6D, 0x65];
+    show("ascii", ascii[..]);
+    let two = [0xC3u8, 0xA9];
+    show("two-byte", two[..]);
+    let four = [0xF0u8, 0x9F, 0x98, 0x80];
+    show("four-byte", four[..]);
+    show("empty", ascii[0..0]);
+    let lone = [0x61u8, 0x80];
+    show("lone continuation", lone[..]);
+    let truncated = [0xE2u8, 0x82];
+    show("truncated", truncated[..]);
+    let overlong = [0xC0u8, 0xAF];
+    show("overlong", overlong[..]);
+    let surrogate = [0xEDu8, 0xA0, 0x80];
+    show("surrogate", surrogate[..]);
+    let large = [0xF4u8, 0x90, 0x80, 0x80];
+    show("above U+10FFFF", large[..]);
+    let ff = [0xFFu8];
+    show("FF", ff[..]);
+
+    // Bytes read at run time (here, a vector) become text, which a String can then hold.
+    var bytes = Vector<u8>.create();
+    for (b in ascii) {
+        bytes.push(b)!;
+    }
+    var message = String.create();
+    message.append("hello, ")!;
+    message.append(StringView.fromUtf8(bytes)!)!;
+    message.append("!")!;
+    Console.write("built: ");
+    Console.writeLine(message);
+}

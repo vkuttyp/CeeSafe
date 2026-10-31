@@ -74,8 +74,8 @@ fn checkCName(c: borrow mut Checker, name: Slice<u8>, span: Span, what: StringVi
     } else if (startsWithText(name, "__") || (name.length > 1 && name[0] == '_' && isAsciiUpper(name[1]))) {
         reason = 3;
     } else if ((!isLibraryFile(c) && // the library calls the runtime by its names (lib/std, §38.3)
-        (startsWithText(name, "nova_") || startsWithText(name, "nv_") || startsWithText(name, "NV_"))) ||
-        (name.length > 2 && startsWithText(name, "nv") && isAsciiUpper(name[2]))) {
+        (startsWithText(name, "ceesafe_") || startsWithText(name, "cee_") || startsWithText(name, "CEE_"))) ||
+        (name.length > 3 && startsWithText(name, "cee") && isAsciiUpper(name[3]))) {
         reason = 4;
     }
     if (reason == 0) {
@@ -92,7 +92,7 @@ fn checkCName(c: borrow mut Checker, name: Slice<u8>, span: Span, what: StringVi
             1 => "is not a C identifier",
             2 => "is a C keyword or a name C programs depend on",
             3 => "is reserved by the C standard",
-            _ => "is reserved for the Nova runtime and generated code (c-backend.md §2.1)",
+            _ => "is reserved for the CeeSafe runtime and generated code (c-backend.md §2.1)",
         },
     )?;
     appendText(mut message, " (type-system.md §28.2)")?;
@@ -652,7 +652,7 @@ fn checkForeignInterfaces(c: borrow mut Checker) -> Result<void, AllocError> {
             var message = Vector<u8>.create();
             appendText(
                 mut message,
-                "a @repr(C) struct that holds C state cannot have a drop: C makes and discards it without calling Nova (type-system.md §28.5)",
+                "a @repr(C) struct that holds C state cannot have a drop: C makes and discards it without calling CeeSafe (type-system.md §28.5)",
             )?;
             c.error(notFfiSafe(), span.start, span.end, message)?;
         }
@@ -772,7 +772,7 @@ fn checkForeignInterfaces(c: borrow mut Checker) -> Result<void, AllocError> {
                 appendQuotedType(mut message, c, t)?;
                 appendText(
                     mut message,
-                    ": only integers, bool, raw pointers to C types, embedded imported types and arrays of integers, bool or imported types are spelled alike in C and Nova (type-system.md §31.1)",
+                    ": only integers, bool, raw pointers to C types, embedded imported types and arrays of integers, bool or imported types are spelled alike in C and CeeSafe (type-system.md §31.1)",
                 )?;
                 c.error(notFfiSafe(), span.start, span.end, message)?;
             }

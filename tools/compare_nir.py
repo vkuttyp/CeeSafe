@@ -17,6 +17,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from compare_parse import options_of  # noqa: E402
+from names import compared_files, for_compiler, map_back  # noqa: E402
 
 OFF = ["--no-closure-specialisation", "--no-placement", "--no-bce", "--no-oce"]
 
@@ -41,9 +42,9 @@ def compare(arguments):
     if reference.returncode != 0:
         return path, None  # novac does not build it: nothing to compare
     with tempfile.TemporaryDirectory() as out:
-        ours = subprocess.run([ceesafec, "build", "--emit", "c", "-o", out, "--dump-nir"] + OFF + options + [path],
-                              cwd=root, capture_output=True)
-    return path, ours.returncode == 0 and ours.stdout == reference.stdout
+        cwd, argv = for_compiler(ceesafec, root, ["build", "--emit", "c", "-o", out, "--dump-nir"] + OFF + options + [path])
+        ours = subprocess.run([ceesafec] + argv, cwd=cwd, capture_output=True)
+    return path, ours.returncode == 0 and map_back(ours.stdout) == reference.stdout
 
 
 def main():
@@ -65,7 +66,7 @@ def main():
             OFF.remove(off[part])
     ceesafec = os.path.abspath(args.ceesafec)
     novac = os.path.expanduser(args.novac)
-    work = [(args.root, ceesafec, novac, path) for path in files(args.root, args.paths)]
+    work = [(args.root, ceesafec, novac, path) for path in compared_files(args.root, files(args.root, args.paths))]
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
         results = list(pool.map(compare, work))
     built = [(p, same) for p, same in results if same is not None]

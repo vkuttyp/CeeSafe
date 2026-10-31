@@ -1,0 +1,122 @@
+// Library methods taking closures (type-system.md §36.4, M11 G8c): sortBy, forEach, any, all and retain on slices,
+// arrays and vectors, with Copy and move-type elements, plus swap and truncate. Sorting runs every path of the
+// introsort: insertion sort, partitioning, and heapsort (all-equal keys exhaust the depth limit).
+struct Item { key: i32; name: Box<i32>; }
+
+fn compare(a: borrow i32, b: borrow i32) -> i32 => a - b;
+fn make(w: StringView) -> String {
+    var s = String.create();
+    s.append(w)!;
+    return s;
+}
+fn length(s: borrow String) -> i32 => truncate<i32>(s.view().length);
+
+fn sorted(v: Slice<i64>) -> bool {
+    for (i in 1..v.length) { if (v[i - 1] > v[i]) { return false; } }
+    return true;
+}
+
+fn main() {
+    var values = [5, 3, 9, 1, 4];
+    values[..].sortBy((a, b) => a - b);
+    var total = 0;
+    values[..].forEach((v) => { total += v; Console.write(v); Console.write(" "); });
+    Console.writeLine(total);
+    Console.writeLine(values[..].any((v) => v > 8));
+    Console.writeLine(values[..].all((v) => v % 2 == 1));
+    values[..].sortBy((a, b) => b - a);
+    Console.writeLine(values[0]);
+    values[..].sortBy(compare);                       // a function value, through an adapter
+    Console.writeLine(values[0]);
+    values[1..4].sortBy((a, b) => b - a);             // a sub-slice
+    Console.writeLine(values[1]);
+
+    // Empty and one-element slices.
+    let none = [7];
+    Console.writeLine(none[0..0].any((v) => true));
+    Console.writeLine(none[0..0].all((v) => false));
+    var one = [7];
+    one[..].sortBy(compare);
+    Console.writeLine(one[0]);
+
+    // Move-type elements: strings sorted by length, then filtered.
+    var names = Vector<String>.create();
+    names.push(make("kiwi"))!; names.push(make("fig"))!; names.push(make("banana"))!;
+    names.push(make("apple"))!; names.push(make("nut"))!;
+    names.sortBy((a, b) => length(a) - length(b));
+    var calls = 0;
+    names.retain((n) => { calls += 1; return length(n) > 3; });
+    Console.writeLine(calls);
+    names.forEach((n) => { Console.writeLine(n.view()); });
+
+    // Large inputs: random keys, many duplicates, all equal, already sorted, reversed.
+    var big = Vector<i64>.create();
+    var x: i64 = 12345;
+    for (i in 0..2000) { x = (x * 1103515245 + 12345) % 2147483648; big.push(x % 1000)!; }
+    var comparisons = 0;
+    big.sortBy((a, b) => { comparisons += 1; return if (a < b) -1 else if (a > b) 1 else 0; });
+    Console.writeLine(sorted(big));
+    Console.writeLine(comparisons < 2000 * 40);
+    big.sortBy((a, b) => if (a > b) -1 else if (a < b) 1 else 0);
+    Console.writeLine(big[0] >= big[1999]);
+    var same = Vector<i64>.create();
+    for (i in 0..1000) { same.push(4)!; }
+    same.sortBy((a, b) => if (a < b) -1 else if (a > b) 1 else 0);
+    Console.writeLine(same.all((v) => v == 4));
+    var up = Vector<i64>.create();
+    for (i in 0..1000) { up.push(i as i64)!; }
+    up.sortBy((a, b) => if (a < b) -1 else if (a > b) 1 else 0);
+    Console.writeLine(sorted(up));
+    up.sortBy((a, b) => if (a > b) -1 else if (a < b) 1 else 0);
+    Console.writeLine(up[0]);
+
+    // An inconsistent comparator leaves a permutation: the sum is unchanged.
+    var flip = 0;
+    big.sortBy((a, b) => { flip += 1; return if (flip % 3 == 0) 1 else -1; });
+    var sum: i64 = 0;
+    big.forEach((v) => { sum += v; });
+    Console.writeLine(sum > 0);
+
+    // Boxes in structs: swapped, sorted and dropped without leaks (checked under the sanitizers).
+    var items = Vector<Item>.create();
+    for (i in 0..40) { items.push(Item { key: (i * 7) % 40, name: Box.create(i)! })!; }
+    items.sortBy((a, b) => a.key - b.key);
+    Console.writeLine(items[0].key);
+    Console.writeLine(items[39].key);
+    items.retain((it) => it.key % 2 == 0);
+    Console.writeLine(items.length);
+    items.swap(0, 19);
+    Console.writeLine(items[0].key);
+    items.truncate(5);
+    Console.writeLine(items.length);
+    items.truncate(50);
+    Console.writeLine(items.length);
+    Console.writeLine(items[4].name >= 0);
+}
+// expect-stdout: 1 3 4 5 9 22
+// expect-stdout: true
+// expect-stdout: false
+// expect-stdout: 9
+// expect-stdout: 1
+// expect-stdout: 5
+// expect-stdout: false
+// expect-stdout: true
+// expect-stdout: 7
+// expect-stdout: 5
+// expect-stdout: kiwi
+// expect-stdout: apple
+// expect-stdout: banana
+// expect-stdout: true
+// expect-stdout: true
+// expect-stdout: true
+// expect-stdout: true
+// expect-stdout: true
+// expect-stdout: 999
+// expect-stdout: true
+// expect-stdout: 0
+// expect-stdout: 39
+// expect-stdout: 20
+// expect-stdout: 38
+// expect-stdout: 5
+// expect-stdout: 5
+// expect-stdout: true

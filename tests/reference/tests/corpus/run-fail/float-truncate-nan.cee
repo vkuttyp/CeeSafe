@@ -1,0 +1,9 @@
+// truncate<T> of NaN panics (type-system.md §35.4).
+fn main() {
+    let zero = 0.0;
+    let nan = zero / zero;
+    Console.writeLine("before");
+    let n = truncate<i32>(nan); // expect-panic: float out of range
+    Console.writeLine(n);
+}
+// expect-stdout: before

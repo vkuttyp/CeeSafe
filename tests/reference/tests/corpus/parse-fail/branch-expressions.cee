@@ -1,0 +1,11 @@
+// `if` and `match` expressions (type-system.md §15.3, M11 G5): the else is required, value arms need commas, and an
+// `if` that begins a statement is the statement form, whose branches are blocks.
+fn missingElse(c: bool) -> i32 {
+    return if (c) 1; // error[N0100]
+}
+fn arms(c: i32) -> i32 {
+    return match (c) { 1 => 10 2 => 20, _ => 0 }; // error[N0100]
+}
+fn statementForm(c: bool) {
+    if (c) 1 else 2; // error[N0100]
+}

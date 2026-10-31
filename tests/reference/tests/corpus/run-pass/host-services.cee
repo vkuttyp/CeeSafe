@@ -1,0 +1,101 @@
+// ADR 0028 (M15 S7): the environment, a temporary directory, directories, File.kind and the working directory
+// (type-system.md §26.8-§26.10). Process.capture needs a real program to run, so HostServicesTests covers it.
+// expect-stdout: PATH is set: true
+// expect-stdout: unset variable: null
+// expect-stdout: temporary: a directory
+// expect-stdout: created twice: AlreadyExists
+// expect-stdout: listing: alpha beta.txt zeta
+// expect-stdout: kinds: file directory null
+// expect-stdout: missing listing: NotFound
+// expect-stdout: not empty: removed after emptying
+// expect-stdout: gone: null
+// expect-stdout: working directory: present
+
+fn join(directory: borrow String, name: StringView) -> String {
+    var path = String.create();
+    path.append(directory.view())!;
+    path.append("/")!;
+    path.append(name)!;
+    return path;
+}
+
+fn kindName(kind: Result<PathKind?, IoError>) -> StringView => match (kind) {
+    Ok(Some(PathKind.File)) => "file",
+    Ok(Some(PathKind.Directory)) => "directory",
+    Ok(Some(PathKind.Other)) => "other",
+    Ok(null) => "null",
+    Err(_) => "error",
+};
+
+fn errorName(e: IoError) -> StringView => match (e) {
+    IoError.NotFound => "NotFound",
+    IoError.AlreadyExists => "AlreadyExists",
+    _ => "another error",
+};
+
+fn main() {
+    Console.write("PATH is set: ");
+    Console.writeLine(Environment.variable("PATH") != null);
+    Console.write("unset variable: ");
+    Console.writeLine(if (Environment.variable("NOVA_TEST_SURELY_UNSET_VARIABLE") == null) "null" else "set");
+
+    let root = Directory.temporary()!;
+    Console.write("temporary: a ");
+    Console.writeLine(kindName(File.kind(root.view())));
+
+    let zeta = join(root, "zeta");
+    let alpha = join(root, "alpha");
+    let beta = join(root, "beta.txt");
+    Directory.create(zeta.view())!;
+    Directory.create(alpha.view())!;
+    Console.write("created twice: ");
+    match (Directory.create(alpha.view())) {
+        Ok() => { Console.writeLine("Ok"); }
+        Err(e) => { Console.writeLine(errorName(e)); }
+    }
+    {
+        // Closed at the block's end: Windows cannot remove an open file.
+        var file = File.create(beta.view())!;
+        file.write("text".bytes())!;
+    }
+
+    // Sorted by byte value, whatever order the platform lists them in.
+    Console.write("listing:");
+    let names = Directory.list(root.view())!;
+    for (name in names) {
+        Console.write(" ");
+        Console.write(name);
+    }
+    Console.writeLine("");
+
+    let missing = join(root, "missing");
+    Console.write("kinds: ");
+    Console.write(kindName(File.kind(beta.view())));
+    Console.write(" ");
+    Console.write(kindName(File.kind(alpha.view())));
+    Console.write(" ");
+    Console.writeLine(kindName(File.kind(missing.view())));
+
+    Console.write("missing listing: ");
+    match (Directory.list(missing.view())) {
+        Ok(_) => { Console.writeLine("Ok"); }
+        Err(e) => { Console.writeLine(errorName(e)); }
+    }
+
+    Console.write("not empty: ");
+    let refused = Directory.remove(root.view());
+    File.remove(beta.view())!;
+    Directory.remove(alpha.view())!;
+    Directory.remove(zeta.view())!;
+    Directory.remove(root.view())!;
+    let wasRefused = match (refused) {
+        Ok() => false,
+        Err(_) => true,
+    };
+    Console.writeLine(if (wasRefused) "removed after emptying" else "removed at once");
+    Console.write("gone: ");
+    Console.writeLine(kindName(File.kind(root.view())));
+
+    Console.write("working directory: ");
+    Console.writeLine(if (Directory.current()!.length > 0) "present" else "empty");
+}

@@ -1,0 +1,10 @@
+// A call through a function value (type-system.md §36.1): the result carries the loans of every reference argument.
+fn pick(x: borrow i32) -> borrow i32 => x;
+
+fn main() {
+    var a = 1;
+    let f = pick;
+    let r = f(borrow a);
+    a = 2; // error[N0240]
+    Console.writeLine(r);
+}

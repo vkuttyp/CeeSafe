@@ -1,0 +1,31 @@
+// The rejected programs of the repository's README.md, one function each: keep their code identical to the README's
+// (test annotations aside).
+
+fn vectorInvalidation() {
+    var numbers = Vector<i32>.create();
+    numbers.push(1)!;
+    let first = borrow numbers[0];
+    numbers.push(2)!; // may reallocate the storage `first` points into // error[N0241]
+    Console.writeLine(first);
+}
+
+fn split<region r>(line: StringView<r>) -> Result<Vector<StringView<r>>, AllocError> {
+    var fields = Vector<StringView<r>>.create();
+    fields.push(line)?;
+    return Ok(fields);
+}
+
+fn viewsOutliveText() {
+    var text = String.create();
+    text.append("id,name")!;
+    let fields = split(text.view())!;
+    text.clear(); // error[N0241]
+    Console.writeLine(fields.length);
+}
+
+fn arenaReset() {
+    var arena = Arena.create(SystemHeap {}, 4096u64);
+    let table = arena.allocArray(16usize, 0u32)!;
+    arena.reset(); // frees every allocation, while `table` is still in use // error[N0241]
+    table[0] = 1;
+}

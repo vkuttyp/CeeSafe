@@ -1,0 +1,27 @@
+// Explicit overflow methods (type-system.md §6, M11 G4b): arguments, receivers, result types and reserved names.
+
+interface Adds { fn wrappingAdd(borrow this, other: u32) -> u32; }
+interface Twice { fn twice(borrow this) -> u32; }
+
+impl Adds for u32 {
+    fn wrappingAdd(borrow this, other: u32) -> u32 => other; // error[N0228]
+}
+impl Twice for u32 {
+    fn twice(borrow this) -> u32 => this.wrappingMul(2);
+}
+
+fn main() {
+    let a: u8 = 1;
+    let b: u16 = 2;
+    a.wrappingAdd(); // error[N0209]
+    a.saturatingSub(1, 2); // error[N0209]
+    a.checkedMul(b); // error[N0205]
+    a.wrappingAdd(true); // error[N0205]
+    let c: u8 = a.checkedAdd(1); // error[N0205]
+    let d: u8? = a.checkedAdd(1);
+    let e: u8 = a.saturatingAdd(300); // error[N0206]
+    let f = true;
+    f.wrappingAdd(1); // error[N0234]
+    let g: u32 = 7;
+    let h = g.twice();
+}

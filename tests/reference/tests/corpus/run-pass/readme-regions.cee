@@ -1,0 +1,30 @@
+// An example from the repository's README.md: keep its code identical to the README's (test annotations aside).
+
+/// Splits a line at commas without copying: each field is a view into `line`.
+fn split<region r>(line: StringView<r>) -> Result<Vector<StringView<r>>, AllocError> {
+    var fields = Vector<StringView<r>>.create();
+    var start: usize = 0;
+    for (i in 0..line.length) {
+        if (line[i] == 44) { // ','
+            fields.push(line[start..i])?;
+            start = i + 1;
+        }
+    }
+    fields.push(line[start..])?;
+    return Ok(fields); // the result borrows from `line`
+}
+
+fn main() {
+    var text = String.create();
+    text.append("id,name,,score")!;
+    let fields = split(text.view())!;
+    // text.clear();                              // error: `text` is borrowed by `fields`
+    Console.writeLine(fields.length);
+    for (field in fields) { Console.writeLine(field); }
+}
+
+// expect-stdout: 4
+// expect-stdout: id
+// expect-stdout: name
+// expect-stdout:
+// expect-stdout: score

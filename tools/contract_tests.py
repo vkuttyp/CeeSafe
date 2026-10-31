@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Every contract test of the port against one ceesafec (ROADMAP P6: "both pass the compiler contract tests").
 
-Runs, against the pinned novac and the reference corpus at the pinned tag:
+Runs, against the pinned novac and the reference corpus at the pinned tag (since the fork point, docs/fork-point.md,
+novac 0.6.0's output is the frozen baseline and ceesafec's is compared with CeeSafe's names mapped back, tools/names.py):
 - parse and check comparisons (text, JSON, dumps), NIR comparisons, C comparisons in four shapes (flat, --split, -g,
   -g --split) both in P5's form (everything off) and in novac's default form (everything on, P7), the latter also over
   the benchmarks and programs, the four optimisation reports, CeeSafe's own C, the package fixtures;
-- the corpus runner over run-pass, run-fail, ffi (and freestanding) under -Werror and ASan+UBSan with leak checks, and
+- the corpus runner over CeeSafe's corpus (tests/reference, since the fork): run-pass, run-fail, ffi (and freestanding)
+  under -Werror and ASan+UBSan with leak checks, and
   over the optimisation families and emit-c's snapshots, all in the default form;
 - the command line (usage, `explain`, `fix`), `fmt`, `doc`, the package commands, `run --interp`, the `lsp` and
-  `mcp` servers and debugging with editors/debug (P8);
+  `mcp` servers, debugging with editors/debug and the link-collision test (P8);
 - the M2 mutation suite, the M3 fault sweep, the collection properties and the freestanding checks.
 
 Each step's last line is printed; the expected results are the P2–P7 gates' (docs/p*-plan.md).
@@ -47,6 +49,8 @@ def main():
     novac = os.path.abspath(os.path.expanduser(args.novac))
     root = os.path.abspath(args.root)
     corpus = os.path.join(root, "tests", "corpus")
+    # CeeSafe's own corpus since the fork (tools/fork_corpus.py): the run tools check ceesafec against its annotations.
+    own_corpus = os.path.join(HERE, "..", "tests", "reference", "tests", "corpus")
     families = sorted("tests/corpus/" + d for d in os.listdir(corpus) if os.path.isdir(os.path.join(corpus, d)))
     parse_families = [f for f in families if f.endswith("parse-pass") or f.endswith("parse-fail")]
     check_families = [f for f in families if f not in parse_families]
@@ -87,18 +91,19 @@ def main():
         ("interp", py + [f"{HERE}/compare_interp.py"] + common),
         ("servers", py + [f"{HERE}/compare_servers.py"] + common),
         ("debugger", py + [f"{HERE}/debugger_check.py", "--ceesafec", cee]),
-        ("run -Werror", py + [f"{HERE}/run_corpus.py", "--compiler", cee, "--corpus", corpus] + run_families +
+        ("link", py + [f"{HERE}/link_collision.py", "--ceesafec", cee, "--novac", novac]),
+        ("run -Werror", py + [f"{HERE}/run_corpus.py", "--compiler", cee, "--corpus", own_corpus] + run_families +
          ["--cflag=-Werror"]),
-        ("run asan", py + [f"{HERE}/run_corpus.py", "--compiler", cee, "--corpus", corpus] + run_families +
+        ("run asan", py + [f"{HERE}/run_corpus.py", "--compiler", cee, "--corpus", own_corpus] + run_families +
          ["--cc", "clang", "--cflag=-O1", "--cflag=-Werror", "--cflag=-fsanitize=address,undefined",
           "--cflag=-fno-sanitize-recover=all", "--check-leaks"]),
-        ("families", py + [f"{HERE}/run_corpus.py", "--compiler", cee, "--corpus", corpus] +
+        ("families", py + [f"{HERE}/run_corpus.py", "--compiler", cee, "--corpus", own_corpus] +
          [x for f in ("emit-c", "bounds-checks", "overflow-checks", "placement", "closure-calls") for x in ("--family", f)]),
         ("mutations", py + [f"{HERE}/mutation_suite.py", "--compiler", cee]),
         ("fault sweep", py + [f"{HERE}/fault_injection.py", "--compiler", cee, "--reference", novac, "--corpus",
                               corpus]),
         ("collections", py + [f"{HERE}/collection_properties.py", "--compiler", cee, "--reference", novac, "--sweep"]),
-        ("freestanding", py + [f"{HERE}/freestanding_check.py", "--compiler", cee, "--corpus", corpus]),
+        ("freestanding", py + [f"{HERE}/freestanding_check.py", "--compiler", cee, "--corpus", own_corpus]),
     ]
     failed = 0
     with tempfile.TemporaryDirectory() as work:

@@ -1,0 +1,10 @@
+// Closure literals (grammar.md §2, type-system.md §36.2, M11 G8b): parameters with and without types, none, block and
+// expression bodies, a closure returning a closure, and closure types with sources.
+struct Holder<region r> { run: borrow(r) fn(i32) -> i32; again: borrow mut(r) fn(); }
+fn f() {
+    let a = (x: i32, y) => x + y;
+    let b = () => { Console.writeLine(1); };
+    let c = (x) => (y) => x * y;
+    let d = (p: (i32), q: fn(i32) -> i32) => q(p);
+    let e = (if (true) 1 else 2) + 3;
+}

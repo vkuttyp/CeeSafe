@@ -18,17 +18,22 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-from names import map_back
+from names import dialect, for_compiler, map_back
 
 OFF = ["--no-placement", "--no-bce", "--no-oce", "--no-closure-specialisation"]
 
 
 def run(compiler, arguments, cwd, env, own_report=False):
+    d = dialect(compiler)
+    cwd, arguments = for_compiler(compiler, cwd, arguments)
+    if "NOVA_ALLOC_REPORT" in env and d.cee:
+        env = {**{k: v for k, v in env.items() if k != "NOVA_ALLOC_REPORT"}, d.alloc_report: env["NOVA_ALLOC_REPORT"]}
+    alloc = d.alloc.encode()
     try:
         p = subprocess.run([compiler] + arguments, cwd=cwd, capture_output=True, env=env, stdin=subprocess.DEVNULL,
                            timeout=300)
         stderr = p.stderr
-        if own_report and stderr.startswith(b"nova alloc: ") or own_report and b"\nnova alloc: " in stderr:
+        if own_report and stderr.startswith(alloc) or own_report and b"\n" + alloc in stderr:
             stderr = stderr[:stderr.rstrip(b"\n").rfind(b"\n") + 1] if b"\n" in stderr.rstrip(b"\n") else b""
         return p.returncode, p.stdout, stderr
     except subprocess.TimeoutExpired:

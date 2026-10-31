@@ -1,0 +1,24 @@
+// Bulk slice operations hold loans like any slice (type-system.md §16.5): the receiver's loan is live while the
+// argument is evaluated (not two-phase), so a source or fill value cannot come from the destination.
+
+fn params(m: SliceMut<u8>, s: Slice<u8>) {
+    m.fill(m[0]); // error[N0242] // error[N0242]
+    m.copyFrom(m); // error[N0241]
+    let v = m[0];
+    m.fill(v);
+    m.copyFrom(s);
+}
+
+fn arrays() {
+    var a = [1u8, 2, 3, 4];
+    a[0..2].copyFrom(a[2..4]); // error[N0241]
+    a[1..].fill(a[0]); // error[N0242]
+    let first = borrow mut a[..2];
+    a[2..].fill(1); // error[N0241]
+    first.fill(2);
+    var b = [0u8; 4];
+    b[..].copyFrom(a[..]);
+    a[..].copyFrom(b[..]);
+}
+
+fn main() { }

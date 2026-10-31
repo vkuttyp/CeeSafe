@@ -18,6 +18,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from compare_parse import options_of  # noqa: E402
 from compare_nir import files  # noqa: E402
+from names import compared_files, for_compiler, map_back  # noqa: E402
 
 REPORTS = {"closure-calls": "--explain-closure-calls", "allocations": "--explain-allocations",
            "bounds-checks": "--explain-bounds-checks", "overflow-checks": "--explain-overflow-checks"}
@@ -31,9 +32,9 @@ def compare(arguments):
                                    capture_output=True)
         if reference.returncode != 0:
             return path, None, b""
-        ours = subprocess.run([ceesafec, "build", "--emit", "c", "-o", out, switch] + options + [path], cwd=root,
-                              capture_output=True)
-    return path, ours.returncode == 0 and ours.stdout == reference.stdout, reference.stdout
+        cwd, argv = for_compiler(ceesafec, root, ["build", "--emit", "c", "-o", out, switch] + options + [path])
+        ours = subprocess.run([ceesafec] + argv, cwd=cwd, capture_output=True)
+    return path, ours.returncode == 0 and map_back(ours.stdout) == reference.stdout, reference.stdout
 
 
 def main():
@@ -48,7 +49,8 @@ def main():
     args = parser.parse_args()
     ceesafec = os.path.abspath(args.ceesafec)
     novac = os.path.expanduser(args.novac)
-    work = [(args.root, ceesafec, novac, p, REPORTS[args.report]) for p in files(args.root, args.paths)]
+    work = [(args.root, ceesafec, novac, p, REPORTS[args.report])
+            for p in compared_files(args.root, files(args.root, args.paths))]
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
         results = list(pool.map(compare, work))
     built = [(p, same, text) for p, same, text in results if same is not None]

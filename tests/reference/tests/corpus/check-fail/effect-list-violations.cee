@@ -1,0 +1,37 @@
+// Values held to their types' effect lists (type-system.md §36.3): a named function where it is named, a closure
+// literal and an adapter in their bodies, and calls through a list that allows an effect the context forbids.
+fn isEven(v: i32) -> bool => v % 2 == 0;
+fn noisy(v: i32) -> bool { Console.writeLine(v); return true; }
+fn indirect(v: i32) -> bool => noisy(v);
+fn grow(v: i32) -> bool {
+    var items = Vector<i32>.create();
+    items.push(v)!;
+    return items.length > 0;
+}
+
+fn quietly(f: @effects() fn(i32) -> bool) -> bool => f(1);
+fn quietClosure(f: borrow @effects() fn(i32) -> bool) -> bool => f(1);
+fn noSleep(f: @effects(alloc) fn(i32) -> bool) -> bool => f(1);
+
+@context(irq)
+fn handler(f: @effects(alloc) fn(i32) -> bool) -> bool => f(1); // error[N0295]
+
+@context(atomic)
+fn spin(f: borrow @effects(sleep) fn(i32) -> bool) -> bool => f(1); // error[N0295]
+
+struct Hook { run: @effects() fn(i32) -> bool; }
+
+fn main() {
+    quietly(isEven);
+    quietly(noisy); // error[N0295]
+    quietly(indirect); // error[N0295]
+    noSleep(grow);
+    quietly(grow); // error[N0295]
+    quietClosure(noisy); // error[N0295]
+    let k = 3;
+    quietClosure((v) => { Console.writeLine(v); return v > k; }); // error[N0295]
+    var g: @effects() fn(i32) -> bool = isEven;
+    g = noisy; // error[N0295]
+    let hook = Hook { run: noisy }; // error[N0295]
+    Console.writeLine(g(2) && hook.run(1) && handler(grow) && spin((v) => v > k));
+}

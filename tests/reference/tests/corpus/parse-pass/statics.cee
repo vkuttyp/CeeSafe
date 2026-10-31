@@ -1,0 +1,7 @@
+// Static items (grammar.md StaticDecl; type-system.md §39).
+static LIMIT: u64 = 8;
+public static NAME: StringView = "nova";
+static mut COUNT: u32 = 0;
+private static mut TABLE: [u8; 2] = [1, 2];
+
+fn main() {}

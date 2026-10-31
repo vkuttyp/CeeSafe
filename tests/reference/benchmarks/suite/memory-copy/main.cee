@@ -1,0 +1,26 @@
+// memory-copy (benchmarks/suite/README.md): 4 KiB blocks, copied with copyFrom (type-system.md §16.5, M9b).
+const SIZE: usize = 16777216;
+const BLOCK: usize = 4096;
+
+fn main() -> i32 {
+    var src = Vector<u8>.withCapacity(SIZE)!;
+    var dst = Vector<u8>.withCapacity(SIZE)!;
+    for (i in 0..SIZE) { src.push(truncate<u8>(i % 251))!; dst.push(0)!; }
+    let from = src.view();
+    let to = dst.viewMut();
+    var sum: u64 = 0;
+    for (pass in 0..320) {
+        // The blocks in a fixed permuted order (2053 is odd, so each block once): no C compiler can merge them.
+        for (i in 0..SIZE / BLOCK) {
+            let block = i * 2053 % (SIZE / BLOCK) * BLOCK;
+            to[block..block + BLOCK].copyFrom(from[block..block + BLOCK]);
+        }
+        var at: usize = 0;
+        while (at < SIZE) {
+            sum += to[at] as u64;
+            at += BLOCK;
+        }
+    }
+    Console.writeLine(sum);
+    return 0;
+}

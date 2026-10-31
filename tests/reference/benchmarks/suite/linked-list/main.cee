@@ -1,0 +1,40 @@
+// linked-list (benchmarks/suite/README.md): Box nodes, walked, then dropped (iteratively, type-system.md §18.5).
+struct Node { value: u64; next: Box<Node>?; }
+
+/// The node a box holds, as a reference. (Written when Some(b) did not coerce a box reference to its contents, finding
+/// F3; it does now, docs/milestone-11.md. The helper stays so timings remain comparable.)
+fn contents(b: borrow Box<Node>) -> borrow Node => b;
+
+fn after(n: borrow Node) -> borrow Node? {
+    match (borrow n.next) {
+        Some(next) => { return Some(contents(next)); }
+        null => { return null; }
+    }
+}
+
+fn total(start: borrow Node?) -> u64 {
+    var sum: u64 = 0;
+    var at = start;
+    while (at != null) {
+        let node = at!;
+        sum += node.value;
+        at = after(node);
+    }
+    return sum;
+}
+
+fn main() -> i32 {
+    var sum: u64 = 0;
+    for (round in 0..10u64) {
+        var head: Box<Node>? = null;
+        for (i in 0..2000000u64) {
+            head = Some(Box.create(Node { value: (i + round) % 1000, next: head })!);
+        }
+        match (borrow head) {
+            Some(first) => { sum += total(Some(contents(first))); }
+            null => {}
+        }
+    }
+    Console.writeLine(sum);
+    return 0;
+}

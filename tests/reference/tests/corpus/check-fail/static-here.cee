@@ -1,0 +1,30 @@
+// profile: freestanding
+// option: kernel cosmoos
+// option: no-float
+// `here` (type-system.md §39.4, ADR 0027) is only a C constant macro's argument in a static initialiser, and it points
+// to the type the macro initialises.
+@header("kernel/mutex.h")
+extern "C" {
+    struct waitqueue;
+    @constant
+    fn WAITQUEUE_INIT_AT(at: *mut spinlock_t) -> waitqueue;
+}
+
+struct Holder {
+    lock: spinlock_t;
+}
+
+struct Queue {
+    wq: waitqueue;
+}
+
+@constant
+fn wrongPlace() -> Holder => Holder { lock: SPINLOCK_INIT(here) }; // error[N0338]
+
+@constant
+fn wrongType() -> Queue => Queue { wq: WAITQUEUE_INIT_AT(here) }; // error[N0338]
+
+fn atRunTime() -> u64 {
+    let p = here; // error[N0200]
+    return 0;
+}

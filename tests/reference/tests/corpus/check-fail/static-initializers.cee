@@ -1,0 +1,32 @@
+// A static's initialiser is evaluated at compile time (type-system.md §39.4; N0338): literals, constants, struct and
+// array literals, string literals, `@constant` calls and C constant macros; nothing else.
+extern "C" {
+    @constant
+    fn SPINLOCK_INIT(name: *CChar) -> u64;
+}
+
+fn compute() -> u64 => 4;
+
+enum Mode { Fast, Slow }
+
+static A: u64 = compute(); // error[N0338]
+static B: u64 = 2;
+static C: u64 = B; // error[N0338]
+
+struct Holder {
+    mode: u32;
+
+    // Not a single expression.
+    @constant
+    fn make(m: u32) -> Holder { // error[N0338]
+        let x = m;
+        return Holder { mode: x };
+    }
+}
+
+static LOCK: u64 = SPINLOCK_INIT("lock\0".ptr as *CChar);
+
+// A C constant macro outside an initialiser or a @constant function.
+fn runtime() -> u64 => SPINLOCK_INIT("x\0".ptr as *CChar); // error[N0338]
+
+fn main() {}

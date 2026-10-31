@@ -1,0 +1,32 @@
+// A program's own Result<S, IoError>, with S a struct or an enum, is an ordinary result: the backend's I/O
+// conversion helpers (c-backend.md §2) are written only for the results I/O built-ins return. Found by M11's
+// acceptance probes (milestone-11.md).
+enum Kind { A(i32), B }
+struct Pair { x: i32; y: i32; }
+
+fn classify(r: Result<Kind, IoError>) -> i32 => match (r) {
+    Ok(Kind.A(x)) => x,
+    Ok(Kind.B) => 0,
+    Err(IoError.NotFound) => -1,
+    Err(_) => -2,
+};
+
+fn sum(r: Result<Pair, IoError>) -> i32 => match (r) {
+    Ok(p) => p.x + p.y,
+    Err(_) => -3,
+};
+
+fn main() {
+    Console.writeLine(classify(Ok(Kind.A(7))));
+    Console.writeLine(classify(Ok(Kind.B)));
+    Console.writeLine(classify(Err(IoError.NotFound)));
+    Console.writeLine(classify(Err(IoError.PermissionDenied)));
+    Console.writeLine(sum(Ok(Pair { x: 2, y: 3 })));
+    Console.writeLine(sum(Err(IoError.NotFound)));
+}
+// expect-stdout: 7
+// expect-stdout: 0
+// expect-stdout: -1
+// expect-stdout: -2
+// expect-stdout: 5
+// expect-stdout: -3

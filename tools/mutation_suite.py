@@ -19,6 +19,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from names import dialect  # noqa: E402
+
 MUTANTS_PER_SEED = 120
 INT_MAX = 2147483647
 
@@ -312,7 +315,7 @@ def mutants(seed):
 
 def diagnostics(compiler, source):
     with tempfile.TemporaryDirectory() as directory:
-        path = os.path.join(directory, "mutant.nova")
+        path = os.path.join(directory, "mutant" + dialect(compiler).ext)  # ceesafec reads only .cee (Decision 0005)
         with open(path, "w", encoding="utf-8") as f:
             f.write(source)
         run = subprocess.run([compiler, "check", "--diagnostics-format=json", path], capture_output=True, cwd=directory)

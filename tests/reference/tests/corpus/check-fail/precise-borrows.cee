@@ -1,0 +1,39 @@
+// What borrow-checker precision (M13 G5) still rejects: a field a closure names, written while the closure lives; a
+// local the closure uses whole; and two loans of one element, or of an element at a variable index.
+
+struct Settings {
+    width: u64;
+    height: u64;
+}
+
+fn show(s: borrow Settings) {}
+
+struct Doc {
+    count: u64;
+    width: u64;
+
+    fn resize(borrow mut this) {
+        let readWidth = () => this.width;
+        this.width = 2; // error[N0240]
+        Console.writeLine(readWidth());
+    }
+}
+
+fn main() {
+    var s = Settings { width: 4, height: 3 };
+    let area = () => s.width * s.height;
+    s.width = 5; // error[N0240]
+    Console.writeLine(area());
+    let all = () => show(s);
+    s.height = 1; // error[N0240]
+    all();
+    var values = [10u64, 20, 30];
+    let i: usize = 2;
+    let a = borrow mut values[0];
+    let b = borrow mut values[0]; // error[N0241]
+    let c = borrow mut values[i]; // error[N0241]
+    a += 1;
+    let halves = values[..].splitAtMut(1);
+    values[0] = 1; // error[N0240]
+    halves.left[0] = 2;
+}

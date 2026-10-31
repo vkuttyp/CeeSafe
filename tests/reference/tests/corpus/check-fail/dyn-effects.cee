@@ -1,0 +1,38 @@
+// Effects through dyn (type-system.md §37.3): a call has the interface method's effect list, or may sleep and allocate
+// without one; an impl without its own list takes its interface's, and is held to it.
+
+interface Shape {
+    fn area(borrow this) -> u64;
+}
+
+interface Quiet {
+    @effects() fn ping(borrow this);
+}
+
+struct Square {
+    side: u64;
+}
+
+impl Shape for Square {
+    fn area(borrow this) -> u64 => this.side * this.side;
+}
+
+struct Noisy {
+    n: u64;
+}
+
+impl Quiet for Noisy {
+    fn ping(borrow this) { Console.writeLine(this.n); } // error[N0295]
+}
+
+@context(atomic)
+fn tick(s: borrow dyn Shape) -> u64 => s.area(); // error[N0295]
+
+@context(atomic)
+fn quiet(q: borrow dyn Quiet) { q.ping(); }
+
+fn main() {
+    let sq = Square { side: 2 };
+    Console.writeLine(tick(sq));
+    quiet(Noisy { n: 1 });
+}

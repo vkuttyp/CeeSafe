@@ -1,0 +1,20 @@
+// profile: freestanding
+// option: kernel cosmoos
+// option: no-float
+// M14 K1's acceptance (type-system.md §39.2, ADR 0024/0025): a static is changed only through its own methods, and a
+// static lock's data and a per-CPU value are reached only through their guards, never directly.
+struct Table {
+    count: u64;
+}
+
+static TABLE: SpinLock<Table> = SpinLock<Table>.constant("nova.table\0".ptr as *CChar, Table { count: 0 });
+static COUNTS: [u64; 4] = [0; 4];
+static TICKS: PerCpu<u64> = PerCpu<u64>.constant(0);
+
+fn writeOutsideGuard() {
+    COUNTS[0] = 1; // error[N0211]
+}
+
+fn readOutsideGuard() -> u64 => TABLE.data.count; // error[N0296]
+
+fn perCpuWithoutGuard() -> u64 => TICKS.values[0]; // error[N0296]

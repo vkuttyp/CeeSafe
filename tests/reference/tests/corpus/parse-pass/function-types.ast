@@ -1,0 +1,11 @@
+(unit
+  (fn default a (params (f (fn (i32) i32)) (g (fn ())) (h (fn ((borrow-mut (Vector u8)) StringView) bool)))
+    (block)
+  )
+  (fn default b (params (make (fn () (fn (i32) i32))) (maybe (optional (fn (i32))))) (returns (fn (i64 i64) i64))
+    (=> make)
+  )
+  (struct default Handler
+    (field default run (fn ((borrow Handler)) i32))
+  )
+)

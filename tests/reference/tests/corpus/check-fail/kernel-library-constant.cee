@@ -1,0 +1,7 @@
+// profile: freestanding
+// option: kernel cosmoos
+// option: no-float
+// A lock built with a C constant macro (SpinLock.constant) is only for a static (type-system.md §39.4; N0338).
+fn buildAtRunTime() {
+    let lock = SpinLock<u64>.constant("x\0".ptr as *CChar, 0); // error[N0338]
+}

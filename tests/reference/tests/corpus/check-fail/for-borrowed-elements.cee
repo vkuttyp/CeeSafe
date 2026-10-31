@@ -1,0 +1,17 @@
+// `for` over non-Copy elements borrows them (type-system.md §16.4, M11 G2): the borrow rules apply in the body.
+struct Res { id: u64; drop { } }
+fn consume(r: Res) { }
+
+fn grows(v: borrow mut Vector<Res>) {
+    for (r in v) {
+        v.push(Res { id: r.id })!; // error[N0241]
+    }
+}
+
+fn movesOut(rs: Slice<Res>) {
+    for (r in rs) {
+        consume(r); // error[N0251]
+    }
+}
+
+fn main() { }

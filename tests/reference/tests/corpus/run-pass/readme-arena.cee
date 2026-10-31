@@ -1,0 +1,17 @@
+// An example from the repository's README.md: keep its code identical to the README's (test annotations aside).
+
+fn distinctBytes(input: Slice<u8>) -> Result<u64, AllocError> {
+    using arena = Arena.create(SystemHeap {}, 65536u64);
+    let counts = arena.allocArray(256usize, 0u32)?; // lives in `arena`, not on the heap
+    for (b in input) { counts[b as usize] += 1; }
+
+    var distinct: u64 = 0;
+    for (c in counts) { if (c != 0) { distinct += 1; } }
+    return Ok(distinct); // returning `counts` itself would be a compile error
+}                        // the whole arena is released here
+
+fn main() {
+    Console.writeLine(distinctBytes("hello, world".bytes())!);
+}
+
+// expect-stdout: 9

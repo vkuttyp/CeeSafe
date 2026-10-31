@@ -53,7 +53,7 @@ Slices S0–S6 keep ceesafec's C byte-identical to novac's, so every P5–P7 gat
 The rename contract (ROADMAP §3.4) applied to the package commands: `ceesafe.toml`, `ceesafe.lock`, `.cee`,
 `$CEESAFE_HOME` (default `~/.ceesafe`), `$CEESAFE_INDEX`; the agent section between `<!--CEESAFE START-->` and
 `<!--CEESAFE END-->`, `.cursor/rules/ceesafe.mdc`, and the MCP server `ceesafe` (`ceesafec mcp`) with tools
-`ceesafe_*` in the agent template and configurations. Prose keeps "Nova" until the fork point (S7), and the default
+`ceesafe_*` in the agent template and configurations. Prose said "Nova" until the fork point (S7), and the default
 index is CeeSafe's own, `github.com/vkuttyp/CeeSafe-index` (owner, 2026-10-31): a Nova index's packages are Nova
 packages, which ceesafec does not read (Decision 0003).
 

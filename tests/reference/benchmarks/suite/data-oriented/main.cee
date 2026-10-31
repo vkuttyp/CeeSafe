@@ -1,0 +1,41 @@
+// data-oriented (benchmarks/suite/README.md): particles as separate arrays, reflecting at the walls.
+const N: usize = 1000000;
+const W: i32 = 1000;
+
+fn main() -> i32 {
+    var x = Vector<i32>.withCapacity(N)!;
+    var y = Vector<i32>.withCapacity(N)!;
+    var vx = Vector<i32>.withCapacity(N)!;
+    var vy = Vector<i32>.withCapacity(N)!;
+    for (i in 0..N) {
+        let k = truncate<i32>(i);
+        x.push(k % 1000)!;
+        y.push(3 * k % 1000)!;
+        vx.push(k % 7 - 3)!;
+        vy.push(k % 5 - 2)!;
+    }
+    for (s in 0..100) {
+        for (i in 0..N) {
+            x[i] += vx[i];
+            if (x[i] < 0) {
+                x[i] = -x[i];
+                vx[i] = -vx[i];
+            } else if (x[i] >= W) {
+                x[i] = 2 * (W - 1) - x[i];
+                vx[i] = -vx[i];
+            }
+            y[i] += vy[i];
+            if (y[i] < 0) {
+                y[i] = -y[i];
+                vy[i] = -vy[i];
+            } else if (y[i] >= W) {
+                y[i] = 2 * (W - 1) - y[i];
+                vy[i] = -vy[i];
+            }
+        }
+    }
+    var sum: u64 = 0;
+    for (i in 0..N) { sum += truncate<u64>(x[i] + y[i]); }
+    Console.writeLine(sum);
+    return 0;
+}

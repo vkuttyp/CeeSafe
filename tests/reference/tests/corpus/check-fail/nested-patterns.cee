@@ -1,0 +1,74 @@
+// Nested patterns (type-system.md §15.2, M11 G1): exhaustiveness and unreachable arms over whole patterns, and the
+// type rules of each nested position.
+enum Shape { Circle(u32), Rect(u32, u32), Empty }
+struct Point { x: u32; }
+enum Holder<region r> { Ref(borrow(r) u32), Val(Point) }
+
+fn missingVariant(r: Result<Shape, u8>) -> u32 {
+    match (r) { // error[N0256]
+        Ok(Shape.Circle(x)) => { return x; }
+        Ok(Shape.Empty) => { return 0; }
+        Err(e) => { return e as u32; }
+    }
+}
+
+fn missingLiteralFallback(o: u32?) -> u32 {
+    match (o) { // error[N0256]
+        Some(3) => { return 3; }
+        null => { return 0; }
+    }
+}
+
+fn missingNestedNull(o: bool??) -> u32 {
+    match (o) { // error[N0256]
+        Some(Some(true)) => { return 1; }
+        Some(Some(false)) => { return 2; }
+        null => { return 4; }
+    }
+}
+
+fn unreachable(o: Shape?) -> u32 {
+    match (o) {
+        Some(Shape.Rect(w, h)) => { return w * h; }
+        Some(_) => { return 1; }
+        Some(Shape.Circle(r)) => { return r; } // error[N0257]
+        null => { return 0; }
+    }
+}
+
+fn throughReference<region r>(h: Holder<r>) -> u32 {
+    match (h) {
+        Holder.Ref(3) => { return 3; } // error[N0205]
+        _ => { return 0; }
+    }
+}
+
+fn literalOnStruct<region r>(h: Holder<r>) -> u32 {
+    match (h) {
+        Holder.Val(7) => { return 7; } // error[N0205]
+        _ => { return 0; }
+    }
+}
+
+fn nullOnInteger(r: Result<u32, u8>) -> u32 {
+    match (r) {
+        Ok(null) => { return 0; } // error[N0205]
+        _ => { return 1; }
+    }
+}
+
+fn wrongArity(r: Result<Shape, u8>) -> u32 {
+    match (r) {
+        Ok(Shape.Rect(w)) => { return 0; } // error[N0209]
+        _ => { return 0; }
+    }
+}
+
+fn mutableThroughReference(r: borrow Result<Shape, u8>) -> u32 {
+    match (r) {
+        Ok(Shape.Circle(var x)) => { return 0; } // error[N0246]
+        _ => { return 1; }
+    }
+}
+
+fn main() { }

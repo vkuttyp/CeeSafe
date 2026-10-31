@@ -1,0 +1,29 @@
+// `if` and `match` expressions (type-system.md §15.3, M11 G5): a move in one branch, a loan carried by the result,
+// and a temporary that ends with its branch.
+struct Res { id: i32; drop { } }
+
+fn make() -> Res => Res { id: 1 };
+fn take(r: Res) { }
+fn same(r: borrow Res) -> borrow Res => r;
+
+fn moves(c: bool) {
+    let r = Res { id: 2 };
+    let s = if (c) r else make();
+    take(r); // error[N0250]
+}
+
+fn temporaries(c: bool) {
+    let s = make();
+    let t = if (c) same(make()) else borrow s; // error[N0243]
+    Console.writeLine(t.id);
+}
+
+fn loans(c: bool) {
+    var a = make();
+    var b = make();
+    let r = if (c) borrow a else borrow b;
+    a = make(); // error[N0240]
+    Console.writeLine(r.id);
+}
+
+fn main() { }

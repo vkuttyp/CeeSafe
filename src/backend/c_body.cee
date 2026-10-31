@@ -44,9 +44,9 @@ fn appendSignature(
         count += 1;
         if (k == 0 && source.closureEnvironment != none()) {
             // A closure's environment arrives as the closure's code-pointer address (§36.2): converted on entry.
-            e.t(if (withNames) "const void *nv_env" else "const void *")?;
+            e.t(if (withNames) "const void *cee_env" else "const void *")?;
         } else if (withNames) {
-            e.t("NV_UNUSED ")?;
+            e.t("CEE_UNUSED ")?;
             appendCTypeName(c, mut e.buf, function.locals[k as usize].typ)?;
             e.t(" ")?;
             appendLocalName(c, mut e.buf, function, k)?;
@@ -59,7 +59,7 @@ fn appendSignature(
             e.t(", ")?;
         }
         count += 1;
-        e.t(if (withNames) "uint64_t nv_caller" else "uint64_t")?;
+        e.t(if (withNames) "uint64_t cee_caller" else "uint64_t")?;
     }
     if (count == 0) {
         e.t("void")?;
@@ -120,13 +120,13 @@ fn emitFunction(
     if (c.hir.functions[source as usize].closureEnvironment != none()) {
         // The pointer to the environment's first member, back to the environment (C11 6.7.2.1p15).
         let environment = function.locals[0].typ;
-        e.t("    NV_UNUSED ")?;
+        e.t("    CEE_UNUSED ")?;
         appendCTypeName(c, mut e.buf, environment)?;
         e.t(" ")?;
         appendLocalName(c, mut e.buf, function, 0)?;
         e.t(" = (")?;
         appendCTypeName(c, mut e.buf, environment)?;
-        e.t(")(uintptr_t)nv_env;")?;
+        e.t(")(uintptr_t)cee_env;")?;
         e.emit()?;
     }
     var partly = Vector<bool>.create();
@@ -147,7 +147,7 @@ fn emitFunction(
         let t = function.locals[k as usize].typ;
         // Zero-initialised: Nova's definite assignment already forbids reading it first (§5).
         let zero = localZero(c, t);
-        var text = copyBytes("NV_UNUSED ".bytes())?;
+        var text = copyBytes("CEE_UNUSED ".bytes())?;
         appendCTypeName(c, mut text, t)?;
         text.push(' ')?;
         appendLocalName(c, mut text, function, k)?;
@@ -163,9 +163,9 @@ fn emitFunction(
     if ((f as usize) < e.placements.length) {
         // The storage of each stack-placed box (§2.2).
         for (slot in 0..e.placements[f as usize].slots.length) {
-            var text = copyBytes("NV_UNUSED ".bytes())?;
+            var text = copyBytes("CEE_UNUSED ".bytes())?;
             appendCTypeName(c, mut text, e.placements[f as usize].slots[slot])?;
-            appendText(mut text, " nv_box_")?;
+            appendText(mut text, " cee_box_")?;
             appendDecimal(mut text, slot as u64)?;
             appendText(mut text, " = {0};")?;
             declarations.push(text)?;
@@ -536,11 +536,11 @@ fn emitConstruction(
             var operand = Vector<u8>.create();
             appendOperand(e, c, n, sources, f, mut operand, o)?;
             e.t(indent)?;
-            e.t("for (uint64_t nv_i = 0; nv_i < ")?;
+            e.t("for (uint64_t cee_i = 0; cee_i < ")?;
             e.d(truncate<u64>(c.types.info(n.rvalueTypes[r as usize]).arrayLength))?;
-            e.t("u; nv_i++) ")?;
+            e.t("u; cee_i++) ")?;
             e.b(target)?;
-            e.t(".e[nv_i] = ")?;
+            e.t(".e[cee_i] = ")?;
             e.b(operand.view())?;
             e.t(";")?;
             return e.emit();
@@ -654,7 +654,7 @@ fn emitStatement(
                 )?;
                 e.t("    ")?;
                 e.b(place.view())?;
-                e.t(" = nova_scratch_enter_root(")?;
+                e.t(" = ceesafe_scratch_enter_root(")?;
                 e.b(location.view())?;
                 e.t(");")?;
                 return e.emit();
@@ -673,7 +673,7 @@ fn emitStatement(
             let slot = placedSlot(e, f, s);
             if (builtin == bfBoxCreate() && slot != none()) {
                 // A stack-placed box (§2.2): the value goes into the slot, and nothing is allocated.
-                var storage = copyBytes("nv_box_".bytes())?;
+                var storage = copyBytes("cee_box_".bytes())?;
                 appendDecimal(mut storage, slot as u64)?;
                 if (built != none()) {
                     emitConstruction(e, c, n, sources, f, statementRvalue(n, built), storage.view(), "    ")?;
@@ -713,11 +713,11 @@ fn emitStatement(
                 e.line("    {")?;
                 e.t("        ")?;
                 appendCTypeName(c, mut e.buf, contents)?;
-                e.t(" *nv_p = ")?;
+                e.t(" *cee_p = ")?;
                 appendBoxAllocateName(c, mut e.buf, resultType)?;
                 e.t("();")?;
                 e.emit()?;
-                e.line("        if (nv_p == NULL) {")?;
+                e.line("        if (cee_p == NULL) {")?;
                 var error = Vector<u8>.create();
                 appendAllocErrorResult(e, c, mut error, resultType)?;
                 e.t("            ")?;
@@ -728,9 +728,9 @@ fn emitStatement(
                 e.emit()?;
                 e.line("        } else {")?;
                 let constructionValue = statementRvalue(n, built);
-                emitConstruction(e, c, n, sources, f, constructionValue, "(*nv_p)".bytes(), "            ")?;
+                emitConstruction(e, c, n, sources, f, constructionValue, "(*cee_p)".bytes(), "            ")?;
                 var ok = Vector<u8>.create();
-                appendOkValue(e, c, mut ok, resultType, "nv_p".bytes())?;
+                appendOkValue(e, c, mut ok, resultType, "cee_p".bytes())?;
                 e.t("            ")?;
                 e.b(place.view())?;
                 e.t(" = ")?;
@@ -751,19 +751,19 @@ fn emitStatement(
                             let operand = operandText(e, c, n, sources, f, o)?;
                             e.t("    { ")?;
                             appendCTypeName(c, mut e.buf, integer)?;
-                            e.t(" nv_r;")?;
+                            e.t(" cee_r;")?;
                             e.emit()?;
                             var some = Vector<u8>.create();
-                            appendOptionValue(e, c, mut some, optionType, true, "nv_r".bytes())?;
+                            appendOptionValue(e, c, mut some, optionType, true, "cee_r".bytes())?;
                             var missing = Vector<u8>.create();
                             appendOptionValue(e, c, mut missing, optionType, false, "".bytes())?;
                             e.t("      ")?;
                             e.b(place.view())?;
-                            e.t(" = nv_try_ftoi_")?;
+                            e.t(" = cee_try_ftoi_")?;
                             appendSuffix(c, mut e.buf, integer)?;
                             e.t("((double)")?;
                             e.b(operand.view())?;
-                            e.t(", &nv_r) ? ")?;
+                            e.t(", &cee_r) ? ")?;
                             e.b(some.view())?;
                             e.t(" : ")?;
                             e.b(missing.view())?;
@@ -780,13 +780,13 @@ fn emitStatement(
                 let optionType = n.rvalueTypes[r as usize];
                 let place = appendPlaceIn(e, c, n, sources, f, target)?;
                 var call = Vector<u8>.create();
-                appendArithmeticCall(e, c, n, sources, f, mut call, r, "&nv_r")?;
+                appendArithmeticCall(e, c, n, sources, f, mut call, r, "&cee_r")?;
                 e.t("    { ")?;
                 appendCTypeName(c, mut e.buf, n.operandTypes[builtinArgument(n, r, 0) as usize])?;
-                e.t(" nv_r;")?;
+                e.t(" cee_r;")?;
                 e.emit()?;
                 var some = Vector<u8>.create();
-                appendOptionValue(e, c, mut some, optionType, true, "nv_r".bytes())?;
+                appendOptionValue(e, c, mut some, optionType, true, "cee_r".bytes())?;
                 var missing = Vector<u8>.create();
                 appendOptionValue(e, c, mut missing, optionType, false, "".bytes())?;
                 e.t("      ")?;
@@ -864,7 +864,7 @@ fn emitStatement(
             let place = appendPlaceIn(e, c, n, sources, f, box)?;
             var release = Vector<u8>.create();
             if (c.types.isPoolBox(boxType)) {
-                appendText(mut release, "nova_pool_release(")?;
+                appendText(mut release, "ceesafe_pool_release(")?;
                 appendBytes(mut release, place.view())?;
                 appendText(mut release, ".pool, ")?;
                 appendBytes(mut release, place.view())?;
@@ -875,7 +875,7 @@ fn emitStatement(
                 appendBytes(mut release, place.view())?;
                 appendText(mut release, ");")?;
             } else {
-                appendText(mut release, "nova_free(")?;
+                appendText(mut release, "ceesafe_free(")?;
                 appendBytes(mut release, place.view())?;
                 appendText(mut release, ", ")?;
                 appendAllocatorId(c, mut release, c.types.info(boxType).allocator)?;
@@ -897,7 +897,7 @@ fn emitStatement(
             let i = operandText(e, c, n, sources, f, index)?;
             let l = operandText(e, c, n, sources, f, length)?;
             let site = siteText(e, c, n, sources, f, span.start)?;
-            e.t("    nv_check_index(")?;
+            e.t("    cee_check_index(")?;
             e.b(i.view())?;
             e.t(", ")?;
             e.b(l.view())?;
@@ -913,7 +913,7 @@ fn emitStatement(
                 let hi = operandText(e, c, n, sources, f, high)?;
                 let place = appendPlaceIn(e, c, n, sources, f, text)?;
                 let site = siteText(e, c, n, sources, f, span.start)?;
-                e.t("    nv_check_range(")?;
+                e.t("    cee_check_range(")?;
                 e.b(lo.view())?;
                 e.t(", ")?;
                 e.b(hi.view())?;
@@ -930,7 +930,7 @@ fn emitStatement(
                 let lo = operandText(e, c, n, sources, f, low)?;
                 let hi = operandText(e, c, n, sources, f, high)?;
                 let site = siteText(e, c, n, sources, f, span.start)?;
-                e.t("    nv_check_str_range(((nv_str){ .ptr = ")?;
+                e.t("    cee_check_str_range(((cee_str){ .ptr = ")?;
                 e.b(place.view())?;
                 e.t(".ptr, .len = ")?;
                 e.b(place.view())?;
@@ -947,7 +947,7 @@ fn emitStatement(
             let hi = operandText(e, c, n, sources, f, high)?;
             let len = operandText(e, c, n, sources, f, length)?;
             let site = siteText(e, c, n, sources, f, span.start)?;
-            e.t("    nv_check_range(")?;
+            e.t("    cee_check_range(")?;
             e.b(lo.view())?;
             e.t(", ")?;
             e.b(hi.view())?;
@@ -962,7 +962,7 @@ fn emitStatement(
             let l = operandText(e, c, n, sources, f, left)?;
             let r = operandText(e, c, n, sources, f, right)?;
             let site = siteText(e, c, n, sources, f, span.start)?;
-            e.t("    nv_check_length(")?;
+            e.t("    cee_check_length(")?;
             e.b(l.view())?;
             e.t(", ")?;
             e.b(r.view())?;
@@ -1077,10 +1077,10 @@ fn emitBuiltin(
     }
     if (b == bfCheckedAdd() || b == bfCheckedSub() || b == bfCheckedMul()) {
         var call = Vector<u8>.create();
-        appendArithmeticCall(e, c, n, sources, f, mut call, r, "&nv_r")?;
+        appendArithmeticCall(e, c, n, sources, f, mut call, r, "&cee_r")?;
         e.t("    { ")?;
         appendCTypeName(c, mut e.buf, n.operandTypes[n.at(arguments, 0) as usize])?;
-        e.t(" nv_r; (void)")?;
+        e.t(" cee_r; (void)")?;
         e.b(call.view())?;
         e.t("; }")?;
         return e.emit();
@@ -1088,7 +1088,7 @@ fn emitBuiltin(
     if (b == bfSliceCopy()) {
         let destination = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
         let source = operandText(e, c, n, sources, f, n.at(arguments, 1))?;
-        e.t("    nv_slice_copy(")?;
+        e.t("    cee_slice_copy(")?;
         e.b(destination.view())?;
         e.t(".ptr, ")?;
         e.b(source.view())?;
@@ -1106,7 +1106,7 @@ fn emitBuiltin(
         let element = c.types.info(c.types.info(n.operandTypes[n.at(arguments, 0) as usize]).pointee).element;
         let info = c.types.info(element);
         if (c.types.is(element, TypeKind.Bool) || (c.types.is(element, TypeKind.Integer) && info.bits == 8)) {
-            e.t("    nv_slice_fill_byte(")?;
+            e.t("    cee_slice_fill_byte(")?;
             e.b(slice.view())?;
             e.t(".ptr, ")?;
             if (!(c.types.is(element, TypeKind.Integer) && !info.signed)) {
@@ -1117,11 +1117,11 @@ fn emitBuiltin(
             e.b(slice.view())?;
             e.t(".len);")?;
         } else {
-            e.t("    for (uint64_t nv_i = 0u; nv_i < ")?;
+            e.t("    for (uint64_t cee_i = 0u; cee_i < ")?;
             e.b(slice.view())?;
-            e.t(".len; nv_i++) ")?;
+            e.t(".len; cee_i++) ")?;
             e.b(slice.view())?;
-            e.t(".ptr[nv_i] = ")?;
+            e.t(".ptr[cee_i] = ")?;
             e.b(value.view())?;
             e.t(";")?;
         }
@@ -1135,17 +1135,17 @@ fn emitBuiltin(
         let element = c.types.info(c.types.info(c.types.info(vectorType).pointee).pointee).element;
         e.t("    { ")?;
         appendCTypeName(c, mut e.buf, vectorType)?;
-        e.t(" nv_v = ")?;
+        e.t(" cee_v = ")?;
         e.b(vector.view())?;
-        e.t("; uint64_t nv_n = ")?;
+        e.t("; uint64_t cee_n = ")?;
         e.b(keep.view())?;
-        e.t("; if (nv_n < nv_v->len) { uint64_t nv_e = nv_v->len; nv_v->len = nv_n;")?;
+        e.t("; if (cee_n < cee_v->len) { uint64_t cee_e = cee_v->len; cee_v->len = cee_n;")?;
         if (element != none() && c.types.needsDrop(element)) {
-            e.t(" for (uint64_t nv_i = nv_n; nv_i < nv_e; nv_i++) ")?;
+            e.t(" for (uint64_t cee_i = cee_n; cee_i < cee_e; cee_i++) ")?;
             appendDropGlueName(c, mut e.buf, element)?;
-            e.t("(&nv_v->ptr[nv_i]);")?;
+            e.t("(&cee_v->ptr[cee_i]);")?;
         } else {
-            e.t(" (void)nv_e;")?;
+            e.t(" (void)cee_e;")?;
         }
         e.t(" } }")?;
         return e.emit();
@@ -1158,7 +1158,7 @@ fn emitBuiltin(
         let element = c.types.info(c.types.info(n.operandTypes[n.at(arguments, 0) as usize]).pointee).element;
         e.t("    { ")?;
         appendCTypeName(c, mut e.buf, element)?;
-        e.t(" nv_t = ")?;
+        e.t(" cee_t = ")?;
         e.b(slice.view())?;
         e.t(".ptr[")?;
         e.b(i.view())?;
@@ -1174,29 +1174,29 @@ fn emitBuiltin(
         e.b(slice.view())?;
         e.t(".ptr[")?;
         e.b(j.view())?;
-        e.t("] = nv_t; }")?;
+        e.t("] = cee_t; }")?;
         return e.emit();
     }
     if (b == bfFailAfter()) {
         let count = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
-        e.t("    nova_fail_after(")?;
+        e.t("    ceesafe_fail_after(")?;
         e.b(count.view())?;
         e.t(");")?;
         return e.emit();
     }
     if (b == bfFailReset()) {
-        return e.line("    nova_fail_reset();");
+        return e.line("    ceesafe_fail_reset();");
     }
     if (b == bfArenaReset()) {
         let arena = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
-        e.t("    nova_arena_reset(")?;
+        e.t("    ceesafe_arena_reset(")?;
         e.b(arena.view())?;
         e.t(");")?;
         return e.emit();
     }
     if (b == bfConsoleWriteBytes()) {
         let bytes = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
-        e.t("    nova_write_bytes(")?;
+        e.t("    ceesafe_write_bytes(")?;
         e.b(bytes.view())?;
         e.t(".ptr, ")?;
         e.b(bytes.view())?;
@@ -1206,13 +1206,13 @@ fn emitBuiltin(
     if (b == bfConsoleWriteError() || b == bfConsoleWriteErrorLine()) {
         for (k in 0..arguments.count) {
             let text = operandText(e, c, n, sources, f, n.at(arguments, k))?;
-            e.t("    nova_write_error(")?;
+            e.t("    ceesafe_write_error(")?;
             e.b(text.view())?;
             e.t(");")?;
             e.emit()?;
         }
         if (b == bfConsoleWriteErrorLine()) {
-            e.line("    nova_write_error(((nv_str){ .ptr = (const uint8_t *)\"\\n\", .len = 1u }));")?;
+            e.line("    ceesafe_write_error(((cee_str){ .ptr = (const uint8_t *)\"\\n\", .len = 1u }));")?;
         }
         return Ok();
     }
@@ -1222,7 +1222,7 @@ fn emitBuiltin(
         match (n.operands[o as usize]) {
             NirOperand.String(text) => {
                 let bytes = n.textOf(text);
-                e.t("    nova_write_str(")?;
+                e.t("    ceesafe_write_str(")?;
                 appendCStringLiteral(mut e.buf, bytes)?;
                 e.t(", ")?;
                 e.d(bytes.length as u64)?;
@@ -1234,33 +1234,33 @@ fn emitBuiltin(
         }
         let operand = operandText(e, c, n, sources, f, o)?;
         if (c.types.is(t, TypeKind.Bool)) {
-            e.t("    nova_write_bool(")?;
+            e.t("    ceesafe_write_bool(")?;
             e.b(operand.view())?;
             e.t(");")?;
         } else if (c.types.is(t, TypeKind.Float)) {
             // The shortest round-trip text, into a buffer that lives to the end of the block (§35.7).
-            e.t("    nova_write_view(nova_format_f")?;
+            e.t("    ceesafe_write_view(ceesafe_format_f")?;
             e.d(c.types.info(t).bits as u64)?;
             e.t("(")?;
             e.b(operand.view())?;
-            e.t(", (uint8_t[NV_FLOAT_CHARS]){ 0 }));")?;
+            e.t(", (uint8_t[CEE_FLOAT_CHARS]){ 0 }));")?;
         } else if (c.types.isStringView(t)) {
-            e.t("    nova_write_view(")?;
+            e.t("    ceesafe_write_view(")?;
             e.b(operand.view())?;
             e.t(");")?;
         } else if (c.types.info(t).signed) {
-            e.t("    nova_write_i64((int64_t)")?;
+            e.t("    ceesafe_write_i64((int64_t)")?;
             e.b(operand.view())?;
             e.t(");")?;
         } else {
-            e.t("    nova_write_u64((uint64_t)")?;
+            e.t("    ceesafe_write_u64((uint64_t)")?;
             e.b(operand.view())?;
             e.t(");")?;
         }
         e.emit()?;
     }
     if (b == bfConsoleWriteLine()) {
-        e.line("    nova_write_newline();")?;
+        e.line("    ceesafe_write_newline();")?;
     }
     return Ok();
 }
@@ -1331,14 +1331,14 @@ fn emitTerminator(
         }
         NirTerminator.Exit(code) => {
             let operand = operandText(e, c, n, sources, f, code)?;
-            e.t("    nova_exit(")?;
+            e.t("    ceesafe_exit(")?;
             e.b(operand.view())?;
             e.t(");")?;
         }
         NirTerminator.Panic(kind) => {
             e.t(match (kind) {
-                NirPanicKind.UnwrapNull => "    nova_panic(NV_PANIC_UNWRAP_NULL, ",
-                NirPanicKind.Unwrap => "    nova_panic(NV_PANIC_UNWRAP, ",
+                NirPanicKind.UnwrapNull => "    ceesafe_panic(CEE_PANIC_UNWRAP_NULL, ",
+                NirPanicKind.Unwrap => "    ceesafe_panic(CEE_PANIC_UNWRAP, ",
             })?;
             var location = Vector<u8>.create();
             appendLocation(e, mut location, sources, c.hir.functions[source as usize].file, span.start)?;
@@ -1346,7 +1346,7 @@ fn emitTerminator(
             e.t(");")?;
         }
         NirTerminator.Unreachable => {
-            e.t("    nova_panic(NV_PANIC_UNREACHABLE, ")?;
+            e.t("    ceesafe_panic(CEE_PANIC_UNREACHABLE, ")?;
             var location = Vector<u8>.create();
             appendLocation(
                 e,
@@ -1377,14 +1377,14 @@ fn appendArithmeticCall(
     let b = builtinOf(n, r);
     let name =
         if (b ==
-            bfWrappingAdd()) "nv_wrapping_add_" else if (b ==
-            bfWrappingSub()) "nv_wrapping_sub_" else if (b ==
-            bfWrappingMul()) "nv_wrapping_mul_" else if (b ==
-            bfCheckedAdd()) "nv_try_add_" else if (b ==
-            bfCheckedSub()) "nv_try_sub_" else if (b ==
-            bfCheckedMul()) "nv_try_mul_" else if (b ==
-            bfSaturatingAdd()) "nv_saturating_add_" else if (b ==
-            bfSaturatingSub()) "nv_saturating_sub_" else "nv_saturating_mul_";
+            bfWrappingAdd()) "cee_wrapping_add_" else if (b ==
+            bfWrappingSub()) "cee_wrapping_sub_" else if (b ==
+            bfWrappingMul()) "cee_wrapping_mul_" else if (b ==
+            bfCheckedAdd()) "cee_try_add_" else if (b ==
+            bfCheckedSub()) "cee_try_sub_" else if (b ==
+            bfCheckedMul()) "cee_try_mul_" else if (b ==
+            bfSaturatingAdd()) "cee_saturating_add_" else if (b ==
+            bfSaturatingSub()) "cee_saturating_sub_" else "cee_saturating_mul_";
     let left = operandText(e, c, n, sources, f, builtinArgument(n, r, 0))?;
     let right = operandText(e, c, n, sources, f, builtinArgument(n, r, 1))?;
     appendText(out, name)?;
@@ -1421,7 +1421,7 @@ fn appendSite(
         e.sites.put(key, site)?;
         e.siteList.push(CSite { file: id, line: position.line, column: position.column })?;
     }
-    appendText(out, "&nvL_")?;
+    appendText(out, "&ceeL_")?;
     return appendDecimal(out, site as u64);
 }
 
@@ -1554,7 +1554,7 @@ fn appendRvalue(
                         return out.push(')');
                     }
                     let site = siteText(e, c, n, sources, f, span.start)?;
-                    appendText(out, "nv_neg_")?;
+                    appendText(out, "cee_neg_")?;
                     appendSuffix(c, out, t)?;
                     out.push('(')?;
                     appendBytes(out, operand.view())?;
@@ -1570,7 +1570,7 @@ fn appendRvalue(
             let bits = c.types.info(t).bits;
             let operand = operandText(e, c, n, sources, f, o)?;
             if (c.types.info(t).signed) {
-                appendText(out, "nv_as_i")?;
+                appendText(out, "cee_as_i")?;
                 appendDecimal(out, bits as u64)?;
                 out.push('(')?;
             }
@@ -1587,7 +1587,7 @@ fn appendRvalue(
             let operand = operandText(e, c, n, sources, f, o)?;
             match (kind) {
                 FloatToIntKind.Saturating => {
-                    appendText(out, "nv_sat_ftoi_")?;
+                    appendText(out, "cee_sat_ftoi_")?;
                     appendSuffix(c, out, t)?;
                     appendText(out, "((double)")?;
                     appendBytes(out, operand.view())?;
@@ -1595,7 +1595,7 @@ fn appendRvalue(
                 }
                 _ => {
                     let site = siteText(e, c, n, sources, f, span.start)?;
-                    appendText(out, "nv_ftoi_")?;
+                    appendText(out, "cee_ftoi_")?;
                     appendSuffix(c, out, t)?;
                     appendText(out, "((double)")?;
                     appendBytes(out, operand.view())?;
@@ -1763,7 +1763,7 @@ fn appendCast(
     if (c.types.is(t, TypeKind.Float) && c.types.info(t).bits == 32 && c.types.is(from, TypeKind.Float) &&
         c.types.info(from).bits == 64) {
         // round<f32>(d): without C's undefined behaviour for finite values beyond f32's range (§35.6).
-        appendText(out, "nv_f64_to_f32(")?;
+        appendText(out, "cee_f64_to_f32(")?;
         appendBytes(out, operand.view())?;
         return out.push(')');
     }
@@ -1803,12 +1803,12 @@ fn appendBuiltinRvalue(
     t: u32,
 ) -> Result<void, AllocError> {
     if (b == bfFloatBits()) {
-        appendText(out, "nv_f")?;
+        appendText(out, "cee_f")?;
         appendDecimal(out, c.types.info(argumentType(n, arguments, 0)).bits as u64)?;
         return appendBuiltinCall(e, c, n, sources, f, out, "_bits".bytes(), arguments);
     }
     if (b == bfFloatFromBits()) {
-        appendText(out, "nv_f")?;
+        appendText(out, "cee_f")?;
         appendDecimal(out, c.types.info(t).bits as u64)?;
         return appendBuiltinCall(e, c, n, sources, f, out, "_from_bits".bytes(), arguments);
     }
@@ -1818,32 +1818,32 @@ fn appendBuiltinRvalue(
         appendText(
             out,
             if (b ==
-                bfFloatSqrt()) "nv_sqrt_f" else if (b ==
-                bfFloatAbs()) "nv_abs_f" else if (b ==
-                bfFloatFloor()) "nv_floor_f" else if (b ==
-                bfFloatCeil()) "nv_ceil_f" else if (b == bfFloatMin()) "nv_min_f" else "nv_max_f",
+                bfFloatSqrt()) "cee_sqrt_f" else if (b ==
+                bfFloatAbs()) "cee_abs_f" else if (b ==
+                bfFloatFloor()) "cee_floor_f" else if (b ==
+                bfFloatCeil()) "cee_ceil_f" else if (b == bfFloatMin()) "cee_min_f" else "cee_max_f",
         )?;
         appendDecimal(out, c.types.info(t).bits as u64)?;
         return appendBuiltinCall(e, c, n, sources, f, out, "".bytes(), arguments);
     }
     if (b == bfThreadSpawn()) {
-        return appendHelperCall(e, c, n, sources, f, out, "nvTS_", argumentType(n, arguments, 0), arguments);
+        return appendHelperCall(e, c, n, sources, f, out, "ceeTS_", argumentType(n, arguments, 0), arguments);
     }
     if (b == bfThreadJoin()) {
-        return appendHelperCall(e, c, n, sources, f, out, "nvTJ_", t, arguments);
+        return appendHelperCall(e, c, n, sources, f, out, "ceeTJ_", t, arguments);
     }
     if (b == bfThreadBoth()) {
-        var name = copyBytes("nvBOTH_".bytes())?;
+        var name = copyBytes("ceeBOTH_".bytes())?;
         appendMangle(c, mut name, argumentType(n, arguments, 0))?;
         name.push('_')?;
         appendMangle(c, mut name, argumentType(n, arguments, 1))?;
         return appendBuiltinCall(e, c, n, sources, f, out, name.view(), arguments);
     }
     if (b == bfThreadSpawnBoxed()) {
-        return appendHelperCall(e, c, n, sources, f, out, "nvTSB_", c.types.info(resultOkOf(c, t)).element, arguments);
+        return appendHelperCall(e, c, n, sources, f, out, "ceeTSB_", c.types.info(resultOkOf(c, t)).element, arguments);
     }
     if (b == bfArenaCreate()) {
-        appendText(out, "nova_arena_create(")?;
+        appendText(out, "ceesafe_arena_create(")?;
         appendAllocatorId(c, out, argumentType(n, arguments, 0))?;
         appendText(out, ", ")?;
         let capacity = operandText(e, c, n, sources, f, n.at(arguments, 1))?;
@@ -1867,14 +1867,14 @@ fn appendBuiltinRvalue(
     }
     if (b == bfFixedBufferOver()) {
         let buffer = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
-        appendText(out, "nova_fba_over(")?;
+        appendText(out, "ceesafe_fba_over(")?;
         appendBytes(out, buffer.view())?;
         appendText(out, ".ptr, ")?;
         appendBytes(out, buffer.view())?;
         return appendText(out, ".len)");
     }
     if (b == bfPoolCreate()) {
-        appendText(out, "nova_pool_create(")?;
+        appendText(out, "ceesafe_pool_create(")?;
         appendAllocatorId(c, out, argumentType(n, arguments, 0))?;
         appendText(out, ", (uint64_t)")?;
         let count = operandText(e, c, n, sources, f, n.at(arguments, 1))?;
@@ -1882,26 +1882,26 @@ fn appendBuiltinRvalue(
         return out.push(')');
     }
     if (b == bfPoolTake()) {
-        return appendHelperCall(e, c, n, sources, f, out, "nvPT_", argumentType(n, arguments, 1), arguments);
+        return appendHelperCall(e, c, n, sources, f, out, "ceePT_", argumentType(n, arguments, 1), arguments);
     }
     if (b == bfScratchNest()) {
-        return appendBuiltinCall(e, c, n, sources, f, out, "nova_scratch_enter_child".bytes(), arguments);
+        return appendBuiltinCall(e, c, n, sources, f, out, "ceesafe_scratch_enter_child".bytes(), arguments);
     }
     if (b == bfFileOpen() || b == bfFileCreate()) {
         var call = Vector<u8>.create();
-        appendBuiltinCall(e, c, n, sources, f, mut call, "nova_file_open".bytes(), arguments)?;
+        appendBuiltinCall(e, c, n, sources, f, mut call, "ceesafe_file_open".bytes(), arguments)?;
         call.pop();
         appendText(mut call, if (b == bfFileOpen()) ", 0u)" else ", 1u)")?;
         return appendIoCall(c, out, t, call.view());
     }
     if (b == bfFileRemove()) {
         var call = Vector<u8>.create();
-        appendBuiltinCall(e, c, n, sources, f, mut call, "nova_file_remove".bytes(), arguments)?;
+        appendBuiltinCall(e, c, n, sources, f, mut call, "ceesafe_file_remove".bytes(), arguments)?;
         return appendIoCall(c, out, t, call.view());
     }
     if (b == bfResourceRead() || b == bfResourceWrite() || b == bfConsoleRead()) {
         var call = Vector<u8>.create();
-        appendText(mut call, if (b == bfResourceWrite()) "nova_fd_write(" else "nova_fd_read(")?;
+        appendText(mut call, if (b == bfResourceWrite()) "ceesafe_fd_write(" else "ceesafe_fd_read(")?;
         var buffer = Vector<u8>.create();
         if (b == bfConsoleRead()) {
             appendText(mut call, "0")?;
@@ -1923,7 +1923,7 @@ fn appendBuiltinRvalue(
         var call = Vector<u8>.create();
         appendBuiltinCall(
             e, c, n, sources, f, mut call,
-            (if (b == bfTcpListen()) "nova_tcp_listen" else "nova_tcp_connect").bytes(), arguments,
+            (if (b == bfTcpListen()) "ceesafe_tcp_listen" else "ceesafe_tcp_connect").bytes(), arguments,
         )?;
         return appendIoCall(c, out, t, call.view());
     }
@@ -1933,8 +1933,8 @@ fn appendBuiltinRvalue(
         appendText(
             mut call,
             if (b ==
-                bfTcpPort()) "nova_tcp_port(*" else if (b ==
-                bfTcpAccept()) "nova_tcp_accept(*" else "nova_tcp_shutdown_write(*",
+                bfTcpPort()) "ceesafe_tcp_port(*" else if (b ==
+                bfTcpAccept()) "ceesafe_tcp_accept(*" else "ceesafe_tcp_shutdown_write(*",
         )?;
         appendBytes(mut call, resource.view())?;
         call.push(')')?;
@@ -1942,12 +1942,12 @@ fn appendBuiltinRvalue(
     }
     if (b == bfIoErrorMessage()) {
         let error = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
-        appendText(out, "nova_io_message((uint32_t)")?;
+        appendText(out, "ceesafe_io_message((uint32_t)")?;
         appendBytes(out, error.view())?;
         return appendText(out, ".tag)");
     }
     if (b == bfArgumentCount()) {
-        return appendText(out, "nova_arg_count()");
+        return appendText(out, "ceesafe_arg_count()");
     }
     if (b == bfPtrAdd() || b == bfPtrSub() || b == bfPtrOffset()) {
         return appendPointerStep(e, c, n, sources, f, out, r);
@@ -1987,10 +1987,10 @@ fn appendBuiltinRvalue(
         return out.push(')');
     }
     if (b == bfSpinHint()) {
-        return appendText(out, "nv_spin_hint()");
+        return appendText(out, "cee_spin_hint()");
     }
     if (b == bfCallerAddress()) {
-        return appendText(out, "nv_caller");
+        return appendText(out, "cee_caller");
     }
     if (b == bfOffsetOf()) {
         let index = match (n.operands[n.at(arguments, 1) as usize]) {
@@ -2046,10 +2046,10 @@ fn appendBuiltinRvalue(
         return out.push(')');
     }
     if (b == bfTargetIsX8664()) {
-        return appendText(out, "nv_target_is_x86_64()");
+        return appendText(out, "cee_target_is_x86_64()");
     }
     if (b == bfTargetIsAArch64()) {
-        return appendText(out, "nv_target_is_aarch64()");
+        return appendText(out, "cee_target_is_aarch64()");
     }
     if (b == bfSlicePtr()) {
         let slice = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
@@ -2063,12 +2063,12 @@ fn appendBuiltinRvalue(
         // The operand is a place or constant, so reading it twice is safe (§22.2).
         let bytes = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
         var view = Vector<u8>.create();
-        appendText(mut view, "((nv_str){ .ptr = ")?;
+        appendText(mut view, "((cee_str){ .ptr = ")?;
         appendBytes(mut view, bytes.view())?;
         appendText(mut view, ".ptr, .len = ")?;
         appendBytes(mut view, bytes.view())?;
         appendText(mut view, ".len })")?;
-        appendText(out, "(nova_utf8_valid(")?;
+        appendText(out, "(ceesafe_utf8_valid(")?;
         appendBytes(out, bytes.view())?;
         appendText(out, ".ptr, ")?;
         appendBytes(out, bytes.view())?;
@@ -2092,7 +2092,7 @@ fn appendBuiltinRvalue(
     if (b == bfProcessRun()) {
         let program = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
         let list = operandText(e, c, n, sources, f, n.at(arguments, 1))?;
-        var call = copyBytes("nova_process_run(".bytes())?;
+        var call = copyBytes("ceesafe_process_run(".bytes())?;
         appendBytes(mut call, program.view())?;
         appendText(mut call, ", ")?;
         appendBytes(mut call, list.view())?;
@@ -2102,7 +2102,7 @@ fn appendBuiltinRvalue(
         return appendIoCall(c, out, t, call.view());
     }
     if (b == bfArgument()) {
-        return appendBuiltinCall(e, c, n, sources, f, out, "nvARG".bytes(), arguments);
+        return appendBuiltinCall(e, c, n, sources, f, out, "ceeARG".bytes(), arguments);
     }
     if (b == bfVectorCreate()) {
         appendText(out, "((")?;
@@ -2115,28 +2115,28 @@ fn appendBuiltinRvalue(
             appendSlotName(c, out, t)?;
             return appendText(
                 out,
-                " *)(void *)&nova_vec_empty, .len = 0u, .cap = 0u, .count = 0u, .free = UINT32_MAX })",
+                " *)(void *)&ceesafe_vec_empty, .len = 0u, .cap = 0u, .count = 0u, .free = UINT32_MAX })",
             );
         }
         appendCTypeName(c, out, c.types.info(c.types.info(t).pointee).element)?;
-        return appendText(out, " *)(void *)&nova_vec_empty, .len = 0u, .cap = 0u })");
+        return appendText(out, " *)(void *)&ceesafe_vec_empty, .len = 0u, .cap = 0u })");
     }
     let receiver = if (arguments.count > 0) c.types.info(argumentType(n, arguments, 0)).pointee else none();
     if (b == bfStableVectorPush()) {
-        return appendHelperCall(e, c, n, sources, f, out, "nvSVP_", receiver, arguments);
+        return appendHelperCall(e, c, n, sources, f, out, "ceeSVP_", receiver, arguments);
     }
     if (b == bfSlotMapInsert()) {
-        return appendHelperCall(e, c, n, sources, f, out, "nvKI_", receiver, arguments);
+        return appendHelperCall(e, c, n, sources, f, out, "ceeKI_", receiver, arguments);
     }
     if (b == bfSlotMapGet()) {
         let mutable = c.types.info(argumentType(n, arguments, 0)).mutableReference;
-        return appendHelperCall(e, c, n, sources, f, out, if (mutable) "nvKM_" else "nvKG_", receiver, arguments);
+        return appendHelperCall(e, c, n, sources, f, out, if (mutable) "ceeKM_" else "ceeKG_", receiver, arguments);
     }
     if (b == bfSlotMapRemove()) {
-        return appendHelperCall(e, c, n, sources, f, out, "nvKR_", receiver, arguments);
+        return appendHelperCall(e, c, n, sources, f, out, "ceeKR_", receiver, arguments);
     }
     if (b == bfSlotMapContains()) {
-        return appendHelperCall(e, c, n, sources, f, out, "nvKV_", receiver, arguments);
+        return appendHelperCall(e, c, n, sources, f, out, "ceeKV_", receiver, arguments);
     }
     if (b == bfSlotMapLength() || b == bfVectorCapacity()) {
         let container = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
@@ -2144,44 +2144,44 @@ fn appendBuiltinRvalue(
         return appendText(out, if (b == bfSlotMapLength()) "->count" else "->cap");
     }
     if (b == bfVectorWithCapacity()) {
-        return appendHelperCall(e, c, n, sources, f, out, "nvVW_", resultOkOf(c, t), arguments);
+        return appendHelperCall(e, c, n, sources, f, out, "ceeVW_", resultOkOf(c, t), arguments);
     }
     if (b == bfVectorPush()) {
-        return appendHelperCall(e, c, n, sources, f, out, "nvVP_", receiver, arguments);
+        return appendHelperCall(e, c, n, sources, f, out, "ceeVP_", receiver, arguments);
     }
     if (b == bfStringAppend()) {
-        return appendHelperCall(e, c, n, sources, f, out, "nvVA_", receiver, arguments);
+        return appendHelperCall(e, c, n, sources, f, out, "ceeVA_", receiver, arguments);
     }
     if (b == bfStringAppendNumber()) {
         // The digits go into a compound literal, which lives to the end of the block, past the call (rt.h).
         let s = operandText(e, c, n, sources, f, n.at(arguments, 0))?;
         let number = operandText(e, c, n, sources, f, n.at(arguments, 1))?;
         let numberType = argumentType(n, arguments, 1);
-        appendText(out, "nvVA_")?;
+        appendText(out, "ceeVA_")?;
         appendMangle(c, out, receiver)?;
         out.push('(')?;
         appendBytes(out, s.view())?;
         appendText(out, ", ")?;
         if (c.types.is(numberType, TypeKind.Float)) {
-            appendText(out, "nova_format_f")?;
+            appendText(out, "ceesafe_format_f")?;
             appendDecimal(out, c.types.info(numberType).bits as u64)?;
             out.push('(')?;
             appendBytes(out, number.view())?;
-            return appendText(out, ", (uint8_t[NV_FLOAT_CHARS]){ 0 }))");
+            return appendText(out, ", (uint8_t[CEE_FLOAT_CHARS]){ 0 }))");
         }
         if (c.types.info(numberType).signed) {
-            appendText(out, "nv_format_i64((int64_t)")?;
+            appendText(out, "cee_format_i64((int64_t)")?;
         } else {
-            appendText(out, "nv_format_u64((uint64_t)")?;
+            appendText(out, "cee_format_u64((uint64_t)")?;
         }
         appendBytes(out, number.view())?;
-        return appendText(out, ", (uint8_t[NV_DIGITS]){ 0 }))");
+        return appendText(out, ", (uint8_t[CEE_DIGITS]){ 0 }))");
     }
     if (b == bfVectorPop()) {
-        return appendHelperCall(e, c, n, sources, f, out, "nvVO_", receiver, arguments);
+        return appendHelperCall(e, c, n, sources, f, out, "ceeVO_", receiver, arguments);
     }
     if (b == bfVectorClear()) {
-        return appendHelperCall(e, c, n, sources, f, out, "nvVC_", receiver, arguments);
+        return appendHelperCall(e, c, n, sources, f, out, "ceeVC_", receiver, arguments);
     }
     if (b == bfBoxCreate()) {
         appendBoxCreateName(c, out, t)?;
@@ -2274,7 +2274,7 @@ fn appendBinary(
         if (index == 3) {
             out.push('!')?;
         }
-        appendText(out, if (c.types.is(operandType, TypeKind.Handle)) "nova_handle_eq(" else "nova_str_eq(")?;
+        appendText(out, if (c.types.is(operandType, TypeKind.Handle)) "ceesafe_handle_eq(" else "ceesafe_str_eq(")?;
         appendBytes(out, l.view())?;
         appendText(out, ", ")?;
         appendBytes(out, r.view())?;
@@ -2320,11 +2320,11 @@ fn appendBinary(
         return appendText(out, "))");
     }
     let helper = match (op) {
-        BinaryOp.Add => "nv_add_",
-        BinaryOp.Subtract => "nv_sub_",
-        BinaryOp.Multiply => "nv_mul_",
-        BinaryOp.Divide => "nv_div_",
-        BinaryOp.Remainder => "nv_rem_",
+        BinaryOp.Add => "cee_add_",
+        BinaryOp.Subtract => "cee_sub_",
+        BinaryOp.Multiply => "cee_mul_",
+        BinaryOp.Divide => "cee_div_",
+        BinaryOp.Remainder => "cee_rem_",
         _ => "",
     };
     if (helper.length > 0) {
@@ -2354,13 +2354,15 @@ fn appendBinary(
         let site = siteText(e, c, n, sources, f, start)?;
         let amountType = n.operandTypes[right as usize];
         let bits = c.types.info(operandType).bits;
-        appendText(out, if (index == 11) "nv_shl_" else "nv_shr_")?;
+        appendText(out, if (index == 11) "cee_shl_" else "cee_shr_")?;
         appendSuffix(c, out, operandType)?;
         out.push('(')?;
         appendBytes(out, l.view())?;
         appendText(
             out,
-            if (c.types.info(amountType).signed) ", nv_shift_amount_s((int64_t)" else ", nv_shift_amount_u((uint64_t)",
+            if (c.types.info(
+                amountType,
+            ).signed) ", cee_shift_amount_s((int64_t)" else ", cee_shift_amount_u((uint64_t)",
         )?;
         appendBytes(out, r.view())?;
         appendText(out, ", ")?;
@@ -2415,7 +2417,7 @@ fn appendOperand(
         NirOperand.String(text) => {
             // String literals are static data, so a view of one never dangles (§22.2).
             let bytes = n.textOf(text);
-            appendText(out, "((nv_str){ .ptr = (const uint8_t *)")?;
+            appendText(out, "((cee_str){ .ptr = (const uint8_t *)")?;
             appendCStringLiteral(out, bytes)?;
             appendText(out, ", .len = ")?;
             appendDecimal(out, bytes.length as u64)?;
@@ -2518,7 +2520,7 @@ fn appendPlaceParts(
                     _ => null,
                 };
                 if (stable != none()) {
-                    appendText(mut next, "(*nvSVE_")?;
+                    appendText(mut next, "(*ceeSVE_")?;
                     appendMangle(c, mut next, stable)?;
                     appendText(mut next, "(&")?;
                     appendBytes(mut next, text.view())?;
@@ -2531,7 +2533,7 @@ fn appendPlaceParts(
                     let huge = constant != null && !constant!.negative && size > 0 &&
                         constant!.magnitude > 0x7FFFFFFFFFFFFFFF / truncate<u64>(size);
                     appendBytes(mut next, text.view())?;
-                    appendText(mut next, if (huge) ".ptr[nv_opaque_index(" else ".ptr[")?;
+                    appendText(mut next, if (huge) ".ptr[cee_opaque_index(" else ".ptr[")?;
                     appendBytes(mut next, index.view())?;
                     appendText(mut next, if (huge) ")]" else "]")?;
                 } else {
@@ -2539,7 +2541,7 @@ fn appendPlaceParts(
                     let past = constant != null && !constant!.negative &&
                         constant!.magnitude >= truncate<u64>(c.types.info(t).arrayLength);
                     appendBytes(mut next, text.view())?;
-                    appendText(mut next, if (past) ".e[nv_opaque_index(" else ".e[")?;
+                    appendText(mut next, if (past) ".e[cee_opaque_index(" else ".e[")?;
                     appendBytes(mut next, index.view())?;
                     appendText(mut next, if (past) ")]" else "]")?;
                 }
@@ -2622,7 +2624,7 @@ fn appendAggregate(
     appendText(out, "((")?;
     appendCTypeName(c, out, t)?;
     if (fields.length == 0) {
-        return appendText(out, "){ .nv_empty = 0 })");
+        return appendText(out, "){ .cee_empty = 0 })");
     }
     appendText(out, "){ ")?;
     // Fields of C state are left to C's zero-filling (§33.2); C array members are assigned after (ADR 0029).

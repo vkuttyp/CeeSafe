@@ -1,0 +1,35 @@
+// What overwriting still may not do (lifetimes.md §5, M11 G3): only a reference may be overwritten while a loan goes
+// through it. A box owns its contents, an owned value its fields, and writing into the referent is a write to it.
+struct Node { value: u64; next: Box<Node>?; }
+fn use(r: borrow u64) { }
+
+fn overwriteBox() {
+    var b = Box.create(Node { value: 1, next: null })!;
+    let r = borrow b.value;
+    b = Box.create(Node { value: 2, next: null })!; // error[N0240]
+    use(r);
+}
+
+fn overwriteOwned() {
+    var n = Node { value: 1, next: null };
+    let r = borrow n.value;
+    n = Node { value: 2, next: null }; // error[N0240]
+    use(r);
+}
+
+fn writeReferent(n: borrow mut Node) {
+    let r = borrow n.value;
+    n.value = 3; // error[N0240]
+    use(r);
+}
+
+fn outlivesIteration() {
+    var kept: borrow u64? = null;
+    for (i in 0..3u64) {
+        let v = i;
+        kept = Some(borrow v);
+    } // error[N0243]
+    match (kept) { Some(r) => { use(r); } null => { } }
+}
+
+fn main() { }

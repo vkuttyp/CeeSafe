@@ -1,0 +1,11 @@
+// A static that nothing uses is still emitted (type-system.md §39), and so is its type, a library struct the program
+// uses nowhere else. Found by the random program generator (M14 K7).
+
+static UNUSED: AtomicU32 = AtomicU32.constant(1);
+static ALSO_UNUSED: AtomicU64 = AtomicU64.constant(2);
+
+fn main() {
+    Console.writeLine(1);
+}
+
+// expect-stdout: 1

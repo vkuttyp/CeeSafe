@@ -1,0 +1,43 @@
+// f32 and f64 (type-system.md §35, M11 G7a): no implicit conversions, the operators floats do not have, lossy `as`,
+// conversion arguments, literal range, and the reserved method names.
+interface Measure { fn bits(borrow this) -> u64; }
+
+impl Measure for f64 {
+    fn bits(borrow this) -> u64 => 0; // error[N0228]
+}
+interface Rounding { fn floor(borrow this) -> f32; }
+
+impl Rounding for f32 {
+    fn floor(borrow this) -> f32 => this.ceil(); // error[N0228]
+}
+
+fn main() {
+    let a: f64 = 1; // error[N0205]
+    let b: i32 = 1.5; // error[N0205]
+    let c: f32 = 1.5;
+    let d: f64 = 2.5;
+    let e = c + d; // error[N0207]
+    let f = d % 2.0; // error[N0207]
+    let g = d & d; // error[N0207]
+    let h = 1e39f32; // error[N0206]
+    let i: i32 = 7;
+    let j = i as f32; // error[N0208]
+    let k = d as i64; // error[N0208]
+    let l = d as f32; // error[N0208]
+    let m = truncate<f32>(d); // error[N0207]
+    let n = round<i32>(d); // error[N0207]
+    let o = checkedTruncate<i32>(i); // error[N0207]
+    let p = saturatingTruncate<i32, u8>(d); // error[N0216]
+    match (d) { _ => { } } // error[N0207]
+    let q = d.bits(1); // error[N0209]
+    let r = f64.fromBits(d); // error[N0205]
+    let s = f64.parse("1.5"); // error[N0200]
+    let t = c < d; // error[N0207]
+    let u = i + 1.0; // error[N0205]
+    let v = d.sqrt(1.0); // error[N0209]
+    let w = d.min(); // error[N0209]
+    let x = c.min(d); // error[N0205]
+    let y = i.sqrt(); // error[N0234]
+    let ok: f32 = 2.0 * c - 0.5;
+    let fine = d.max(1).floor(); // error[N0205]
+}

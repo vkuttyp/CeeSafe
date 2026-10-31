@@ -1,0 +1,49 @@
+// profile: freestanding
+// option: kernel cosmoos
+// option: no-float
+// lib/kernel (ADR 0025): a static spinlock and a static per-CPU counter, built at compile time with CosmoOS's
+// SPINLOCK_INIT (type-system.md §39), used under their guards; a lock in a kernel-heap box; a kernel object.
+struct Table {
+    count: u64;
+}
+
+static TABLE: SpinLock<Table> = SpinLock<Table>.constant("nova.table\0".ptr as *CChar, Table { count: 0 });
+static TICKS: PerCpu<u64> = PerCpu<u64>.constant(0);
+
+@export("kl_bump")
+fn bump() -> u64 {
+    var guard = TABLE.lock();
+    let table = guard.data();
+    table.count += 1;
+    return table.count;
+}
+
+@export("kl_tick")
+fn tick() -> u64 {
+    var mine = TICKS.local(IrqGuard.enter());
+    let value = mine.get();
+    value += 1;
+    return value;
+}
+
+@export("kl_boxed")
+fn boxed() -> u64 {
+    match (SpinLock<u64>.create("nova.boxed\0".ptr as *CChar, 7)) {
+        Ok(lock) => {
+            var guard = lock.lock();
+            return guard.data();
+        }
+        Err(e) => { return 0; }
+    }
+}
+
+@export("kl_object")
+fn object() -> u32 {
+    match (KRef<u64>.create("nova.object\0".ptr as *CChar, 9)) {
+        Ok(first) => {
+            let second = first.clone();
+            return second.count();
+        }
+        Err(e) => { return 0; }
+    }
+}

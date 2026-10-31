@@ -1,0 +1,28 @@
+// Bulk slice operations (type-system.md §16.5): receivers, element types and sources. Loans: slice-bulk-loans.nova.
+
+struct Res { id: i32; drop { } }
+
+fn receivers(s: Slice<u8>, m: SliceMut<u8>, r: SliceMut<Res>, w: Slice<u16>) {
+    s.fill(0); // error[N0211]
+    s.copyFrom(s); // error[N0211]
+    s[0..1].fill(0); // error[N0248]
+    r.fill(Res { id: 1 }); // error[N0259]
+    m.copyFrom(w); // error[N0205]
+    m.fill(true); // error[N0205]
+    m.fill(1, 2); // error[N0209]
+    m.copyFrom(); // error[N0209]
+    m.copy(s); // error[N0200]
+    m.copyFrom(s);
+    m[1..].copyFrom(s[1..]);
+}
+
+fn generic<T>(m: SliceMut<T>, v: T) {
+    m.fill(v); // error[N0259]
+}
+
+fn arrays() {
+    let fixed = [1u8, 2];
+    fixed[..].fill(0); // error[N0248]
+}
+
+fn main() { }

@@ -1,0 +1,62 @@
+// Atomic operations with an ordering (type-system.md §38.3, ADR 0021): each `…With` method on each atomic type, and a
+// value published with a release store and read after an acquire load on the other thread of `Thread.both`.
+
+struct Message {
+    data: AtomicU64;
+    ready: AtomicBool;
+}
+
+fn send(m: borrow Message) {
+    m.data.storeWith(42, StoreOrdering.Relaxed);
+    m.ready.storeWith(true, StoreOrdering.Release);
+}
+
+fn receive(m: borrow Message) -> u64 {
+    while (!m.ready.loadWith(LoadOrdering.Acquire)) {}
+    return m.data.loadWith(LoadOrdering.Relaxed);
+}
+
+fn main() {
+    let a = AtomicU64.create(5);
+    a.storeWith(7, StoreOrdering.Release);
+    Console.writeLine(a.loadWith(LoadOrdering.Acquire));
+    Console.writeLine(a.fetchAddWith(3, Ordering.Relaxed));
+    Console.writeLine(a.fetchSubWith(1, Ordering.Release));
+    Console.writeLine(a.swapWith(1, Ordering.AcquireRelease));
+    match (a.compareExchangeWith(1, 9, Ordering.SequentiallyConsistent)) {
+        Ok(old) => { Console.writeLine(old); }
+        Err(now) => { Console.writeLine(now); }
+    }
+    match (a.compareExchangeWith(1, 2, Ordering.Acquire)) {
+        Ok(old) => { Console.writeLine(old); }
+        Err(now) => { Console.writeLine(now + 100); }
+    }
+
+    let b = AtomicU32.create(1);
+    Console.writeLine(b.fetchAddWith(2, Ordering.AcquireRelease) + b.loadWith(LoadOrdering.SequentiallyConsistent));
+    let c = AtomicUSize.create(10);
+    c.storeWith(c.fetchSubWith(4, Ordering.Relaxed) + 1, StoreOrdering.SequentiallyConsistent);
+    Console.writeLine(c.loadWith(LoadOrdering.Relaxed));
+    let d = AtomicBool.create(false);
+    Console.writeLine(d.swapWith(true, Ordering.Release));
+    Console.writeLine(d.loadWith(LoadOrdering.Acquire));
+
+    let m = Message { data: AtomicU64.create(0), ready: AtomicBool.create(false) };
+    var got: u64 = 0;
+    // The receiver spins, so it is the new thread: the interpreter switches threads only when one blocks or ends
+    // (ADR 0016 §3.8), and the sender, running here, must finish first there.
+    Thread.both(() => { got = receive(borrow m); }, () => { send(borrow m); });
+    Console.writeLine(got);
+}
+
+// expect-stdout: 7
+// expect-stdout: 7
+// expect-stdout: 10
+// expect-stdout: 9
+// expect-stdout: 1
+// expect-stdout: 109
+// expect-stdout: 4
+// expect-stdout: 11
+// expect-stdout: false
+// expect-stdout: true
+// expect-stdout: 42

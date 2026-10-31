@@ -1,0 +1,6 @@
+fn f(n: i32) {
+    let d = n.field; // error[N0234]
+    let e = truncate(n); // error[N0216]
+    let g = f<i32>(n); // error[N0216]
+}
+fn h(x: Std.Int) { } // error[N0216]

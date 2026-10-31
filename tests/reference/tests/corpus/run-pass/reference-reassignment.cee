@@ -1,0 +1,52 @@
+// Overwriting a reference is not a use of what it pointed to (lifetimes.md §5, M11 G3). (Reference locals are `let`:
+// what is overwritten here is an optional reference, and a local made anew in each iteration.)
+struct Node { value: u64; next: Box<Node>?; }
+
+fn nextOf(n: borrow Node) -> borrow Node? {
+    match (borrow n.next) {
+        Some(b) => { return Some(b); }
+        null => { return null; }
+    }
+}
+
+/// A cursor walking a list: `node` is reassigned each iteration while `cursor`, made through it, lives on.
+fn sum(list: borrow Node?) -> u64 {
+    var total: u64 = 0;
+    var cursor = list;
+    while (cursor != null) {
+        let node = cursor!;
+        total += node.value;
+        match (borrow node.next) {
+            Some(next) => { cursor = Some(next); }
+            null => { cursor = null; }
+        }
+    }
+    return total;
+}
+
+/// F1 (milestone-9.md): a temporary reassigned in each iteration while the reference made through it is kept.
+struct Link<region r> { value: u64; previous: borrow(r) Link<r>?; }
+
+fn build<region r>(arena: borrow(r) Arena) -> borrow(r) Link<r>? {
+    var last: borrow(r) Link<r>? = null;
+    for (i in 1..4u64) { last = Some(arena.alloc(Link { value: i, previous: last })!); }
+    return last;
+}
+
+fn chain<region r>(start: borrow(r) Link<r>?) -> u64 {
+    match (start) {
+        Some(l) => { return l.value * 10 + chain(l.previous); }
+        null => { return 0; }
+    }
+}
+
+fn main() {
+    let tail = Box.create(Node { value: 3, next: null })!;
+    let middle = Box.create(Node { value: 2, next: Some(tail) })!;
+    let head = Node { value: 1, next: Some(middle) };
+    Console.writeLine(sum(Some(borrow head)));
+    let arena = Arena.create(SystemHeap {}, 1024u64);
+    Console.writeLine(chain(build(borrow arena)));
+}
+// expect-stdout: 6
+// expect-stdout: 60

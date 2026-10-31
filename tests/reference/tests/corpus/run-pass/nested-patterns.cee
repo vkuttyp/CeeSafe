@@ -1,0 +1,116 @@
+// Nested patterns (type-system.md §15.2, M11 G1): arms tried in order, nested patterns tested left to right and
+// depth first, bindings by copy, by reference or by move (§18.4).
+
+enum Shape { Circle(u32), Rect(u32, u32), Empty }
+enum ParseError { Empty, BadDigit(u8) }
+
+struct Res { id: u32; drop { Console.write("drop "); Console.writeLine(this.id); } }
+enum Slot { Full(Res), Spare }
+
+fn describe(r: Result<Shape, ParseError>) -> u32 {
+    match (r) {
+        Ok(Shape.Circle(0)) => { return 100; }                    // a literal inside a payload
+        Ok(Shape.Circle(radius)) => { return radius; }            // the earlier arm did not match: falls through here
+        Ok(Shape.Rect(1, h)) => { return 200 + h; }
+        Ok(Shape.Rect(w, 1)) => { return 300 + w; }
+        Ok(Shape.Rect(w, h)) => { return w * h; }
+        Ok(Shape.Empty) => { return 0; }
+        Err(ParseError.BadDigit(c)) => { return 1000 + c as u32; }
+        Err(ParseError.Empty) => { return 999; }
+    }
+}
+
+fn flags(o: bool??) -> u32 {
+    match (o) {
+        Some(Some(true)) => { return 1; }
+        Some(Some(false)) => { return 2; }
+        Some(null) => { return 3; }
+        null => { return 4; }
+    }
+}
+
+fn deep(o: Result<u32?, u8>?) -> u32 {
+    match (o) {
+        Some(Ok(Some(var x))) => { x += 1; return x; }            // a mutable binding, three levels down
+        Some(Ok(null)) => { return 0; }
+        Some(Err(_)) => { return 7; }
+        null => { return 8; }
+    }
+}
+
+/// On a reference, nested bindings are references into the scrutinee.
+fn area(s: borrow Result<Shape, ParseError>) -> u32 {
+    match (s) {
+        Ok(Shape.Rect(w, h)) => { return w * h; }
+        _ => { return 0; }
+    }
+}
+
+/// A consuming match moves the box out of two levels of payload; the other arms' values are destroyed.
+fn take(r: Result<Slot, u32>) -> u32 {
+    match (r) {
+        Ok(Slot.Full(res)) => { let id = res.id; Console.write("took "); Console.writeLine(id); return id; }
+        Ok(Slot.Spare) => { return 0; }
+        Err(code) => { return code; }
+    }
+}
+
+/// A Copy payload with a nested pattern inside a consuming match: its bindings are copies.
+fn mixed(r: Result<Slot, Shape>) -> u32 {
+    match (r) {
+        Err(Shape.Circle(radius)) => { return radius; }
+        Ok(Slot.Full(res)) => { return res.id; }
+        _ => { return 0; }
+    }
+}
+
+fn main() {
+    Console.writeLine(describe(Ok(Shape.Circle(0))));
+    Console.writeLine(describe(Ok(Shape.Circle(5))));
+    Console.writeLine(describe(Ok(Shape.Rect(1, 9))));
+    Console.writeLine(describe(Ok(Shape.Rect(4, 1))));
+    Console.writeLine(describe(Ok(Shape.Rect(3, 4))));
+    Console.writeLine(describe(Ok(Shape.Empty)));
+    Console.writeLine(describe(Err(ParseError.BadDigit(65))));
+    Console.writeLine(describe(Err(ParseError.Empty)));
+    Console.writeLine(flags(Some(Some(true))));
+    Console.writeLine(flags(Some(Some(false))));
+    Console.writeLine(flags(Some(null)));
+    Console.writeLine(flags(null));
+    Console.writeLine(deep(Some(Ok(Some(41)))));
+    Console.writeLine(deep(Some(Ok(null))));
+    Console.writeLine(deep(Some(Err(2))));
+    Console.writeLine(deep(null));
+    let rect: Result<Shape, ParseError> = Ok(Shape.Rect(6, 7));
+    Console.writeLine(area(borrow rect));
+    Console.writeLine(take(Ok(Slot.Full(Res { id: 11 }))));
+    Console.writeLine(take(Ok(Slot.Spare)));
+    Console.writeLine(take(Err(5)));
+    Console.writeLine(mixed(Err(Shape.Circle(12))));
+    Console.writeLine(mixed(Ok(Slot.Full(Res { id: 13 }))));
+}
+// expect-stdout: 100
+// expect-stdout: 5
+// expect-stdout: 209
+// expect-stdout: 304
+// expect-stdout: 12
+// expect-stdout: 0
+// expect-stdout: 1065
+// expect-stdout: 999
+// expect-stdout: 1
+// expect-stdout: 2
+// expect-stdout: 3
+// expect-stdout: 4
+// expect-stdout: 42
+// expect-stdout: 0
+// expect-stdout: 7
+// expect-stdout: 8
+// expect-stdout: 42
+// expect-stdout: took 11
+// expect-stdout: drop 11
+// expect-stdout: 11
+// expect-stdout: 0
+// expect-stdout: 5
+// expect-stdout: 12
+// expect-stdout: drop 13
+// expect-stdout: 13

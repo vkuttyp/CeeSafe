@@ -1,0 +1,15 @@
+// M15 S4 (#4): `truncate`'s argument is evaluated before the vector's mutable loan starts (two-phase, type-system.md
+// §23.1), as for `push`, so it may read the vector itself.
+// expect-stdout: 2
+// expect-stdout: 0
+
+fn main() {
+    var v = Vector<u32>.create();
+    v.push(1)!;
+    v.push(2)!;
+    v.push(truncate<u32>(v.length))!;
+    v.truncate(v.length - 1);
+    Console.writeLine(v.length);
+    v.truncate(v.length - v.length);
+    Console.writeLine(v.length);
+}

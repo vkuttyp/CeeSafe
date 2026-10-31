@@ -1,0 +1,7 @@
+// profile: freestanding
+// Threads need the hosted runtime (type-system.md §38.5): N0293 in a freestanding build.
+
+fn start() -> u64 {
+    let t = Thread.spawn(move () => 1u64)!; // error[N0293]
+    return 0;
+}

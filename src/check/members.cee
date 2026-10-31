@@ -117,7 +117,7 @@ fn synthStructLiteral(
         appendQuotedName(mut message, c, nameIdent.symbol)?;
         appendText(
             mut message,
-            " is a C type imported from a header: Nova cannot make one, only point to one (type-system.md §31.2)",
+            " is a C type imported from a header: CeeSafe cannot make one, only point to one (type-system.md §31.2)",
         )?;
         c.error(importedTypeByValue(), nameSpan.start, nameSpan.end, message)?;
         for (k in 0..fields.count) {

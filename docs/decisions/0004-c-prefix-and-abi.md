@@ -1,6 +1,8 @@
 # Decision 0004 — The C prefix and ABI version
 
 - Status: **Accepted** by the owner, 2026-10-30 ("Go with option 2, switch the prefix at P8"). Proposed at P7 S4.
+  The names were confirmed on 2026-10-31 ("cee_ as proposed") and switched at P8 S7 (`docs/fork-point.md`), with the
+  ABI version and the link-collision test (`tools/link_collision.py`).
 - Relates to: ROADMAP §P7's third item ("Switch to the approved CeeSafe C prefix and ABI version, keeping a versioned
   legacy mode with link-collision tests"), Decision 0003 (Nova and CeeSafe in parallel; CeeSafe tracks Nova until P8).
 

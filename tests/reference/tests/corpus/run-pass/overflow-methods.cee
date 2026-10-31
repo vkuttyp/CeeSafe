@@ -1,0 +1,156 @@
+// Explicit overflow behaviour (type-system.md §6, M11 G4b): wrapping, checked and saturating arithmetic on every
+// integer width and signedness, at and past both bounds; none of them panics.
+
+fn showOption(x: i64?) {
+    match (x) {
+        Some(v) => { Console.writeLine(v); }
+        null => { Console.writeLine("null"); }
+    }
+}
+
+fn showU(x: u64?) {
+    match (x) {
+        Some(v) => { Console.writeLine(v); }
+        null => { Console.writeLine("null"); }
+    }
+}
+
+fn wrapping() {
+    let a: u8 = 200;
+    Console.writeLine(a.wrappingAdd(100));        // 44
+    Console.writeLine(a.wrappingSub(201));        // 255
+    Console.writeLine(a.wrappingMul(2));          // 144
+    let b: i8 = 127;
+    Console.writeLine(b.wrappingAdd(1));          // -128
+    let c: i8 = -128;
+    Console.writeLine(c.wrappingSub(1));          // 127
+    Console.writeLine(c.wrappingMul(-1));         // -128
+    let d: u16 = 65535;
+    Console.writeLine(d.wrappingMul(d));          // 1
+    let e: i32 = 65536;
+    Console.writeLine(e.wrappingMul(e));          // 0
+    let f: u64 = 0;
+    Console.writeLine(f.wrappingSub(1));          // 18446744073709551615
+    let g: i64 = 9223372036854775807;
+    Console.writeLine(g.wrappingAdd(1));          // -9223372036854775808
+    let h: u32 = 4000000000;
+    Console.writeLine(h.wrappingAdd(h));          // 3705032704
+}
+
+/// A hash in the FNV-1a style: the one place wrapping is meant (no overflow check, no panic).
+fn hash(text: Slice<u8>) -> u32 {
+    var h: u32 = 2166136261;
+    for (byte in text) {
+        h = (h ^ (byte as u32)).wrappingMul(16777619);
+    }
+    return h;
+}
+
+fn checked() {
+    let a: u8 = 250;
+    let sum = a.checkedAdd(5);
+    match (sum) {
+        Some(v) => { Console.writeLine(v); }      // 255
+        null => { Console.writeLine("null"); }
+    }
+    match (a.checkedAdd(6)) {
+        Some(v) => { Console.writeLine(v); }
+        null => { Console.writeLine("null"); }    // null
+    }
+    let b: i16 = -32768;
+    match (b.checkedSub(1)) {
+        Some(v) => { Console.writeLine(v); }
+        null => { Console.writeLine("null"); }    // null
+    }
+    match (b.checkedMul(-1)) {
+        Some(v) => { Console.writeLine(v); }
+        null => { Console.writeLine("null"); }    // null
+    }
+    let c: i64 = -3;
+    showOption(c.checkedMul(4));                  // -12
+    let min: i64 = -9223372036854775807 - 1;
+    showOption(min.checkedMul(-1));               // null
+    showOption(min.checkedAdd(-1));               // null
+    showOption(min.checkedSub(-1));               // -9223372036854775807
+    let d: u64 = 4294967296;
+    showU(d.checkedMul(d));                       // null
+    showU(d.checkedMul(4294967295));              // 18446744069414584320
+    let z: u64 = 3;
+    showU(z.checkedSub(4));                       // null
+    let e: u32 = 7;
+    let f = e.checkedSub(7)!;                     // 0, unwrapped
+    Console.writeLine(f);
+    e.checkedAdd(1);                              // discarded: nothing happens
+}
+
+fn saturating() {
+    let a: u8 = 250;
+    Console.writeLine(a.saturatingAdd(10));       // 255
+    Console.writeLine(a.saturatingSub(251));      // 0
+    Console.writeLine(a.saturatingMul(2));        // 255
+    let b: i8 = 100;
+    Console.writeLine(b.saturatingAdd(100));      // 127
+    Console.writeLine(b.saturatingAdd(-100));     // 0
+    let c: i8 = -100;
+    Console.writeLine(c.saturatingAdd(-100));     // -128
+    Console.writeLine(c.saturatingSub(100));      // -128
+    Console.writeLine(c.saturatingSub(-100));     // 0
+    Console.writeLine(b.saturatingSub(-100));     // 127
+    Console.writeLine(c.saturatingMul(2));        // -128
+    Console.writeLine(c.saturatingMul(-2));       // 127
+    let min: i64 = -9223372036854775807 - 1;
+    Console.writeLine(min.saturatingMul(-1));     // 9223372036854775807
+    Console.writeLine(min.saturatingSub(1));      // -9223372036854775808
+    let d: u64 = 18446744073709551615;
+    Console.writeLine(d.saturatingMul(d));        // 18446744073709551615
+    Console.writeLine(d.saturatingAdd(1));        // 18446744073709551615
+    let e: i32 = 5;
+    Console.writeLine(e.saturatingSub(7));        // -2: in range, the exact result
+}
+
+fn main() {
+    wrapping();
+    Console.writeLine(hash("nova".bytes()));
+    checked();
+    saturating();
+}
+// expect-stdout: 44
+// expect-stdout: 255
+// expect-stdout: 144
+// expect-stdout: -128
+// expect-stdout: 127
+// expect-stdout: -128
+// expect-stdout: 1
+// expect-stdout: 0
+// expect-stdout: 18446744073709551615
+// expect-stdout: -9223372036854775808
+// expect-stdout: 3705032704
+// expect-stdout: 2173952735
+// expect-stdout: 255
+// expect-stdout: null
+// expect-stdout: null
+// expect-stdout: null
+// expect-stdout: -12
+// expect-stdout: null
+// expect-stdout: null
+// expect-stdout: -9223372036854775807
+// expect-stdout: null
+// expect-stdout: 18446744069414584320
+// expect-stdout: null
+// expect-stdout: 0
+// expect-stdout: 255
+// expect-stdout: 0
+// expect-stdout: 255
+// expect-stdout: 127
+// expect-stdout: 0
+// expect-stdout: -128
+// expect-stdout: -128
+// expect-stdout: 0
+// expect-stdout: 127
+// expect-stdout: -128
+// expect-stdout: 127
+// expect-stdout: 9223372036854775807
+// expect-stdout: -9223372036854775808
+// expect-stdout: 18446744073709551615
+// expect-stdout: 18446744073709551615
+// expect-stdout: -2

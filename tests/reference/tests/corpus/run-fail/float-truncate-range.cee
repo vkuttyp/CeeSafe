@@ -1,0 +1,9 @@
+// truncate<T> panics when the value rounded toward zero does not fit T (type-system.md §35.4): 2^31 is one past i32.
+fn main() {
+    let fits = truncate<i32>(2147483647.9);
+    Console.writeLine(fits);
+    let x: f64 = 2147483648.0;
+    let n = truncate<i32>(x); // expect-panic: float out of range
+    Console.writeLine(n);
+}
+// expect-stdout: 2147483647

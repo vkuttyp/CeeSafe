@@ -1,0 +1,41 @@
+// binary-trees (benchmarks/suite/README.md): the Benchmarks Game's, one heap allocation per node.
+struct Node { left: Box<Node>?; right: Box<Node>?; }
+
+fn make(depth: u32) -> Box<Node> {
+    if (depth == 0) { return Box.create(Node { left: null, right: null })!; }
+    return Box.create(Node { left: Some(make(depth - 1)), right: Some(make(depth - 1)) })!;
+}
+
+fn check(n: borrow Node) -> u64 {
+    match (borrow n.left) {
+        Some(l) => {
+            match (borrow n.right) {
+                Some(r) => { return 1 + check(l) + check(r); }
+                null => { return 1 + check(l); }
+            }
+        }
+        null => { return 1; }
+    }
+}
+
+fn main() -> i32 {
+    let max: u32 = 17;
+    var total: u64 = 0;
+    {
+        let stretch = make(max + 1);
+        total += check(stretch);
+    }
+    let lived = make(max);
+    var d: u32 = 4;
+    while (d <= max) {
+        let iterations: u64 = 1u64 << (max - d + 4);
+        for (i in 0..iterations) {
+            let t = make(d);
+            total += check(t);
+        }
+        d += 2;
+    }
+    total += check(lived);
+    Console.writeLine(total);
+    return 0;
+}

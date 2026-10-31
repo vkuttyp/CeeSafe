@@ -1,0 +1,5 @@
+// Parenthesised types (grammar.md §2, M11 G6): a reference to an optional, an optional reference, and source lists.
+fn a(o: borrow (i32?), p: borrow i32?, q: (borrow i32)?, r: borrow mut (Box<Node>?)) { }
+fn b(x: borrow i32, y: borrow (i32?)) -> borrow(x) i32 => x;
+fn c(x: borrow (i32?), y: borrow i32) -> borrow(x) (i32?) => x;
+fn d(x: (i32)) -> ((i32?)) => x;

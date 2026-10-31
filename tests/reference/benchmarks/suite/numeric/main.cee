@@ -1,0 +1,36 @@
+// numeric (benchmarks/suite/README.md): a sieve and an integer matrix product.
+const LIMIT: usize = 40000000;
+const M: usize = 320;
+
+fn main() -> i32 {
+    var composite = Vector<u8>.withCapacity(LIMIT + 1)!;
+    for (i in 0..LIMIT + 1) { composite.push(0)!; }
+    var primes: u64 = 0;
+    for (i in 2..LIMIT + 1) {
+        if (composite[i] != 0) { continue; }
+        primes += 1;
+        var j = i * i;
+        while (j <= LIMIT) {
+            composite[j] = 1;
+            j += i;
+        }
+    }
+    var a = Vector<u64>.withCapacity(M * M)!;
+    var b = Vector<u64>.withCapacity(M * M)!;
+    for (i in 0..M) {
+        for (j in 0..M) {
+            a.push((i * j % 100) as u64)!;
+            b.push(((i + j) % 100) as u64)!;
+        }
+    }
+    var product: u64 = 0;
+    for (i in 0..M) {
+        for (j in 0..M) {
+            var c: u64 = 0;
+            for (k in 0..M) { c += a[i * M + k] * b[k * M + j]; }
+            product += c;
+        }
+    }
+    Console.writeLine(primes * 1000000 + product % 1000000);
+    return 0;
+}

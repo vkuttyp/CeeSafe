@@ -1,0 +1,12 @@
+// profile: freestanding
+// option: kernel cosmoos
+// option: no-float
+// M14 K1's acceptance (ADR 0025): a per-CPU loan owns its interrupt guard, so one guard cannot lend twice.
+static TICKS: PerCpu<u64> = PerCpu<u64>.constant(0);
+
+fn guardReused() -> u64 {
+    let irq = IrqGuard.enter();
+    var first = TICKS.local(irq);
+    var second = TICKS.local(irq); // error[N0250]
+    return 0;
+}

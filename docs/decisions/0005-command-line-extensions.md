@@ -1,6 +1,7 @@
 # Decision 0005 — Which files the command line reads
 
-- Status: **Proposed** at P8 S6 (2026-10-31), for the owner to accept.
+- Status: **Accepted** by the owner, 2026-10-31 ("Only .cee/.c at the fork"); proposed at P8 S6. Implemented at S7
+  (`requireSourceName` in `src/main.cee`; `docs/fork-point.md`).
 - Relates to: Decision 0003 §2 ("Whether ceesafec later accepts only `.cee` files is P8's to decide, with the command
   line"), Decision 0004 (the C prefix switches at the fork point), `docs/p8-plan.md` S6 and S7.
 
@@ -35,5 +36,6 @@ the C prefix, with the corpus renamed in the same slice. The message would be th
 
 ## Consequences
 
-- S6 changes nothing on the command line; S7 gains this item beside the prefix switch.
+- S6 changed nothing on the command line; S7 made the switch, with CeeSafe's corpus (`tests/reference/`, written by
+  `tools/fork_corpus.py`) and the comparison tools giving ceesafec `.cee` names.
 - Until then, the help text keeps saying `<file.cee>`, which is what CeeSafe's users should write.

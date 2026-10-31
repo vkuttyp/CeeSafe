@@ -1,0 +1,11 @@
+// heap-alloc (benchmarks/suite/README.md): the same array, on the heap each time.
+fn main() -> i32 {
+    var sum: u64 = 0;
+    for (i in 0..10000000u64) {
+        var a = Box.create([0u64; 32])!;
+        for (j in 0..32usize) { a[j] = (i + j as u64) % 1000; }
+        for (j in 0..32usize) { sum += a[j]; }
+    }
+    Console.writeLine(sum);
+    return 0;
+}

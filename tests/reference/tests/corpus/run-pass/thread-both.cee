@@ -1,0 +1,81 @@
+// Fork-join threads (type-system.md §38.6, ADR 0018): `Thread.both(a, b)` runs `a` on a new thread and `b` here, and
+// returns once both have finished, so the closures may borrow the caller's data: the halves of a slice read in
+// parallel, the halves of a buffer changed in parallel (`splitAtMut`), a `Mutex` both lock, an `fn()` value, and
+// recursion to four threads.
+
+fn sum(values: Slice<u64>) -> u64 {
+    var total: u64 = 0;
+    for (v in values) {
+        total = total + v;
+    }
+    return total;
+}
+
+// Four threads: each half split again.
+fn parallelSum(values: Slice<u64>, depth: u32) -> u64 {
+    if (depth == 0 || values.length < 2) {
+        return sum(values);
+    }
+    let halves = values.splitAt(values.length / 2);
+    var low: u64 = 0;
+    var high: u64 = 0;
+    Thread.both(() => { low = parallelSum(halves.left, depth - 1); }, () => { high = parallelSum(halves.right, depth - 1); });
+    return low + high;
+}
+
+fn double(values: SliceMut<u64>) {
+    for (i in 0..values.length) {
+        values[i] = values[i] * 2;
+    }
+}
+
+fn nothing() {}
+
+struct Counter {
+    n: u64;
+}
+
+fn main() {
+    var values: [u64; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+
+    // The two halves read on two threads.
+    let halves = values[..].splitAt(4);
+    var low: u64 = 0;
+    var high: u64 = 0;
+    Thread.both(() => { low = sum(halves.left); }, () => { high = sum(halves.right); });
+    Console.writeLine(low);
+    Console.writeLine(high);
+
+    // The two halves changed on two threads.
+    let parts = values[..].splitAtMut(4);
+    Thread.both(() => { double(parts.left); }, () => { double(parts.right); });
+    Console.writeLine(sum(values[..]));
+
+    // Recursion: four threads.
+    Console.writeLine(parallelSum(values[..], 2));
+
+    // A Mutex both lock (Share), and an fn() value.
+    let total = Mutex<Counter>.create(Counter { n: 0 })!;
+    Thread.both(() => {
+        var guard = total.lock();
+        let counter = guard.data();
+        counter.n += 10;
+    }, () => {
+        var guard = total.lock();
+        let counter = guard.data();
+        counter.n += 32;
+    });
+    Thread.both(nothing, () => {
+        var guard = total.lock();
+        let counter = guard.data();
+        counter.n += 100;
+    });
+    var guard = total.lock();
+    Console.writeLine(guard.data().n);
+}
+
+// expect-stdout: 10
+// expect-stdout: 26
+// expect-stdout: 72
+// expect-stdout: 72
+// expect-stdout: 142

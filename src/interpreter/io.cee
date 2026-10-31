@@ -604,7 +604,7 @@ fn hostOut(
 
 fn hostService(it: borrow mut Interp, name: Slice<u8>, arguments: borrow Vector<Value>) -> Result<Value, Stop> {
     requireHostIo(it)?;
-    if (sameText(name, "nova_host_env")) {
+    if (sameText(name, "ceesafe_host_env")) {
         let key = hostBytes(it, arguments, 0, 1)?;
         var bad = key.length >= 4096;
         for (b in key.view()) {
@@ -624,7 +624,7 @@ fn hostService(it: borrow mut Interp, name: Slice<u8>, arguments: borrow Vector<
             null => { return Ok(hostResult(0)); }
         }
     }
-    if (sameText(name, "nova_host_path_kind")) {
+    if (sameText(name, "ceesafe_host_path_kind")) {
         let path = match (hostPath(it, arguments, 0, 1)?) {
             Some(p) => p,
             null => { return Ok(hostFailure(errnoInvalid())); }
@@ -639,19 +639,19 @@ fn hostService(it: borrow mut Interp, name: Slice<u8>, arguments: borrow Vector<
         };
         return Ok(hostResult(kind));
     }
-    if (sameText(name, "nova_host_dir_create") || sameText(name, "nova_host_dir_remove")) {
+    if (sameText(name, "ceesafe_host_dir_create") || sameText(name, "ceesafe_host_dir_remove")) {
         let path = match (hostPath(it, arguments, 0, 1)?) {
             Some(p) => p,
             null => { return Ok(hostFailure(errnoInvalid())); }
         };
         let text = StringView.fromUtf8(path.view())!;
-        let done = if (sameText(name, "nova_host_dir_create")) Directory.create(text) else Directory.remove(text);
+        let done = if (sameText(name, "ceesafe_host_dir_create")) Directory.create(text) else Directory.remove(text);
         return match (done) {
             Ok() => Ok(hostResult(0)),
             Err(e) => Ok(hostFailure(errnoOf(e))),
         };
     }
-    if (sameText(name, "nova_host_dir_open")) {
+    if (sameText(name, "ceesafe_host_dir_open")) {
         let path = hostPath(it, arguments, 0, 1)?;
         var error: i64 = 0;
         var names = Vector<Vector<u8>>.create();
@@ -679,7 +679,7 @@ fn hostService(it: borrow mut Interp, name: Slice<u8>, arguments: borrow Vector<
         it.runtime.listingNext.push(0)!;
         return Ok(hostResult(truncate<i64>(listing)));
     }
-    if (sameText(name, "nova_host_dir_next") || sameText(name, "nova_host_dir_close")) {
+    if (sameText(name, "ceesafe_host_dir_next") || sameText(name, "ceesafe_host_dir_close")) {
         let listing = arguments[0].bits(0, 8)?;
         var index = it.runtime.listingAddresses.length;
         for (k in 0..it.runtime.listingAddresses.length) {
@@ -690,7 +690,7 @@ fn hostService(it: borrow mut Interp, name: Slice<u8>, arguments: borrow Vector<
         if (index == it.runtime.listingAddresses.length) {
             return Err(addressMessage("a directory listing that is not open (", listing, ")"));
         }
-        if (sameText(name, "nova_host_dir_close")) {
+        if (sameText(name, "ceesafe_host_dir_close")) {
             it.runtime.listingAddresses[index] = 0;
             return Ok(hostResult(0));
         }
@@ -705,13 +705,13 @@ fn hostService(it: borrow mut Interp, name: Slice<u8>, arguments: borrow Vector<
         it.memory.storeBits(arguments[2].bits(0, 8)?, entry.length as u64, 8)?;
         return Ok(hostResult(1));
     }
-    if (sameText(name, "nova_host_temporary")) {
+    if (sameText(name, "ceesafe_host_temporary")) {
         return match (Directory.temporary()) {
             Ok(path) => hostOut(it, arguments, path.view().bytes(), 0, 1),
             Err(e) => Ok(hostFailure(errnoOf(e))),
         };
     }
-    if (sameText(name, "nova_host_current")) {
+    if (sameText(name, "ceesafe_host_current")) {
         if (it.options.workingDirectory.length > 0) {
             let directory = copyBytes(it.options.workingDirectory.view())!;
             return hostOut(it, arguments, directory.view(), 0, 1);
@@ -800,109 +800,109 @@ fn cLibraryShape(name: Slice<u8>) -> StringView? {
     if (sameText(name, "free")) {
         return "P:-";
     }
-    if (sameText(name, "nova_host_env")) {
+    if (sameText(name, "ceesafe_host_env")) {
         return "PsPP:l";
     }
-    if (sameText(name, "nova_host_path_kind")) {
+    if (sameText(name, "ceesafe_host_path_kind")) {
         return "Ps:l";
     }
-    if (sameText(name, "nova_host_dir_create")) {
+    if (sameText(name, "ceesafe_host_dir_create")) {
         return "Ps:l";
     }
-    if (sameText(name, "nova_host_dir_remove")) {
+    if (sameText(name, "ceesafe_host_dir_remove")) {
         return "Ps:l";
     }
-    if (sameText(name, "nova_host_dir_open")) {
+    if (sameText(name, "ceesafe_host_dir_open")) {
         return "PsP:P";
     }
-    if (sameText(name, "nova_host_dir_next")) {
+    if (sameText(name, "ceesafe_host_dir_next")) {
         return "PPP:l";
     }
-    if (sameText(name, "nova_host_dir_close")) {
+    if (sameText(name, "ceesafe_host_dir_close")) {
         return "P:-";
     }
-    if (sameText(name, "nova_host_temporary")) {
+    if (sameText(name, "ceesafe_host_temporary")) {
         return "Ps:l";
     }
-    if (sameText(name, "nova_host_current")) {
+    if (sameText(name, "ceesafe_host_current")) {
         return "Ps:l";
     }
-    if (sameText(name, "nova_host_spawn")) {
+    if (sameText(name, "ceesafe_host_spawn")) {
         return "PsPsPsPs:l";
     }
-    if (sameText(name, "nova_io_kind")) {
+    if (sameText(name, "ceesafe_io_kind")) {
         return "i:u";
     }
-    if (sameText(name, "nova_mutex_create")) {
+    if (sameText(name, "ceesafe_mutex_create")) {
         return ":P";
     }
-    if (sameText(name, "nova_mutex_lock")) {
+    if (sameText(name, "ceesafe_mutex_lock")) {
         return "P:-";
     }
-    if (sameText(name, "nova_mutex_unlock")) {
+    if (sameText(name, "ceesafe_mutex_unlock")) {
         return "P:-";
     }
-    if (sameText(name, "nova_mutex_destroy")) {
+    if (sameText(name, "ceesafe_mutex_destroy")) {
         return "P:-";
     }
-    if (sameText(name, "nova_atomic_load_u64")) {
+    if (sameText(name, "ceesafe_atomic_load_u64")) {
         return "P:s";
     }
-    if (sameText(name, "nova_atomic_store_u64")) {
+    if (sameText(name, "ceesafe_atomic_store_u64")) {
         return "Ps:-";
     }
-    if (sameText(name, "nova_atomic_swap_u64")) {
+    if (sameText(name, "ceesafe_atomic_swap_u64")) {
         return "Ps:s";
     }
-    if (sameText(name, "nova_atomic_cas_u64")) {
+    if (sameText(name, "ceesafe_atomic_cas_u64")) {
         return "Pss:s";
     }
-    if (sameText(name, "nova_atomic_add_u64")) {
+    if (sameText(name, "ceesafe_atomic_add_u64")) {
         return "Ps:s";
     }
-    if (sameText(name, "nova_atomic_load_u32")) {
+    if (sameText(name, "ceesafe_atomic_load_u32")) {
         return "P:u";
     }
-    if (sameText(name, "nova_atomic_store_u32")) {
+    if (sameText(name, "ceesafe_atomic_store_u32")) {
         return "Pu:-";
     }
-    if (sameText(name, "nova_atomic_swap_u32")) {
+    if (sameText(name, "ceesafe_atomic_swap_u32")) {
         return "Pu:u";
     }
-    if (sameText(name, "nova_atomic_cas_u32")) {
+    if (sameText(name, "ceesafe_atomic_cas_u32")) {
         return "Puu:u";
     }
-    if (sameText(name, "nova_atomic_add_u32")) {
+    if (sameText(name, "ceesafe_atomic_add_u32")) {
         return "Pu:u";
     }
-    if (sameText(name, "nova_atomic_load_ord_u64")) {
+    if (sameText(name, "ceesafe_atomic_load_ord_u64")) {
         return "Pi:s";
     }
-    if (sameText(name, "nova_atomic_store_ord_u64")) {
+    if (sameText(name, "ceesafe_atomic_store_ord_u64")) {
         return "Psi:-";
     }
-    if (sameText(name, "nova_atomic_swap_ord_u64")) {
+    if (sameText(name, "ceesafe_atomic_swap_ord_u64")) {
         return "Psi:s";
     }
-    if (sameText(name, "nova_atomic_cas_ord_u64")) {
+    if (sameText(name, "ceesafe_atomic_cas_ord_u64")) {
         return "Pssi:s";
     }
-    if (sameText(name, "nova_atomic_add_ord_u64")) {
+    if (sameText(name, "ceesafe_atomic_add_ord_u64")) {
         return "Psi:s";
     }
-    if (sameText(name, "nova_atomic_load_ord_u32")) {
+    if (sameText(name, "ceesafe_atomic_load_ord_u32")) {
         return "Pi:u";
     }
-    if (sameText(name, "nova_atomic_store_ord_u32")) {
+    if (sameText(name, "ceesafe_atomic_store_ord_u32")) {
         return "Pui:-";
     }
-    if (sameText(name, "nova_atomic_swap_ord_u32")) {
+    if (sameText(name, "ceesafe_atomic_swap_ord_u32")) {
         return "Pui:u";
     }
-    if (sameText(name, "nova_atomic_cas_ord_u32")) {
+    if (sameText(name, "ceesafe_atomic_cas_ord_u32")) {
         return "Puui:u";
     }
-    if (sameText(name, "nova_atomic_add_ord_u32")) {
+    if (sameText(name, "ceesafe_atomic_add_ord_u32")) {
         return "Pui:u";
     }
     return null;
@@ -1041,14 +1041,14 @@ fn callC(
         }
         return Ok(valueOf(to, 8));
     }
-    if (sameText(n0, "nova_mutex_create")) {
+    if (sameText(n0, "ceesafe_mutex_create")) {
         return Ok(valueOf(mutexCreate(it)?, 8));
     }
-    if (sameText(n0, "nova_mutex_lock")) {
+    if (sameText(n0, "ceesafe_mutex_lock")) {
         mutexLock(it, c, n, arguments[0].bits(0, 8)?)?;
         return Ok(null);
     }
-    if (sameText(n0, "nova_mutex_unlock")) {
+    if (sameText(n0, "ceesafe_mutex_unlock")) {
         let address = arguments[0].bits(0, 8)?;
         for (k in 0..it.runtime.mutexAddresses.length) {
             if (it.runtime.mutexAddresses[k] == address) {
@@ -1057,7 +1057,7 @@ fn callC(
         }
         return Ok(null);
     }
-    if (sameText(n0, "nova_mutex_destroy")) {
+    if (sameText(n0, "ceesafe_mutex_destroy")) {
         let address = arguments[0].bits(0, 8)?;
         for (k in 0..it.runtime.mutexAddresses.length) {
             if (it.runtime.mutexAddresses[k] == address) {
@@ -1067,20 +1067,20 @@ fn callC(
         freeMemory(it, address)?;
         return Ok(null);
     }
-    if (sameText(n0, "nova_io_kind")) {
+    if (sameText(n0, "ceesafe_io_kind")) {
         let error = truncate<i32>(truncate<u32>(arguments[0].bits(0, 4)?));
         return Ok(valueOf(ioKindOf(error as i64), 4));
     }
-    if (n0.length > 10 && sameText(n0[0..10], "nova_host_")) {
+    if (n0.length > 13 && sameText(n0[0..13], "ceesafe_host_")) {
         let result = hostService(it, n0, arguments)?;
-        return Ok(if (sameText(n0, "nova_host_dir_close")) null else result);
+        return Ok(if (sameText(n0, "ceesafe_host_dir_close")) null else result);
     }
-    // nova_atomic_*: one thread runs at a time (§5), so every operation is atomic; the width is the name's suffix.
+    // ceesafe_atomic_*: one thread runs at a time (§5), so every operation is atomic; the width is the name's suffix.
     let size: usize = if (sameText(n0[n0.length - 3..], "u64")) 8 else 4;
     let mask: u64 = if (size == 8) 0xFFFFFFFFFFFFFFFF else 0xFFFFFFFF;
     let at = arguments[0].bits(0, 8)?;
     let old = it.memory.loadBits(at, size)?;
-    let operation = n0[12..n0.length - 4];
+    let operation = n0[15..n0.length - 4];
     let ordered = operation.length > 4 && sameText(operation[operation.length - 4..], "_ord");
     let plain = operation[0..(if (ordered) operation.length - 4 else operation.length)];
     if (sameText(plain, "store")) {

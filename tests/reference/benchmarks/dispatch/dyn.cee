@@ -1,0 +1,42 @@
+// benchmarks/dispatch (README.md): a call through a dyn table per element, over a vector of boxes of two types.
+interface Shape {
+    fn area(borrow this) -> u64;
+}
+
+struct Square {
+    side: u64;
+}
+
+impl Shape for Square {
+    fn area(borrow this) -> u64 => this.side * this.side;
+}
+
+struct Rect {
+    w: u64;
+    h: u64;
+}
+
+impl Shape for Rect {
+    fn area(borrow this) -> u64 => this.w * this.h;
+}
+
+fn main() -> i32 {
+    var shapes = Vector<Box<dyn Shape>>.create();
+    var seed: u64 = 12345;
+    for (i in 0..1000000u64) {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        if (seed % 2 == 0) {
+            shapes.push(Box.create(Square { side: i % 100 })!)!;
+        } else {
+            shapes.push(Box.create(Rect { w: i % 100, h: seed % 50 })!)!;
+        }
+    }
+    var total: u64 = 0;
+    for (round in 0..100u64) {
+        for (s in shapes) {
+            total += s.area() % 1000 + round;
+        }
+    }
+    Console.writeLine(total);
+    return 0;
+}

@@ -1,0 +1,16 @@
+// Floats in C (type-system.md §35.6; c-backend.md §2): literals by their bits, plain IEEE operators, f64 to f32
+// through nv_f64_to_f32, and float to integer through the range-checked helpers.
+fn convert(x: f64, n: i64) -> i32 {
+    let narrow = round<f32>(x * 2.0 + 0.5);
+    let wide = round<f64>(n);
+    let saturated = saturatingTruncate<u8>(wide);
+    match (checkedTruncate<i16>(x)) {
+        Some(v) => { return v as i32 + saturated as i32; }
+        null => { }
+    }
+    return if (narrow < 1.5f32) -1 else truncate<i32>(narrow);
+}
+
+fn main() {
+    Console.writeLine(convert(3.25, 7));
+}

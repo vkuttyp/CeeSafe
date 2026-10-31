@@ -1,0 +1,38 @@
+// hash-map (benchmarks/suite/README.md): open addressing, linear probing.
+const BITS: u64 = 22;
+const MASK: u64 = 4194303;
+
+fn slotOf(key: u64) -> usize => truncate<usize>((key * 2654435761 >> 10) & MASK);
+
+fn find(keys: borrow Vector<u64>, key: u64) -> usize {
+    var s = slotOf(key);
+    while (keys[s] != 0 && keys[s] != key) { s = (s + 1) & truncate<usize>(MASK); }
+    return s;
+}
+
+fn main() -> i32 {
+    let size = truncate<usize>(MASK + 1);
+    var keys = Vector<u64>.withCapacity(size)!;
+    var values = Vector<u64>.withCapacity(size)!;
+    for (s in 0..size) { keys.push(0)!; values.push(0)!; }
+    for (i in 0..2000000u64) {
+        let key = 7 * i + 1;
+        let s = find(borrow keys, key);
+        keys[s] = key;
+        values[s] = i;
+    }
+    var sum: u64 = 0;
+    var misses: u64 = 0;
+    for (round in 0..8) {
+        for (i in 0..2000000u64) {
+            for (kind in 0..2) {
+                var key = 7 * i + 1;
+                if (kind == 1) { key = 7 * i + 3; }
+                let s = find(borrow keys, key);
+                if (keys[s] == key) { sum += values[s]; } else { misses += 1; }
+            }
+        }
+    }
+    Console.writeLine(sum + misses);
+    return 0;
+}

@@ -22,6 +22,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from run_corpus import expectations, read  # noqa: E402
+from names import dialect  # noqa: E402
 
 ALLOWLIST = {"nova_panic", "memcpy", "memmove", "memset", "memcmp"}
 FORBIDDEN = (".ctors", ".dtors", ".init_array", ".fini_array", ".preinit_array", ".tdata", ".tbss", ".eh_frame",
@@ -72,8 +73,9 @@ def main():
     parser.add_argument("--lld", default=shutil.which("ld.lld"))
     args = parser.parse_args()
     compiler = os.path.abspath(os.path.expanduser(args.compiler))
+    d = dialect(compiler)
     directory = os.path.join(args.corpus, "freestanding")
-    files = sorted(f for f in os.listdir(directory) if f.endswith(".nova"))
+    files = sorted(f for f in os.listdir(directory) if f.endswith((".nova", ".cee")))
     resource = run(["clang", "-print-resource-dir"]).stdout.strip()
     cross = ["-nostdinc", "-isystem", os.path.join(resource, "include"), "-fno-pic", "-fno-pie", "-O2", "-Werror",
              "-mgeneral-regs-only"]
@@ -81,7 +83,7 @@ def main():
     for name in files:
         relative = "freestanding/" + name
         text = read(os.path.join(directory, name))
-        allowed = ALLOWLIST | externs_of(text)
+        allowed = {d.c(n) for n in ALLOWLIST} | externs_of(text)
         with tempfile.TemporaryDirectory() as work:
             obj = os.path.join(work, "package.o")
             built = run([compiler, "build", "--profile", "freestanding", "--emit", "obj", "--cc", "clang",
@@ -92,7 +94,7 @@ def main():
             extra = undefined(args.nm, [obj]) - allowed
             if extra:
                 problems.append(f"{relative} (host) leaves undefined: {', '.join(sorted(extra))}")
-            harness = os.path.join(directory, name[:-5] + ".c")
+            harness = os.path.join(directory, os.path.splitext(name)[0] + ".c")
             exe = os.path.join(work, "environment")
             host_c = os.path.join(work, "host-c")  # the harness includes the generated rt.h
             run([compiler, "build", "--profile", "freestanding", "--emit", "c", "-o", host_c, relative], cwd=args.corpus)
@@ -104,7 +106,7 @@ def main():
             stdout, status, panic, panic_line = expectations(text)
             if ran.stdout != stdout or ran.returncode != status:
                 problems.append(f"{relative}: stdout {ran.stdout!r} status {ran.returncode}, expected {stdout!r} {status}")
-            if panic is not None and not ran.stderr.startswith(f"nova panic: {panic} at {relative}:{panic_line}:"):
+            if panic is not None and not ran.stderr.startswith(f"{d.panic}{panic} at {relative}:{panic_line}:"):
                 problems.append(f"{relative}: panic {ran.stderr.strip()!r}")
             for triple in TRIPLES:
                 flags = [f"--target={triple}"] + cross

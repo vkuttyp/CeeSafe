@@ -1,0 +1,49 @@
+// Character literals (type-system.md §4, M11 G4a): integer literals of a Unicode scalar value, typed by context.
+
+fn isDigit(b: u8) -> bool => b >= '0' && b <= '9';
+
+fn kind(b: u8) -> u32 {
+    match (b) {
+        ' ' => { return 0; }
+        '\n' => { return 1; }
+        'a' => { return 2; }
+        _ => { return 3; }
+    }
+}
+
+/// Parses decimal digits out of text, the way `parsing` had to spell them as 48 and 57 before.
+fn parse(text: StringView) -> u32 {
+    var n: u32 = 0;
+    for (b in text.bytes()) {
+        if (isDigit(b)) { n = n * 10 + (b - '0') as u32; }
+    }
+    return n;
+}
+
+fn main() {
+    Console.writeLine(parse("a1b2c3"));
+    Console.writeLine(kind(' '));
+    Console.writeLine(kind('\n'));
+    Console.writeLine(kind('a'));
+    Console.writeLine(kind('z'));
+    let scalar = '\u{1F600}';                  // no context: a u32 holding U+1F600
+    Console.writeLine(scalar);
+    let e: u16 = 'é';                          // a wider type may hold a non-ASCII scalar value
+    Console.writeLine(e);
+    var letters: u32 = 0;
+    for (c in 'a'..'f') { letters += 1; }      // a range of characters: u32 by default
+    Console.writeLine(letters);
+    match (Some('x')) {
+        Some('x') => { Console.writeLine("x"); }   // nested, inside an optional
+        _ => { Console.writeLine("other"); }
+    }
+}
+// expect-stdout: 123
+// expect-stdout: 0
+// expect-stdout: 1
+// expect-stdout: 2
+// expect-stdout: 3
+// expect-stdout: 128512
+// expect-stdout: 233
+// expect-stdout: 5
+// expect-stdout: x

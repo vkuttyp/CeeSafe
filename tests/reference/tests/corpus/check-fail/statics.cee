@@ -1,0 +1,23 @@
+// Static items (type-system.md §39): a static's type must be `Share`; a static is used as a place behind a shared
+// reference, so it cannot be assigned, moved out of or changed; a `static mut` needs unsafe code.
+struct Raw {
+    p: *mut u8;
+}
+
+static RAW: Raw = Raw { p: 0 as *mut u8 }; // error[N0337]
+
+static LIMIT: u64 = 8;
+static SLOTS: [u64; 2] = [1, 2];
+static mut COUNT: u64 = 0;
+
+fn change() {
+    LIMIT = 9; // error[N0211]
+    SLOTS[0] = 3; // error[N0211]
+}
+
+fn count() -> u64 => COUNT; // error[N0280]
+
+// A reference to a static is allowed only where the return type names the static region.
+fn limit() -> borrow u64 => borrow LIMIT; // error[N0245]
+
+fn main() {}

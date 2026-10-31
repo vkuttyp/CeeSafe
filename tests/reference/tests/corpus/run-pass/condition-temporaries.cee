@@ -1,0 +1,85 @@
+// M15 S2 (#1): temporaries made in an `if` or `while` condition are destroyed once the condition has been evaluated,
+// before the branch, on every evaluation (type-system.md §14.5, lifetimes.md §2). They used to be skipped.
+// Within a condition they are destroyed in reverse order of creation, like any statement's temporaries.
+// expect-stdout: drop 1
+// expect-stdout: if body
+// expect-stdout: drop 2
+// expect-stdout: drop 3
+// expect-stdout: else-if body
+// expect-stdout: drop 5
+// expect-stdout: drop 4
+// expect-stdout: drop 6
+// expect-stdout: drop 7
+// expect-stdout: while body
+// expect-stdout: drop 8
+// expect-stdout: drop 9
+// expect-stdout: left side only
+// expect-stdout: drop 10
+// expect-stdout: drop 9
+// expect-stdout: both sides
+// expect-stdout: drop 12
+// expect-stdout: drop 11
+// expect-stdout: done
+
+struct Noisy {
+    id: u32;
+
+    fn same(borrow this, other: u32) -> bool => this.id == other;
+
+    drop {
+        Console.write("drop ");
+        Console.writeLine(this.id);
+    }
+}
+
+// The temporary owns heap memory too, so the leak check sees a missed drop.
+struct Owner {
+    data: Vector<u64>;
+
+    fn make() -> Owner {
+        var data = Vector<u64>.create();
+        data.push(1)!;
+        return Owner { data: data };
+    }
+
+    fn empty(borrow this) -> bool => this.data.length == 0;
+}
+
+fn make(id: u32) -> Noisy => Noisy { id: id };
+
+fn main() {
+    if (make(1).same(1)) {
+        Console.writeLine("if body");
+    }
+    if (make(2).same(0)) {
+        Console.writeLine("not printed");
+    } else if (make(3).same(3)) {
+        Console.writeLine("else-if body");
+    }
+    // Both sides of `&&` and `||` when evaluated.
+    if (make(4).same(4) && make(5).same(0)) {
+        Console.writeLine("not printed");
+    }
+    var i: u32 = 6;
+    while (make(i).same(i) && i < 8) {
+        if (i == 7) {
+            Console.writeLine("while body");
+        }
+        i += 1;
+    }
+    // The right side of `||` is not evaluated, so only the left temporary is destroyed.
+    if (make(9).same(9) || make(99).same(99)) {
+        Console.writeLine("left side only");
+    }
+    if (make(9).same(0) || make(10).same(10)) {
+        Console.writeLine("both sides");
+    }
+    if (make(11).same(0) || make(12).same(0)) {
+        Console.writeLine("not printed");
+    }
+    var loops: u32 = 0;
+    while (Owner.make().empty() == false && loops < 3) {
+        loops += 1;
+    }
+    Console.writeLine("done");
+}

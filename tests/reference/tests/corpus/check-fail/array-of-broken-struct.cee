@@ -1,0 +1,3 @@
+// An array of a struct whose field type is unknown reports the type, without crashing the checker (G8a fix).
+struct Op { name: Missing; } // error[N0204]
+fn main() { let ops = [Op { name: 1 }, Op { name: 2 }]; }

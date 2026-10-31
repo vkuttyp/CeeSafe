@@ -1,0 +1,50 @@
+// benchmarks/parallel (README.md): the same mix over a vector the program owns, split in halves by Thread.both
+// (type-system.md §38.6) to 2^depth threads, the depth the first argument. Each thread reads its part in place.
+fn mix(i: u64) -> u64 {
+    var x = i;
+    for (k in 0..20u64) {
+        x = (x ^ (x >> 29)).wrappingMul(6364136223846793005).wrappingAdd(k);
+    }
+    return x % 1000;
+}
+
+fn work(values: Slice<u64>) -> u64 {
+    var total: u64 = 0;
+    for (v in values) {
+        total = total.wrappingAdd(mix(v));
+    }
+    return total;
+}
+
+fn split(values: Slice<u64>, depth: u64) -> u64 {
+    if (depth == 0) {
+        return work(values);
+    }
+    let halves = values.splitAt(values.length / 2);
+    var low: u64 = 0;
+    var high: u64 = 0;
+    Thread.both(() => { low = split(halves.left, depth - 1); }, () => { high = split(halves.right, depth - 1); });
+    return low.wrappingAdd(high);
+}
+
+fn parse(text: StringView) -> u64 {
+    var n: u64 = 0;
+    for (c in text.bytes()) {
+        n = n * 10 + (c - 48) as u64;
+    }
+    return n;
+}
+
+fn main() -> i32 {
+    let depth = match (Process.argument(1)) {
+        Some(text) => parse(text),
+        null => 0u64,
+    };
+    let n: u64 = 16000000;
+    var values = Vector<u64>.withCapacity(16000000)!;
+    for (i in 0..n) {
+        values.push(i)!;
+    }
+    Console.writeLine(split(values[..], depth));
+    return 0;
+}

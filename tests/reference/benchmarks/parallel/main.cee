@@ -1,0 +1,44 @@
+// benchmarks/parallel (README.md): one compute-bound sum split across N threads, N the first argument.
+fn work(lo: u64, hi: u64) -> u64 {
+    var total: u64 = 0;
+    for (i in lo..hi) {
+        var x = i;
+        for (k in 0..20u64) {
+            x = (x ^ (x >> 29)).wrappingMul(6364136223846793005).wrappingAdd(k);
+        }
+        total = total.wrappingAdd(x % 1000);
+    }
+    return total;
+}
+
+fn parse(text: StringView) -> u64 {
+    var n: u64 = 0;
+    for (c in text.bytes()) {
+        n = n * 10 + (c - 48) as u64;
+    }
+    return n;
+}
+
+fn main() -> i32 {
+    let threads = match (Process.argument(1)) {
+        Some(text) => parse(text),
+        null => 1u64,
+    };
+    let n: u64 = 40000000;
+    let chunk = n / threads;
+    var workers = Vector<Thread<u64>>.create();
+    for (t in 0..threads) {
+        let lo = t * chunk;
+        let hi = if (t == threads - 1) n else lo + chunk;
+        workers.push(Thread.spawn(move () => work(lo, hi))!)!;
+    }
+    var total: u64 = 0;
+    loop {
+        match (workers.pop()) {
+            Some(w) => { total = total.wrappingAdd(w.join()); }
+            null => { break; }
+        }
+    }
+    Console.writeLine(total);
+    return 0;
+}

@@ -1,0 +1,15 @@
+(unit
+  (struct default Holder (type-params (region r))
+    (field default run (borrow(r) (fn (i32) i32)))
+    (field default again (borrow-mut(r) (fn ())))
+  )
+  (fn default f (params)
+    (block
+      (let a = (closure ((x i32) y) (+ x y)))
+      (let b = (closure () (block (expr (call (. Console writeLine) 1)))))
+      (let c = (closure (x) (closure (y) (* x y))))
+      (let d = (closure ((p i32) (q (fn (i32) i32))) (call q p)))
+      (let e = (+ (paren (if-expr true 1 2)) 3))
+    )
+  )
+)

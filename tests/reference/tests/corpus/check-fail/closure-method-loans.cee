@@ -1,0 +1,9 @@
+// The receiver of a library method is lent for the whole call (type-system.md §36.4), so the closure cannot use it.
+fn main() {
+    var v = Vector<i32>.create();
+    v.push(1)!;
+    v.retain((x) => v.length > 0); // error[N0241]
+    var a = [3, 1, 2];
+    a[..].sortBy((x, y) => x - y + a[0]); // error[N0241]
+    a[..].forEach((x) => { a[0] = 1; }); // error[N0241]
+}

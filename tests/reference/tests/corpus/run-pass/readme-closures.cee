@@ -1,0 +1,21 @@
+// README.md, "Closures and floats": library methods taking closures (type-system.md §36.4) over f64 data (§35).
+struct Reading { sensor: u32; celsius: f64; }
+
+fn main() {
+    var readings = Vector<Reading>.create();
+    for (i in 0..8u32) {
+        readings.push(Reading { sensor: i % 3, celsius: 18.5 + (i as f64) * 0.75 })!;
+    }
+    let limit = 20.0;
+    readings.retain((r) => r.celsius > limit); // captures `limit`
+    readings.sortBy((a, b) => if (a.celsius > b.celsius) -1 else if (a.celsius < b.celsius) 1 else 0);
+    var sum = 0.0;
+    readings.forEach((r) => { sum += r.celsius; }); // writes `sum`: a `borrow mut fn`
+    Console.writeLine(readings.length);
+    Console.writeLine(readings[0].celsius);
+    Console.writeLine(sum / round<f64>(readings.length));
+}
+
+// expect-stdout: 5
+// expect-stdout: 23.75
+// expect-stdout: 22.25

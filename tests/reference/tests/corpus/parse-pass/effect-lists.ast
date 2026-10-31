@@ -1,0 +1,11 @@
+(unit
+  (fn default a (params (f (fn (@effects) (i32) i32)) (g (fn (@effects alloc) ())) (h (borrow (fn (@effects sleep) (i32)))) (k (borrow-mut (fn (@effects) (i32) bool))))
+    (block)
+  )
+  (fn default b (params (maybe (optional (fn (@effects) (i32)))) (many (Vector (fn (@effects sleep alloc) (i64) i64)))) (returns (fn (@effects) (i32) i32))
+    (=> f)
+  )
+  (struct default Handler
+    (field default run (fn (@effects) ((borrow Handler)) i32))
+  )
+)

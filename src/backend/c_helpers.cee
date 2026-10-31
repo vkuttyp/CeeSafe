@@ -123,7 +123,7 @@ fn appendOkValue(
 fn appendAllocatorId(c: borrow Checker, out: borrow mut Vector<u8>, allocator: u32) -> Result<void, AllocError> =>
     appendText(
         out,
-        if (sameText(c.types.name(allocator), "FailingAllocator")) "NV_ALLOC_FAILING" else "NV_ALLOC_SYSTEM",
+        if (sameText(c.types.name(allocator), "FailingAllocator")) "CEE_ALLOC_FAILING" else "CEE_ALLOC_SYSTEM",
     );
 
 fn isUserAllocator(c: borrow Checker, allocator: u32) -> bool {
@@ -236,7 +236,7 @@ fn emitDropGluePrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<v
 }
 
 fn appendBoxFreeName(c: borrow Checker, out: borrow mut Vector<u8>, box: u32) -> Result<void, AllocError> {
-    appendText(out, "nvBF_")?;
+    appendText(out, "ceeBF_")?;
     return appendMangle(c, out, box);
 }
 
@@ -439,7 +439,7 @@ fn emitDropGlue(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Alloc
                 e.t("(p->ptr);")?;
                 e.emit()?;
             }
-            e.line("    nova_pool_release(p->pool, p->ptr);")?;
+            e.line("    ceesafe_pool_release(p->pool, p->ptr);")?;
             e.line("}")?;
             e.line("")?;
             continue;
@@ -463,7 +463,7 @@ fn emitDropGlue(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Alloc
                 appendBoxFreeName(c, mut e.buf, t)?;
                 e.t("(p);")?;
             } else {
-                e.t("        nova_free(p, ")?;
+                e.t("        ceesafe_free(p, ")?;
                 appendAllocatorId(c, mut e.buf, info.allocator)?;
                 e.t(");")?;
             }
@@ -482,13 +482,13 @@ fn emitDropGlue(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Alloc
                 e.line("    for (uint64_t i = 0; i < p->len; i++) {")?;
                 e.t("        ")?;
                 appendDropGlueName(c, mut e.buf, element)?;
-                e.t("(nvSVE_")?;
+                e.t("(ceeSVE_")?;
                 appendMangle(c, mut e.buf, t)?;
                 e.t("(p, i));")?;
                 e.emit()?;
                 e.line("    }")?;
             }
-            e.t("    nova_svec_free(p->chunks, ")?;
+            e.t("    ceesafe_svec_free(p->chunks, ")?;
             appendAllocatorId(c, mut e.buf, info.allocator)?;
             e.t(");")?;
             e.emit()?;
@@ -507,7 +507,7 @@ fn emitDropGlue(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Alloc
                 e.emit()?;
                 e.line("    }")?;
             }
-            e.t("    if (p->cap != 0u) nova_free(p->ptr, ")?;
+            e.t("    if (p->cap != 0u) ceesafe_free(p->ptr, ")?;
             appendAllocatorId(c, mut e.buf, info.allocator)?;
             e.t(");")?;
             e.emit()?;
@@ -527,7 +527,7 @@ fn emitDropGlue(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Alloc
                 e.emit()?;
                 e.line("    }")?;
             }
-            e.t("    if (p->cap != 0u) nova_free(p->ptr, ")?;
+            e.t("    if (p->cap != 0u) ceesafe_free(p->ptr, ")?;
             appendAllocatorId(c, mut e.buf, info.allocator)?;
             e.t(");")?;
             e.emit()?;
@@ -544,7 +544,7 @@ fn emitDropGlue(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Alloc
                 appendBoxFreeName(c, mut e.buf, t)?;
                 e.t("(*p);")?;
             } else {
-                e.t("    nova_free(p->data, ")?;
+                e.t("    ceesafe_free(p->data, ")?;
                 appendAllocatorId(c, mut e.buf, info.allocator)?;
                 e.t(");")?;
             }
@@ -567,7 +567,7 @@ fn emitDropGlue(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Alloc
                 appendBoxFreeName(c, mut e.buf, t)?;
                 e.t("(*p);")?;
             } else {
-                e.t("    nova_free(*p, ")?;
+                e.t("    ceesafe_free(*p, ")?;
                 appendAllocatorId(c, mut e.buf, info.allocator)?;
                 e.t(");")?;
             }
@@ -656,9 +656,9 @@ fn emitDropGlue(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Alloc
 fn appendPoolTakeSignature(c: borrow Checker, out: borrow mut Vector<u8>, result: u32) -> Result<void, AllocError> {
     let contents = c.types.info(resultOkOf(c, result)).pointee;
     appendCTypeName(c, out, result)?;
-    appendText(out, " nvPT_")?;
+    appendText(out, " ceePT_")?;
     appendMangle(c, out, contents)?;
-    appendText(out, "(nv_pool *p, ")?;
+    appendText(out, "(cee_pool *p, ")?;
     appendCTypeName(c, out, contents)?;
     return appendText(out, " v)");
 }
@@ -679,13 +679,13 @@ fn emitPoolTake(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Alloc
         e.emit()?;
         e.t("    _Static_assert(_Alignof(")?;
         e.b(contents.view())?;
-        e.t(") <= 16, \"novac: pool slots are 16-aligned\");")?;
+        e.t(") <= 16, \"ceesafec: pool slots are 16-aligned\");")?;
         e.emit()?;
         e.t("    ")?;
         e.b(contents.view())?;
         e.t(" *slot = (")?;
         e.b(contents.view())?;
-        e.t(" *)nova_pool_take(p, sizeof(")?;
+        e.t(" *)ceesafe_pool_take(p, sizeof(")?;
         e.b(contents.view())?;
         e.t("));")?;
         e.emit()?;
@@ -725,19 +725,19 @@ fn appendRegionId(c: borrow Checker, out: borrow mut Vector<u8>, region: u32) ->
     let pointee = c.types.info(region).pointee;
     let r = if (pointee != none()) pointee else region;
     return appendText(out, match (c.types.info(r).region) {
-        RegionKind.Arena => "NV_REGION_ARENA",
-        RegionKind.FixedBuffer => "NV_REGION_FBA",
-        _ => "NV_REGION_SCRATCH",
+        RegionKind.Arena => "CEE_REGION_ARENA",
+        RegionKind.FixedBuffer => "CEE_REGION_FBA",
+        _ => "CEE_REGION_SCRATCH",
     });
 }
 
 fn appendArenaHelperName(c: borrow Checker, out: borrow mut Vector<u8>, result: u32) -> Result<void, AllocError> {
     let ok = resultOkOf(c, result);
     if (c.types.isSlice(ok)) {
-        appendText(out, "nvAR_")?;
+        appendText(out, "ceeAR_")?;
         return appendMangle(c, out, c.types.info(c.types.info(ok).pointee).element);
     }
-    appendText(out, "nvAA_")?;
+    appendText(out, "ceeAA_")?;
     return appendMangle(c, out, c.types.info(ok).pointee);
 }
 
@@ -799,7 +799,7 @@ fn emitArenaHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, A
             e.b(element.view())?;
             e.t(" *p = (")?;
             e.b(element.view())?;
-            e.t(" *)nova_region_alloc(r, kind, n == 0u ? 1u : n * sizeof(")?;
+            e.t(" *)ceesafe_region_alloc(r, kind, n == 0u ? 1u : n * sizeof(")?;
             e.b(element.view())?;
             e.t("), _Alignof(")?;
             e.b(element.view())?;
@@ -826,7 +826,7 @@ fn emitArenaHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, A
             e.b(contents.view())?;
             e.t(" *p = (")?;
             e.b(contents.view())?;
-            e.t(" *)nova_region_alloc(r, kind, sizeof(")?;
+            e.t(" *)ceesafe_region_alloc(r, kind, sizeof(")?;
             e.b(contents.view())?;
             e.t("), _Alignof(")?;
             e.b(contents.view())?;
@@ -853,12 +853,12 @@ fn emitArenaHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, A
 // ---- Boxes (§18, §30) ----
 
 fn appendBoxCreateName(c: borrow Checker, out: borrow mut Vector<u8>, result: u32) -> Result<void, AllocError> {
-    appendText(out, "nvB_")?;
+    appendText(out, "ceeB_")?;
     return appendMangle(c, out, resultOkOf(c, result));
 }
 
 fn appendBoxAllocateName(c: borrow Checker, out: borrow mut Vector<u8>, result: u32) -> Result<void, AllocError> {
-    appendText(out, "nvBA_")?;
+    appendText(out, "ceeBA_")?;
     return appendMangle(c, out, resultOkOf(c, result));
 }
 
@@ -1010,7 +1010,7 @@ fn emitBoxFree(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, AllocE
 }
 
 fn appendPlacedName(c: borrow Checker, out: borrow mut Vector<u8>, t: u32) -> Result<void, AllocError> {
-    appendText(out, "nvPL_")?;
+    appendText(out, "ceePL_")?;
     return appendMangle(c, out, t);
 }
 
@@ -1192,7 +1192,7 @@ fn emitBoxAllocation(e: borrow mut CEmitter, c: borrow Checker, box: u32, conten
     }
     e.t("    _Static_assert(_Alignof(")?;
     e.b(name.view())?;
-    e.t(") <= _Alignof(nv_max_align_t), \"novac: ")?;
+    e.t(") <= _Alignof(cee_max_align_t), \"ceesafec: ")?;
     e.b(c.types.name(box))?;
     e.t(" needs over-aligned memory\");")?;
     e.emit()?;
@@ -1200,7 +1200,7 @@ fn emitBoxAllocation(e: borrow mut CEmitter, c: borrow Checker, box: u32, conten
     e.b(name.view())?;
     e.t(" *p = (")?;
     e.b(name.view())?;
-    e.t(" *)nova_alloc(sizeof(")?;
+    e.t(" *)ceesafe_alloc(sizeof(")?;
     e.b(name.view())?;
     e.t("), ")?;
     appendAllocatorId(c, mut e.buf, allocator)?;
@@ -1211,7 +1211,7 @@ fn emitBoxAllocation(e: borrow mut CEmitter, c: borrow Checker, box: u32, conten
 // ---- I/O (§26) ----
 
 fn appendIoHelper(c: borrow Checker, out: borrow mut Vector<u8>, result: u32) -> Result<void, AllocError> {
-    appendText(out, "nvIOR_")?;
+    appendText(out, "ceeIOR_")?;
     return appendMangle(c, out, result);
 }
 
@@ -1223,7 +1223,7 @@ fn emitIoHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<v
             appendCTypeName(c, mut e.buf, result)?;
             e.t(" ")?;
             appendIoHelper(c, mut e.buf, result)?;
-            e.t("(nv_io_result);")?;
+            e.t("(cee_io_result);")?;
             e.emit()?;
         }
     }
@@ -1231,7 +1231,7 @@ fn emitIoHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<v
     if (option != none()) {
         e.helperProto()?;
         appendCTypeName(c, mut e.buf, option)?;
-        e.t(" nvARG(uint64_t);")?;
+        e.t(" ceeARG(uint64_t);")?;
         e.emit()?;
     }
     return Ok();
@@ -1253,16 +1253,16 @@ fn emitIoHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Allo
         e.b(name.view())?;
         e.t(" ")?;
         appendIoHelper(c, mut e.buf, result)?;
-        e.t("(nv_io_result r) {")?;
+        e.t("(cee_io_result r) {")?;
         e.emit()?;
         e.line("    if (r.error != 0) {")?;
         e.t("        ")?;
         appendCTypeName(c, mut e.buf, error)?;
         e.t(" e = { .tag = (uint")?;
         e.d((c.types.enums[c.types.info(error).enumDef as usize].tagSize * 8) as u64)?;
-        e.t("_t)nova_io_kind(r.error) };")?;
+        e.t("_t)ceesafe_io_kind(r.error) };")?;
         e.emit()?;
-        e.t("        if (e.tag == NV_IO_OTHER) e.u.")?;
+        e.t("        if (e.tag == CEE_IO_OTHER) e.u.")?;
         appendCVariantName(c, mut e.buf, other)?;
         e.t(".")?;
         appendFieldName(c, mut e.buf, c.types.variants[other as usize].payload[0])?;
@@ -1299,10 +1299,10 @@ fn emitIoHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Allo
         let name = cTypeName(c, option)?;
         e.helper()?;
         e.b(name.view())?;
-        e.t(" nvARG(uint64_t index) {")?;
+        e.t(" ceeARG(uint64_t index) {")?;
         e.emit()?;
-        e.line("    nv_str text;")?;
-        e.t("    if (!nova_arg(index, &text)) return ((")?;
+        e.line("    cee_str text;")?;
+        e.t("    if (!ceesafe_arg(index, &text)) return ((")?;
         e.b(name.view())?;
         e.t("){ .tag = 0 });")?;
         e.emit()?;
@@ -1321,7 +1321,7 @@ fn emitIoHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Allo
 // ---- Vectors, strings and containers (§23, §24) ----
 
 fn appendSlotName(c: borrow Checker, out: borrow mut Vector<u8>, map: u32) -> Result<void, AllocError> {
-    appendText(out, "nvKS_")?;
+    appendText(out, "ceeKS_")?;
     return appendMangle(c, out, map);
 }
 
@@ -1340,7 +1340,7 @@ fn emitContainerHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> R
             let element = cTypeName(c, c.types.info(c.types.info(t).pointee).element)?;
             e.helperProto()?;
             e.b(element.view())?;
-            e.t(" *nvSVE_")?;
+            e.t(" *ceeSVE_")?;
             e.b(m.view())?;
             e.t("(")?;
             e.b(name.view())?;
@@ -1349,7 +1349,7 @@ fn emitContainerHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> R
             e.helperProto()?;
             let pushResult = resultOfOk(e, c, c.types.usize);
             appendCTypeName(c, mut e.buf, pushResult)?;
-            e.t(" nvSVP_")?;
+            e.t(" ceeSVP_")?;
             e.b(m.view())?;
             e.t("(")?;
             e.b(name.view())?;
@@ -1361,16 +1361,16 @@ fn emitContainerHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> R
         }
         let value = c.types.info(t).element;
         e.helperProto()?;
-        e.t("bool nvKV_")?;
+        e.t("bool ceeKV_")?;
         e.b(m.view())?;
         e.t("(const ")?;
         e.b(name.view())?;
-        e.t(" *, nv_handle);")?;
+        e.t(" *, cee_handle);")?;
         e.emit()?;
         e.helperProto()?;
         let insertResult = resultOfOk(e, c, handleTypeOf(c, value));
         appendCTypeName(c, mut e.buf, insertResult)?;
-        e.t(" nvKI_")?;
+        e.t(" ceeKI_")?;
         e.b(m.view())?;
         e.t("(")?;
         e.b(name.view())?;
@@ -1380,27 +1380,27 @@ fn emitContainerHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> R
         e.emit()?;
         e.helperProto()?;
         appendCTypeName(c, mut e.buf, optionFor(c, referenceTypeTo(c, value, false)))?;
-        e.t(" nvKG_")?;
+        e.t(" ceeKG_")?;
         e.b(m.view())?;
         e.t("(const ")?;
         e.b(name.view())?;
-        e.t(" *, nv_handle);")?;
+        e.t(" *, cee_handle);")?;
         e.emit()?;
         e.helperProto()?;
         appendCTypeName(c, mut e.buf, optionFor(c, referenceTypeTo(c, value, true)))?;
-        e.t(" nvKM_")?;
+        e.t(" ceeKM_")?;
         e.b(m.view())?;
         e.t("(")?;
         e.b(name.view())?;
-        e.t(" *, nv_handle);")?;
+        e.t(" *, cee_handle);")?;
         e.emit()?;
         e.helperProto()?;
         appendCTypeName(c, mut e.buf, optionFor(c, value))?;
-        e.t(" nvKR_")?;
+        e.t(" ceeKR_")?;
         e.b(m.view())?;
         e.t("(")?;
         e.b(name.view())?;
-        e.t(" *, nv_handle);")?;
+        e.t(" *, cee_handle);")?;
         e.emit()?;
     }
     return Ok();
@@ -1423,7 +1423,7 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
             let result = resultOfOk(e, c, c.types.usize);
             e.helper()?;
             e.b(element.view())?;
-            e.t(" *nvSVE_")?;
+            e.t(" *ceeSVE_")?;
             e.b(m.view())?;
             e.t("(")?;
             e.b(name.view())?;
@@ -1431,7 +1431,7 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
             e.emit()?;
             e.t("    return (")?;
             e.b(element.view())?;
-            e.t(" *)nova_svec_at(v->chunks, i, sizeof(")?;
+            e.t(" *)ceesafe_svec_at(v->chunks, i, sizeof(")?;
             e.b(element.view())?;
             e.t("));")?;
             e.emit()?;
@@ -1439,7 +1439,7 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
             e.line("")?;
             e.helper()?;
             appendCTypeName(c, mut e.buf, result)?;
-            e.t(" nvSVP_")?;
+            e.t(" ceeSVP_")?;
             e.b(m.view())?;
             e.t("(")?;
             e.b(name.view())?;
@@ -1449,7 +1449,7 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
             e.emit()?;
             e.t("    _Static_assert(_Alignof(")?;
             e.b(element.view())?;
-            e.t(") <= _Alignof(nv_max_align_t), \"novac: ")?;
+            e.t(") <= _Alignof(cee_max_align_t), \"ceesafec: ")?;
             e.b(c.types.name(t))?;
             e.t(" needs over-aligned memory\");")?;
             e.emit()?;
@@ -1457,7 +1457,7 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
             e.b(element.view())?;
             e.t(" *slot = (")?;
             e.b(element.view())?;
-            e.t(" *)nova_svec_slot(v->chunks, v->len, sizeof(")?;
+            e.t(" *)ceesafe_svec_slot(v->chunks, v->len, sizeof(")?;
             e.b(element.view())?;
             e.t("), ")?;
             e.b(allocator.view())?;
@@ -1495,18 +1495,18 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
         appendSlotName(c, mut slot, t)?;
         let insertResult = resultOfOk(e, c, handleTypeOf(c, valueType));
         e.helper()?;
-        e.t("bool nvKV_")?;
+        e.t("bool ceeKV_")?;
         e.b(m.view())?;
         e.t("(const ")?;
         e.b(name.view())?;
-        e.t(" *map, nv_handle h) {")?;
+        e.t(" *map, cee_handle h) {")?;
         e.emit()?;
         e.line("    return h.index < map->len && map->ptr[h.index].gen == h.gen;")?;
         e.line("}")?;
         e.line("")?;
         e.helper()?;
         appendCTypeName(c, mut e.buf, insertResult)?;
-        e.t(" nvKI_")?;
+        e.t(" ceeKI_")?;
         e.b(m.view())?;
         e.t("(")?;
         e.b(name.view())?;
@@ -1516,7 +1516,7 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
         e.emit()?;
         e.t("    _Static_assert(_Alignof(")?;
         e.b(slot.view())?;
-        e.t(") <= _Alignof(nv_max_align_t), \"novac: ")?;
+        e.t(") <= _Alignof(cee_max_align_t), \"ceesafec: ")?;
         e.b(c.types.name(t))?;
         e.t(" needs over-aligned memory\");")?;
         e.emit()?;
@@ -1525,7 +1525,9 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
         e.line("        index = map->free;")?;
         e.line("        map->free = map->ptr[index].next;")?;
         e.line("    } else {")?;
-        e.t("        void *p = map->len < UINT32_MAX - 1u ? nova_vec_grow(map->ptr, map->len, &map->cap, 1u, sizeof(")?;
+        e.t(
+            "        void *p = map->len < UINT32_MAX - 1u ? ceesafe_vec_grow(map->ptr, map->len, &map->cap, 1u, sizeof(",
+        )?;
         e.b(slot.view())?;
         e.t("), ")?;
         e.b(allocator.view())?;
@@ -1562,7 +1564,7 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
             c,
             mut ok,
             insertResult,
-            "((nv_handle){ .index = index, .gen = map->ptr[index].gen })".bytes(),
+            "((cee_handle){ .index = index, .gen = map->ptr[index].gen })".bytes(),
         )?;
         e.t("    return ")?;
         e.b(ok.view())?;
@@ -1574,15 +1576,15 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
             let optionType = optionFor(c, referenceTypeTo(c, valueType, mutable));
             e.helper()?;
             appendCTypeName(c, mut e.buf, optionType)?;
-            e.t(if (mutable) " nvKM_" else " nvKG_")?;
+            e.t(if (mutable) " ceeKM_" else " ceeKG_")?;
             e.b(m.view())?;
             e.t(if (mutable) "(" else "(const ")?;
             e.b(name.view())?;
-            e.t(" *map, nv_handle h) {")?;
+            e.t(" *map, cee_handle h) {")?;
             e.emit()?;
             var missing = Vector<u8>.create();
             appendOptionValue(e, c, mut missing, optionType, false, "".bytes())?;
-            e.t("    if (!nvKV_")?;
+            e.t("    if (!ceeKV_")?;
             e.b(m.view())?;
             e.t("(map, h)) return ")?;
             e.b(missing.view())?;
@@ -1600,15 +1602,15 @@ fn emitContainerHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<voi
         let removedType = optionFor(c, valueType);
         e.helper()?;
         appendCTypeName(c, mut e.buf, removedType)?;
-        e.t(" nvKR_")?;
+        e.t(" ceeKR_")?;
         e.b(m.view())?;
         e.t("(")?;
         e.b(name.view())?;
-        e.t(" *map, nv_handle h) {")?;
+        e.t(" *map, cee_handle h) {")?;
         e.emit()?;
         var missing = Vector<u8>.create();
         appendOptionValue(e, c, mut missing, removedType, false, "".bytes())?;
-        e.t("    if (!nvKV_")?;
+        e.t("    if (!ceeKV_")?;
         e.b(m.view())?;
         e.t("(map, h)) return ")?;
         e.b(missing.view())?;
@@ -1645,16 +1647,16 @@ fn emitVectorHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Resu
         if (c.types.isString(vector)) {
             e.helperProto()?;
             appendCTypeName(c, mut e.buf, voidResult)?;
-            e.t(" nvVA_")?;
+            e.t(" ceeVA_")?;
             e.b(m.view())?;
             e.t("(")?;
             e.b(name.view())?;
-            e.t(" *, nv_str);")?;
+            e.t(" *, cee_str);")?;
             e.emit()?;
         } else {
             e.helperProto()?;
             appendCTypeName(c, mut e.buf, voidResult)?;
-            e.t(" nvVP_")?;
+            e.t(" ceeVP_")?;
             e.b(m.view())?;
             e.t("(")?;
             e.b(name.view())?;
@@ -1664,7 +1666,7 @@ fn emitVectorHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Resu
             e.emit()?;
             e.helperProto()?;
             appendCTypeName(c, mut e.buf, optionFor(c, elementType))?;
-            e.t(" nvVO_")?;
+            e.t(" ceeVO_")?;
             e.b(m.view())?;
             e.t("(")?;
             e.b(name.view())?;
@@ -1672,7 +1674,7 @@ fn emitVectorHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Resu
             e.emit()?;
         }
         e.helperProto()?;
-        e.t("void nvVC_")?;
+        e.t("void ceeVC_")?;
         e.b(m.view())?;
         e.t("(")?;
         e.b(name.view())?;
@@ -1684,7 +1686,7 @@ fn emitVectorHelperPrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Resu
         if (isVectorWithCapacityResult(c, result)) {
             e.helperProto()?;
             appendCTypeName(c, mut e.buf, result)?;
-            e.t(" nvVW_")?;
+            e.t(" ceeVW_")?;
             appendMangle(c, mut e.buf, resultOkOf(c, result))?;
             e.t("(uint64_t);")?;
             e.emit()?;
@@ -1712,15 +1714,15 @@ fn emitVectorHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, 
         if (c.types.isString(vector)) {
             e.helper()?;
             e.b(result.view())?;
-            e.t(" nvVA_")?;
+            e.t(" ceeVA_")?;
             e.b(m.view())?;
             e.t("(")?;
             e.b(name.view())?;
-            e.t(" *s, nv_str text) {")?;
+            e.t(" *s, cee_str text) {")?;
             e.emit()?;
             e.line("    if (text.len > s->cap - s->len) {")?;
             e.line("        uint64_t cap = s->cap;")?;
-            e.t("        void *p = nova_vec_grow(s->ptr, s->len, &cap, text.len, 1u, ")?;
+            e.t("        void *p = ceesafe_vec_grow(s->ptr, s->len, &cap, text.len, 1u, ")?;
             e.b(allocator.view())?;
             e.t(");")?;
             e.emit()?;
@@ -1735,7 +1737,7 @@ fn emitVectorHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, 
             e.line("    if (text.len <= 16u) {")?;
             e.line("        for (uint64_t i = 0u; i < text.len; i++) s->ptr[s->len + i] = text.ptr[i];")?;
             e.line("    } else {")?;
-            e.line("        nova_mem_copy(s->ptr + s->len, text.ptr, (size_t)text.len);")?;
+            e.line("        ceesafe_mem_copy(s->ptr + s->len, text.ptr, (size_t)text.len);")?;
             e.line("    }")?;
             e.line("    s->len += text.len;")?;
             e.t("    return ((")?;
@@ -1749,7 +1751,7 @@ fn emitVectorHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, 
             let optionType = optionFor(c, elementType);
             e.helper()?;
             e.b(result.view())?;
-            e.t(" nvVP_")?;
+            e.t(" ceeVP_")?;
             e.b(m.view())?;
             e.t("(")?;
             e.b(name.view())?;
@@ -1759,13 +1761,13 @@ fn emitVectorHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, 
             e.emit()?;
             e.t("    _Static_assert(_Alignof(")?;
             e.b(element.view())?;
-            e.t(") <= _Alignof(nv_max_align_t), \"novac: ")?;
+            e.t(") <= _Alignof(cee_max_align_t), \"ceesafec: ")?;
             e.b(c.types.name(vector))?;
             e.t(" needs over-aligned memory\");")?;
             e.emit()?;
             e.line("    if (v->len == v->cap) {")?;
             e.line("        uint64_t cap = v->cap;")?;
-            e.t("        void *p = nova_vec_grow(v->ptr, v->len, &cap, 1u, sizeof(")?;
+            e.t("        void *p = ceesafe_vec_grow(v->ptr, v->len, &cap, 1u, sizeof(")?;
             e.b(element.view())?;
             e.t("), ")?;
             e.b(allocator.view())?;
@@ -1799,7 +1801,7 @@ fn emitVectorHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, 
             e.line("")?;
             e.helper()?;
             appendCTypeName(c, mut e.buf, optionType)?;
-            e.t(" nvVO_")?;
+            e.t(" ceeVO_")?;
             e.b(m.view())?;
             e.t("(")?;
             e.b(name.view())?;
@@ -1822,7 +1824,7 @@ fn emitVectorHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, 
             e.line("")?;
         }
         e.helper()?;
-        e.t("void nvVC_")?;
+        e.t("void ceeVC_")?;
         e.b(m.view())?;
         e.t("(")?;
         e.b(name.view())?;
@@ -1853,7 +1855,7 @@ fn emitVectorHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, 
         let element = cTypeName(c, c.types.info(c.types.info(vector).pointee).element)?;
         e.helper()?;
         e.b(name.view())?;
-        e.t(" nvVW_")?;
+        e.t(" ceeVW_")?;
         appendMangle(c, mut e.buf, vector)?;
         e.t("(uint64_t n) {")?;
         e.emit()?;
@@ -1861,9 +1863,9 @@ fn emitVectorHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, 
         appendCTypeName(c, mut e.buf, vector)?;
         e.t(" v = { .ptr = (")?;
         e.b(element.view())?;
-        e.t(" *)(void *)&nova_vec_empty, .len = 0u, .cap = 0u };")?;
+        e.t(" *)(void *)&ceesafe_vec_empty, .len = 0u, .cap = 0u };")?;
         e.emit()?;
-        e.t("    void *p = nova_vec_grow(v.ptr, 0u, &v.cap, n, sizeof(")?;
+        e.t("    void *p = ceesafe_vec_grow(v.ptr, 0u, &v.cap, n, sizeof(")?;
         e.b(element.view())?;
         e.t("), ")?;
         appendAllocatorId(c, mut e.buf, c.types.info(vector).allocator)?;

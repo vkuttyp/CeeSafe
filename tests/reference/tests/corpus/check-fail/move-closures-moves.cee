@@ -1,0 +1,16 @@
+// Moves into and out of owning closures (type-system.md §36.5): a captured local is moved into the closure, so it
+// cannot be used afterwards; and the body cannot move a capture out, since the closure may be called again.
+
+struct Item {
+    n: u64;
+    name: String;
+}
+
+fn main() {
+    let item = Item { n: 1, name: String.create() };
+    let keep: Box<dyn fn() -> u64> = Box.create(move () => item.n)!;
+    Console.writeLine(item.n); // error[N0250]
+    let other = Item { n: 2, name: String.create() };
+    let take: Box<dyn fn() -> Item> = Box.create(move () => other)!; // error[N0251]
+    Console.writeLine(keep());
+}

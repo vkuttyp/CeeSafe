@@ -59,8 +59,7 @@ describe.skipIf(!existsSync(ceesafec))("ceesafec lsp through vscode-jsonrpc", ()
       textDocument: { uri },
       position: { line: 3, character: 8 },
     });
-    // The fence names `nova` as novac's does: hover text stays novac's until the fork point (Decision 0003).
-    expect(hover.contents.value).toBe("```nova\nlet n: i32\n```");
+    expect(hover.contents.value).toBe("```ceesafe\nlet n: i32\n```");
     const definition = await connection.sendRequest("textDocument/definition", {
       textDocument: { uri },
       position: { line: 3, character: 13 },

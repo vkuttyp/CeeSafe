@@ -1,0 +1,25 @@
+// large-objects (benchmarks/suite/README.md): zeroed 64 KiB buffers replacing each other in a ring.
+fn main() -> i32 {
+    var ring = Vector<Box<[u8; 65536]>?>.withCapacity(8)!;
+    for (s in 0..8usize) { ring.push(null)!; }
+    var sum: u64 = 0;
+    for (i in 0..400000u64) {
+        var b = Box.create([0u8; 65536])!;
+        b[0] = truncate<u8>(i % 256);
+        b[65535] = truncate<u8>(3 * i % 256);
+        let slot = truncate<usize>(i % 8);
+        match (borrow ring[slot]) {
+            Some(old) => { sum += old[0] as u64 + old[65535] as u64; }
+            null => {}
+        }
+        ring[slot] = b;
+    }
+    for (s in 0..8usize) {
+        match (borrow ring[s]) {
+            Some(old) => { sum += old[0] as u64 + old[65535] as u64; }
+            null => {}
+        }
+    }
+    Console.writeLine(sum);
+    return 0;
+}

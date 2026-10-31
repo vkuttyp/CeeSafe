@@ -1,0 +1,60 @@
+// String.appendNumber (type-system.md §23.2, M11 G4c): every integer type at its bounds, zero, a reference argument,
+// a literal (i32 by default), and a line built in a loop with `?`.
+
+fn row(values: Slice<i64>) -> Result<String, AllocError> {
+    var line = String.create();
+    for (i in 0..values.length) {
+        if (i > 0) {
+            line.append(", ")?;
+        }
+        line.appendNumber(values[i])?;
+    }
+    return Ok(line);
+}
+
+fn main() {
+    var s = String.create();
+    let a: u8 = 255;
+    let b: i8 = -128;
+    let c: u16 = 0;
+    let d: i16 = 32767;
+    let e: u32 = 4294967295;
+    let f: i32 = -2147483648;
+    let g: u64 = 18446744073709551615;
+    let h: i64 = -9223372036854775807 - 1;
+    let k: usize = 1000;
+    s.appendNumber(a)!;
+    s.append(" ")!;
+    s.appendNumber(b)!;
+    s.append(" ")!;
+    s.appendNumber(c)!;
+    s.append(" ")!;
+    s.appendNumber(d)!;
+    Console.writeLine(s);
+    s.clear();
+    s.appendNumber(e)!;
+    s.append(" ")!;
+    s.appendNumber(f)!;
+    Console.writeLine(s);
+    s.clear();
+    s.appendNumber(g)!;
+    s.append(" ")!;
+    s.appendNumber(h)!;
+    Console.writeLine(s);
+    s.clear();
+    let r = borrow k;
+    s.appendNumber(r)!;          // through a reference
+    s.appendNumber(-7)!;         // a literal: i32
+    s.appendNumber('A')!;        // a character literal: u32
+    Console.writeLine(s);
+    let values = [3i64, -40, 500];
+    let line = row(values[..])!;
+    Console.writeLine(line);
+    Console.writeLine(s.length);
+}
+// expect-stdout: 255 -128 0 32767
+// expect-stdout: 4294967295 -2147483648
+// expect-stdout: 18446744073709551615 -9223372036854775808
+// expect-stdout: 1000-765
+// expect-stdout: 3, -40, 500
+// expect-stdout: 8

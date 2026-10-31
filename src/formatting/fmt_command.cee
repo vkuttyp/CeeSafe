@@ -119,6 +119,19 @@ fn copyDiagnostic(d: borrow Diagnostic) -> Result<Diagnostic, AllocError> {
     );
 }
 
+/// 0 if every path in `paths` is a directory or a `.cee` file (Decision 0005), else the usage error's exit status.
+fn requireNamedSources(paths: borrow Vector<Vector<u8>>) -> i32 {
+    for (path in paths.view()) {
+        if (!isDirectory(path.view())) {
+            let status = requireSourceName(path.view());
+            if (status != 0) {
+                return status;
+            }
+        }
+    }
+    return 0;
+}
+
 /// The source files named, or under a directory named, in ordinal order (Program.NovaFiles).
 fn namedSourceFiles(paths: borrow Vector<Vector<u8>>, out: borrow mut Vector<Vector<u8>>) -> Result<void, AllocError> {
     for (path in paths.view()) {
@@ -136,7 +149,7 @@ fn namedSourceFiles(paths: borrow Vector<Vector<u8>>, out: borrow mut Vector<Vec
                 out.push(copyBytes(f.view())?)?;
             }
         } else {
-            out.push(copyBytes(path.view())?)?;
+            out.push(copyBytes(path.view())?)?; // a named file must be a .cee file (requireNamedSources)
         }
     }
     return Ok();
@@ -204,6 +217,10 @@ fn fmtCommand(arguments: borrow Vector<Vector<u8>>, json: bool) -> i32 {
         }
     }
     var files = Vector<Vector<u8>>.create();
+    let named = requireNamedSources(paths);
+    if (named != 0) {
+        return named;
+    }
     namedSourceFiles(paths, mut files)!;
     if (paths.length == 0) {
         var found = false;
@@ -217,7 +234,7 @@ fn fmtCommand(arguments: borrow Vector<Vector<u8>>, json: bool) -> i32 {
         }
     }
     if (files.length == 0) {
-        return finishFmt(json, fail("no Nova input files"), Diagnostics.create(), Vector<SourceText>.create());
+        return finishFmt(json, fail("no CeeSafe input files"), Diagnostics.create(), Vector<SourceText>.create());
     }
     if (stdout && files.length != 1) {
         return finishFmt(json, fail("fmt --stdout takes one file"), Diagnostics.create(), Vector<SourceText>.create());

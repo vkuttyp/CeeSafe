@@ -1,0 +1,26 @@
+// An example from the repository's README.md: keep its code identical to the README's (test annotations aside).
+
+interface Shape {
+    fn area(borrow this) -> u64;
+}
+
+struct Square { side: u64; }
+struct Rect { w: u64; h: u64; }
+
+impl Shape for Square { fn area(borrow this) -> u64 => this.side * this.side; }
+impl Shape for Rect { fn area(borrow this) -> u64 => this.w * this.h; }
+
+fn total<S: Shape>(shapes: Slice<S>) -> u64 {
+    var sum: u64 = 0;
+    for (shape in shapes) { sum += shape.area(); } // shape: borrow S
+    return sum;
+}
+
+fn main() {
+    let squares = [Square { side: 2 }, Square { side: 3 }];
+    var rects = Vector<Rect>.create();
+    rects.push(Rect { w: 4, h: 5 })!;
+    Console.writeLine(total(squares[..]) + total(rects.view()));
+}
+
+// expect-stdout: 33

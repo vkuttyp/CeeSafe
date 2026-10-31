@@ -1,0 +1,30 @@
+// An example from the repository's README.md: keep its code identical to the README's (test annotations aside).
+
+enum ParseError { Empty, BadDigit(u8), TooLarge }
+
+fn parse(text: StringView) -> Result<u32, ParseError> {
+    if (text.length == 0) { return Err(ParseError.Empty); }
+    var value: u64 = 0;
+    for (c in text.bytes()) {
+        if (c < 48 || c > 57) { return Err(ParseError.BadDigit(c)); }
+        value = value * 10 + (c - 48) as u64;
+        if (value > 4294967295) { return Err(ParseError.TooLarge); }
+    }
+    return Ok(truncate<u32>(value));
+}
+
+fn sum(a: StringView, b: StringView) -> Result<u32, ParseError> {
+    return Ok(parse(a)? + parse(b)?); // `?` returns the error to the caller
+}
+
+fn main() {
+    match (sum("120", "3x")) {
+        Ok(total) => { Console.writeLine(total); }
+        Err(ParseError.BadDigit(c)) => { Console.write("bad digit: "); Console.writeLine(c); }
+        Err(_) => { Console.writeLine("cannot parse"); }
+    }
+    Console.writeLine(sum("120", "3")!);
+}
+
+// expect-stdout: bad digit: 120
+// expect-stdout: 123

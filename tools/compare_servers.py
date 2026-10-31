@@ -27,7 +27,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-from names import map_back
+from names import FORK_DIVERGENCES, map_back
 
 FAMILIES = ("parse-pass", "parse-fail", "check-pass", "check-fail", "run-pass", "run-fail")
 
@@ -142,7 +142,9 @@ def mcp_file_session(path, text, run):
              tool("emit_c", {"files": files, "explain": ["overflow-checks", "allocations", "bounds-checks"]}, 5)]
     if run:
         lines.append(tool("run", {"files": files, "args": ["a", "b c"], "stdin": "line one\nline two\n"}, 6))
-        lines.append(tool("run", {"files": files, "maxOutputBytes": 7, "maxSteps": 2000}, 7))
+        # Only the step limit: a cut at a byte limit falls elsewhere in the renamed messages (`ceesafe panic:` is three
+        # bytes longer than `nova panic:`); the arguments session cuts a program's own output.
+        lines.append(tool("run", {"files": files, "maxSteps": 2000}, 7))
     for k, match in enumerate(re.finditer(r"\w+", text)):
         line, character = utf16_position(text, match.start())
         lines.append(tool("symbol", {"files": files, "path": path, "line": line + 1, "column": character + 1}, 100 + k))
@@ -258,15 +260,17 @@ def mcp_normalise(output, mapping=lambda line: line):
 
 def to_cee(data):
     """A session for ceesafec: the tool and resource names it serves."""
-    return re.sub(rb'"name": ?"nova_', lambda m: m.group(0).replace(b"nova_", b"ceesafe_"), data).replace(
-        b"nova://", b"ceesafe://")
+    data = re.sub(rb'"name": ?"nova_', lambda m: m.group(0).replace(b"nova_", b"ceesafe_"), data)
+    data = re.sub(rb'"name": ?"(write-nova|port-c-to-nova)"', lambda m: m.group(0).replace(b"nova", b"ceesafe"), data)
+    return data.replace(b"nova://", b"ceesafe://")
 
 
 def compare_mcp(cee, novac, name, cee_data, data, cwd):
     mine = serve(cee, ["mcp"], cee_data, cwd)
     ref = serve(novac, ["mcp"], data, cwd)
+    # Both sides mapped back: Nova's documents, which both serve as they are, mention the CeeSafe port.
     mapped = (mine[0], mcp_normalise(mine[1], map_back), map_back(mine[2]))
-    ref = (ref[0], mcp_normalise(ref[1]), ref[2])
+    ref = (ref[0], mcp_normalise(ref[1], map_back), map_back(ref[2]))
     return None if mapped == ref else (name, mapped, ref)
 
 
@@ -325,7 +329,8 @@ def main():
     if not files:
         for family in FAMILIES:
             directory = os.path.join(root, "tests", "corpus", family)
-            files += sorted(f"tests/corpus/{family}/{n}" for n in os.listdir(directory) if n.endswith(".nova"))
+            files += sorted(f"tests/corpus/{family}/{n}" for n in os.listdir(directory)
+                            if n.endswith(".nova") and f"tests/corpus/{family}/{n}" not in FORK_DIVERGENCES)
     cases, results, mcp_results = [], [], []
     scratch = tempfile.mkdtemp(prefix="servers-")
     try:

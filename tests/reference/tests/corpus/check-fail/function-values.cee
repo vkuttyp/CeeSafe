@@ -1,0 +1,30 @@
+// Function values (type-system.md §36.1, M11 G8a): what cannot be one, signatures that must match, calls, and
+// function types whose reference result has no single source.
+extern "C" {
+    fn abs(x: i32) -> i32;
+}
+
+/// Safety: none needed; this only tests that an unsafe function is not a value.
+unsafe fn risky(x: i32) -> i32 => x;
+
+fn first<region r>(a: StringView<r>, b: StringView<r>) -> StringView<r> => a;
+fn identity<T>(x: T) -> T => x;
+fn double(x: i32) -> i32 => x * 2;
+fn pair(a: borrow i32, b: borrow i32) -> borrow(a) i32 => a;
+
+fn main() {
+    let a = abs; // error[N0298]
+    let b = risky; // error[N0298]
+    let c = first; // error[N0298]
+    let d = main; // error[N0298]
+    let e = identity; // error[N0210]
+    let f: fn(i64) -> i64 = double; // error[N0205]
+    let g = double;
+    let h = g(1, 2); // error[N0209]
+    let i = g == g; // error[N0207]
+    let j = pair; // error[N0298]
+    let k: fn(i32) -> i32 = identity<i32>;
+    let l = k(g(3));
+}
+
+fn twoSources(f: fn(borrow i32, borrow i32) -> borrow i32) { } // error[N0245]

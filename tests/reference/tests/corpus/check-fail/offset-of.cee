@@ -1,0 +1,14 @@
+// offsetOf<T>(field) takes one struct type and the name of one of its fields (type-system.md §30.1, ADR 0030).
+struct Pair { a: u8; b: u32; }
+enum Mode { On, Off }
+
+fn bad() {
+    let a = offsetOf<Pair>(); // error[N0209]
+    let b = offsetOf(b); // error[N0209]
+    let c = offsetOf<Pair>(1); // error[N0209]
+    let d = offsetOf<Pair>(c); // error[N0339]
+    let e = offsetOf<Mode>(On); // error[N0339]
+    let f = offsetOf<u32>(x); // error[N0339]
+}
+
+fn good() -> usize => offsetOf<Pair>(b);

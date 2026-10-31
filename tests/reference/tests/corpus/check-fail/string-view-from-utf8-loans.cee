@@ -1,0 +1,10 @@
+// M15 S6: the view from `StringView.fromUtf8` borrows its bytes, so they cannot change while it is used
+// (type-system.md §22.2).
+
+fn main() {
+    var bytes = Vector<u8>.create();
+    bytes.push(0x61)!;
+    let text = StringView.fromUtf8(bytes)!;
+    bytes.push(0x62)!; // error[N0241]
+    Console.writeLine(text);
+}

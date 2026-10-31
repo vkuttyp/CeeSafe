@@ -1,0 +1,5 @@
+// Effect lists on function and closure types (grammar.md §2, type-system.md §36.3, M11 G8b′): before `fn`, also
+// inside `borrow`, in fields, results, optionals and generic arguments.
+fn a(f: @effects() fn(i32) -> i32, g: @effects(alloc) fn(), h: borrow @effects(sleep) fn(i32), k: borrow mut @effects() fn(i32) -> bool) { }
+fn b(maybe: (@effects() fn(i32))?, many: Vector<@effects(sleep, alloc) fn(i64) -> i64>) -> @effects() fn(i32) -> i32 => f;
+struct Handler { run: @effects() fn(borrow Handler) -> i32; }

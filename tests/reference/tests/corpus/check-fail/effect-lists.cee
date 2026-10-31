@@ -1,0 +1,25 @@
+// Effect lists on function and closure types (type-system.md §36.3): misused attributes (N0290), and values whose
+// effects are not known to be in the expected list (N0299). Inference does not narrow a value's type.
+fn isEven(v: i32) -> bool => v % 2 == 0;
+
+fn quietly(f: @effects() fn(i32) -> bool) -> bool => f(1);
+fn quietClosure(f: borrow @effects() fn(i32) -> bool) -> bool => f(1);
+fn allocating(f: @effects(alloc) fn(i32) -> bool) -> bool => f(1);
+
+fn bad1(f: @effects(blocking) fn(i32)) { } // error[N0290]
+fn bad2(f: @context(atomic) fn(i32)) { } // error[N0290]
+fn bad3(f: @effects(sleep) @effects(alloc) fn(i32)) { } // error[N0290]
+
+fn main() {
+    let plain = isEven;                        // a fn(i32) -> bool: no effect list
+    quietly(plain); // error[N0299]
+    quietClosure(plain); // error[N0299]
+    let some: @effects(alloc) fn(i32) -> bool = isEven;
+    quietly(some); // error[N0299]
+    allocating(some);
+    let k = 1;
+    let loud: borrow fn(i32) -> bool = (v) => v > k;
+    quietClosure(loud); // error[N0299]
+    let narrow: borrow @effects(alloc) fn(i32) -> bool = (v) => v > k;
+    quietClosure(narrow); // error[N0299]
+}

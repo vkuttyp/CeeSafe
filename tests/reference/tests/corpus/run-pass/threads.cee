@@ -1,0 +1,127 @@
+// Threads (type-system.md §38, ADR 0016): spawn and join, results of several types, shared state through Arc with a
+// Mutex and with atomics, a thread joined by its drop, and values moved into threads.
+
+struct Counter {
+    n: u64;
+}
+
+struct Noisy {
+    id: u64;
+    drop {
+        Console.write("drop ");
+        Console.writeLine(this.id);
+    }
+}
+
+interface Job {
+    fn run(borrow this) -> u64;
+}
+
+struct Double {
+    n: u64;
+}
+
+impl Job for Double {
+    fn run(borrow this) -> u64 => this.n * 2;
+}
+
+// A closure made in one place and run on a thread in another (type-system.md §38.2, §38.4).
+fn worker(base: u64) -> Box<dyn mut fn() -> u64 + Send> {
+    return Box.create(move () => base + 1)!;
+}
+
+fn main() {
+    // Results: an integer, a String moved back, nothing.
+    let square = Thread.spawn(move () => 7u64 * 7)!;
+    Console.writeLine(square.join()); // 49
+    var words = Vector<String>.create();
+    words.push(String.create())!;
+    let built = Thread.spawn(move () => {
+        var text = String.create();
+        text.append("from a thread with ")!;
+        text.appendNumber(words.length)!;
+        return text;
+    })!;
+    let text = built.join();
+    Console.writeLine(text);
+    let quiet = Thread.spawn(move () => {})!;
+    quiet.join();
+
+    // A Mutex behind an Arc, from four threads.
+    let counter = Arc<Mutex<Counter>>.create(Mutex<Counter>.create(Counter { n: 0 })!)!;
+    var workers = Vector<Thread<u64>>.create();
+    for (i in 0..4u64) {
+        let mine = counter.clone();
+        workers.push(Thread.spawn(move () => {
+            for (k in 0..1000u64) {
+                var guard = mine.get().lock();
+                let data = guard.data();
+                data.n += 1;
+            }
+            return i;
+        })!)!;
+    }
+    var ids: u64 = 0;
+    loop {
+        match (workers.pop()) {
+            Some(t) => { ids += t.join(); }
+            null => { break; }
+        }
+    }
+    Console.writeLine(ids); // 0 + 1 + 2 + 3
+    {
+        var guard = counter.get().lock();
+        Console.writeLine(guard.data().n); // 4000
+    }
+
+    // Atomics behind an Arc.
+    let hits = Arc<AtomicU64>.create(AtomicU64.create(0))!;
+    let a = hits.clone();
+    let b = hits.clone();
+    let ta = Thread.spawn(move () => {
+        for (k in 0..500u64) { a.get().fetchAdd(1); }
+    })!;
+    let tb = Thread.spawn(move () => {
+        for (k in 0..500u64) { b.get().fetchAdd(2); }
+    })!;
+    ta.join();
+    tb.join();
+    Console.writeLine(hits.get().load()); // 1500
+    let flag = AtomicBool.create(false);
+    Console.writeLine(flag.swap(true)); // false
+    match (flag.compareExchange(true, false)) {
+        Ok(old) => { Console.writeLine(old); } // true
+        Err(now) => { Console.writeLine(now); }
+    }
+
+    // A value moved into a thread is destroyed when the thread is joined; an unjoined thread is joined by its drop.
+    let owned = Noisy { id: 1 };
+    let keeper = Thread.spawn(move () => owned.id + 1)!;
+    Console.writeLine(keeper.join()); // 2, then "drop 1"
+    let later = Noisy { id: 2 };
+    let unjoined = Thread.spawn(move () => later.id)!;
+    // Boxed closures and dyn values that are Send cross to threads.
+    let made = Thread.spawn(worker(41))!;
+    Console.writeLine(made.join()); // 42
+    let job: Box<dyn Job + Send> = Box.create(Double { n: 21 })!;
+    let ran = Thread.spawn(move () => job.run())!;
+    Console.writeLine(ran.join()); // 42
+    let plain: Box<dyn Job> = Box.create(Double { n: 1 })!; // forgetting `+ Send` is allowed
+    Console.writeLine(plain.run());
+    Console.writeLine("end");
+}
+
+// expect-stdout: 49
+// expect-stdout: from a thread with 1
+// expect-stdout: 6
+// expect-stdout: 4000
+// expect-stdout: 1500
+// expect-stdout: false
+// expect-stdout: true
+// expect-stdout: drop 1
+// expect-stdout: 2
+// expect-stdout: 42
+// expect-stdout: 42
+// expect-stdout: 2
+// expect-stdout: end
+// expect-stdout: drop 2

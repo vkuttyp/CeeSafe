@@ -1,0 +1,116 @@
+// Closures (type-system.md §36.2, M11 G8b): shared and mutable captures, capture-free literals as plain functions,
+// function values as closures, nested closures, generics, `this`, a closure in a struct, loops, references, results.
+
+struct Counter {
+    step: i32;
+    fn total(this, values: Slice<i32>) -> i32 {
+        var sum = 0;
+        each(values, (v) => { sum += v * this.step; });
+        return sum;
+    }
+}
+
+struct Button<region r> {
+    label: StringView<r>;
+    onClick: borrow mut(r) fn(i32);
+}
+
+fn countIf(values: Slice<i32>, keep: borrow fn(i32) -> bool) -> i32 {
+    var n = 0;
+    for (v in values) { if (keep(v)) { n += 1; } }
+    return n;
+}
+
+fn each(values: Slice<i32>, visit: borrow mut fn(i32)) {
+    for (v in values) { visit(v); }
+}
+
+fn find<T: Copy>(values: Slice<T>, matches: borrow fn(T) -> bool) -> T? {
+    for (v in values) { if (matches(v)) { return v; } }
+    return null;
+}
+
+fn compose(f: fn(i32) -> i32, g: borrow fn(i32) -> i32, x: i32) -> i32 => g(f(x));
+fn isEven(x: i32) -> bool => x % 2 == 0;
+fn press<region r>(button: borrow mut Button<r>, times: i32) {
+    for (i in 0..times) { button.onClick(i); }
+}
+
+/// Captures of reference parameters and of a closure: references to references in the environment (C: `T *const *`).
+struct P { x: i32; }
+fn throughReferences(p: borrow P, q: borrow mut P, k: borrow fn(i32) -> i32) -> i32 {
+    let f = (v: i32) => v + p.x + k(v);
+    let g = (v: i32) => { q.x += v + p.x; };
+    g(1);
+    return f(2) + q.x;
+}
+
+fn main() {
+    let values = [3, 8, 1, 9, 4];
+    let limit = 4;
+    Console.writeLine(countIf(values[..], (v) => v > limit));      // 2
+    var total = 0;
+    each(values[..], (v) => { total += v; });
+    Console.writeLine(total);                                       // 25
+
+    let twice = (x: i32) => x * 2;                                  // a plain fn(i32) -> i32
+    Console.writeLine(compose(twice, (x) => x + limit, 5));         // 14
+    Console.writeLine(countIf(values[..], isEven));                 // 2: a function value as a closure
+
+    // Nested: the inner closure captures `limit` and `hits` through the outer one.
+    var hits = 0;
+    each(values[..], (v) => {
+        let check = (w: i32) => w > limit;
+        if (check(v)) { hits += 1; }
+    });
+    Console.writeLine(hits);                                        // 2
+
+    // Generic code, an optional result, `this` in a method.
+    match (find<i32>(values[..], (v) => v > 8)) {
+        Some(v) => { Console.writeLine(v); }                        // 9
+        null => { Console.writeLine("none"); }
+    }
+    let counter = Counter { step: 10 };
+    Console.writeLine(counter.total(values[..]));                    // 250
+
+    // A closure in a struct with a region parameter, called through the field.
+    var clicks = 0;
+    let onClick = (i: i32) => { clicks += i + 1; };
+    var button = Button { label: "ok", onClick: onClick };
+    press(mut button, 3);
+    Console.writeLine(button.label);
+    Console.writeLine(clicks);                                      // 6
+
+    // A closure made in each iteration, and one taking a reference and returning a String.
+    var sum = 0;
+    for (i in 0..3) {
+        let addI = (x: i32) => x + i;
+        sum += addI(10);
+    }
+    Console.writeLine(sum);                                         // 33
+    let prefix = "nova";
+    let describe = (n: borrow i32) => {
+        var s = String.create();
+        s.append(prefix)!;
+        s.append("-")!;
+        s.appendNumber(n)!;
+        Console.writeLine(s);
+    };
+    describe(borrow total);                                         // nova-25
+    let a = P { x: 3 };
+    var b = P { x: 4 };
+    let n = 5;
+    Console.writeLine(throughReferences(borrow a, mut b, (v) => v * n));    // 23
+}
+// expect-stdout: 2
+// expect-stdout: 25
+// expect-stdout: 14
+// expect-stdout: 2
+// expect-stdout: 2
+// expect-stdout: 9
+// expect-stdout: 250
+// expect-stdout: ok
+// expect-stdout: 6
+// expect-stdout: 33
+// expect-stdout: nova-25
+// expect-stdout: 23

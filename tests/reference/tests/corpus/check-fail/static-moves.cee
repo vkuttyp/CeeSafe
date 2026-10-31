@@ -1,0 +1,10 @@
+// A static is a place behind a shared reference (type-system.md §39.2): a value that is not Copy cannot be moved out
+// of it (N0251), as out of any place reached through a reference.
+static OPENED: AtomicU64 = AtomicU64.constant(0);
+
+fn take() -> u64 {
+    let a = OPENED; // error[N0251]
+    return a.load();
+}
+
+fn main() {}

@@ -1,0 +1,20 @@
+// An array of imported C structs is C state (C9, type-system.md §33.1): it is never moved or copied out of its
+// place (§33.2), while an array of bytes in a C struct is an ordinary value. Checked after type checking, so this
+// file has no other errors.
+@header("parts.h")
+extern "C" {
+    struct part {
+        uuid: [u8; 16];
+    }
+    struct table {
+        parts: [part; 4];
+    }
+}
+
+fn copies(t: borrow mut table) {
+    let parts = t.parts; // error[N0294]
+    let uuid = t.parts[1].uuid;
+    t.parts[0].uuid = uuid;
+    let first = borrow mut t.parts[0];
+    first.uuid[3] = 9;
+}

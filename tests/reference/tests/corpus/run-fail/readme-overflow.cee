@@ -1,0 +1,7 @@
+// An example from the repository's README.md: keep its code identical to the README's (test annotations aside).
+
+fn main() {
+    var level: u8 = 250;
+    for (i in 0..10) { level += 1; } // u8 arithmetic is checked: this panics at 256 // expect-panic: integer overflow
+    Console.writeLine(level);
+}

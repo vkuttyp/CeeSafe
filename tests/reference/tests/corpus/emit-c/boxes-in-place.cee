@@ -1,0 +1,13 @@
+// Box.create built in place (c-backend.md §2, M9e′): the allocation first, then the construction written into the
+// box's memory. A value whose type needs a drop goes through nvB_, which destroys it if the allocation fails.
+struct Res { id: i32; drop { } }
+
+fn table() -> Result<Box<[u8; 64]>, AllocError> => Box.create([7u8; 64]);
+
+fn holder(id: i32) -> Result<Box<Res>, AllocError> => Box.create(Res { id: id });
+
+fn main() -> i32 {
+    let t = table()!;
+    let h = holder(3)!;
+    return truncate<i32>(t[63] as i64) + h.id;
+}

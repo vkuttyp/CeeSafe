@@ -1,0 +1,40 @@
+// References to optionals (type-system.md §22.1, M11 G6): a list appended at its tail through a borrow mut (Box<Node>?),
+// reads through borrow (T?), == null, and an optional replaced through a reference.
+struct Node { value: i32; next: Box<Node>?; }
+
+/// Appends at the end: the slot is a reference to an optional, written when it is null.
+fn append(slot: borrow mut (Box<Node>?), value: i32) {
+    match (slot) {
+        Some(node) => { append(mut node.next, value); }
+        null => { slot = Some(Box.create(Node { value: value, next: null })!); }
+    }
+}
+
+fn sum(slot: borrow (Box<Node>?)) -> i32 => match (slot) {
+    Some(node) => node.value + sum(borrow node.next),
+    null => 0,
+};
+
+fn describe(o: borrow (i32?)) -> i32 {
+    if (o == null) {
+        return -1;
+    }
+    return match (o) { Some(v) => v, null => 0 };
+}
+
+fn clear(o: borrow mut (i32?)) { o = null; }
+
+fn main() {
+    var head: Box<Node>? = null;
+    append(mut head, 1);
+    append(mut head, 2);
+    append(mut head, 3);
+    Console.writeLine(sum(borrow head));
+    var x: i32? = 5;
+    Console.writeLine(describe(borrow x));
+    clear(mut x);
+    Console.writeLine(describe(borrow x));
+}
+// expect-stdout: 6
+// expect-stdout: 5
+// expect-stdout: -1

@@ -1,0 +1,28 @@
+(unit
+  (fn default f (params (r (Result Shape u8)) (o (optional (optional bool))))
+    (block
+      (match r
+        (arm (Ok (Shape.Rect 1 var h))
+          (block)
+        )
+        (arm (Ok (Shape.Circle (neg 2)))
+          (block)
+        )
+        (arm (Err _)
+          (block)
+        )
+      )
+      (match o
+        (arm (Some (Some true))
+          (block)
+        )
+        (arm (Some null)
+          (block)
+        )
+        (arm _
+          (block)
+        )
+      )
+    )
+  )
+)

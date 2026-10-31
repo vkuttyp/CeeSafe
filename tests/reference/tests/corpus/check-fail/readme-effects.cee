@@ -1,0 +1,21 @@
+// The context-effects example of the repository's README.md: keep its code identical to the README's (test
+// annotations aside). It is a file of its own because effects are checked only once borrow checking passes.
+
+@header("kernel/sched.h")
+extern "C" {
+    @effects(sleep)
+    fn cosmo_sleep_ms(ms: u32);
+}
+
+/// Holding a spin-lock guard makes the code that runs meanwhile atomic: it must not sleep.
+@context(atomic)
+struct SpinGuard { cpu: u32; drop {} }
+
+/// Safety: cosmo_sleep_ms has no preconditions; it may sleep.
+fn backOff() { unsafe { cosmo_sleep_ms(1); } }
+
+fn update(counter: borrow mut u64) {
+    let guard = SpinGuard { cpu: 0 };
+    counter += 1;
+    backOff(); // sleeps while the guard is held // error[N0295]
+}

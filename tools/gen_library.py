@@ -2,8 +2,9 @@
 """Writes src/library/sources.cee: the Nova libraries novac embeds (the reference's CoreLibrary.cs).
 
 lib/core, lib/std and lib/kernel, each in ordinal path order, with line endings made "\\n" as CoreLibrary.Load does.
-Each file is one string literal; its path is "lib/core/NAME.nova" and so on, which marks it as library code. The files
-come from a Nova checkout at the pinned tag, which must be clean.
+Each file is one string literal; its path is "lib/core/NAME.cee" and so on, which marks it as library code. The files
+come from a Nova checkout at the pinned tag, which must be clean, and are given CeeSafe's names (tools/names.py: the
+runtime's functions they declare, the prose of their comments).
 
 usage: python3 tools/gen_library.py [--nova PATH]   (default ~/Nova; formats with $CEESAFEC, default out/ceesafec)
 """
@@ -12,6 +13,8 @@ import argparse
 import os
 import subprocess
 import sys
+
+from names import map_forward
 
 GROUPS = (("lib/core/", 0), ("lib/std/", 1), ("lib/kernel/", 2))
 
@@ -52,7 +55,7 @@ def main():
         for name in sorted(n for n in os.listdir(directory) if n.endswith(".nova")):
             with open(os.path.join(directory, name), encoding="utf-8-sig") as f:
                 text = f.read().replace("\r\n", "\n").replace("\r", "\n")
-            files.append((prefix + name, group, text))
+            files.append((prefix + map_forward(name), group, map_forward(text)))
     paths = "\n".join(f"    {k} => \"{p}\"," for k, (p, _, _) in enumerate(files[:-1]))
     groups = "\n".join(f"    {k} => {g}," for k, (_, g, _) in enumerate(files[:-1]))
     last = files[-1]

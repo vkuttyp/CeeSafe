@@ -1,0 +1,57 @@
+// benchmarks/atomics (README.md): a single-producer, single-consumer ring of 1,024 slots between the two threads of
+// Thread.both (type-system.md §38.6). Every atomic operation is sequentially consistent (lib/std's atomics, ADR 0016),
+// the question OD-24 asks a benchmark to answer. The first argument is the number of values passed, in millions.
+const SLOTS: u64 = 1024;
+
+struct Ring {
+    head: AtomicU64;
+    tail: AtomicU64;
+    slots: Vector<AtomicU64>;
+}
+
+fn produce(ring: borrow Ring, n: u64) {
+    var tail: u64 = 0;
+    while (tail < n) {
+        while (tail - ring.head.load() == SLOTS) {}
+        ring.slots[(tail % SLOTS) as usize].store(tail);
+        tail += 1;
+        ring.tail.store(tail);
+    }
+}
+
+fn consume(ring: borrow Ring, n: u64) -> u64 {
+    var head: u64 = 0;
+    var total: u64 = 0;
+    while (head < n) {
+        while (ring.tail.load() == head) {}
+        total = total.wrappingAdd(ring.slots[(head % SLOTS) as usize].load() ^ head.wrappingMul(0x9e3779b97f4a7c15));
+        head += 1;
+        ring.head.store(head);
+    }
+    return total;
+}
+
+fn parse(text: StringView) -> u64 {
+    var n: u64 = 0;
+    for (c in text.bytes()) {
+        n = n * 10 + (c - 48) as u64;
+    }
+    return n;
+}
+
+fn main() -> i32 {
+    let millions = match (Process.argument(1)) {
+        Some(text) => parse(text),
+        null => 1u64,
+    };
+    let n = millions * 1000000;
+    var slots = Vector<AtomicU64>.withCapacity(SLOTS as usize)!;
+    for (i in 0..SLOTS) {
+        slots.push(AtomicU64.create(0))!;
+    }
+    let ring = Ring { head: AtomicU64.create(0), tail: AtomicU64.create(0), slots: slots };
+    var total: u64 = 0;
+    Thread.both(() => { produce(borrow ring, n); }, () => { total = consume(borrow ring, n); });
+    Console.writeLine(total);
+    return 0;
+}

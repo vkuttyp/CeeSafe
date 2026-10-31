@@ -1847,7 +1847,7 @@ fn runMain(it: borrow mut Interp, c: borrow Checker, n: borrow NirProgram, main:
         Ok(code) => { return truncate<i32>(truncate<u32>(code) & 0xFF); }
         Err(stop) => {
             if (stop.kind == 0) {
-                var m = copyBytes("nova interp: fault: ".bytes())!;
+                var m = copyBytes("ceesafe interp: fault: ".bytes())!;
                 appendBytes(mut m, stop.message.view())!;
                 appendText(mut m, " at ")!;
                 if (stop.hasLocation) {
@@ -1861,7 +1861,7 @@ fn runMain(it: borrow mut Interp, c: borrow Checker, n: borrow NirProgram, main:
                 return faultExitStatus();
             }
             if (stop.kind == 1) {
-                var m = copyBytes("nova panic: ".bytes())!;
+                var m = copyBytes("ceesafe panic: ".bytes())!;
                 appendBytes(mut m, stop.message.view())!;
                 appendText(mut m, " at ")!;
                 appendBytes(mut m, stop.location.view())!;

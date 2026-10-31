@@ -1,0 +1,163 @@
+// f32 and f64 (type-system.md §35, M11 G7a): literals, IEEE arithmetic and comparisons, infinities, NaN and signed
+// zeros, conversions at their boundaries, bits, constants, and floats in structs, generics and branch expressions.
+// Values are shown by their bits or truncated, since printing floats is G7b. NaN bits are not printed (§35.3).
+
+const HALF: f64 = 1.0 / 2.0;
+const SCALE: f32 = 2.5 * 4.0;
+const TINY: f32 = 1e-45;                                // f32's smallest subnormal
+
+struct Point { x: f64; y: f64; }
+
+fn length2(p: Point) -> f64 => p.x * p.x + p.y * p.y;
+
+fn either<T>(c: bool, a: T, b: T) -> T => if (c) a else b;
+
+fn show(label: StringView, ok: bool) {
+    Console.write(label);
+    Console.writeLine(if (ok) " ok" else " FAILED");
+}
+
+fn main() {
+    // Literals: each rounded once in its own type.
+    Console.writeLine(0.1.bits());                      // 4591870180066957722
+    Console.writeLine(0.1f32.bits());                   // 1036831949
+    let flexible: f32 = 0.1;
+    Console.writeLine(flexible.bits());                 // 1036831949: the literal took f32
+    Console.writeLine(1e300.bits());
+    Console.writeLine(6.02e23f64.bits());
+    Console.writeLine(2.5e-3.bits());
+
+    // Arithmetic, rounded to nearest even in the operands' type.
+    Console.writeLine((0.1 + 0.2).bits());              // 4599075939470750516 (0.30000000000000004)
+    Console.writeLine((0.1f32 + 0.2f32).bits());        // 1050253722: f32 arithmetic, not f64 rounded to f32
+    Console.writeLine(truncate<i32>(7.0 / 2.0 * 10.0)); // 35
+    let third = 1.0 / 3.0;
+    Console.writeLine(third.bits());
+
+    // Infinities, NaN and zeros never panic.
+    let inf = 1.0 / 0.0;
+    let ninf = -1.0 / 0.0;
+    let nan = 0.0 / 0.0;
+    Console.writeLine(inf.bits());                      // 9218868437227405312
+    Console.writeLine(ninf.bits());
+    Console.writeLine((1e308 * 10.0).bits() == inf.bits());
+    show("nan != nan", nan != nan && !(nan == nan));
+    show("nan unordered", !(nan < 1.0) && !(nan > 1.0) && !(nan <= nan) && !(nan >= nan));
+    show("inf - inf is nan", (inf - inf) != (inf - inf));
+    let negzero = -0.0;
+    Console.writeLine(negzero.bits());                  // 9223372036854775808
+    show("-0 == 0", negzero == 0.0);
+    Console.writeLine((1.0 / negzero).bits() == ninf.bits());
+    show("ordering", -1.5 < -1.0 && 2.0 <= 2.0 && 3.0 > 2.5 && 1e-300 > 0.0);
+
+    // Conversions: `as` is exact, round<T> rounds once, truncate goes toward zero.
+    let small: i32 = -2147483648;
+    Console.writeLine((small as f64).bits());
+    let byte: u8 = 255;
+    Console.writeLine((byte as f32).bits());
+    Console.writeLine((0.1f32 as f64).bits());          // 4591870180174331904: f32's 0.1, widened exactly
+    let big: i64 = 9007199254740993;                    // 2^53 + 1
+    Console.writeLine(round<f64>(big).bits());          // 2^53: ties to even
+    let top: u64 = 18446744073709551615;
+    Console.writeLine(round<f32>(top).bits());          // 2^64 in f32
+    Console.writeLine(round<f32>(1e300).bits());        // f32 infinity
+    Console.writeLine(round<f32>(0.1).bits());          // 1036831949
+    Console.writeLine(round<f64>(5).bits());
+    Console.writeLine(truncate<i32>(-2.9));             // -2
+    Console.writeLine(truncate<u8>(255.99));            // 255
+    Console.writeLine(truncate<i8>(-128.99));           // -128
+    Console.writeLine(truncate<i64>(-9223372036854775808.0));
+    Console.writeLine(truncate<u64>(18446744073709549568.0));
+    Console.writeLine(truncate<u32>(-0.99));            // 0
+    Console.writeLine(saturatingTruncate<i8>(1000.0));  // 127
+    Console.writeLine(saturatingTruncate<i8>(-1000.0)); // -128
+    Console.writeLine(saturatingTruncate<u16>(nan));    // 0
+    Console.writeLine(saturatingTruncate<u64>(inf));    // 18446744073709551615
+    Console.writeLine(saturatingTruncate<i32>(ninf));   // -2147483648
+    match (checkedTruncate<u8>(256.0)) {
+        Some(v) => { Console.writeLine(v); }
+        null => { Console.writeLine("null"); }
+    }
+    match (checkedTruncate<u8>(255.5)) {
+        Some(v) => { Console.writeLine(v); }
+        null => { Console.writeLine("null"); }
+    }
+
+    // Bits round-trip, NaNs included.
+    let fromBits = f64.fromBits(4607182418800017408);
+    show("fromBits", fromBits == 1.0);
+    let quiet = f32.fromBits(2143289344);
+    show("f32 NaN from bits", quiet != quiet);
+    Console.writeLine(f32.fromBits(1065353216).bits()); // 1065353216 (1.0)
+
+    // Constants fold with the run-time rounding.
+    Console.writeLine(HALF.bits());
+    Console.writeLine(truncate<i32>(SCALE));            // 10
+    Console.writeLine(TINY.bits());                     // 1
+
+    // Structs, compound assignment, generics and branch expressions.
+    var p = Point { x: 3.0, y: 4.0 };
+    Console.writeLine(truncate<i32>(length2(p)));       // 25
+    p.x *= 2.0;
+    p.y -= 4.0;
+    Console.writeLine(truncate<i32>(length2(p)));       // 36
+    Console.writeLine(either<f32>(false, 1.0, 2.5).bits());
+    let scale: f32 = if (p.x > 1.0) 1.5 else 0.5;       // flexible branches take f32
+    Console.writeLine(scale.bits());                    // 1069547520
+    var sum = 0.0;
+    let samples = [1.5, 2.25, 4.0];
+    for (s in samples) { sum += s; }
+    Console.writeLine(truncate<i64>(sum / round<f64>(samples.length) * 1000.0));   // 2583
+}
+// expect-stdout: 4591870180066957722
+// expect-stdout: 1036831949
+// expect-stdout: 1036831949
+// expect-stdout: 9094988921128908188
+// expect-stdout: 4962930089146241889
+// expect-stdout: 4567911030049346683
+// expect-stdout: 4599075939470750516
+// expect-stdout: 1050253722
+// expect-stdout: 35
+// expect-stdout: 4599676419421066581
+// expect-stdout: 9218868437227405312
+// expect-stdout: 18442240474082181120
+// expect-stdout: true
+// expect-stdout: nan != nan ok
+// expect-stdout: nan unordered ok
+// expect-stdout: inf - inf is nan ok
+// expect-stdout: 9223372036854775808
+// expect-stdout: -0 == 0 ok
+// expect-stdout: true
+// expect-stdout: ordering ok
+// expect-stdout: 13970166044103278592
+// expect-stdout: 1132396544
+// expect-stdout: 4591870180174331904
+// expect-stdout: 4845873199050653696
+// expect-stdout: 1602224128
+// expect-stdout: 2139095040
+// expect-stdout: 1036831949
+// expect-stdout: 4617315517961601024
+// expect-stdout: -2
+// expect-stdout: 255
+// expect-stdout: -128
+// expect-stdout: -9223372036854775808
+// expect-stdout: 18446744073709549568
+// expect-stdout: 0
+// expect-stdout: 127
+// expect-stdout: -128
+// expect-stdout: 0
+// expect-stdout: 18446744073709551615
+// expect-stdout: -2147483648
+// expect-stdout: null
+// expect-stdout: 255
+// expect-stdout: fromBits ok
+// expect-stdout: f32 NaN from bits ok
+// expect-stdout: 1065353216
+// expect-stdout: 4602678819172646912
+// expect-stdout: 10
+// expect-stdout: 1
+// expect-stdout: 25
+// expect-stdout: 36
+// expect-stdout: 1075838976
+// expect-stdout: 1069547520
+// expect-stdout: 2583

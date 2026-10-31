@@ -1,0 +1,11 @@
+// M15 S4: two-phase only orders the argument before the loan; truncating while an element is still borrowed is still
+// rejected (H2, type-system.md §23.1).
+
+fn main() {
+    var v = Vector<u32>.create();
+    v.push(1)!;
+    v.push(2)!;
+    let r = borrow v[1];
+    v.truncate(v.length - 1); // error[N0241]
+    Console.writeLine(r);
+}

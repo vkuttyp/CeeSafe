@@ -1,0 +1,9 @@
+// ADR 0028 (M15 S7): the host services' arguments (type-system.md §26.7-§26.10).
+
+fn main() {
+    let kind = File.kind(1); // error[N0205]
+    let output = Process.capture("program"); // error[N0209]
+    let names = Directory.list(7); // error[N0205]
+    let value = Environment.variable(); // error[N0209]
+    let removed = Directory.delete("x"); // error[N0200]
+}

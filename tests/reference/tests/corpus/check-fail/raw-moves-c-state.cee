@@ -1,0 +1,25 @@
+// profile: freestanding
+// option: kernel cosmoos
+// option: no-float
+// C state through raw pointers (type-system.md §27.3, §33; ADR 0027): `p.write(v)` places it, running its @placed
+// methods at `p`, but `p.read()` would move it, and C state never moves.
+struct Slot {
+    raw: spinlock_t;
+    id: u32;
+
+    /// Safety: runs once, at the slot's final address.
+    @placed
+    fn init(borrow mut this) {
+        unsafe { spinlock_init(borrow mut this.raw as *mut spinlock_t, "slot\0".ptr as *CChar); }
+    }
+}
+
+/// Safety: p is a fresh block of a Slot's size and alignment; the read is rejected before it could run.
+@export("rm_slot")
+fn slot(p: *mut void) {
+    let slot = p as *mut Slot;
+    unsafe {
+        slot.write(Slot { id: 1 });
+        let moved = slot.read(); // error[N0282]
+    }
+}

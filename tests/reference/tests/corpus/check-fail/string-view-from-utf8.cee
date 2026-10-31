@@ -1,0 +1,7 @@
+// M15 S6: `StringView.fromUtf8` takes bytes, and is the only `StringView` function (type-system.md §22.2).
+
+fn main() {
+    let numbers = [1u32, 2];
+    let wrong = StringView.fromUtf8(numbers[..]); // error[N0205]
+    let missing = StringView.fromText(numbers[..]); // error[N0200]
+}

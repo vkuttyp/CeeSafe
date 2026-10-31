@@ -1,0 +1,34 @@
+// Character-boundary checks of view slices (optimisations.md §2.9): removed where the text is a local that only ever
+// holds ASCII literals (one, either of two, or a copy of one), kept for non-ASCII text, a parameter, and a view a call
+// returns. The range check stays in every case. The .bce snapshot lists each slice.
+
+fn first(text: StringView) -> StringView => text[0..1];
+
+fn pick(n: u32) -> StringView => if (n == 0) "zero" else "other";
+
+fn main() {
+    let digits = "0123456789";
+    let d: usize = 7;
+    Console.writeLine(digits[d..d + 1]);
+
+    let copy = digits;
+    Console.writeLine(copy[2..4]);
+
+    let accented = "caf\u{e9}";
+    Console.writeLine(accented[0..3]);
+
+    Console.writeLine(first("xyz"));
+
+    let either = if (d > 3) "fixed" else "loose";
+    Console.writeLine(either[0..2]);
+
+    let returned = pick(0);
+    Console.writeLine(returned[0..2]);
+}
+
+// expect-stdout: 7
+// expect-stdout: 23
+// expect-stdout: caf
+// expect-stdout: x
+// expect-stdout: fi
+// expect-stdout: ze

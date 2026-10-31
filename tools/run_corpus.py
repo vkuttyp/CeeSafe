@@ -28,6 +28,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+
+from names import dialect, map_back
 import time
 
 RUNNER = "tools/run_corpus.py v1"
@@ -128,6 +130,7 @@ class Runner:
     def __init__(self, args, compiler):
         self.args, self.compiler = args, compiler
         self.corpus = args.corpus
+        self.d = dialect(compiler)  # its programs' messages and file names (Nova's, or CeeSafe's since the fork)
 
     def command(self, argv, out_dir=None, collect=()):
         """Runs the compiler from the corpus root, so paths in diagnostics and panics are corpus-relative."""
@@ -157,7 +160,7 @@ class Runner:
         try:
             env = dict(os.environ)
             if self.args.check_leaks:
-                env["NOVA_ALLOC_REPORT"] = "1"
+                env[self.d.alloc_report] = "1"
             p = subprocess.run([exe], cwd=self.corpus, capture_output=True, timeout=self.args.timeout, env=env)
             status, stdout, stderr = p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
         except subprocess.TimeoutExpired:
@@ -203,10 +206,12 @@ def match_annotations(expected, actual, problems):
         problems.append(f"unexpected {code} at {line}:{column}: {message}")
 
 
-def compare_snapshot(actual, snapshot, problems, label):
+def compare_snapshot(actual, snapshot, problems, label, back=False):
     if not os.path.isfile(snapshot):
         problems.append(f"missing snapshot {os.path.basename(snapshot)}")
         return
+    if back:
+        actual = map_back(actual)  # the snapshots are Nova's, the frozen baseline (docs/fork-point.md)
     if normalise(actual) != normalise(read(snapshot)):
         problems.append(f"{label} differs from {os.path.basename(snapshot)}")
 
@@ -214,7 +219,7 @@ def compare_snapshot(actual, snapshot, problems, label):
 def run_test(runner, family, path, work):
     """Runs one corpus file. Returns (problems, skipped reason or None, outcomes)."""
     text = read(os.path.join(runner.corpus, path))
-    stem = os.path.join(runner.corpus, path[:-len(".nova")])
+    stem = os.path.join(runner.corpus, os.path.splitext(path)[0])
     options = compile_options(text)
     extra = runner.args.with_files
     problems, outcomes = [], []
@@ -230,7 +235,7 @@ def run_test(runner, family, path, work):
         if family == "parse-pass":
             problems += [f"unexpected {c} at {l}:{col}: {m}" for l, c, col, m in found]
             dump = cmd(["parse", "--dump-ast", path])
-            compare_snapshot(dump.stdout, stem + ".ast", problems, "AST dump")
+            compare_snapshot(dump.stdout, stem + ".ast", problems, "AST dump", runner.d.cee)
         else:
             expected = annotations(text)
             if not expected:
@@ -246,7 +251,7 @@ def run_test(runner, family, path, work):
         if family == "check-pass":
             problems += [f"unexpected {c} at {l}:{col}: {m}" for l, c, col, m in found]
             dump = cmd(["check", "--dump-hir"] + options + [path] + extra)
-            compare_snapshot(dump.stdout, stem + ".hir", problems, "HIR dump")
+            compare_snapshot(dump.stdout, stem + ".hir", problems, "HIR dump", runner.d.cee)
         else:
             expected = annotations(text)
             if not expected:
@@ -257,7 +262,7 @@ def run_test(runner, family, path, work):
         exe = os.path.join(work, "program")
         inputs = [path] + extra
         if family == "ffi":
-            inputs.append(path[:-len(".nova")] + ".c")
+            inputs.append(os.path.splitext(path)[0] + ".c")
             # NAME.types.h is found from the corpus family's directory (FfiTests copies it beside the C).
             inputs_flags = ["--cflag", "-I" + os.path.dirname(os.path.join(runner.corpus, path))]
         else:
@@ -272,25 +277,26 @@ def run_test(runner, family, path, work):
             if run.stdout.replace("\r\n", "\n") != stdout:
                 problems.append(f"stdout differs:\n--- expected\n{stdout}--- actual\n{run.stdout}")
             if runner.args.check_leaks:
-                m = re.search(r"nova alloc: attempts=\d+ live=(\d+)", run.stderr)
+                m = re.search(re.escape(runner.d.alloc) + r"attempts=\d+ live=(\d+)", run.stderr)
                 # A panic skips destructors (run-fail), and Process.exit ends the program before main returns, which
                 # prints no report; a report with live allocations is a leak.
                 if panic is None and m is not None and m.group(1) != "0":
                     problems.append(f"leak check: {m.group(0)}")
-                run.stderr = re.sub(r"nova alloc: attempts=\d+ live=\d+\n?", "", run.stderr)
+                run.stderr = re.sub(re.escape(runner.d.alloc) + r"attempts=\d+ live=\d+\n?", "", run.stderr)
             if run.status != exit_code:
                 problems.append(f"exit {run.status}, expected {exit_code}; stderr: {run.stderr.strip()[:300]}")
-            if panic is not None and not run.stderr.startswith(f"nova panic: {panic} at {path}:{panic_line}:"):
+            if panic is not None and not run.stderr.startswith(f"{runner.d.panic}{panic} at {path}:{panic_line}:"):
                 problems.append(f"panic message differs: {run.stderr.strip()[:300]}")
         if family == "ffi":
             out = os.path.join(work, "c")
-            e = cmd(["build", "--emit", "c"] + inputs + ["-o", out], out, ["nova_exports.h"])
+            exports = runner.d.exports
+            e = cmd(["build", "--emit", "c"] + inputs + ["-o", out], out, [exports])
             snapshot = stem + ".h"
-            header = e.files.get("nova_exports.h")
+            header = e.files.get(exports)
             if header is None and os.path.isfile(snapshot):
-                problems.append("no nova_exports.h, but a .h snapshot exists")
+                problems.append(f"no {exports}, but a .h snapshot exists")
             elif header is not None:
-                compare_snapshot(header, snapshot, problems, "nova_exports.h")
+                compare_snapshot(header, snapshot, problems, exports, runner.d.cee)
 
     elif family == "emit-c":
         out = os.path.join(work, "c")
@@ -303,7 +309,7 @@ def run_test(runner, family, path, work):
         if "main.c" not in o.files:
             problems.append(f"no main.c (status {o.status}): {o.stderr.strip()[:500]}")
         else:
-            compare_snapshot(o.files["main.c"], stem + ".c", problems, "main.c")
+            compare_snapshot(o.files["main.c"], stem + ".c", problems, "main.c", runner.d.cee)
 
     elif family == "freestanding":
         obj = os.path.join(work, "program.o")
@@ -320,7 +326,7 @@ def run_test(runner, family, path, work):
         if o.status != 0:
             problems.append(f"build failed (status {o.status}): {o.stderr.strip()[:500]}")
         else:
-            compare_snapshot(o.stdout, stem + extension, problems, option)
+            compare_snapshot(o.stdout, stem + extension, problems, option, runner.d.cee)
 
     return problems, None, outcomes
 
@@ -329,7 +335,7 @@ def corpus_files(corpus, families, text_filter):
     for family in families:
         directory = os.path.join(corpus, family)
         for name in sorted(os.listdir(directory)):
-            if name.endswith(".nova"):
+            if name.endswith((".nova", ".cee")):
                 path = f"{family}/{name}"
                 if not text_filter or text_filter in path:
                     yield family, path

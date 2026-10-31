@@ -1,0 +1,44 @@
+// parsing (benchmarks/suite/README.md): write lines into a byte buffer, then parse them.
+fn number(b: borrow mut Vector<u8>, value: u64) {
+    var digits = [0u8; 20];
+    var n: usize = 0;
+    var v = value;
+    loop {
+        digits[n] = truncate<u8>('0' + v % 10);
+        n += 1;
+        v = v / 10;
+        if (v == 0) { break; }
+    }
+    while (n > 0) {
+        n -= 1;
+        b.push(digits[n])!;
+    }
+}
+
+fn main() -> i32 {
+    var b = Vector<u8>.create();
+    for (i in 0..2000000u64) {
+        b.push('k')!;
+        number(mut b, i);
+        b.push('=')!;
+        number(mut b, 7 * i % 100000);
+        b.push('\n')!;
+    }
+    var sum: u64 = 0;
+    for (pass in 0..8) {
+        var i: usize = 0;
+        while (i < b.length) {
+            while (b[i] != '=') { i += 1; }
+            i += 1;
+            var v: u64 = 0;
+            while (b[i] != '\n') {
+                v = v * 10 + (b[i] - '0') as u64;
+                i += 1;
+            }
+            i += 1;
+            sum += v;
+        }
+    }
+    Console.writeLine(sum);
+    return 0;
+}

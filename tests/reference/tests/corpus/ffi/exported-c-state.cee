@@ -1,0 +1,127 @@
+// @repr(C) structs that hold C state and arrays (ADR 0029, type-system.md §28.5): Nova defines `xs_table`, a lock, a
+// self-pointing list head and an array of entries; C embeds it by value in its own struct, in a static and on the
+// stack (exported-c-state.c), and Nova's exports work on it through pointers. `Grid` is a plain @repr(C) struct with
+// arrays, made as a value in Nova and in a static.
+
+@header("exported-c-state.types.h")
+extern "C" {
+    @ctype("xs_lock_t")
+    struct xs_lock_t;
+    struct xs_list {
+        next: *mut xs_list;
+        prev: *mut xs_list;
+    }
+    @effects()
+    fn xs_lock_init(l: *mut xs_lock_t);
+    @effects()
+    fn xs_list_init(l: *mut xs_list);
+    fn c_main() -> i32;
+}
+
+@repr(C)
+struct xs_entry {
+    obj: *mut void; // null: free
+    rights: u32;
+}
+
+@repr(C)
+struct xs_table {
+    lock: xs_lock_t;
+    head: xs_list;
+    entries: [xs_entry; 4];
+    count: u32;
+    limit: u32;
+    exiting: bool;
+}
+
+@repr(C)
+struct Grid {
+    tag: u8;
+    data: [u8; 3];
+    cells: [[u16; 2]; 2];
+}
+
+/// A C-laid-out struct's field offset in a static initialiser (ADR 0030).
+static COUNT_AT: usize = offsetOf<xs_table>(count);
+
+static mut GRID: Grid = Grid { tag: 7, data: [1, 2, 3], cells: [[4, 5], [6, 7]] };
+
+/// Safety: `t` points to storage for a table that nothing uses yet.
+@export("xs_table_init")
+unsafe fn tableInit(t: *mut xs_table, limit: u32) {
+    let table = Ptr.toBorrowMut(t);
+    xs_lock_init(borrow mut table.lock as *mut xs_lock_t);
+    xs_list_init(borrow mut table.head as *mut xs_list);
+    for (i in 0..table.entries.length) {
+        table.entries[i] = xs_entry { obj: 0 as *mut void, rights: 0 };
+    }
+    table.count = 0;
+    table.limit = limit;
+    table.exiting = false;
+}
+
+/// The lowest free slot, or -1 at the table's limit.
+/// Safety: `t` is a table xs_table_init initialised; `obj` is not null.
+@export("xs_install")
+unsafe fn install(t: *mut xs_table, obj: *mut void, rights: u32) -> i32 {
+    let table = Ptr.toBorrowMut(t);
+    if (table.exiting || table.count >= table.limit) {
+        return -1;
+    }
+    for (i in 0..table.entries.length) {
+        if (table.entries[i].obj.isNull()) {
+            table.entries[i] = xs_entry { obj: obj, rights: rights };
+            table.count += 1;
+            return truncate<i32>(i);
+        }
+    }
+    return -1;
+}
+
+/// Field offsets, as C's offsetof gives them (ADR 0030): a Nova-laid-out struct's (a constant), a C-laid-out one's,
+/// an imported one's, and one from a static initialiser.
+/// Safety: `out` has four writable words.
+@export("xs_offsets")
+unsafe fn offsets(out: *mut usize) {
+    out.write(offsetOf<xs_entry>(rights));
+    out.add(1).write(offsetOf<xs_table>(entries));
+    out.add(2).write(offsetOf<xs_list>(prev));
+    out.add(3).write(COUNT_AT);
+}
+
+/// The sum of a grid's numbers.
+/// Safety: `g` points to a grid.
+@export("xs_grid_sum")
+unsafe fn gridSum(g: *Grid) -> u32 {
+    let grid = Ptr.toBorrow(g);
+    var sum: u32 = grid.tag as u32;
+    for (b in grid.data) { sum += b as u32; }
+    for (row in grid.cells) {
+        for (c in row) { sum += c as u32; }
+    }
+    return sum;
+}
+
+/// Safety: the grid pointers are to live grids; GRID is changed only here, with no thread; c_main only calls the
+/// exports above, with objects it owns.
+fn main() -> i32 {
+    let local = Grid { tag: 1, data: [10, 20, 30], cells: [[1, 2], [3, 4]] };
+    var copy = local;
+    copy.data[1] = 25;
+    copy.cells[1] = [100, 200];
+    unsafe {
+        Console.writeLine(gridSum(borrow local as *Grid));
+        Console.writeLine(gridSum(borrow copy as *Grid));
+        GRID.cells[0][1] = 50;
+        Console.writeLine(gridSum(borrow GRID as *Grid));
+        return c_main();
+    }
+}
+
+// expect-stdout: 71
+// expect-stdout: 369
+// expect-stdout: 80
+// expect-stdout: static 0 1 2 -1 3 7 1
+// expect-stdout: embedded 0 -1 1 2 1
+// expect-stdout: stack 0 1 2 3 -1 1
+// expect-stdout: offsets 1 1 1 1

@@ -197,8 +197,8 @@ Subdirectories under `src/` are only for organisation, since every `.nova` file 
 | Source extension | `.nova` (`Packages/Manifest.cs:271`, `Program.cs:697`) | `.cee` | P6R |
 | Manifest and lock | `nova.toml`, `nova.lock` (`Manifest.cs:32`, `Workspace.cs:28`) | `ceesafe.toml`, `ceesafe.lock` | P6R; conversion in P8 |
 | Home | `$NOVA_HOME`, `~/.nova` (`Workspace.cs:111`) | `$CEESAFE_HOME`, `~/.ceesafe` | done (P8 S3) |
-| Generated C | `nv_`, `nvMk_`, `NOVA_PROGRAM_*_H`, `nova_exports.h` | `cee_`, `cee<X>_`, `ceesafe_exports.h` (Decision 0004) | P8, at the fork point |
-| Runtime | `nova_*` (~374), `nv*` (~424), `NOVA_*` (10), `runtime/include/nova/rt.h` | `ceesafe_*`, `CEE_*`, `ceesafe/rt.h`, ABI version (Decision 0004) | P8, at the fork point |
+| Generated C | `nv_`, `nvMk_`, `NOVA_PROGRAM_*_H`, `nova_exports.h` | `cee_`, `cee<X>_`, `ceesafe_exports.h` (Decision 0004) | done (P8 S7) |
+| Runtime | `nova_*` (~374), `nv*` (~424), `NOVA_*` (10), `runtime/include/nova/rt.h` | `ceesafe_*`, `CEE_*`, `ceesafe/rt.h`, ABI version (Decision 0004) | done (P8 S7) |
 | Diagnostics | 126 `N####` codes (`Diagnostics/Diagnostic.cs:14`), used by 159 corpus files | letter open, with a mapping | P6R |
 | MCP/LSP | server `novac`, tools `nova_*` | `ceesafec`, `ceesafe_*` | done (P8 S5) |
 | Agent files | `<!--NOVA START/END-->`, `nova.mdc` | `<!--CEESAFE START/END-->`, `ceesafe.mdc` | done (P8 S3) |
@@ -526,12 +526,15 @@ Dependencies: P7. Parser-only tools may start after P2, and semantic tools after
   lib/std's rename and child environments).
 - [x] The normal self-build uses package mode, and P6 is rerun through it (S6: both hosts, both forms).
 
-- [ ] Decide whether the command line accepts only `.cee` files (Decision 0003 §2; Decision 0005 proposed).
-- [ ] With the fork point, switch to the CeeSafe C prefix and ABI version (Decision 0004: `cee_`/`ceesafe_*`,
+- [x] Decide whether the command line accepts only `.cee` files (Decision 0005, accepted: only `.cee` and `.c` since
+  the fork, S7).
+- [x] With the fork point, switch to the CeeSafe C prefix and ABI version (Decision 0004: `cee_`/`ceesafe_*`,
   `ceesafe/rt.h`, `CEESAFE_ABI_VERSION`), with a link-collision test: one program linking a novac-built and a
-  ceesafec-built library.
-- [ ] The fork point (Decision 0003 §3): the owner decides when CeeSafe stops tracking Nova; CeeSafe's own
-  specifications and corpus start there, and the novac comparisons become regression tests against its output.
+  ceesafec-built library (S7; `tools/link_collision.py`).
+- [x] The fork point (Decision 0003 §3): taken at S7 (`docs/fork-point.md`). CeeSafe's corpus starts there
+  (`tests/reference/`), and the novac comparisons are regression tests against novac 0.6.0's output with CeeSafe's
+  names mapped back. CeeSafe's own specification does not exist yet: ceesafec embeds Nova's `v0.6.0` documents as
+  reference material, and writing CeeSafe's is the next task after P8.
 
 Gate: every command and flag in the P0 ledger is implemented, or has an accepted decision. The contract suites pass.
 No C# fallback.

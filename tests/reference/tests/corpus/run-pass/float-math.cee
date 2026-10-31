@@ -1,0 +1,65 @@
+// Float math methods (type-system.md §35.8, M11 G7c): sqrt, abs, floor, ceil, min and max at signed zeros, halves,
+// 2^52 + 1 (already integral), huge and tiny values, NaN, and in f32. Bits show the signs of zero results.
+fn main() {
+    let values = [2.0, -0.0, 0.0, -0.5, 0.5, -1.5, 1.5, 2.5, -2.5, 4503599627370497.0, -4503599627370497.0, 1e300, -1e-300];
+    for (v in values) {
+        Console.write(v);
+        Console.write(" sqrt=");
+        Console.write(v.sqrt());
+        Console.write(" abs=");
+        Console.write(v.abs());
+        Console.write(" floor=");
+        Console.write(v.floor());
+        Console.write(" ceil=");
+        Console.write(v.ceil());
+        Console.write(" bits(floor)=");
+        Console.write(v.floor().bits());
+        Console.write(" bits(ceil)=");
+        Console.writeLine(v.ceil().bits());
+    }
+    let zero = 0.0;
+    let nan = zero / zero;
+    Console.writeLine(nan.min(1.0));
+    Console.writeLine(1.0.max(nan));
+    Console.writeLine((-0.0).min(0.0).bits());
+    Console.writeLine(0.0.min(-0.0).bits());
+    Console.writeLine((-0.0).max(0.0).bits());
+    Console.writeLine(3.0.min(2.0));
+    Console.writeLine(3.0.max(2.0));
+    let f: f32 = 2.0;
+    Console.writeLine(f.sqrt());
+    Console.writeLine(f.sqrt().bits());
+    let g: f32 = -7.5;
+    Console.writeLine(g.floor());
+    Console.writeLine(g.ceil());
+    Console.writeLine(g.abs().min(3.0));
+    Console.writeLine((-1.0).sqrt());
+    Console.writeLine((-0.0).sqrt().bits());       // -0: IEEE squareRoot keeps it
+}
+// expect-stdout: 2 sqrt=1.4142135623730951 abs=2 floor=2 ceil=2 bits(floor)=4611686018427387904 bits(ceil)=4611686018427387904
+// expect-stdout: 0 sqrt=0 abs=0 floor=0 ceil=0 bits(floor)=9223372036854775808 bits(ceil)=9223372036854775808
+// expect-stdout: 0 sqrt=0 abs=0 floor=0 ceil=0 bits(floor)=0 bits(ceil)=0
+// expect-stdout: -0.5 sqrt=NaN abs=0.5 floor=-1 ceil=0 bits(floor)=13830554455654793216 bits(ceil)=9223372036854775808
+// expect-stdout: 0.5 sqrt=0.7071067811865476 abs=0.5 floor=0 ceil=1 bits(floor)=0 bits(ceil)=4607182418800017408
+// expect-stdout: -1.5 sqrt=NaN abs=1.5 floor=-2 ceil=-1 bits(floor)=13835058055282163712 bits(ceil)=13830554455654793216
+// expect-stdout: 1.5 sqrt=1.224744871391589 abs=1.5 floor=1 ceil=2 bits(floor)=4607182418800017408 bits(ceil)=4611686018427387904
+// expect-stdout: 2.5 sqrt=1.5811388300841898 abs=2.5 floor=2 ceil=3 bits(floor)=4611686018427387904 bits(ceil)=4613937818241073152
+// expect-stdout: -2.5 sqrt=NaN abs=2.5 floor=-3 ceil=-2 bits(floor)=13837309855095848960 bits(ceil)=13835058055282163712
+// expect-stdout: 4503599627370497 sqrt=67108864 abs=4503599627370497 floor=4503599627370497 ceil=4503599627370497 bits(floor)=4841369599423283201 bits(ceil)=4841369599423283201
+// expect-stdout: -4503599627370497 sqrt=NaN abs=4503599627370497 floor=-4503599627370497 ceil=-4503599627370497 bits(floor)=14064741636278059009 bits(ceil)=14064741636278059009
+// expect-stdout: 1e+300 sqrt=1e+150 abs=1e+300 floor=1e+300 ceil=1e+300 bits(floor)=9094988921128908188 bits(ceil)=9094988921128908188
+// expect-stdout: -1e-300 sqrt=NaN abs=1e-300 floor=-1 ceil=0 bits(floor)=13830554455654793216 bits(ceil)=9223372036854775808
+// expect-stdout: NaN
+// expect-stdout: NaN
+// expect-stdout: 9223372036854775808
+// expect-stdout: 9223372036854775808
+// expect-stdout: 0
+// expect-stdout: 2
+// expect-stdout: 3
+// expect-stdout: 1.4142135
+// expect-stdout: 1068827891
+// expect-stdout: -8
+// expect-stdout: -7
+// expect-stdout: 3
+// expect-stdout: NaN
+// expect-stdout: 9223372036854775808

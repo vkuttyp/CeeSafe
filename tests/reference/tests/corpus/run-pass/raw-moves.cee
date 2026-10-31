@@ -1,0 +1,45 @@
+// Moves through raw pointers (type-system.md §27.3, ADR 0027): `p.write(v)` moves a value that is not Copy into
+// raw memory without destroying what was there, and `p.read()` moves it out, so each value is dropped exactly once.
+
+struct Noisy {
+    id: i32;
+
+    drop {
+        Console.write("drop ");
+        Console.writeLine(this.id);
+    }
+}
+
+struct Pair {
+    left: Noisy;
+    right: Box<Noisy>;
+}
+
+/// Safety: the block is a fresh allocation of 32 bytes, 16-byte aligned, which holds a Noisy and then a Pair, each
+/// written once and read out once before the next write; it is freed as the bytes it was made as.
+fn main() {
+    let block = Box.create([0u64; 4])!;
+    let raw = Box.intoRaw(block);
+    let p = raw as *mut Noisy;
+    let a = Noisy { id: 1 };
+    unsafe { p.write(a); }
+    Console.writeLine("written");
+    let b = unsafe { p.read() };
+    Console.writeLine(b.id);
+
+    let q = raw as *mut Pair;
+    unsafe { q.write(Pair { left: Noisy { id: 2 }, right: Box.create(Noisy { id: 3 })! }); }
+    let pair = unsafe { q.read() };
+    Console.writeLine(pair.left.id + pair.right.id);
+
+    let back: Box<[u64; 4]> = unsafe { Box.fromRaw(raw) };
+    Console.writeLine("end");
+}
+
+// expect-stdout: written
+// expect-stdout: 1
+// expect-stdout: 5
+// expect-stdout: end
+// expect-stdout: drop 2
+// expect-stdout: drop 3
+// expect-stdout: drop 1

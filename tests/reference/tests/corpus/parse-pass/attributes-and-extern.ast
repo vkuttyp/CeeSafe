@@ -1,0 +1,43 @@
+(unit
+  (extern default "C"
+    (fn default strlen (params (s (ptr CChar))) (returns usize)
+    )
+    (@effects sleep)
+    (fn public write (params (fd i32) (buffer (ptr u8)) (count usize)) (returns isize)
+    )
+  )
+  (@repr C)
+  (struct default Point
+    (field default x i32)
+    (field default y i32)
+  )
+  (@repr u8)
+  (enum default Color
+    (variant Red)
+    (variant Green)
+  )
+  (@export "geo_length")
+  (fn public length (params (p Point)) (returns i32)
+    (=> (+ (. p x) (. p y)))
+  )
+  (@export)
+  (@effects)
+  (fn default plain (params)
+    (block)
+  )
+  (@header "dev.h" "kernel/types.h")
+  (extern default "C"
+    (fn default dev_open (params (d (ptr-mut dev))) (returns i32)
+    )
+    (c-struct default dev
+      (field default base u64)
+      (field default next (ptr-mut dev))
+    )
+    (c-struct default opaque_t opaque
+    )
+    (@ctype "cell_t")
+    (c-struct public cell
+      (field default v i32)
+    )
+  )
+)

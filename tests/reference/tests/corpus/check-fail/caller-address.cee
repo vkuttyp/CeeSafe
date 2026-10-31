@@ -1,0 +1,12 @@
+// callerAddress() names the C caller of an @export function, so it is valid only in such a function's own body
+// (ADR 0030).
+fn plain() -> usize => callerAddress(); // error[N0340]
+
+@export("in_export")
+fn inExport() -> usize {
+    let f = () => callerAddress(); // error[N0340]
+    return callerAddress();
+}
+
+@export("with_argument")
+fn withArgument() -> usize => callerAddress(1); // error[N0209]

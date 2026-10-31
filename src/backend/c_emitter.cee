@@ -139,7 +139,7 @@ struct CEmitter {
 
     /// The same for a prototype (FnProto).
     fn fnProto(borrow mut this) -> Result<void, AllocError> =>
-        appendText(mut this.buf, if (this.split) "NV_UNUSED " else "static NV_UNUSED ");
+        appendText(mut this.buf, if (this.split) "CEE_UNUSED " else "static CEE_UNUSED ");
 
     /// The linkage of a per-type helper (Helper): `static inline` in the header when split (ADR 0022 §3.2).
     fn helper(borrow mut this) -> Result<void, AllocError> =>
@@ -147,7 +147,7 @@ struct CEmitter {
 
     /// The same for a prototype (HelperProto).
     fn helperProto(borrow mut this) -> Result<void, AllocError> =>
-        appendText(mut this.buf, if (this.split) "static inline NV_UNUSED " else "static NV_UNUSED ");
+        appendText(mut this.buf, if (this.split) "static inline CEE_UNUSED " else "static CEE_UNUSED ");
 
     /// Appends text to the line being built.
     fn t(borrow mut this, text: StringView) -> Result<void, AllocError> => appendText(mut this.buf, text);

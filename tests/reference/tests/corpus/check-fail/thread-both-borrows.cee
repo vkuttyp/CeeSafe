@@ -1,0 +1,10 @@
+// Fork-join loans (type-system.md §38.6, ownership T4): both closures are live for the whole call, so two that change
+// one value, or one reading what the other changes, are refused (N0241). Disjoint ones are not.
+
+fn main() {
+    var x: u64 = 0;
+    var y: u64 = 0;
+    Thread.both(() => { x = x + 1; }, () => { x = x + 2; }); // error[N0241]
+    Thread.both(() => { y = x; }, () => { x = 3; }); // error[N0241]
+    Thread.both(() => { x = 1; }, () => { y = 2; });
+}

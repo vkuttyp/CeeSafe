@@ -1,0 +1,51 @@
+// Function values (type-system.md §36.1, M11 G8a): passed as arguments, chosen by a branch expression, generic
+// instances, fields of structs, a higher-order helper, scoped parameters and results, borrow mut parameters, no result.
+struct Op { code: i32; apply: fn(i32, i32) -> i32; }
+
+fn double(x: i32) -> i32 => x * 2;
+fn negate(x: i32) -> i32 => -x;
+fn add(a: i32, b: i32) -> i32 => a + b;
+fn mul(a: i32, b: i32) -> i32 => a * b;
+fn identity<T>(x: T) -> T => x;
+fn first(s: StringView) -> StringView => s[0..1];
+fn bump(counter: borrow mut i32) { counter += 1; }
+fn report(x: i32) { Console.write("report "); Console.writeLine(x); }
+
+fn applyTwice(f: fn(i32) -> i32, x: i32) -> i32 => f(f(x));
+fn map(values: Slice<i32>, f: fn(i32) -> i32, out: SliceMut<i32>) {
+    for (i in 0..values.length) { out[i] = f(values[i]); }
+}
+
+fn main() {
+    Console.writeLine(applyTwice(double, 5));
+    let pick: fn(i32) -> i32 = if (true) negate else double;
+    Console.writeLine(pick(3));
+    let id = identity<i64>;
+    Console.writeLine(id(7));
+    let ops = [Op { code: 1, apply: add }, Op { code: 2, apply: mul }];
+    for (op in ops) {
+        Console.write(op.code);
+        Console.write(" ");
+        Console.writeLine(op.apply(6, 7));
+    }
+    var out = [0, 0, 0];
+    let values = [1, 2, 3];
+    map(values[..], double, mut out[..]);
+    Console.writeLine(out[2]);
+    let f = first;
+    Console.writeLine(f("nova"));
+    var count = 0;
+    let inc: fn(borrow mut i32) = bump;
+    inc(mut count);
+    inc(mut count);
+    let say = report;
+    say(count);
+}
+// expect-stdout: 20
+// expect-stdout: -3
+// expect-stdout: 7
+// expect-stdout: 1 13
+// expect-stdout: 2 42
+// expect-stdout: 6
+// expect-stdout: n
+// expect-stdout: report 2

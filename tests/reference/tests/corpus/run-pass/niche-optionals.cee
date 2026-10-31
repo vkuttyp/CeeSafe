@@ -1,0 +1,89 @@
+// Optional boxes and references in the niche layout (type-system.md §22.1, M9e′): a pointer alone, null for `null`.
+// The generated C asserts each size; this program uses them every way the language allows.
+
+struct Node {
+    value: u64;
+    next: Box<Node>?;                         // 8 bytes, not 16: a node is 16 bytes in all
+}
+
+struct Counter { hits: u64; drop { Console.write("drop "); Console.writeLine(this.hits); } }
+
+fn push(head: Box<Node>?, value: u64) -> Result<Box<Node>, AllocError> => Box.create(Node { value: value, next: head });
+
+/// An optional reference walks the list: each step is 8 bytes, a pointer or null.
+fn sum(list: borrow Node?) -> u64 {
+    match (list) {
+        Some(node) => { return node.value + sum(nextOf(node)); }
+        null => { return 0; }
+    }
+}
+
+fn contents(b: borrow Box<Node>) -> borrow Node => b;
+
+/// `?` on an optional reference.
+fn second(list: borrow Node) -> u64? {
+    let next = nextOf(list)?;
+    return next.value;
+}
+
+fn nextOf(n: borrow Node) -> borrow Node? {
+    match (borrow n.next) {
+        Some(b) => { return contents(b); }
+        null => { return null; }
+    }
+}
+
+/// A consuming match moves the box out of `Some`; dropping the optional drops the box and what it owns.
+fn takeCounter(c: Box<Counter>?) -> u64 {
+    match (c) {
+        Some(box) => { return box.hits; }
+        null => { return 0; }
+    }
+}
+
+fn main() {
+    var head: Box<Node>? = null;
+    for (i in 1..5u64) { head = Some(push(head, i)!); }
+    match (borrow head) {
+        Some(first) => { Console.writeLine(sum(contents(first))); }
+        null => { Console.writeLine(sum(null)); }
+    }
+    match (head) {
+        Some(first) => {
+            Console.writeLine(first.value);
+            Console.writeLine(second(contents(borrow first))!);
+        }
+        null => {}
+    }
+
+    Console.writeLine(takeCounter(Some(Box.create(Counter { hits: 7 })!)));
+    Console.writeLine(takeCounter(null));
+    let kept: Box<Counter>? = Some(Box.create(Counter { hits: 9 })!);
+    Console.writeLine(kept == null);
+
+    // Optionals of optionals keep a tag around the niche: `pop` returns `Box<Counter>??`.
+    var slots = Vector<Box<Counter>?>.create();
+    slots.push(null)!;
+    slots.push(Some(Box.create(Counter { hits: 3 })!))!;
+    match (slots.pop()) {
+        Some(inner) => { Console.writeLine(inner != null); }
+        null => {}
+    }
+    match (slots.pop()) {
+        Some(inner) => { Console.writeLine(inner == null); }
+        null => {}
+    }
+    Console.writeLine(slots.pop() == null);
+}
+// expect-stdout: 10
+// expect-stdout: 4
+// expect-stdout: 3
+// expect-stdout: drop 7
+// expect-stdout: 7
+// expect-stdout: 0
+// expect-stdout: false
+// expect-stdout: true
+// expect-stdout: drop 3
+// expect-stdout: true
+// expect-stdout: true
+// expect-stdout: drop 9

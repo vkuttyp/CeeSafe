@@ -2,8 +2,8 @@
 """Debugging a `ceesafec build -g` program with editors/debug (docs/p8-plan.md S6; Nova's DebuggerTests).
 
 Under lldb on macOS, gdb elsewhere (or the one given): breakpoints at source lines, `ceesafe-locals` and `ceesafe-bt`
-showing CeeSafe names, a breakpoint on nova_panic stopping at the failed check, the same through `--split` with
-CEESAFE_PROGRAM, and the name demangling of ceesafe_names.py. The assertions are DebuggerTests'.
+showing CeeSafe names, a breakpoint on ceesafe_panic stopping at the failed check, the same through `--split` with
+CEESAFE_PROGRAM, and the name demangling of ceesafe_names.py; a breakpoint on ceesafe_panic stops at the failed check. The assertions are DebuggerTests'.
 
 usage: python3 tools/debugger_check.py --ceesafec out/ceesafec [--debugger lldb|gdb]
 """
@@ -87,8 +87,8 @@ def main():
     problems = []
     sys.path.insert(0, SCRIPTS)
     import ceesafe_names
-    for c, name in (("nvF_length", "length"), ("nvM_7Counter_bump", "Counter.bump"),
-                    ("nvM_12SpinLock_u64_create", "SpinLock_u64.create"), ("main", "main")):
+    for c, name in (("ceeF_length", "length"), ("ceeM_7Counter_bump", "Counter.bump"),
+                    ("ceeM_12SpinLock_u64_create", "SpinLock_u64.create"), ("main", "main")):
         if ceesafe_names.function(c) != name:
             problems.append(f"demangling: {c} gave {ceesafe_names.function(c)!r}, not {name!r}")
     checked = ["demangling"]
@@ -111,7 +111,7 @@ def main():
             text = debug(cee, debugger, work, "demo", PROGRAM, commands, ["--split", "--program", "demo"], env)
             expect(problems, "split", text, wanted)
             text = debug(cee, debugger, work, "panic", PANICKING,
-                         ["b nova_panic" if debugger == "lldb" else "break nova_panic", "run", "ceesafe-bt"])
+                         ["b ceesafe_panic" if debugger == "lldb" else "break ceesafe_panic", "run", "ceesafe-bt"])
             expect(problems, "panic", text, ["grow at panic.cee:2", "main at panic.cee:7"])
             checked += ["breakpoints", "split", "panic"]
         finally:

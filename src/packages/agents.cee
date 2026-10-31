@@ -48,7 +48,7 @@ fn agentMcpJson(k: usize) -> StringView => match (k) {
 };
 
 fn agentPreamble(k: usize) -> StringView => match (k) {
-    4 => "---\ndescription: Nova: how to check, fix and run this package\nalwaysApply: true\n---\n\n",
+    4 => "---\ndescription: CeeSafe: how to check, fix and run this package\nalwaysApply: true\n---\n\n",
     _ => "",
 };
 

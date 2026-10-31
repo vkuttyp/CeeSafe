@@ -1,0 +1,45 @@
+// `for` over non-Copy elements (type-system.md §16.4, M11 G2): the variable borrows each element in place. Arrays
+// hold only Copy elements in v0 (N0259), so these are slices and vectors.
+interface Shape { fn area(borrow this) -> u64; }
+struct Square { side: u64; }
+impl Shape for Square { fn area(borrow this) -> u64 => this.side * this.side; }
+
+struct Res { id: u64; drop { Console.write("drop "); Console.writeLine(this.id); } }
+
+fn total<S: Shape>(shapes: Slice<S>) -> u64 {
+    var sum: u64 = 0;
+    for (shape in shapes) { sum += shape.area(); }         // shape: borrow S, since S is not known to be Copy
+    return sum;
+}
+
+fn ids(rs: Slice<Res>) -> u64 {
+    var sum: u64 = 0;
+    for (r in rs) { sum += r.id; }                          // r: borrow Res; nothing moves, nothing is dropped
+    return sum;
+}
+
+fn main() {
+    let squares = [Square { side: 2 }, Square { side: 3 }];
+    Console.writeLine(total(squares[..]));
+    var held = Vector<Res>.create();
+    held.push(Res { id: 1 })!;
+    held.push(Res { id: 2 })!;
+    Console.writeLine(ids(held.view()));
+    var names = Vector<String>.create();
+    var a = String.create();
+    a.append("ab")!;
+    names.push(a)!;
+    for (n in names) { Console.writeLine(n.view()); }       // over a vector of Strings: each one borrowed
+    var boxes = Vector<Box<u32>>.create();
+    boxes.push(Box.create(5u32)!)!;
+    boxes.push(Box.create(6u32)!)!;
+    var t: u32 = 0;
+    for (b in boxes) { t += b; }                            // b: borrow Box<u32>, read through
+    Console.writeLine(t);
+}
+// expect-stdout: 13
+// expect-stdout: 3
+// expect-stdout: ab
+// expect-stdout: 11
+// expect-stdout: drop 1
+// expect-stdout: drop 2

@@ -1,0 +1,11 @@
+// `if` and `match` expressions (type-system.md §15.3, M11 G5): chains, block branches, value arms, extent.
+fn f(x: i32, shape: Shape) -> i32 {
+    let sign = if (x < 0) -1 else if (x == 0) 0 else 1;
+    let name = match (shape) {
+        Shape.Circle(_) => "circle",
+        Shape.Square(side) => if (side > 10) "big square" else "square",
+        Shape.None => { return 0; }
+    };
+    let y = (if (x > 0) 1 else 2) + 3;
+    return if (x > 0) 1 else 2 + 3;
+}

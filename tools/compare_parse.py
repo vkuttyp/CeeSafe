@@ -17,6 +17,9 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from names import compared_files, for_compiler, output_of  # noqa: E402
+
 
 def files_of(root, paths):
     result = []
@@ -32,9 +35,10 @@ def files_of(root, paths):
 
 
 def outcome(compiler, argv, root):
+    cwd, argv = for_compiler(compiler, root, argv)
     try:
-        p = subprocess.run([compiler] + argv, cwd=root, capture_output=True, timeout=120)
-        return p.returncode, p.stdout, p.stderr
+        p = subprocess.run([compiler] + argv, cwd=cwd, capture_output=True, timeout=120)
+        return p.returncode, output_of(compiler, p.stdout), output_of(compiler, p.stderr)
     except subprocess.TimeoutExpired:
         return "timeout", b"", b""
 
@@ -103,7 +107,7 @@ def main():
     args = parser.parse_args()
     args.ceesafec = os.path.abspath(os.path.expanduser(args.ceesafec))
     args.novac = os.path.abspath(os.path.expanduser(args.novac))
-    files = files_of(args.root, args.paths)
+    files = compared_files(args.root, files_of(args.root, args.paths))
     with ThreadPoolExecutor(args.jobs) as pool:
         results = list(pool.map(lambda f: compare(args, args.root, f), files))
     problems = [p for r in results for p in r]

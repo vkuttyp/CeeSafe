@@ -1,0 +1,74 @@
+// C9 (ADR 0014): array members and C member names of imported C structs (type-system.md §31.1), pointer
+// arithmetic on them (§31.2), constant arrays (§10) and exported constants (§28.4).
+@header("parts.h")
+extern "C" {
+    struct part {
+        @cname("type")
+        kind: [u8; 16];
+        uuid: [u8; 16];
+        @cname(kind) // error[N0290]
+        flags: u32;
+        @cname("ceesafe_hidden") // error[N0292]
+        hidden: u32;
+        @cname("uuid") // error[N0228]
+        again: [u8; 16];
+        @ctype("x") // error[N0290]
+        other: u32;
+    }
+    struct table {
+        parts: [part; 4];
+        pairs: [Pair; 2]; // error[N0291]
+        grid: [[u8; 2]; 2]; // error[N0291]
+        links: [*mut part; 2]; // error[N0291]
+    }
+}
+
+struct Pair { a: i32; b: i32; }
+
+struct Holder {
+    parts: [part; 2]; // C state by value, in a field (§33.1)
+}
+
+fn local(t: borrow table) {
+    let first = borrow t.parts[0];
+    let kind = first.kind; // a copy of a C array of bytes
+}
+
+fn param(parts: [part; 4]) {} // error[N0294]
+
+/// Safety: these pointers are never dereferenced: each operation is checked only.
+fn pointers(p: *mut part, q: *part) {
+    unsafe {
+        let next = p.add(1);
+        let before = q.sub(2);
+        let r = q.read(); // error[N0294]
+        let s = Slice.fromRaw(q, 2); // error[N0294]
+    }
+}
+
+const BYTES: [u8; 3] = [1, 2, 3];
+const REPEATED: [bool; 4] = [false; 4];
+const PAIRS: [Pair; 1] = [Pair { a: 1, b: 2 }]; // error[N0216]
+const NESTED: [[u8; 1]; 1] = [[1]]; // error[N0216]
+const CALLED: [u8; 2] = [1, twice(1)]; // error[N0217]
+const WRONG: [u8; 2] = [1, 300]; // error[N0206]
+
+fn twice(x: u8) -> u8 => x * 2;
+
+@export("bytes_out")
+const EXPORTED: [u8; 2] = [7, 8];
+
+@export("bytes_out") // error[N0201]
+const AGAIN: u8 = 1;
+
+@export("cee_private") // error[N0292]
+const RESERVED: u8 = 1;
+
+@export(1) // error[N0290]
+const NUMBERED: u8 = 1;
+
+@export
+const RATIO: f64 = 0.5; // error[N0291]
+
+@callback // error[N0290]
+const NOT_A_FUNCTION: u8 = 1;

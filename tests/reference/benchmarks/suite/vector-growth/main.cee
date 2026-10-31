@@ -1,0 +1,11 @@
+// vector-growth (benchmarks/suite/README.md).
+fn main() -> i32 {
+    var sum: u64 = 0;
+    for (round in 0..10u64) {
+        var v = Vector<u64>.create();
+        for (i in 0..20000000u64) { v.push((i + round) % 1000)!; }
+        for (x in v[..]) { sum += x; }
+    }
+    Console.writeLine(sum);
+    return 0;
+}

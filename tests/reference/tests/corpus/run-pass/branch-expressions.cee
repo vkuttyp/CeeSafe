@@ -1,0 +1,106 @@
+// `if` and `match` expressions (type-system.md §15.3, M11 G5): values of every kind, block branches that leave,
+// nested patterns, consuming matches, references, drops, generics, and evaluation order.
+
+enum Shape { Circle(i32), Square(i32), None }
+
+struct Res { id: i32; drop { Console.writeLine(this.id); } }
+
+enum Holder { Full(Res), Empty }
+
+fn trace(n: i32) -> i32 {
+    Console.writeLine(n);
+    return n;
+}
+
+fn name(shape: Shape) -> StringView {
+    return match (shape) {
+        Shape.Circle(_) => "circle",
+        Shape.Square(side) => if (side > 10) "big square" else "square",
+        Shape.None => { return "none"; }
+    };
+}
+
+fn sign(x: i32) -> i32 => if (x < 0) -1 else if (x == 0) 0 else 1;
+
+/// The branch not taken is not evaluated, so only one Res is made (and dropped, at the caller's end).
+fn pick(c: bool) -> Res => if (c) Res { id: 1 } else Res { id: 2 };
+
+/// A consuming match expression: the Res moves out of the Holder.
+fn open(h: Holder) -> Res => match (h) { Holder.Full(r) => r, Holder.Empty => Res { id: 0 } };
+
+fn larger(a: borrow Res, b: borrow Res) -> borrow(a, b) Res => if (a.id >= b.id) a else b;
+
+fn either<T>(c: bool, a: T, b: T) -> T => if (c) a else b;
+
+fn depth(value: Result<i32?, i32>) -> i32 => match (value) {
+    Ok(Some(0)) => 0,
+    Ok(Some(n)) => n,
+    Ok(null) => -1,
+    Err(code) => -100 - code,
+};
+
+fn sumPositive(values: Slice<i32>) -> i32 {
+    var total = 0;
+    for (v in values) {
+        let w = if (v > 0) v else { continue; };
+        total += w;
+        let stop = match (w) { 100 => { break; }, _ => false };
+    }
+    return total;
+}
+
+fn main() {
+    Console.writeLine(name(Shape.Circle(1)));
+    Console.writeLine(name(Shape.Square(20)));
+    Console.writeLine(name(Shape.Square(2)));
+    Console.writeLine(name(Shape.None));
+    Console.writeLine(sign(-5) + sign(0) * 10 + sign(7) * 100);
+
+    // A flexible branching operand takes the other operand's type (§5): u8 here.
+    let x: u8 = 200;
+    let y = x + if (x > 100) 55 else 2;
+    Console.writeLine(y);
+
+    // Only the branch taken is evaluated: trace prints 2 only.
+    let z = if (x > 100) trace(2) else trace(3);
+    Console.writeLine(z);
+
+    let r = pick(false);
+    Console.writeLine(r.id);
+    let opened = open(Holder.Full(Res { id: 7 }));
+    Console.writeLine(opened.id);
+    Console.writeLine(larger(borrow r, borrow opened).id);
+    Console.writeLine(either<i64>(false, 1, 2));
+
+    Console.writeLine(depth(Ok(Some(0))) + depth(Ok(Some(9))) + depth(Ok(null)) + depth(Err(5)));
+    let values = [3, -1, 4, 100, 5];
+    Console.writeLine(sumPositive(values[..]));
+
+    // `null` takes the expected type.
+    let o: i32? = if (x > 0) 5 else null;
+    Console.writeLine(o!);
+
+    // Nested in a condition and an argument; parenthesised in a larger expression.
+    if ((if (x > 0) 1 else 2) + 1 == 2) {
+        Console.writeLine(trace(if (z == 2) 40 else 50) + 2);
+    }
+}
+// expect-stdout: circle
+// expect-stdout: big square
+// expect-stdout: square
+// expect-stdout: none
+// expect-stdout: 99
+// expect-stdout: 255
+// expect-stdout: 2
+// expect-stdout: 2
+// expect-stdout: 2
+// expect-stdout: 7
+// expect-stdout: 7
+// expect-stdout: 2
+// expect-stdout: -97
+// expect-stdout: 107
+// expect-stdout: 5
+// expect-stdout: 40
+// expect-stdout: 42
+// expect-stdout: 7
+// expect-stdout: 2

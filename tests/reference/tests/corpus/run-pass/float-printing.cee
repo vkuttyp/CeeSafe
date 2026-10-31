@@ -1,0 +1,83 @@
+// Printing floats (type-system.md §35.7, M11 G7b): the shortest text that reads back as the same value, laid out as
+// ECMAScript's Number::toString; f32 values print with f32's shortest digits. Also String.appendNumber.
+
+fn main() {
+    Console.writeLine(0.1);
+    Console.writeLine(0.1 + 0.2);
+    Console.writeLine(1.5);
+    Console.writeLine(-2.25);
+    Console.writeLine(100.0);
+    Console.writeLine(123456.789);
+    Console.writeLine(1e20);
+    Console.writeLine(1e21);
+    Console.writeLine(0.000001);
+    Console.writeLine(1.5e-7);
+    Console.writeLine(6.02e23);
+    Console.writeLine(1.7976931348623157e308);
+    Console.writeLine(5e-324);
+    Console.writeLine(2.2250738585072014e-308);
+    let zero = 0.0;
+    Console.writeLine(-zero);
+    Console.writeLine(1.0 / zero);
+    Console.writeLine(-1.0 / zero);
+    // Branches that are all flexible float literals default to f64 (§15.3; found by the fuzzer in G7c: was i32).
+    Console.writeLine(if (zero == 0.0) 0.5 else 1.5);
+    Console.writeLine(zero / zero);
+    let quarter = 0.25;
+    Console.writeLine(quarter * 4.0 - 1.0);
+    // A power of two, where the decimal below is not the nearest that reads back (2^-25).
+    Console.writeLine(f64.fromBits(4494592428115755008));
+
+    // f32: its own shortest digits, not those of the f64 it would widen to.
+    Console.writeLine(0.1f32);
+    let third: f32 = 1.0 / 3.0;
+    Console.writeLine(third);
+    Console.writeLine(third as f64);
+    Console.writeLine(16777216.0f32);
+    Console.writeLine(3.4028235e38f32);
+    Console.writeLine(1e-45f32);
+
+    // Within a line, and into a String.
+    Console.write("x = ");
+    Console.write(2.5);
+    Console.write(", y = ");
+    Console.writeLine(-0.125f32);
+    var s = String.create();
+    s.append("[")!;
+    s.appendNumber(3.75)!;
+    s.append(", ")!;
+    s.appendNumber(1e-10f32)!;
+    s.append(", ")!;
+    s.appendNumber(-1e100)!;
+    s.append("]")!;
+    Console.writeLine(s);
+}
+// expect-stdout: 0.1
+// expect-stdout: 0.30000000000000004
+// expect-stdout: 1.5
+// expect-stdout: -2.25
+// expect-stdout: 100
+// expect-stdout: 123456.789
+// expect-stdout: 100000000000000000000
+// expect-stdout: 1e+21
+// expect-stdout: 0.000001
+// expect-stdout: 1.5e-7
+// expect-stdout: 6.02e+23
+// expect-stdout: 1.7976931348623157e+308
+// expect-stdout: 5e-324
+// expect-stdout: 2.2250738585072014e-308
+// expect-stdout: 0
+// expect-stdout: Infinity
+// expect-stdout: -Infinity
+// expect-stdout: 0.5
+// expect-stdout: NaN
+// expect-stdout: 0
+// expect-stdout: 2.9802322387695312e-8
+// expect-stdout: 0.1
+// expect-stdout: 0.33333334
+// expect-stdout: 0.3333333432674408
+// expect-stdout: 16777216
+// expect-stdout: 3.4028235e+38
+// expect-stdout: 1e-45
+// expect-stdout: x = 2.5, y = -0.125
+// expect-stdout: [3.75, 1e-10, -1e+100]

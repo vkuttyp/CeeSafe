@@ -1,0 +1,51 @@
+// Overflow checks that stay (optimisations.md §3.3); the .oce snapshot lists each one as kept. Each is a near miss:
+// removing it would be wrong for some input, even where this program's own inputs do not overflow.
+
+/// A sum of two unbounded values.
+fn sum(a: u32, b: u32) -> u32 => a + b;
+
+/// A subtraction tested the wrong way: `a <= b` leaves `a - b` free to go below zero.
+fn wrongWay(a: u32, b: u32) -> u32 {
+    if (a <= b) { return a - b; }
+    return 0;
+}
+
+/// A counter bounded by `<=` a value that may be the type's maximum: `i + 1` may overflow.
+fn inclusive(n: u8) -> u32 {
+    var t: u32 = 0;
+    var i: u8 = 0;
+    while (i <= n) {
+        t += 1;
+        if (i == n) { return t; }
+        i += 1;
+    }
+    return t;
+}
+
+/// A negation of a negative value, which may be the minimum.
+fn negate(x: i32) -> i32 {
+    if (x < 0) { return -x; }
+    return x;
+}
+
+/// A product of a product: the first, of two u32 values, is proved; the second is not bounded below the type's maximum.
+fn cube(x: u32) -> u64 => (x as u64) * (x as u64) * (x as u64);
+
+/// A predecessor with no test.
+fn predecessor(x: u32) -> u32 => x - 1;
+
+fn main() {
+    Console.writeLine(sum(1, 2));
+    Console.writeLine(wrongWay(5, 5));
+    Console.writeLine(inclusive(3));
+    Console.writeLine(negate(-7));
+    Console.writeLine(cube(3));
+    Console.writeLine(predecessor(5));
+}
+
+// expect-stdout: 3
+// expect-stdout: 0
+// expect-stdout: 4
+// expect-stdout: 7
+// expect-stdout: 27
+// expect-stdout: 4
