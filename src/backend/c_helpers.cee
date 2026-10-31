@@ -799,7 +799,7 @@ fn emitArenaHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, A
             e.b(element.view())?;
             e.t(" *p = (")?;
             e.b(element.view())?;
-            e.t(" *)ceesafe_region_alloc(r, kind, n == 0u ? 1u : n * sizeof(")?;
+            e.t(" *)ceesafe_region_alloc_fast(r, kind, n == 0u ? 1u : n * sizeof(")?;
             e.b(element.view())?;
             e.t("), _Alignof(")?;
             e.b(element.view())?;
@@ -826,7 +826,7 @@ fn emitArenaHelpers(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, A
             e.b(contents.view())?;
             e.t(" *p = (")?;
             e.b(contents.view())?;
-            e.t(" *)ceesafe_region_alloc(r, kind, sizeof(")?;
+            e.t(" *)ceesafe_region_alloc_fast(r, kind, sizeof(")?;
             e.b(contents.view())?;
             e.t("), _Alignof(")?;
             e.b(contents.view())?;
@@ -859,6 +859,11 @@ fn appendBoxCreateName(c: borrow Checker, out: borrow mut Vector<u8>, result: u3
 
 fn appendBoxAllocateName(c: borrow Checker, out: borrow mut Vector<u8>, result: u32) -> Result<void, AllocError> {
     appendText(out, "ceeBA_")?;
+    return appendMangle(c, out, resultOkOf(c, result));
+}
+
+fn appendBoxZeroedName(c: borrow Checker, out: borrow mut Vector<u8>, result: u32) -> Result<void, AllocError> {
+    appendText(out, "ceeBZ_")?;
     return appendMangle(c, out, resultOkOf(c, result));
 }
 
@@ -902,6 +907,14 @@ fn emitBoxCreatePrototypes(e: borrow mut CEmitter, c: borrow Checker) -> Result<
             appendCTypeName(c, mut e.buf, contents)?;
             e.t(" *")?;
             appendBoxAllocateName(c, mut e.buf, result)?;
+            e.t("(void);")?;
+            e.emit()?;
+        }
+        if (inSet(e.zeroedResults, result)) {
+            e.helperProto()?;
+            appendCTypeName(c, mut e.buf, contents)?;
+            e.t(" *")?;
+            appendBoxZeroedName(c, mut e.buf, result)?;
             e.t("(void);")?;
             e.emit()?;
         }
@@ -1157,6 +1170,32 @@ fn emitBoxCreate(e: borrow mut CEmitter, c: borrow Checker) -> Result<void, Allo
             e.emit()?;
             emitBoxAllocation(e, c, box, contents)?;
             e.line("    return p;")?;
+            e.line("}")?;
+            e.line("")?;
+        }
+        if (inSet(e.zeroedResults, result)) {
+            // The allocation with every byte zero, for a box built from a zero repeat (§2): nothing to construct.
+            let name = cTypeName(c, contents)?;
+            e.helper()?;
+            e.b(name.view())?;
+            e.t(" *")?;
+            appendBoxZeroedName(c, mut e.buf, result)?;
+            e.t("(void) {")?;
+            e.emit()?;
+            e.t("    _Static_assert(_Alignof(")?;
+            e.b(name.view())?;
+            e.t(") <= _Alignof(cee_max_align_t), \"ceesafec: ")?;
+            e.b(c.types.name(box))?;
+            e.t(" needs over-aligned memory\");")?;
+            e.emit()?;
+            e.t("    return (")?;
+            e.b(name.view())?;
+            e.t(" *)ceesafe_alloc_zeroed(sizeof(")?;
+            e.b(name.view())?;
+            e.t("), ")?;
+            appendAllocatorId(c, mut e.buf, c.types.info(box).allocator)?;
+            e.t(");")?;
+            e.emit()?;
             e.line("}")?;
             e.line("")?;
         }

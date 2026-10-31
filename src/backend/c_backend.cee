@@ -106,6 +106,7 @@ fn generateC(
     emitter.sites = trial.sites;
     emitter.siteList = trial.siteList;
     emitter.inPlaceResults = trial.inPlaceResults;
+    emitter.zeroedResults = trial.zeroedResults;
     emitter.usedLibrary = trial.usedLibrary;
     emitter.usedVariants = trial.usedVariants;
     if (o.placement) {

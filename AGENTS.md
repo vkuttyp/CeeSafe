@@ -86,7 +86,8 @@ the markers, and never edit between them.
   sources, `out/ceesafec fmt --check` lists the ones that would change. The generators (`tools/gen_*.py`) format their
   output with it too ($CEESAFEC).
 - Nova and CeeSafe exist in parallel (Decision 0003): ceesafec reads only `ceesafe.toml` packages, but files named on
-  the command line may have any extension, so Nova's corpus and `tests/` stay `.nova`, compared with novac. CeeSafe
+  the command line may have any extension, so Nova's corpus stays `.nova`, compared with novac; CeeSafe's own tests
+  (`tests/support`, `tests/reference`) are `.cee`. Since Decision 0007 ceesafec's C is CeeSafe's own, not novac's. CeeSafe
   tracks Nova (its specifications, releases and corpus) until P8. Diagnostic codes keep the letter N.
 - A missing language or library feature is an upstream Nova task (ROADMAP's N track: spec and ADR in `~/Nova`, then a
   novac release and a re-pin). Pure library code (tables, interner, bignum, JSON) is written here in Nova. Never
@@ -102,8 +103,8 @@ python3 tools/run_corpus.py --compiler out/ceesafec --reference ~/.nova/0.6.0/bi
 python3 tools/run_corpus.py --compiler ~/.nova/0.6.0/bin/novac --corpus probes --family run-pass --family check-fail \
     --family parse-fail                                                  # the P1 probes
 W=""; for f in src/support/*.cee; do W="$W --with $f"; done                # zsh: then ${=W}
-python3 tools/run_corpus.py --compiler ~/.nova/0.6.0/bin/novac --corpus tests/support --family run-pass $W --check-leaks
-python3 tools/fault_sweep.py --compiler ~/.nova/0.6.0/bin/novac tests/support/fault/alloc-sweep.nova src/support/*.cee
+python3 tools/run_corpus.py --compiler out/ceesafec --corpus tests/support --family run-pass $W --check-leaks
+python3 tools/fault_sweep.py --compiler out/ceesafec tests/support/fault/alloc-sweep.cee src/support/*.cee
 python3 tools/oracles/support_models.py                                  # oracle summaries for tests/support
 python3 tools/inventory.py                                               # regenerate docs/reference-inventory.md
 python3 tools/gen_catalog.py --nova <Nova at the pinned tag>            # regenerate src/diagnostics/catalog.cee
@@ -146,6 +147,8 @@ src/syntax/ src/diagnostics/            the frontend (P2): tokens, lexer, AST, p
 tests/syntax/                           lexer edge cases (tools/lexer_fuzz.py --cases), and known differences
 tests/support/                          support-library tests (run-pass, fault/)
 tools/oracles/                          independent oracles and generators for tests
+runtime/                                the C runtime ceesafec embeds (tools/gen_runtime.py; Decision 0007)
+benchmarks/                             CeeSafe against Rust and C (run.py; results in guide/performance.md)
 out/                                    build output, never committed
 ```
 

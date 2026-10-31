@@ -51,6 +51,7 @@ const guide = [
       { text: "Formatting and documentation", link: "/guide/formatting-and-docs" },
       { text: "Editors", link: "/guide/editors" },
       { text: "Debugging", link: "/guide/debugging" },
+      { text: "Performance", link: "/guide/performance" },
     ],
   },
 ];

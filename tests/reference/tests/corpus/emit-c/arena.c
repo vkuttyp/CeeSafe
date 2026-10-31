@@ -132,7 +132,7 @@ static int32_t nvF_main(void) {
 }
 
 static nvR_QS5PointE10AllocError nvAA_S5Point(void *r, uint32_t kind, nvT_Point v) {
-    nvT_Point *p = (nvT_Point *)nova_region_alloc(r, kind, sizeof(nvT_Point), _Alignof(nvT_Point));
+    nvT_Point *p = (nvT_Point *)nova_region_alloc_fast(r, kind, sizeof(nvT_Point), _Alignof(nvT_Point));
     if (p == NULL) return ((nvR_QS5PointE10AllocError){ .tag = 1, .u.v_Err = { .f__0 = ((nvE_AllocError){ .tag = 0 }) } });
     *p = v;
     return nvMk_nvR_QS5PointE10AllocError_v_Ok(p);
@@ -140,7 +140,7 @@ static nvR_QS5PointE10AllocError nvAA_S5Point(void *r, uint32_t kind, nvT_Point 
 
 static nvR_QUu16E10AllocError nvAR_u16(void *r, uint32_t kind, uint64_t n, uint16_t fill) {
     if (n > UINT64_MAX / sizeof(uint16_t)) return ((nvR_QUu16E10AllocError){ .tag = 1, .u.v_Err = { .f__0 = ((nvE_AllocError){ .tag = 0 }) } });
-    uint16_t *p = (uint16_t *)nova_region_alloc(r, kind, n == 0u ? 1u : n * sizeof(uint16_t), _Alignof(uint16_t));
+    uint16_t *p = (uint16_t *)nova_region_alloc_fast(r, kind, n == 0u ? 1u : n * sizeof(uint16_t), _Alignof(uint16_t));
     if (p == NULL) return ((nvR_QUu16E10AllocError){ .tag = 1, .u.v_Err = { .f__0 = ((nvE_AllocError){ .tag = 0 }) } });
     for (uint64_t i = 0; i < n; i++) p[i] = fill;
     return nvMk_nvR_QUu16E10AllocError_v_Ok(((nvSm_u16){ .ptr = p, .len = n }));

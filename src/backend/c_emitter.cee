@@ -46,6 +46,7 @@ struct CEmitter {
     oce: bool;                             // off: --no-oce
     usedTypes: Vector<bool>;               // by type: mentioned by emitted code
     inPlaceResults: Vector<bool>;          // by type: Box.create results some site builds in place (nvBA_)
+    zeroedResults: Vector<bool>;           // by type: Box.create results some site builds from all-zero bytes (ceeBZ_)
     headerStructs: Vector<u32>;            // defined by the exports header (ADR 0030)
     compiled: Vector<u32>;                 // the NIR functions compiled to C (CompiledFunctions)
     composites: Vector<u32>;               // Composites
@@ -92,6 +93,7 @@ struct CEmitter {
         oce: false,
         usedTypes: Vector<bool>.create(),
         inPlaceResults: Vector<bool>.create(),
+        zeroedResults: Vector<bool>.create(),
         headerStructs: Vector<u32>.create(),
         compiled: Vector<u32>.create(),
         composites: Vector<u32>.create(),

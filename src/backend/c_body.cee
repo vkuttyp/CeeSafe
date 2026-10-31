@@ -591,6 +591,16 @@ fn isZeroOperand(n: borrow NirProgram, o: u32) -> bool => match (n.operands[o as
     _ => false,
 };
 
+/// An array repeat of a constant whose bytes are all zero: an integer or bool 0, or a float whose bits are 0 (+0.0).
+fn isZeroRepeat(n: borrow NirProgram, r: u32) -> bool => match (n.rvalues[r as usize]) {
+    NirRvalue.ArrayRepeat(o) => match (n.operands[o as usize]) {
+        NirOperand.Const(value) => value.magnitude == 0,
+        NirOperand.Zero => true,
+        _ => false,
+    },
+    _ => false,
+};
+
 fn appendPlaceIn(
     e: borrow mut CEmitter,
     c: borrow Checker,
@@ -706,7 +716,13 @@ fn emitStatement(
                 // Built in place (§2): allocate first, then construct in the box's memory.
                 let resultType = n.rvalueTypes[r as usize];
                 let contents = c.types.info(resultOkOf(c, resultType)).pointee;
-                if (!inSet(e.inPlaceResults, resultType)) {
+                let constructionValue = statementRvalue(n, built);
+                // An array of zero bytes from a heap allocator: zeroed memory, no loop (c-backend.md §2).
+                let zeroed = isZeroRepeat(n, constructionValue) &&
+                    !isUserAllocator(c, c.types.info(resultOkOf(c, resultType)).allocator);
+                if (zeroed) {
+                    markType(mut e.zeroedResults, resultType)?;
+                } else {
                     markType(mut e.inPlaceResults, resultType)?;
                 }
                 let place = appendPlaceIn(e, c, n, sources, f, target)?;
@@ -714,7 +730,11 @@ fn emitStatement(
                 e.t("        ")?;
                 appendCTypeName(c, mut e.buf, contents)?;
                 e.t(" *cee_p = ")?;
-                appendBoxAllocateName(c, mut e.buf, resultType)?;
+                if (zeroed) {
+                    appendBoxZeroedName(c, mut e.buf, resultType)?;
+                } else {
+                    appendBoxAllocateName(c, mut e.buf, resultType)?;
+                }
                 e.t("();")?;
                 e.emit()?;
                 e.line("        if (cee_p == NULL) {")?;
@@ -727,8 +747,9 @@ fn emitStatement(
                 e.t(";")?;
                 e.emit()?;
                 e.line("        } else {")?;
-                let constructionValue = statementRvalue(n, built);
-                emitConstruction(e, c, n, sources, f, constructionValue, "(*cee_p)".bytes(), "            ")?;
+                if (!zeroed) {
+                    emitConstruction(e, c, n, sources, f, constructionValue, "(*cee_p)".bytes(), "            ")?;
+                }
                 var ok = Vector<u8>.create();
                 appendOkValue(e, c, mut ok, resultType, "cee_p".bytes())?;
                 e.t("            ")?;
