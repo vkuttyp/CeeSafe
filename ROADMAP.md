@@ -547,8 +547,9 @@ Dependencies: P8.
 - [ ] Run a recorded 24-hour differential fuzz campaign against novac, with optimisations off and on, flat and
   structured C, closures, `dyn`, threads and numeric edges. Port the generator to Nova.
 - [ ] Measure compiler throughput and peak memory against novac. Run it on the Ryzen host with `nice`.
-- [ ] Release `ceesafec` for the six platforms, with checksums, licences, install scripts and macOS notarisation.
-  Nothing is published until the owner asks.
+- [x] Release `ceesafec` for the six platforms, with checksums, licences, install scripts and macOS notarisation:
+  v0.1.0, 2026-10-31, on the owner's word (`docs/release.md`; every platform's binary built from one C seed and
+  checked to emit it).
 - [ ] Ship a source-release C seed (in the spirit of ADR 0023 option A), verified to build with a C toolchain alone.
 - [ ] Build and run `ceesafec` on CosmoOS userland, on both architectures, including self-compilation.
 - [ ] Have the safety passes and `unsafe` adapters reviewed independently when a reviewer is available.
@@ -757,4 +758,10 @@ guest), C2 (412 sweep runs), C3, C5, C7 and C8 booted on x86_64; C4 on both arch
 a ceesafec bug (a closure with an `unsafe { e }` body crashed the capture scan), fixed with a regression program in
 `tests/check/`; the contract suite passes after the fix (36/36). Not run: aarch64 boots, C8 `--cycles`.
 
-Not yet run: P9.
+**Release v0.1.0** (2026-10-31; `docs/release.md`): the contract suite on the 0.1.0 build (36/36); two dry runs of
+`release.yml` (the first found `cl`'s objects written into the seed directory), then the tag: six platforms, each
+binary built from the Linux seed and emitting it byte for byte (osx-x64 checked under Rosetta), macOS signed and
+notarized (Accepted), published with SHA256SUMS at github.com/vkuttyp/CeeSafe/releases/tag/v0.1.0;
+`install.sh` from the site installs it and builds a program. `main` is 0.2.0-dev.
+
+Not yet run: the rest of P9.
