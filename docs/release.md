@@ -17,7 +17,7 @@ One C seed for every platform, so every binary is built from the same C and chec
    the Developer ID and notarized. A smoke test runs `--version`, the interpreter, a native build and the MCP server.
    `osx-x64` is built on an arm64 runner by ceesafec's own driver (`--cflag -arch --cflag x86_64`) and run under
    Rosetta when the runner has it.
-3. **publish** (tags only): `SHA256SUMS` and the GitHub release.
+3. **publish**: `SHA256SUMS` and the GitHub release.
 
 | Archive | Built on | Contents |
 |---|---|---|
@@ -32,10 +32,9 @@ One C seed for every platform, so every binary is built from the same C and chec
    is reproducible.
 2. Run the contract suite on the commit: `python3 tools/contract_tests.py --ceesafec out/ceesafec` (`spec/testing.md`;
    it includes the fixed point).
-3. Dry run: `gh workflow run release.yml --ref main` builds, checks, signs and notarizes everything without
-   publishing.
-4. Tag and push: `git tag v<version> && git push origin v<version>`.
-5. Move `main` to the next development version (`<next>-dev`).
+3. Tag and push: `git tag v<version> && git push origin v<version>`. Only such a tag runs the workflow (there is no
+   manual or branch trigger); it builds, checks, signs and notarizes everything and publishes only if every job passes.
+4. Move `main` to the next development version (`<next>-dev`).
 
 ## Secrets
 

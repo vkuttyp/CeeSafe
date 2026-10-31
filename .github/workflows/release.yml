@@ -6,12 +6,11 @@ name: release
 # `build`, and checks that the result emits the seed byte for byte. The macOS binaries are signed with the project's
 # Developer ID and notarized; SHA256SUMS covers every archive.
 
+# Only a pushed tag v<version> runs it: there is no manual or branch trigger, so nothing else builds or publishes a
+# release.
 on:
   push:
     tags: ["v*"]
-  # A dry run (gh workflow run release.yml): every build, check, signature and notarization of a release, without the
-  # tag check and without publishing.
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -37,9 +36,7 @@ jobs:
             echo "::error::ceesafeVersion ($constant) and compilerBanner ($banner) disagree; see docs/release.md"
             exit 1
           fi
-          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
-            echo "dry run: version $constant, nothing will be published"
-          elif [ "${GITHUB_REF_NAME#v}" != "$constant" ]; then
+          if [ "${GITHUB_REF_NAME#v}" != "$constant" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match ceesafec's version ($constant); see docs/release.md"
             exit 1
           fi
@@ -229,7 +226,7 @@ jobs:
 
   publish:
     needs: [version, build]
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
