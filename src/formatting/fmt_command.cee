@@ -149,11 +149,11 @@ fn packageSourceFiles(
     found: borrow mut bool,
     json: bool,
 ) -> Result<i32, AllocError> {
-    let cwd = match (Directory.current()) {
+    let cwd = match (currentDirectory()) {
         Ok(d) => d,
         Err(_) => { return Ok(0); }
     };
-    let directory = match (findManifestDirectory(cwd.view().bytes())?) {
+    let directory = match (findManifestDirectory(cwd.view())?) {
         Some(d) => d,
         null => { return Ok(0); }
     };

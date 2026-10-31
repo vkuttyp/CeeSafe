@@ -289,7 +289,7 @@ fn checkAlone(path: Slice<u8>, text: Slice<u8>) -> Result<Compiled, AllocError> 
 /// A document that is a source of a package (CheckInPackage): checked with the package, its other files from disk and
 /// its locked dependencies, never fetching. Null when the document is not in a package that resolves.
 fn checkInPackage(path: Slice<u8>, text: Slice<u8>, file: borrow mut u32) -> Result<Compiled?, AllocError> {
-    if (path.length == 0 || path[0] != '/') {
+    if (!isRooted(path)) {
         return Ok(null);
     }
     let parent = joinPath(path, "..".bytes())?;

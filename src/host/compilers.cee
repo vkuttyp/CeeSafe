@@ -1,0 +1,426 @@
+// Which C compiler `build` runs, and how (the reference's Backend.C/CCompilers.cs; tooling.md §8). On Linux and macOS
+// it is the one named, else `cc`. On Windows, without a name, it looks for clang, then MinGW's gcc, then MSVC's cl,
+// and runs clang or cl in Visual Studio's developer environment when the process lacks it. lib/std cannot give a child
+// process an environment (docs/p8-plan.md, upstream gaps), so that environment comes from the batch file every
+// Windows tool runs through (toolchain.cee's runThroughBatch), which calls vcvarsall.bat before the compiler.
+
+/// A C compiler to run (CCompiler): its path, whether it takes MSVC's flags, and the vcvarsall.bat to call first (empty
+/// when the process's own environment serves).
+struct CCompiler {
+    path: Vector<u8>;
+    msvc: bool;
+    vcvars: Vector<u8>;
+}
+
+/// Whether ceesafec runs on Windows: its working directory has a drive (Nova 0.6.0 has no query for the host system).
+fn hostIsWindows() -> bool {
+    return match (currentDirectory()) {
+        Ok(cwd) => hasDrive(cwd.view()),
+        Err(_) => false,
+    };
+}
+
+/// The file name of `path` without its directory and extension (Path.GetFileNameWithoutExtension); `\` separates
+/// on Windows.
+fn compilerStem(path: Slice<u8>) -> Vector<u8> {
+    var start = path.length;
+    while (start > 0 && path[start - 1] != '/' && path[start - 1] != '\\') {
+        start -= 1;
+    }
+    var end = path.length;
+    while (end > start && path[end - 1] != '.') {
+        end -= 1;
+    }
+    var stem = Vector<u8>.create();
+    for (c in path[start..(if (end > start + 1) end - 1 else path.length)]) {
+        stem.push(lowerAscii(c))!;
+    }
+    return stem;
+}
+
+/// A compiler whose file name is `cl` is MSVC (KindOf, §8.3).
+fn isMsvcName(path: Slice<u8>) -> bool {
+    let stem = compilerStem(path);
+    return sameText(stem.view(), "cl");
+}
+
+/// Whether the compiler's file name contains `gcc` (MinGW's).
+fn isGccName(path: Slice<u8>) -> bool {
+    let stem = compilerStem(path);
+    return containsText(stem.view(), "gcc");
+}
+
+fn containsText(text: Slice<u8>, part: StringView) -> bool => containsSlice(text, part.bytes());
+
+/// The first `name` (with `.exe` on Windows) in the directories of `PATH` (FindInPath).
+fn findInPath(name: StringView, windows: bool) -> Vector<u8>? {
+    let path = match (Environment.variable("PATH")) {
+        Some(p) => p.bytes(),
+        null => { return null; }
+    };
+    var file = copyBytes(name.bytes())!;
+    let lower = compilerBase(file.view()).length >= 4 && findIgnoringCase(
+        file[file.length - 4..],
+        ".exe".bytes(),
+        0,
+    ) != null;
+    if (windows && !lower) {
+        appendText(mut file, ".exe")!;
+    }
+    let separator: u8 = if (windows) ';' else ':';
+    var start: usize = 0;
+    for (k in 0..path.length + 1) {
+        if (k == path.length || path[k] == separator) {
+            let entry = trimmed(path[start..k]);
+            var from: usize = 0;
+            var to = entry.length;
+            while (from < to && entry[from] == '"') {
+                from += 1;
+            }
+            while (to > from && entry[to - 1] == '"') {
+                to -= 1;
+            }
+            let directory = entry[from..to];
+            if (directory.length > 0) {
+                var candidate = copyBytes(directory)!;
+                candidate.push(if (windows) '\\' else '/')!;
+                appendBytes(mut candidate, file.view())!;
+                if (fileExists(candidate.view()) && !isDirectory(candidate.view())) {
+                    return candidate;
+                }
+            }
+            start = k + 1;
+        }
+    }
+    return null;
+}
+
+/// The architecture vcvarsall.bat is given for this machine (HostArchitecture).
+fn hostArchitecture() -> StringView => if (Target.isAArch64()) "arm64" else "x64";
+
+/// Visual Studio (or its Build Tools) with the C++ tools for this machine, by vswhere; null without one.
+fn visualStudioDirectory() -> Vector<u8>? {
+    let base = match (Environment.variable("ProgramFiles(x86)")) {
+        Some(p) => p.bytes(),
+        null => { return null; }
+    };
+    var vswhere = copyBytes(base)!;
+    appendText(mut vswhere, "\\Microsoft Visual Studio\\Installer\\vswhere.exe")!;
+    if (!fileExists(vswhere.view())) {
+        return null;
+    }
+    var arguments = Vector<Vector<u8>>.create();
+    pushText(mut arguments, "-latest")!;
+    pushText(mut arguments, "-products")!;
+    pushText(mut arguments, "*")!;
+    pushText(mut arguments, "-requires")!;
+    pushText(
+        mut arguments,
+        if (Target.isAArch64()) "Microsoft.VisualStudio.Component.VC.Tools.ARM64" else "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+    )!;
+    pushText(mut arguments, "-property")!;
+    pushText(mut arguments, "installationPath")!;
+    let result = runTool(vswhere.view(), arguments)!;
+    if (!result.started || result.status != 0) {
+        return null;
+    }
+    let out = result.stdout.view();
+    var start: usize = 0;
+    for (k in 0..out.length + 1) {
+        if (k == out.length || out[k] == '\n') {
+            let line = trimmed(out[start..k]);
+            if (line.length > 0) {
+                return if (isDirectory(line)) copyBytes(line)! else null;
+            }
+            start = k + 1;
+        }
+    }
+    return null;
+}
+
+/// The compiler for `requested` (--cc, else $CC; empty for neither), or the error to report (Locate).
+fn locateCompiler(requested: Slice<u8>, error: borrow mut Vector<u8>) -> CCompiler? {
+    if (!hostIsWindows()) {
+        let name = if (requested.length == 0) copyBytes("cc".bytes())! else copyBytes(requested)!;
+        let msvc = isMsvcName(name.view());
+        return CCompiler { path: name, msvc: msvc, vcvars: Vector<u8>.create() };
+    }
+    let found = if (requested.length == 0) findOnWindows() else resolveCompiler(requested);
+    let path = match (found) {
+        Some(p) => p,
+        null => {
+            if (requested.length == 0) {
+                appendText(
+                    error,
+                    "no C compiler found: looked for clang, %ProgramFiles%\\LLVM\\bin\\clang.exe, gcc and cl, and for Visual Studio with the C++ tools. Install LLVM (winget install LLVM.LLVM) with Visual Studio's \"Desktop development with C++\" workload or its Build Tools, or MinGW-w64; or name one with --cc (tooling.md §8)",
+                )!;
+            } else {
+                appendText(error, "cannot find the C compiler '")!;
+                appendBytes(error, requested)!;
+                appendText(error, "'")!;
+            }
+            return null;
+        }
+    };
+    let msvc = isMsvcName(path.view());
+    let gcc = isGccName(path.view());
+    // clang and cl compile against Visual Studio's C library and the Windows SDK (§8.2); MinGW's gcc brings its own.
+    let include = match (Environment.variable("INCLUDE")) {
+        Some(v) => trimmed(v.bytes()).length > 0,
+        null => false,
+    };
+    if (gcc || include) {
+        return CCompiler { path: path, msvc: msvc, vcvars: Vector<u8>.create() };
+    }
+    let directory = visualStudioDirectory();
+    var vcvars = Vector<u8>.create();
+    match (borrow directory) {
+        Some(d) => {
+            vcvars = copyBytes(d.view())!;
+            appendText(mut vcvars, "\\VC\\Auxiliary\\Build\\vcvarsall.bat")!;
+        }
+        null => {}
+    }
+    if (directory == null || !fileExists(vcvars.view())) {
+        appendText(error, "'")!;
+        appendBytes(error, path.view())!;
+        appendText(error, "' needs Visual Studio's C headers and libraries, and ")!;
+        match (borrow directory) {
+            Some(d) => {
+                appendText(error, "Visual Studio at ")!;
+                appendBytes(error, d.view())!;
+                appendText(error, " has no vcvarsall.bat")!;
+            }
+            null => {
+                appendText(error, "no Visual Studio with the C++ tools for ")!;
+                appendText(error, hostArchitecture())!;
+                appendText(error, " was found (vswhere)")!;
+            }
+        }
+        appendText(
+            error,
+            ". Install Visual Studio's \"Desktop development with C++\" workload or its Build Tools, run ceesafec from a Visual Studio developer prompt, or use MinGW-w64's gcc (tooling.md §8.2)",
+        )!;
+        return null;
+    }
+    // cl itself is then found in that environment's PATH, by cmd.
+    return CCompiler { path: path, msvc: msvc, vcvars: vcvars };
+}
+
+/// §8.1's order on Windows; cl from Visual Studio when nothing is on PATH (FindOnWindows).
+fn findOnWindows() -> Vector<u8>? {
+    match (findInPath("clang", true)) {
+        Some(p) => { return p; }
+        null => {}
+    }
+    match (Environment.variable("ProgramFiles")) {
+        Some(base) => {
+            var llvm = copyBytes(base.bytes())!;
+            appendText(mut llvm, "\\LLVM\\bin\\clang.exe")!;
+            if (fileExists(llvm.view())) {
+                return llvm;
+            }
+        }
+        null => {}
+    }
+    match (findInPath("gcc", true)) {
+        Some(p) => { return p; }
+        null => {}
+    }
+    match (findInPath("cl", true)) {
+        Some(p) => { return p; }
+        null => {}
+    }
+    return if (visualStudioDirectory() != null) copyBytes("cl".bytes())! else null;
+}
+
+/// A named compiler: a path as it is if the file exists, else found on PATH, else cl when Visual Studio has it
+/// (Resolve).
+fn resolveCompiler(compiler: Slice<u8>) -> Vector<u8>? {
+    var hasSeparator = isRooted(compiler);
+    for (c in compiler) {
+        hasSeparator = hasSeparator || c == '/' || c == '\\';
+    }
+    if (hasSeparator) {
+        return if (fileExists(compiler)) copyBytes(compiler)! else null;
+    }
+    match (findInPath(StringView.fromUtf8(compiler)!, true)) {
+        Some(p) => { return p; }
+        null => {}
+    }
+    return if (isMsvcName(compiler) && visualStudioDirectory() != null) copyBytes(compiler)! else null;
+}
+
+/// MSVC's compile of an executable (§8.3): `/O2`, or `/Zi /Od` for `-g`, the objects beside the C, and the 8 MiB stack
+/// Linux and macOS give the main thread (c-backend.md §1.1).
+fn msvcArguments(
+    directory: Slice<u8>,
+    files: borrow Vector<CFile>,
+    output: Slice<u8>,
+    debug: bool,
+    userFlags: borrow Vector<Vector<u8>>,
+) -> Result<Vector<Vector<u8>>, AllocError> {
+    var arguments = Vector<Vector<u8>>.create();
+    pushText(mut arguments, "/nologo")?;
+    pushText(mut arguments, "/std:c11")?;
+    pushText(mut arguments, "/W3")?;
+    pushText(mut arguments, "/I")?;
+    pushBytes(mut arguments, directory)?;
+    if (debug) {
+        pushText(mut arguments, "/Zi")?;
+        pushText(mut arguments, "/Od")?;
+    } else {
+        pushText(mut arguments, "/O2")?;
+    }
+    for (flag in userFlags.view()) {
+        pushBytes(mut arguments, flag.view())?;
+    }
+    for (file in files.view()) {
+        if (isCSourceName(file.name.view())) {
+            arguments.push(windowsJoin(directory, file.name.view())?)?;
+        }
+    }
+    var objects = copyBytes("/Fo:".bytes())?;
+    appendBytes(mut objects, directory)?;
+    objects.push('\\')?;
+    arguments.push(objects)?;
+    var executable = copyBytes("/Fe:".bytes())?;
+    appendBytes(mut executable, output)?;
+    arguments.push(executable)?;
+    pushText(mut arguments, "/link")?;
+    pushText(mut arguments, "/STACK:8388608")?;
+    return Ok(arguments);
+}
+
+/// `directory\name` (Path.Combine on Windows).
+fn windowsJoin(directory: Slice<u8>, name: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var path = copyBytes(directory)?;
+    path.push('\\')?;
+    for (c in name) {
+        path.push(if (c == '/') '\\' else c)?;
+    }
+    return Ok(path);
+}
+
+/// Runs `compiler` with `arguments`, after its vcvarsall.bat if it has one. `work` is the build's directory. On
+/// Windows the arguments go in a response file there (`@file`, which clang, gcc and cl read), since cmd's lines are at
+/// most 8191 characters and the split form names over a hundred files.
+fn runCompiler(
+    compiler: borrow CCompiler,
+    work: Slice<u8>,
+    arguments: borrow Vector<Vector<u8>>,
+) -> Result<ToolOutcome, AllocError> {
+    if (!hostIsWindows()) {
+        return runTool(compiler.path.view(), arguments);
+    }
+    // cl reads a response file by the C runtime's rules, options with their values on one line; clang and gcc read it
+    // by GNU's, where a backslash escapes (so `C:\x` must be written `C:\\x`).
+    var text = Vector<u8>.create();
+    for (a in arguments.view()) {
+        if (compiler.msvc) {
+            appendCrtQuoted(mut text, a.view())?;
+            text.push(' ')?;
+        } else {
+            appendGnuQuoted(mut text, a.view())?;
+            appendText(mut text, "\n")?;
+        }
+    }
+    let path = windowsJoin(work, "ceesafec.rsp".bytes())?;
+    match (writeFile(StringView.fromUtf8(path.view())!, text.view())) {
+        Ok() => {}
+        Err(e) => { return Ok(notStarted(e)); }
+    }
+    var at = copyBytes("@".bytes())?;
+    appendBytes(mut at, path.view())?;
+    var responses = Vector<Vector<u8>>.create();
+    responses.push(at)?;
+    return runThroughBatch(compiler.path.view(), responses, compiler.vcvars.view());
+}
+
+/// `argument` quoted as GNU's response files are read (clang's and gcc's): `\` and `"` escaped by a backslash.
+fn appendGnuQuoted(out: borrow mut Vector<u8>, argument: Slice<u8>) -> Result<void, AllocError> {
+    out.push('"')?;
+    for (c in argument) {
+        if (c == '\\' || c == '"') {
+            out.push('\\')?;
+        }
+        out.push(c)?;
+    }
+    out.push('"')?;
+    return Ok();
+}
+
+/// `argument` quoted as the C runtime parses it (CommandLineToArgvW; the runtime's nova_host_quote): backslashes are
+/// literal except before a quote, where they are doubled, and a quote is escaped.
+fn appendCrtQuoted(out: borrow mut Vector<u8>, argument: Slice<u8>) -> Result<void, AllocError> {
+    out.push('"')?;
+    var slashes: usize = 0;
+    for (c in argument) {
+        if (c == '\\') {
+            slashes += 1;
+            continue;
+        }
+        let count = if (c == '"') slashes * 2 + 1 else slashes;
+        for (k in 0..count) {
+            out.push('\\')?;
+        }
+        slashes = 0;
+        out.push(c)?;
+    }
+    for (k in 0..slashes * 2) {
+        out.push('\\')?;
+    }
+    out.push('"')?;
+    return Ok();
+}
+
+/// cl's standard output without the names of the files it compiles and its "Generating Code..." lines
+/// (WithoutMsvcProgress).
+fn withoutMsvcProgress(output: Slice<u8>, files: borrow Vector<CFile>) -> Result<Vector<u8>, AllocError> {
+    var kept = Vector<u8>.create();
+    var start: usize = 0;
+    for (k in 0..output.length + 1) {
+        if (k == output.length || output[k] == '\n') {
+            let raw = output[start..k];
+            let line = if (raw.length > 0 && raw[raw.length - 1] == '\r') raw[..raw.length - 1] else raw;
+            let name = trimmed(line);
+            var progress = sameText(name, "Generating Code...");
+            for (file in files.view()) {
+                if (isCSourceName(file.name.view())) {
+                    let base = compilerBase(file.name.view());
+                    progress = progress || (name.length == base.length && containsIgnoringCase(name, base));
+                }
+            }
+            if (!progress) {
+                appendBytes(mut kept, line)?;
+                kept.push('\n')?;
+            }
+            start = k + 1;
+        }
+    }
+    // Trim('\n'), then one newline if anything is left.
+    var from: usize = 0;
+    while (from < kept.length && kept[from] == '\n') {
+        from += 1;
+    }
+    var to = kept.length;
+    while (to > from && kept[to - 1] == '\n') {
+        to -= 1;
+    }
+    var text = copyBytes(kept[from..to])?;
+    if (text.length > 0) {
+        text.push('\n')?;
+    }
+    return Ok(text);
+}
+
+/// The file name of a path (Path.GetFileName).
+fn compilerBase(path: Slice<u8>) -> Slice<u8> {
+    var start = path.length;
+    while (start > 0 && path[start - 1] != '/' && path[start - 1] != '\\') {
+        start -= 1;
+    }
+    return path[start..];
+}
+
+fn containsIgnoringCase(text: Slice<u8>, part: Slice<u8>) -> bool => findIgnoringCase(text, part, 0) != null;

@@ -942,7 +942,7 @@ fn sourcesOf(server: borrow McpServer, doc: borrow JsonDoc, arguments: u32) -> R
 /// tool's failure with .NET's message.
 fn readSource(server: borrow McpServer, path: Slice<u8>) -> Result<Vector<u8>, McpFailure> {
     var combined = Vector<u8>.create();
-    if (path.length == 0 || path[0] != '/') {
+    if (!isRooted(path)) {
         appendBytes(mut combined, server.workingDirectory.view())!;
         if (path.length > 0) {
             combined.push('/')!;
@@ -1869,8 +1869,8 @@ fn getPrompt(doc: borrow JsonDoc, parameters: u32) -> Result<McpAnswer, McpFailu
 
 /// Serves until the end of the input; returns 0 (McpServer.Run).
 fn mcpCommand() -> i32 {
-    let directory = match (Directory.current()) {
-        Ok(d) => copyBytes(d.view().bytes())!,
+    let directory = match (currentDirectory()) {
+        Ok(d) => d,
         Err(_) => copyBytes("/".bytes())!,
     };
     var server = McpServer { input: InputReader.create(), version: 0, workingDirectory: directory };

@@ -1,6 +1,6 @@
 # CeeSafe roadmap: port the Nova compiler to Nova, as CeeSafe
 
-Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P7 complete (CeeSafe names since `8941c10`; P7 production C 2026-10-30; stage 0 novac 0.6.0 via the `3d6ac40` anchor); P8 in progress (S0–S5 done, S6 under way 2026-10-31)**.
+Date: 2026-10-30 (revises the 2026-10-29 draft). Status: **P0–P7 complete (CeeSafe names since `8941c10`; P7 production C 2026-10-30; stage 0 novac 0.6.0 via the `3d6ac40` anchor); P8 in progress (S0–S6 done 2026-10-31)**.
 The probes, `src/support/`, the limits, the fault sweep and the skeleton exist (`docs/p1-probes.md`). No compiler code has been ported.
 Repository: `~/dev/CeeSafe`. Reference: `vkuttyp/Nova` (C#/.NET 10), pinned in `bootstrap/reference.md`.
 
@@ -522,8 +522,8 @@ Dependencies: P7. Parser-only tools may start after P2, and semantic tools after
 - [x] Fixes and JSON: the exact schema, `fix --dry-run`, and every corpus fix applied (`FixTests`) (S0).
 - [x] LSP: framing, UTF-16 edits, hover, definition, symbols, formatting, actions. Explicit walkers replace reflection (S5).
 - [x] MCP: lifecycle, tools (`ceesafe_*`), resources and prompts, the sandbox (S5).
-- [ ] Host parity: Windows/MSVC, debugger scripts, the VS Code extension (S6: debugger scripts and extension done;
-  MSVC open).
+- [x] Host parity: Windows/MSVC, debugger scripts, the VS Code extension (S6; git dependencies on Windows wait for
+  lib/std's rename and child environments).
 - [x] The normal self-build uses package mode, and P6 is rerun through it (S6: both hosts, both forms).
 
 - [ ] Decide whether the command line accepts only `.cee` files (Decision 0003 §2; Decision 0005 proposed).
@@ -639,8 +639,8 @@ P4 ──> P5 flat C ──> P6 fixed point ──> P6R rename ──> P7 optimi
    (`docs/p7-plan.md`): ceesafec emits novac's production C (structured, placement, check elimination, closure
    specialisation) byte for byte, and reaches the fixed point in that form. P8 is in progress (`docs/p8-plan.md`):
    `explain`, `fix`, `fmt`, `doc`, the package commands, `run --interp` and the `lsp` and `mcp` servers are identical to
-   novac's (S0–S5); S6 has the package-mode fixed point on both hosts, the debugger scripts and the VS Code
-   extension, with MSVC open. The C prefix switch waits
+   novac's (S0–S5); S6 adds the package-mode fixed point on macOS and Linux, Windows with MSVC and clang (the same
+   C), the debugger scripts and the VS Code extension. Next S7, the fork point, when the owner decides. The C prefix switch waits
    for P8's fork point (Decision 0004).
 4. Upstream (Nova #6, filed 2026-10-30): novac 0.6.0's `offsetOf<T>(field)` is 0 unless `T`'s layout was computed before (CheckOffsetOf reads
    `member.Offset` without `TypeTable.LayoutOf(measured)`); ceesafec gives the true offset.

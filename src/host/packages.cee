@@ -1,19 +1,60 @@
 // Paths and files for packages: joining and normalising paths, listing source files (the rest of package handling
 // is in src/packages/).
 
-/// `directory/relative`, normalised (`.` and `..` resolved); `relative` may be absolute.
+/// Whether `path` starts with a Windows drive, `X:` (a path the operating system gave on Windows).
+fn hasDrive(path: Slice<u8>) -> bool =>
+    path.length >= 2 && path[1] == ':' && ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z'));
+
+/// The length of `path`'s root: 1 for `/`, 3 for a drive's `X:/` (or `X:\`), 2 for a bare `X:`, else 0 (relative).
+fn rootLength(path: Slice<u8>) -> usize {
+    if (hasDrive(path)) {
+        return if (path.length >= 3 && (path[2] == '/' || path[2] == '\\')) 3 else 2;
+    }
+    return if (path.length > 0 && path[0] == '/') 1 else 0;
+}
+
+/// Whether `path` is absolute (Path.IsPathRooted): `/…`, or on Windows `X:/…` and `X:\…`.
+fn isRooted(path: Slice<u8>) -> bool => rootLength(path) > 0;
+
+/// A path the host gave, with `/` separators: on Windows (a path with a drive) each `\` becomes `/`, as ceesafec's paths
+/// use `/` throughout (and novac's output does on every host).
+fn slashedPath(path: Slice<u8>) -> Result<Vector<u8>, AllocError> {
+    var out = copyBytes(path)?;
+    if (hasDrive(path)) {
+        for (k in 0..out.length) {
+            if (out[k] == '\\') {
+                out[k] = '/';
+            }
+        }
+    }
+    return Ok(out);
+}
+
+/// The working directory with `/` separators (slashedPath).
+fn currentDirectory() -> Result<Vector<u8>, IoError> {
+    let cwd = Directory.current()?;
+    return match (slashedPath(cwd.view().bytes())) {
+        Ok(p) => Ok(p),
+        Err(_) => Err(IoError.OutOfMemory),
+    };
+}
+
+/// `directory/relative`, normalised (`.` and `..` resolved); `relative` may be absolute. The root (`/`, or a Windows
+/// drive's `X:/`) is kept; on Windows `\` separates too.
 fn joinPath(directory: Slice<u8>, relative: Slice<u8>) -> Result<Vector<u8>, AllocError> {
     var whole = Vector<u8>.create();
-    if (relative.length == 0 || relative[0] != '/') {
+    if (!isRooted(relative)) {
         appendBytes(mut whole, directory)?;
         whole.push('/')?;
     }
     appendBytes(mut whole, relative)?;
+    let windows = hasDrive(whole.view());
+    let root = rootLength(whole.view());
     var parts = Vector<Vector<u8>>.create();
-    var start: usize = 0;
+    var start = root;
     let bytes = whole.view();
-    for (k in 0..(bytes.length + 1)) {
-        if (k == bytes.length || bytes[k] == '/') {
+    for (k in root..(bytes.length + 1)) {
+        if (k == bytes.length || bytes[k] == '/' || (windows && bytes[k] == '\\')) {
             let part = bytes[start..k];
             if (part.length == 0 || sameText(part, ".")) {} else if (sameText(part, "..")) {
                 if (parts.length > 0) {
@@ -26,11 +67,14 @@ fn joinPath(directory: Slice<u8>, relative: Slice<u8>) -> Result<Vector<u8>, All
         }
     }
     var result = Vector<u8>.create();
+    if (windows) {
+        appendBytes(mut result, bytes[0..2])?; // the drive
+    }
     for (p in parts.view()) {
         result.push('/')?;
         appendBytes(mut result, p.view())?;
     }
-    if (result.length == 0) {
+    if (parts.length == 0) {
         result.push('/')?;
     }
     return Ok(result);

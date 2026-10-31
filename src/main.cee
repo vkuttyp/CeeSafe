@@ -428,11 +428,12 @@ fn readOptions(options: borrow mut Options) -> i32 {
 /// working directory becomes relative to it, and any other absolute path is reduced to its file name.
 fn sourcePath(path: StringView) -> Vector<u8> {
     var result = Vector<u8>.create();
-    let bytes = path.bytes();
-    if (bytes.length > 0 && bytes[0] == '/') {
-        match (Directory.current()) {
+    let host = slashedPath(path.bytes())!;
+    let bytes = host.view();
+    if (isRooted(bytes)) {
+        match (currentDirectory()) {
             Ok(cwd) => {
-                let base = cwd.view().bytes();
+                let base = cwd.view();
                 if (bytes.length > base.length + 1 && sameBytes(
                     bytes[..base.length],
                     base,
@@ -677,14 +678,14 @@ fn loadPackage(
     packages: borrow mut Vector<PackageInfo>,
     files: borrow mut Vector<Vector<Vector<u8>>>,
 ) -> i32 {
-    let cwd = match (Directory.current()) {
+    let cwd = match (currentDirectory()) {
         Ok(d) => d,
         Err(_) => { return fail("cannot read the current directory"); }
     };
-    let directory = match (findManifestDirectory(cwd.view().bytes())!) {
+    let directory = match (findManifestDirectory(cwd.view())!) {
         Some(d) => d,
         null => {
-            if (hasNovaManifest(cwd.view().bytes())!) {
+            if (hasNovaManifest(cwd.view())!) {
                 fail(
                     "no Nova input files, and no ceesafe.toml here or above; this is a Nova package (nova.toml), which CeeSafe does not read (Decision 0003)",
                 );

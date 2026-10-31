@@ -1,6 +1,6 @@
 // Running the C compiler (the reference's Backend.C/CBackend.cs Toolchain and Backend.C/CCompilers.cs): the strict
 // warning set, the flags the generated code's meaning depends on, an executable in one compile, an object as one `-c`
-// per file joined with `-r`. POSIX hosts only: CCompilers' Windows discovery and MSVC's dialect are P9's.
+// per file joined with `-r`. Which compiler, and MSVC's dialect, are in compilers.cee.
 
 /// Default warning set: generated code must compile cleanly under it (StrictWarnings, c-backend.md §1).
 fn strictWarningCount() -> usize => 13;
@@ -61,6 +61,9 @@ struct ToolOutcome {
 
 /// Runs `program` with `arguments`, capturing its output (Toolchain.Run).
 fn runTool(program: Slice<u8>, arguments: borrow Vector<Vector<u8>>) -> Result<ToolOutcome, AllocError> {
+    if (hostIsWindows()) {
+        return runThroughBatch(program, arguments, "".bytes());
+    }
     var views = Vector<StringView>.create();
     for (a in arguments.view()) {
         views.push(StringView.fromUtf8(a.view())!)?;
@@ -91,9 +94,11 @@ fn runTool(program: Slice<u8>, arguments: borrow Vector<Vector<u8>>) -> Result<T
 fn isCSourceName(name: Slice<u8>) -> bool =>
     name.length > 2 && name[name.length - 2] == '.' && name[name.length - 1] == 'c';
 
-/// `novac build`'s compile of an executable (CompileExecutable, GNU dialect): `debug` is `-g -O0`, else `-O2`.
+/// `build`'s compile of an executable (CompileExecutable, §8.3): `compiler`'s flag dialect and environment; `debug` is
+/// debug information and no optimisation; on Windows the 8 MiB stack that Linux and macOS give the main thread
+/// (c-backend.md §1.1).
 fn compileExecutable(
-    compiler: Slice<u8>,
+    compiler: borrow CCompiler,
     directory: Slice<u8>,
     files: borrow Vector<CFile>,
     output: Slice<u8>,
@@ -101,6 +106,21 @@ fn compileExecutable(
     userFlags: borrow Vector<Vector<u8>>,
     freestanding: bool,
 ) -> Result<ToolOutcome, AllocError> {
+    if (compiler.msvc) {
+        if (freestanding) {
+            return Ok(ToolOutcome {
+                started: true,
+                status: 1,
+                stdout: Vector<u8>.create(),
+                stderr: copyBytes(
+                    "ceesafec: the freestanding profile needs clang or gcc, not MSVC (tooling.md §8.3)\n".bytes(),
+                )?,
+                error: IoError.Other(0),
+            });
+        }
+        let arguments = msvcArguments(directory, files, output, debug, userFlags)?;
+        return runCompiler(compiler, directory, arguments);
+    }
     var arguments = Vector<Vector<u8>>.create();
     pushCommonFlags(mut arguments, directory, freestanding)?;
     if (debug) {
@@ -117,9 +137,14 @@ fn compileExecutable(
             arguments.push(joinPath(directory, file.name.view())?)?;
         }
     }
+    if (!freestanding && hostIsWindows()) {
+        // MinGW's ld, or the MSVC linker clang drives.
+        let gcc = isGccName(compiler.path.view());
+        pushText(mut arguments, if (gcc) "-Wl,--stack,8388608" else "-Wl,/STACK:8388608")?;
+    }
     pushText(mut arguments, "-o")?;
     pushBytes(mut arguments, output)?;
-    return runTool(compiler, arguments);
+    return runCompiler(compiler, directory, arguments);
 }
 
 /// Compiles each C file with `-c` and joins the objects into one relocatable object with `-r` (CompileObject,
@@ -204,4 +229,83 @@ fn removeTree(path: Slice<u8>) {
         }
         Err(_) => {}
     }
+}
+
+fn notStarted(error: IoError) -> ToolOutcome => ToolOutcome {
+    started: false,
+    status: -1,
+    stdout: Vector<u8>.create(),
+    stderr: Vector<u8>.create(),
+    error: error,
+};
+
+/// Runs `program` with `arguments` on Windows, after `vcvars` (a vcvarsall.bat, or empty), capturing its output.
+/// lib/std's Process.capture cannot run there at novac 0.6.0: it keeps the input file open for writing while the
+/// runtime reopens it to read, which Windows refuses (docs/p8-plan.md, upstream gaps). So a batch file in a fresh
+/// temporary directory runs the program with its output redirected to files, Process.run runs the batch file, and the
+/// files are read back.
+fn runThroughBatch(
+    program: Slice<u8>,
+    arguments: borrow Vector<Vector<u8>>,
+    vcvars: Slice<u8>,
+) -> Result<ToolOutcome, AllocError> {
+    let temporary = match (Directory.temporary()) {
+        Ok(d) => d,
+        Err(e) => { return Ok(notStarted(e)); }
+    };
+    let directory = copyBytes(temporary.view().bytes())?;
+    let script = windowsJoin(directory.view(), "run.bat".bytes())?;
+    let outPath = windowsJoin(directory.view(), "out.txt".bytes())?;
+    let errPath = windowsJoin(directory.view(), "err.txt".bytes())?;
+    var text = copyBytes("@echo off\r\n".bytes())?;
+    if (vcvars.length > 0) {
+        appendText(mut text, "call \"")?;
+        appendBytes(mut text, vcvars)?;
+        appendText(mut text, "\" ")?;
+        appendText(mut text, hostArchitecture())?;
+        appendText(mut text, " >nul 2>&1 || exit /b 1\r\n")?;
+    }
+    text.push('"')?;
+    appendBytes(mut text, program)?;
+    text.push('"')?;
+    for (a in arguments.view()) {
+        appendText(mut text, " \"")?;
+        appendBytes(mut text, a.view())?;
+        text.push('"')?;
+    }
+    appendText(mut text, " >\"")?;
+    appendBytes(mut text, outPath.view())?;
+    appendText(mut text, "\" 2>\"")?;
+    appendBytes(mut text, errPath.view())?;
+    appendText(mut text, "\"\r\nexit /b %ERRORLEVEL%\r\n")?;
+    match (writeFile(StringView.fromUtf8(script.view())!, text.view())) {
+        Ok() => {}
+        Err(e) => {
+            removeTree(directory.view());
+            return Ok(notStarted(e));
+        }
+    }
+    var quoted = copyBytes("\"".bytes())?;
+    appendBytes(mut quoted, script.view())?;
+    quoted.push('"')?;
+    var views = Vector<StringView>.create();
+    views.push("/d")?;
+    views.push("/c")?;
+    views.push(StringView.fromUtf8(quoted.view())!)?;
+    let status = Process.run("cmd.exe", views);
+    let stdout = match (readFile(StringView.fromUtf8(outPath.view())!)) {
+        Ok(b) => b,
+        Err(_) => Vector<u8>.create(),
+    };
+    let stderr = match (readFile(StringView.fromUtf8(errPath.view())!)) {
+        Ok(b) => b,
+        Err(_) => Vector<u8>.create(),
+    };
+    removeTree(directory.view());
+    return match (status) {
+        Ok(code) => Ok(
+            ToolOutcome { started: true, status: code, stdout: stdout, stderr: stderr, error: IoError.Other(0) },
+        ),
+        Err(e) => Ok(notStarted(e)),
+    };
 }

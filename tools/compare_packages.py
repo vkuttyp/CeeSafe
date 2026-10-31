@@ -10,7 +10,11 @@ so each fixture is first copied with every `nova.toml`, `nova.lock` and `*.nova`
 `ceesafe.lock` and `*.cee`; ceesafec's output on the copy, with those names mapped back, must equal novac's on the
 original.
 
-usage: python3 tools/compare_packages.py --ceesafec out/ceesafec --novac ~/.nova/0.6.0/bin/novac [fixtures...]
+With --windows (both compilers on Windows), two things novac does there are folded before comparing (docs/p8-plan.md,
+known differences): its Console.WriteLine ends lines with CR LF, and with output redirected it writes in the console's
+code page (437: `§` as 0x15, `…` and dashes best-fitted), where ceesafec writes UTF-8 with LF.
+
+usage: python3 tools/compare_packages.py --ceesafec out/ceesafec --novac ~/.nova/0.6.0/bin/novac [--windows] [fixtures...]
 """
 import argparse
 import os
@@ -43,15 +47,25 @@ def renamed_copy(fixture, work):
     return copy
 
 
-def mapped_back(outcome):
+def mapped_back(outcome, windows=False):
     status, output = outcome
-    return status, map_back(output)
+    output = map_back(output)
+    if windows:
+        text = output.decode("utf-8").replace("\u00a7", "\x15").replace("\u2026", ".").replace("\u2013", "-")
+        output = text.replace("\u2014", "-").encode("cp437", "replace")
+    return status, output
+
+
+def novac_output(outcome, windows=False):
+    status, output = outcome
+    return status, output.replace(b"\r\n", b"\n") if windows else output
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--ceesafec", required=True)
     parser.add_argument("--novac", required=True)
+    parser.add_argument("--windows", action="store_true", help="fold novac's CR LF and code page 437 (on Windows)")
     parser.add_argument("fixtures", nargs="*")
     options = parser.parse_args()
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "packages")
@@ -66,9 +80,9 @@ def main():
             copy = renamed_copy(fixture, work)
             ours = os.path.join(copy, "app") if os.path.isdir(os.path.join(copy, "app")) else copy
             for arguments in (["--dump-hir", "--diagnostics-format=json"], []):
-                expected = run(novac, directory, arguments)
+                expected = novac_output(run(novac, directory, arguments), options.windows)
                 actual = run(ceesafec, ours, arguments)
-                if mapped_back(actual) != expected:
+                if mapped_back(actual, options.windows) != expected:
                     differ.append(name)
                     break
     for name in differ:

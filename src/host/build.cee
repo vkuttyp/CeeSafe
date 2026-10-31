@@ -75,13 +75,25 @@ fn buildFiles(
         Ok() => {}
         Err(e) => { return fail(e.message()); }
     }
-    let compiler = if (options.cc.length > 0) copyBytes(options.cc.view())! else copyBytes("cc".bytes())!;
+    // The objects of --emit obj are made with GCC's and clang's flags (§8.3); an executable with the compiler found.
+    var compilerError = Vector<u8>.create();
+    let found: CCompiler? = if (object) CCompiler {
+        path: if (options.cc.length > 0) copyBytes(options.cc.view())! else copyBytes(
+            (if (hostIsWindows()) "clang" else "cc").bytes(),
+        )!,
+        msvc: false,
+        vcvars: Vector<u8>.create(),
+    } else locateCompiler(options.cc.view(), mut compilerError);
+    let compiler = match (found) {
+        Some(c) => c,
+        null => { return failBytes(compilerError.view()); }
+    };
     let work = match (Directory.temporary()) {
         Ok(d) => d,
         Err(e) => { return fail(e.message()); }
     };
     let workBytes = copyBytes(work.view().bytes())!;
-    let status = compileIn(options, files, workBytes.view(), compiler.view(), output.view(), object);
+    let status = compileIn(options, files, workBytes.view(), compiler, output.view(), object);
     removeTree(workBytes.view());
     return status;
 }
@@ -90,10 +102,11 @@ fn compileIn(
     options: borrow Options,
     files: borrow Vector<CFile>,
     work: Slice<u8>,
-    compiler: Slice<u8>,
+    compilerFound: borrow CCompiler,
     output: Slice<u8>,
     object: bool,
 ) -> i32 {
+    let compiler = compilerFound.path.view();
     match (writeFilesUnder(work, files)) {
         Ok() => {}
         Err(e) => {
@@ -119,7 +132,7 @@ fn compileIn(
         flags,
         options.freestanding,
         options.linker.view(),
-    )! else compileExecutable(compiler, work, files, output, options.debug, options.cflags, options.freestanding)!;
+    )! else compileExecutable(compilerFound, work, files, output, options.debug, options.cflags, options.freestanding)!;
     if (!outcome.started) {
         var message = copyBytes("cannot run the C compiler '".bytes())!;
         appendBytes(mut message, compiler)!;
@@ -127,7 +140,13 @@ fn compileIn(
         appendText(mut message, outcome.error.message())!;
         return failBytes(message.view());
     }
-    relayTool(outcome);
+    if (compilerFound.msvc) {
+        let shown = withoutMsvcProgress(outcome.stdout.view(), files)!;
+        Console.writeError(StringView.fromUtf8(shown.view())!);
+        Console.writeError(StringView.fromUtf8(outcome.stderr.view())!);
+    } else {
+        relayTool(outcome);
+    }
     if (outcome.status != 0) {
         var message = copyBytes("the C compiler '".bytes())!;
         appendBytes(mut message, compiler)!;

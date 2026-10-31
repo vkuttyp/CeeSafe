@@ -65,16 +65,20 @@ fn defaultHome() -> Result<Vector<u8>, AllocError> {
     match (Environment.variable("CEESAFE_HOME")) {
         Some(home) => {
             if (home.bytes().length > 0) {
-                return copyBytes(home.bytes());
+                return slashedPath(home.bytes());
             }
         }
         null => {}
     }
+    // The user's profile directory (Environment.SpecialFolder.UserProfile): $HOME, or on Windows %USERPROFILE%.
     let user = match (Environment.variable("HOME")) {
-        Some(h) => h.bytes(),
-        null => "".bytes(),
+        Some(h) => slashedPath(h.bytes())?,
+        null => match (Environment.variable("USERPROFILE")) {
+            Some(h) => slashedPath(h.bytes())?,
+            null => Vector<u8>.create(),
+        },
     };
-    return joinPath(user, ".ceesafe".bytes());
+    return joinPath(user.view(), ".ceesafe".bytes());
 }
 
 /// The default index, or `$CEESAFE_INDEX` (PackageIndex.DefaultUrl): CeeSafe's own, since a Nova index lists Nova

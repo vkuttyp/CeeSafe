@@ -14,11 +14,11 @@ fn reportPackageText(json: bool, packageReport: borrow PackageReport) {
 }
 
 fn currentManifestDirectory() -> Vector<u8>? {
-    let cwd = match (Directory.current()) {
+    let cwd = match (currentDirectory()) {
         Ok(d) => d,
         Err(_) => { return null; }
     };
-    return findManifestDirectory(cwd.view().bytes())!;
+    return findManifestDirectory(cwd.view())!;
 }
 
 /// `ceesafec fetch [--offline] [--update [name…]]`: resolves and writes ceesafe.lock (tooling.md §4.3, §4.7).
@@ -134,14 +134,14 @@ fn indexCheckCommand(arguments: borrow Vector<Vector<u8>>, json: bool) -> i32 {
     if (rest.length > 1 || dashed) {
         return fail("usage: ceesafec index-check [--offline] [index directory]");
     }
-    let cwd = match (Directory.current()) {
+    let cwd = match (currentDirectory()) {
         Ok(d) => d,
         Err(_) => { return fail("cannot read the current directory"); }
     };
     let directory = if (rest.length == 1) joinPath(
-        cwd.view().bytes(),
+        cwd.view(),
         rest[0].view(),
-    )! else copyBytes(cwd.view().bytes())!;
+    )! else copyBytes(cwd.view())!;
     var packageReport = PackageReport.create();
     let count = checkIndex(directory.view(), mut packageReport, offline)!;
     reportPackageText(json, packageReport);
@@ -205,11 +205,11 @@ fn agentsCommand(arguments: borrow Vector<Vector<u8>>) -> i32 {
         Some(d) => d,
         null => { return fail("no ceesafe.toml here or above: run ceesafec agents in a package"); }
     };
-    let cwd = match (Directory.current()) {
+    let cwd = match (currentDirectory()) {
         Ok(d) => d,
         Err(_) => { return fail("cannot read the current directory"); }
     };
-    let shown = relativePath(cwd.view().bytes(), directory.view())!;
+    let shown = relativePath(cwd.view(), directory.view())!;
     writeAgentFiles(directory.view(), shown.view(), agents)!;
     return 0;
 }
@@ -270,11 +270,11 @@ fn newCommand(arguments: borrow Vector<Vector<u8>>) -> i32 {
             return fail(StringView.fromUtf8(message.view())!);
         }
     }
-    let cwd = match (Directory.current()) {
+    let cwd = match (currentDirectory()) {
         Ok(d) => d,
         Err(_) => { return fail("cannot read the current directory"); }
     };
-    let directory = joinPath(cwd.view().bytes(), target)!;
+    let directory = joinPath(cwd.view(), target)!;
     let sourceDirectory = joinPath(directory.view(), "src".bytes())!;
     match (makeDirectories(sourceDirectory.view())) {
         Ok() => {}

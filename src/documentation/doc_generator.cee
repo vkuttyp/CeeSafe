@@ -557,11 +557,11 @@ fn docCommand(arguments: borrow Vector<Vector<u8>>, json: bool) -> i32 {
     var files = Vector<Vector<u8>>.create();
     namedSourceFiles(paths, mut files)!;
     if (paths.length == 0) {
-        let cwd = match (Directory.current()) {
+        let cwd = match (currentDirectory()) {
             Ok(d) => d,
             Err(_) => { return fail("cannot read the current directory"); }
         };
-        match (findManifestDirectory(cwd.view().bytes())!) {
+        match (findManifestDirectory(cwd.view())!) {
             Some(directory) => {
                 // The package's own public items (tooling.md §4.4).
                 var packageReport = PackageReport.create();
