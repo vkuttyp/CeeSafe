@@ -200,7 +200,8 @@ prefix:
 | Owner | Names |
 |---|---|
 | **Runtime** (`ceesafe/rt.h`, `ceesafe_rt_*.c`) | `ceesafe_*`; `cee_` followed by a lowercase letter (`cee_add_i32`, `cee_check_index`, `cee_str`, `cee_loc`); `CEE_*` |
-| **Generated** | `cee` followed by a capital letter: `ceeF_name` (top-level functions), `ceeM_` (members), `ceeG_` (generic instances), `ceeXS<n>_<name>` (variant `n` of the function named `<name>` made by closure-call specialisation, optimisations.md §5), `ceeT_`/`ceeE_` (types), and the helper families (`ceeD_`, `ceeB_`, `ceeVP_`, …); locals `v_<name>_<n>` and `t_<n>`; fields `f_<name>`; variants `v_<name>`; labels `bb<n>`; files `cee_file_<n>`; source locations `ceeL_<n>` (§6) |
+| **Generated** | `cee` followed by a capital letter: `ceeF_name` (top-level functions), `ceeM_` (members), `ceeG_` (generic instances), `ceeXS<n>_<name>` (variant `n` of the function named `<name>` made by closure-call specialisation, optimisations.md §5), `ceeT_`/`ceeE_` (types), and the helper families (`ceeD_`, `ceeB_`, `ceeVP_`, …; for async fns `ceeAF_` frames,
+`ceeAI_` initialisers and `ceeAR_` resume functions, §3a); locals `v_<name>_<n>` and `t_<n>`; fields `f_<name>`; variants `v_<name>`; labels `bb<n>`; files `cee_file_<n>`; source locations `ceeL_<n>` (§6) |
 
 **Packages** (M10 T5, ADR 0013 D4): an item of a dependency, rather than of the package being built, has its
 package's name in its C name: `ceeF_geometry_area`, `ceeT_geometry_Point`, `ceeM_14geometry_Point_norm`. The package
@@ -428,6 +429,50 @@ so early `return`, `?` and `break` need no special backend support. Drop flags a
 Panics are `noreturn` calls into the runtime (`ceesafe_panic(kind, src)`), so destructors are
 not run (panic = abort, OD-5).
 
+## 3a. Async functions (L1; ADR 0031 §3.6, type-system.md §40)
+
+An async fn or async closure `F` lowers to three C items instead of one function:
+
+```c
+typedef struct ceeAF_F {
+    uint32_t state;             /* 0 at entry; k after suspension point k (intermediate-representation.md §3) */
+    /* the parameters, then every local, as fields named like the locals (v_<name>_<n>, t_<n>) */
+    /* one field per await site holding the awaited task's frame: struct ceeAF_G a_<k>; */
+    /* the result, if F's result type is not void: R result; */
+} ceeAF_F;
+static void ceeAI_F(ceeAF_F *f, /* the parameters */);   /* stores the arguments, sets state = 0 */
+static bool ceeAR_F(ceeAF_F *f, ceesafe_task *task);    /* runs F until it returns (true) or suspends (false) */
+```
+
+- **Frames are emitted child-first,** so a frame that embeds another's follows it. A cycle cannot occur (N0343).
+- **Every local is a frame field in v1.** The resume function names a local `f->v_<name>_<n>`, so a pointer to a
+  local stays valid while the frame does, which is until the task returns (type-system.md §40.6). L1 A3 keeps only
+  the locals live across a suspension point.
+- **The resume function is always in flat form** (§3), whatever `--flat-c` says. It opens with
+  `switch (f->state) { case 0: goto bb0; case k: goto resume_k; … }`. Jumping into the middle of loops makes the graph
+  irreducible, so structuring it would fall back to flat form anyway.
+- **`Await(t, dest, bb)`** is
+
+  ```c
+  f->state = k;
+  resume_k:
+      if (!ceeAR_G(&f->a_k, task)) return false;
+      dest = f->a_k.result;
+      goto bb;
+  ```
+
+  and `StartTask(G, args)` into `t` is `ceeAI_G(&f->a_k, args…)`.
+- **`Park(bb)`** is `f->state = k; return false; resume_k: goto bb;`.
+- **`return e`** stores `f->result = e` and returns `true`. Drop elaboration has already dropped the locals.
+- **`Async.run(G(args))`** declares the root frame `ceeAF_G root` in the caller's C function, then calls
+  `ceeAI_G(&root, args…)` and `ceesafe_async_run(&task, resume_thunk, &root)`. A `resume_thunk` adapts `ceeAR_G` to
+  the runtime's `bool (*)(void *frame, ceesafe_task *)`, so no function is called through another type.
+- **`#line`:** every `resume_k` label maps to the `await` or `Async.park()` it resumes after (§7).
+- **Placement** (§2.2) is off in async fns: a box's C-stack slot would not survive a suspension.
+
+The task header and executor are in `runtime/hosted/ceesafe_rt_async.c`, linked when the generated C calls
+`ceesafe_async_*` (§6).
+
 ## 4. Evaluation order and temporaries
 
 NIR has already sequenced every side effect into separate statements, so the C
@@ -481,6 +526,17 @@ Heap (M3b):
     calls `b`, then joins; if the start returned `NULL` it calls `a` first, then `b`. `ceeTF_<closure>` takes the
     closure as `void *`, converts it back to its own type and calls it, so no function pointer is called through
     another type. A `fn()` argument is passed as the address of a local holding it, which lives until the join.
+- **Async** (L1, type-system.md §40): `runtime/hosted/ceesafe_rt_async.c`, linked only when the generated C calls
+  `ceesafe_async_*`.
+  - `ceesafe_task` holds the resume function and root frame, the cancel flag, the shield depth and deadline, the
+    scheduler links and the waker id.
+  - `ceesafe_async_run(task, resume, frame)` resumes the root until it returns.
+    - Between resumes it waits in `poll()` for the earliest timer or a registered descriptor (A1). kqueue (macOS) and
+      epoll (Linux) replace `poll()` in A2, which stays the fallback.
+    - Timers, readiness registrations and child tasks come from `ceesafe_alloc`, so fault injection reaches them.
+  - `ceesafe_async_wake(id)` makes a parked task runnable.
+  - `CEESAFE_CANCEL_AT=k` cancels the root task at its k-th suspension, and `CEESAFE_CANCEL_REPORT` prints
+    `ceesafe cancel: points=N` (`testing.md`).
 - The generated `main` calls `ceesafe_rt_start()` (reads `CEESAFE_FAIL_ALLOC_AT`, `CEESAFE_ALLOC_REPORT`
   via `ceesafe_platform_config`) and returns through `ceesafe_rt_finish(code)`, which prints the
   allocation report if asked. `Process.exit` and panics skip the report.

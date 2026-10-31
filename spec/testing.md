@@ -21,6 +21,8 @@ Sanitizer results are supporting evidence, never proof of the language's safety.
 | CosmoOS (Nova's C1–C9, K3) | `integrations/cosmoos/c*.py`, `k3.py` | ceesafec's C under CosmoOS's own flags, host tests, fuzz targets and module loader rules, and in its QEMU boots; CosmoOS's tree is only read |
 | Same C on another host | `tools/host_c_check.py` | ceesafec built on Windows (MSVC, clang) emits the same C as on macOS and Linux |
 | Specification (§4) | `tools/spec_check.py`, `tools/guide_check.py` | every diagnostic code is explained; the guide's examples do what the pages say; links resolve |
+| Interpreter agreement (L1 A1; planned) | `tools/run_corpus.py --interp` | every run-pass and run-fail program run with `ceesafec run --interp` meets the same annotations as its C build |
+| Cancellation sweep (L1 A2; planned) | `tools/cancel_sweep.py` | every async run-pass program, built with ASan+UBSan, run once per suspension point *k* with `CEESAFE_CANCEL_AT=k`; each run exits cleanly with `live=0` and no sanitizer report |
 
 `tools/contract_tests.py --ceesafec PATH` runs all of these but CosmoOS and the host check, against one ceesafec. None
 of them runs novac or reads a Nova checkout (§3).

@@ -112,7 +112,8 @@ EnumDecl   = 'enum' Identifier TypeParams? '{' (Variant (',' Variant)* ','?)? '}
 Variant    = Identifier ('(' Type (',' Type)* ','? ')')?
 Visibility = 'public' | 'internal' | 'private'
 
-FunctionDecl = 'unsafe'? 'fn' Identifier TypeParams? '(' ParamList? ')' ('->' Type)? FunctionBody   (* 'unsafe': M8a *)
+FunctionDecl = 'unsafe'? 'async'? 'fn' Identifier TypeParams? '(' ParamList? ')' ('->' Type)? FunctionBody
+                                            (* 'unsafe': M8a; 'async': L1, type-system.md §40, ADR 0031 *)
 ParamList    = (Receiver | Param) (',' Param)* ','?
 Receiver     = ('borrow' 'mut'?)? 'this'   (* M2a: by value; M2b: reference receivers *)
 Param        = Identifier ':' Type
@@ -188,7 +189,7 @@ comparisons, which are **non-associative**: `a < b < c` is error N0103.
 | 8 | `+ -` | |
 | 9 | `* / %` | |
 | 10 | `as` | `Expr 'as' Type`, left-assoc (`x as u32 as u64`) |
-| 11 | unary `- !`, `borrow`, `borrow mut`, `move` | prefix, right-assoc (`- -x`) |
+| 11 | unary `- !`, `borrow`, `borrow mut`, `move`; `await` (L1) | prefix, right-assoc (`- -x`); `await`'s operand: below |
 | 12 | postfix: call `(...)`, member `.name` | |
 
 The ordering puts bitwise operators **above** comparisons (as in Rust and Swift), so
@@ -201,6 +202,7 @@ Primary = IntLiteral | FloatLiteral | StringLiteral | CharLiteral | 'true' | 'fa
         | IfExpr | MatchExpr                                 (* M11 (G5): type-system.md §15.3 *)
         | '(' (ClosureParam (',' ClosureParam)*)? ')' '=>' (Block | Expr)   (* M11 (G8b): a closure, §36.2 *)
         | 'move' '(' (ClosureParam (',' ClosureParam)*)? ')' '=>' (Block | Expr)   (* M13 G3: a move literal, §36.5 *)
+        | 'async' '(' (ClosureParam (',' ClosureParam)*)? ')' '=>' (Block | Expr)  (* L1: an async closure, §40.3 *)
         | Identifier GenericArgs? '{' FieldInits? '}'       (* struct literal, M2a; GenericArgs M6a *)
         | '[' Expr (',' Expr)* ','? ']' | '[' Expr ';' IntLiteral ']'   (* array literals, M2d *)
 ClosureParam = Identifier (':' Type)?             (* a '(' … ')' followed by '=>' is a closure *)
@@ -216,7 +218,16 @@ Postfix = Primary ( '(' ArgList? ')' | '.' Identifier | '[' IndexOrRange ']'
 IndexOrRange = Expr | Expr? '..' Expr?               (* M2d: element or slice *)
 ArgList = Arg (',' Arg)* ','?
 Arg     = 'mut' Expr | Expr                (* `mut x` for a `borrow mut` parameter, M2b *)
+Await   = 'await' AwaitOperand ( '?' | '!' ) PostfixRest*         (* L1; type-system.md §40.2, ADR 0031 §3.1 *)
+        | 'await' AwaitOperand
+AwaitOperand = Primary ( '(' ArgList? ')' | '.' Identifier | '[' IndexOrRange ']' )*
+PostfixRest  = '(' ArgList? ')' | '.' Identifier | '[' IndexOrRange ']' | '?' | '!'
 ```
+
+**`await`** (L1, ADR 0031 §3.1): its operand is a primary followed by calls, member accesses and indexes, and the first
+`?` or `!` ends it. That suffix, and every postfix after it, applies to the awaited value: `await f(x)?` is
+`(await f(x))?`, and `await f(x)?.len` is `((await f(x))?).len`. A task is never a `Result`, so a `?` that the
+operand would take could never type.
 
 **Generic arguments in expressions** (`truncate<i64>(x)`, and since M6a `id<i32>(x)`,
 `Pair<u8>.make()` and `Pair<u8> { … }`): after an identifier, `<` starts generic arguments if the

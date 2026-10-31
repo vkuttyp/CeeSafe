@@ -2199,7 +2199,8 @@ fn onInterrupt(count: borrow mut u64) { count += 1; }   // may neither sleep nor
 ```
 
 ### 32.1 Effects
-- There are two effects: **`sleep`** (the code may block) and **`alloc`** (it may allocate memory from a heap).
+- There are three effects: **`sleep`** (the code may block the thread), **`alloc`** (it may allocate memory from a
+  heap), and, since L1 (ADR 0031), **`suspend`** (it may suspend the current task: an `await`, §40.2).
 - The effects of a function are those of every operation its body may perform, including everything it
   calls and every value it drops (drop glue, `drop` blocks, a box's deallocation). They are inferred over the
   whole package. Recursion is handled by iterating to a fixed point.
@@ -2217,9 +2218,10 @@ fn onInterrupt(count: borrow mut u64) { count += 1; }   // may neither sleep nor
 | allocating from a `FixedBufferAllocator`; every other built-in operation on values, pointers and collections | none |
 | console, file, socket and process operations (§26) | `sleep` (and `alloc` for `Process.run`) |
 | dropping a value | the effects of its drop glue: `drop` blocks, the contents' drops, deallocations |
+| `await e` (§40.2), and the library's `Async.park()` | `suspend`, and the effects of starting the awaited task (§40.6) |
 
 ### 32.2 Declaring effects
-- `@effects(e, …)`, with each `e` either `sleep` or `alloc`, and `@effects()` for none:
+- `@effects(e, …)`, with each `e` one of `sleep`, `alloc` and `suspend`, and `@effects()` for none:
   - on an `extern` function, it **declares** what the C function may do. CeeSafe trusts it, as it trusts a
     prototype: a wrong declaration is a wrong binding (R-2);
   - on a CeeSafe function or method, it is an **upper bound**. The inferred effects must be among those
@@ -2227,12 +2229,14 @@ fn onInterrupt(count: borrow mut u64) { count += 1; }   // may neither sleep nor
 - An unknown effect name, or `@effects` twice, is N0290.
 
 ### 32.3 Contexts
-- `@context(atomic)` on a function forbids `sleep` in its body. `@context(irq)`, code that may run in a
-  hardware interrupt, forbids `sleep` and `alloc` (`cosmoos/kernel-memory-and-lifetimes.md` KQ-1: IRQ
+- `@context(atomic)` on a function forbids `sleep` and `suspend` in its body. `@context(irq)`, code that may run in a
+  hardware interrupt, forbids `sleep`, `alloc` and `suspend` (`cosmoos/kernel-memory-and-lifetimes.md` KQ-1: IRQ
   handlers do not allocate). An operation with a forbidden effect is N0295.
+- **An async fn or async closure body (§40) is a context that forbids `sleep`** (ADR 0031 §3.2): blocking would stall
+  every task of its thread. `Async.blocking` (§40.4) is the bridge.
 - `@context(atomic)` on a struct makes holding a value of it an atomic context. At every point of a function
   where a local that holds such a value (the struct itself, or a type containing it by value) may be live,
-  `sleep` is forbidden (N0295). A local is live from its initialisation until it is dropped, moved away or
+  `sleep` and `suspend` are forbidden (N0295): a spin guard may not be held across an `await`. A local is live from its initialisation until it is dropped, moved away or
   its storage ends, and a parameter from the function's entry. "May be live" joins over the control-flow
   paths. Dropping the holder itself is checked as if it were no longer live.
 - A context restricts the body it is declared on, not callers: any code may call an `@context(irq)` function.
@@ -2249,7 +2253,8 @@ Effects are checked in every profile. Only `@context`, `@effects` bounds on CeeS
 `@context(atomic)` types create obligations, so code that uses none is unaffected.
 
 Diagnostics: N0295 (an operation with an effect its context or `@effects` bound forbids; the message names the
-chain of calls that leads to the operation), N0290 (misused `@effects` or `@context`).
+chain of calls that leads to the operation), N0290 (misused `@effects` or `@context`, or an effect name other than
+`sleep`, `alloc` and `suspend`).
 
 ### 32.5 Effects of closure arguments: `@effectsOf` (OD-9c; ADR 0020)
 ```ceesafe
@@ -2700,11 +2705,13 @@ fn demo(lock: *mut spinlock_t, values: Slice<i32>) {
 }
 ```
 - **Syntax** (grammar.md §2): `@effects(e, …)` written immediately before `fn` in a function type, with each `e`
-  `sleep` or `alloc` as in §32.2: `@effects() fn(i32) -> bool`, and for closures `borrow @effects() fn(i32)` and
+  `sleep`, `alloc` or `suspend` as in §32.2: `@effects() fn(i32) -> bool`, and for closures `borrow @effects() fn(i32)` and
   `borrow mut @effects(alloc) fn(i32)`. No other attribute is allowed there (N0290), and only `fn` may follow
   it (a syntax error otherwise): C function pointer types (`extern "C" fn`, §29.5) take no effect list.
 - **The type.** The effect list is part of a function or closure type: `@effects() fn(i32)` and `fn(i32)` are different
-  types. A type without a list may have both effects, so `fn(i32)` is the same type as `@effects(sleep, alloc) fn(i32)`.
+  types. A type without a list may have `sleep` and `alloc`, so `fn(i32)` is the same type as
+  `@effects(sleep, alloc) fn(i32)`. It never has `suspend`: only an async closure's call suspends, and that is a task
+  (§40.3), not an effect of a sync call.
   Everything else (Copy, scoped, loans, C representation) is as in §36.1 and §36.2.
 - **Calls** through a value of such a type have the type's effects (§32.1). Without a list, that is `sleep` and `alloc`.
 - **Values.** Every value of a type with an effect list has at most those effects:
@@ -3162,3 +3169,133 @@ and other `@constant` bodies, called anywhere else is N0338, and it is never com
 Diagnostics: N0337 (a static whose type is not `Share`, or one that is generic or local), N0338 (an initialiser or
 `@constant` body that is not a static initialiser, or a C constant macro used elsewhere), N0280 (a use of a
 `static mut` outside an unsafe context).
+
+## 40. Async functions and structured concurrency (L1; ADR 0031)
+
+```ceesafe
+async fn fetchBoth(net: borrow Net, a: StringView, b: StringView) -> Result<Pair, NetError> {
+    var left = Buffer.withCapacity(4096)?;
+    var right = Buffer.withCapacity(4096)?;
+    await Async.scope(NetError.OutOfMemory, (s) => {
+        s.spawn(async () => { await net.get(a, mut left)?; return Ok(); });   // borrows `left` from this frame
+        s.spawn(async () => { await net.get(b, mut right)?; return Ok(); });  // capturing `left` here too: N0241
+    })?;                                                                         // both children have returned
+    return Ok(Pair { left: left, right: right });
+}
+
+fn main() {
+    let result = Async.run(fetchBoth(Net.system(), "a.example", "b.example"));
+}
+```
+(`Net`, `Buffer` and `Pair` stand for library or user types.)
+
+### 40.1 Async functions and tasks
+- **`async fn f(…) -> T`** (grammar.md §2), at package level or as a method. An `extern` function, an interface method
+  (until L1 A3), a `drop` block and a `@constant` function cannot be async (N0290). `async` comes after `unsafe`.
+- **A call of an async fn is a task**, not a value: it runs nothing until it is awaited (§40.2), run (§40.4) or spawned
+  (§40.5). A task call anywhere else (a `let`, an argument of any other call, a field, a return) is **N0342**. There is
+  no type of tasks in v1, so a task cannot be stored, returned or passed on.
+- **Arguments** are evaluated at the call, in order, and moved or lent into the task's frame. Borrowed arguments stay
+  borrowed until the task has returned (§40.6), by the rules for references (§13, `lifetimes.md`).
+- **The body** is checked like a function body with result type `T`, with three differences: it may `await`
+  (§40.2); it is a context that forbids `sleep` (§32.3), so a blocking call is N0295 with its chain of calls; and its
+  effects (§32.1) are those of its operations, `suspend` among them if it awaits.
+- **Recursion through `await`** (an async fn that awaits itself, directly or through other async fns) would make its
+  frame contain itself: **N0343**, naming the cycle. A recursive *sync* call from an async fn is an ordinary call.
+- A generic async fn is checked once and instantiated like any generic function (§20.3).
+
+### 40.2 `await`
+- **`await e`**: `e` must be a task (a call of an async fn or an async closure), or one of the `Async` operations that
+  produce one (§40.4); otherwise **N0342**. Its value is the task's result, of the task's result type.
+- `await` is allowed only in the body of an async fn or async closure: anywhere else, including a sync closure inside an
+  async fn, a `drop` block and a deferred statement, it is **N0341**.
+- **What it means.** The current task runs `e` to completion; while `e` waits, other tasks of the same thread may run.
+  Every `await` is therefore a point where other tasks run and where cancellation may be observed (§40.7). Nothing else
+  suspends a task.
+- **Borrows across `await`.** A frame never moves (§40.6), so a reference to a local may be held across an `await` with
+  no extra rule. The borrow checker treats `await e` as a call: what `e` borrows is borrowed until it returns.
+- **Effects:** `suspend` (§32.1), so an `await` while a `@context(atomic)` value may be live is N0295.
+
+### 40.3 Async closures
+- **`async (x, …) => body`** (grammar.md §2.1) is a closure literal (§36.2) whose call is a task. Its captures, their
+  modes and their loans are §36.2's. `return` and `?` in the body return from the closure's task.
+- It is accepted only as the argument of `spawn`, `race`, `all` and `shield` (§40.4, §40.5), the way §38.6 accepts
+  only literals: its captures must be visible where it is used (N0342 elsewhere).
+- Its body is an async body: it may await and forbids `sleep`.
+
+### 40.4 The `Async` operations
+`Async` is a built-in type, like `Thread` (§38), in the hosted profile until L1 A4 (§38.5). Every operation below
+except `run` and `blocking`'s closure produces a task, so it is written after `await`.
+
+| Operation | Result | Notes |
+|---|---|---|
+| `Async.run(f(…))` | `T`, the task's result | Runs the task on this thread until it returns. Sync code only: it has `sleep` and `alloc`, so in async code it is N0295 |
+| `Async.scope(oom, body)`, `Async.scopeIn(alloc, oom, body)` | `Result<void, E>` | §40.5 |
+| `Async.race(a, b)` | `Result<Raced<T>, E>` | Two async closures of results `Result<T, E>`; the first to return `Ok` wins, the other is cancelled and awaited; an `Err` from either is the result. `Raced<T>` (lib/std) holds `winner: u32` (0 or 1), `value: T`, and `other: T?`, the loser's value if it also returned `Ok` |
+| `Async.all(a, b)` | `Result<void, E>` | Two async closures of result `Result<void, E>`; both run, the first `Err` cancels the other and is the result. Results travel through captures, as in §38.6 |
+| `Async.shield(ms, body)` | the body's result | Runs an async closure with cancellation ignored (§40.7) for at most `ms: u64` milliseconds |
+| `Async.checkpoint(cancelled)` | `Result<void, E>` | `Err(cancelled)` if the current task is cancelled, else `Ok`: a cancellation point for long computations |
+| `Async.isCancelled()` | `bool` | Whether the current task is cancelled and not shielded |
+| `Async.blocking(closure)` | `T` | Runs a sync closure literal with no parameters on a worker thread and waits for it without blocking other tasks. Its captures follow §38.6's rule and `T` must be `Send` (N0334). If no worker can be started, it runs on the calling thread: the result is the same |
+| `Async.park()`, `Async.waker()` | `void`, `u64` | Library-only primitives (**N0345** elsewhere): suspend the current task until its waker is woken; the current task's waker id |
+
+`race`, `all` and `shield` place their children's frames in the caller's frame, so they never allocate. The library
+(`lib/std/async.cee`, Decision 0008) builds everything that waits for the outside world on `park` and `waker`: timers,
+console and file and socket I/O, `Async.Mutex` and channels (ADR 0032). Its operations return `Result<T, AsyncError>`,
+where `AsyncError` has `Cancelled`, `TimedOut` and `Io(IoError)`.
+
+### 40.5 Scopes
+- **`await Async.scopeIn(alloc, oom, (s) => { … })`**, and `Async.scope(oom, body)` with the system heap (and the
+  `alloc` effect). `body` is a sync closure literal taking the scope `s` and returning `void`. `oom: E` is the error the
+  scope reports if a child's frame cannot be allocated (ADR 0031 §3.3, as amended).
+- **`s.spawn(async () => …)`** starts a child whose result type must be `Result<void, E>`, the same `E` for every child
+  of the scope. It returns `void`. The child's frame comes from the scope's allocator. If it cannot be allocated, the
+  child is not started, the scope's other children are cancelled, and the scope's result is `Err(oom)`.
+- **The scope returns only after every child has returned.** Its result is `Ok()` if every child returned `Ok`;
+  otherwise the first `Err` (in the order the children returned), after the first `Err` has cancelled the others.
+- **The scope-loan rule.** `s` is a scoped collection of closures (§25.4) whose region is the body's environment, and
+  `s.spawn(c)` is checked like adding `c` to it. So, by §36.2 and `lifetimes.md`:
+  - every child's loans are live from its `spawn` until the scope returns;
+  - two children whose captures conflict (one changes what the other uses) are **N0241**;
+  - nothing a child captures can be changed, moved or ended by the body or the enclosing function until the scope
+    returns.
+
+  A child that captures one of the body's own locals, which end when the body returns while the child may still run,
+  is **N0344**: a child borrows from the function that awaits the scope, never from the body.
+- **No `Send` or `Share` check** applies to children: they run on the scope's own thread (ADR 0031 §3.5).
+- There is no detached task: every task a program starts has returned before `Async.run` returns.
+
+### 40.6 Frames
+- Each async fn or async closure has a **frame**: its parameters, its locals, the frames of the tasks it awaits, its
+  result and its resume state. Its size is known at compile time.
+- **A frame is placed once and never moves.** The root frame of `Async.run` is in its caller's storage. An awaited
+  task's frame is in its awaiter's frame. A child's frame is from its scope's allocator, and `race`, `all` and `shield`
+  embed their children's. So every reference into a frame is valid until its task returns.
+- **A frame is destroyed only after its task returns.** Cancellation never destroys a frame (§40.7). Its locals are
+  dropped as the task returns, in the order of §14.
+- Lowering: `intermediate-representation.md` (`StartTask`, `Await`, `Park`) and `c-backend.md` (frame structs and
+  resume functions).
+
+### 40.7 Cancellation
+- **Cancelling a task sets its flag.** A scope cancels its children when one fails (§40.5), `race` and `all` cancel the
+  other child, and the runtime may cancel a root task (the `CEESAFE_CANCEL_AT` sweep, `testing.md`). The flag is
+  inherited: an awaited task and a scope's children are cancelled with their parent.
+- **Only the library's waiting operations observe it,** together with `Async.checkpoint` and `Async.isCancelled`: a
+  cancelled task's next such operation returns `Err(AsyncError.Cancelled)` at once, or, for an operation already
+  waiting, as soon as it can do so safely (a completion-based read first cancels and waits for the kernel's operation).
+  Code between them runs normally, so cancellation is visible only at an `await`.
+- Cleanup is ordinary code: `?` returns the error, and the frame's locals are dropped as the task returns.
+- **`Async.shield(ms, body)`:** within `body`, the library's operations ignore the flag. Once `ms` milliseconds have
+  passed since the shield began, they return `Err(AsyncError.TimedOut)`, never `Cancelled`. After the shield the flag
+  is observed again.
+
+### 40.8 The interpreter and determinism
+- The interpreter runs tasks on one thread with a virtual clock (timers fire in deadline order without waiting) and a
+  run order fixed by a seed. A program whose output does not depend on timing prints the same in C and in the
+  interpreter.
+
+Diagnostics: N0341 (`await` outside an async fn or async closure), N0342 (a task that is not awaited, run or spawned,
+or an operand of `await` that is not a task), N0343 (recursion through `await`), N0344 (a spawned child that captures
+the scope body's own locals), N0345 (`Async.park` or `Async.waker` outside the library); N0295 (blocking in async
+code, `await` while a `@context(atomic)` value is live, `Async.run` in async code); N0241 (conflicting captures of a
+scope's children); N0334 (`Async.blocking`'s captures and result).

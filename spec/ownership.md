@@ -194,6 +194,20 @@ E1–E4 deliberately trade expressiveness for an implementation of tractable siz
   `Share`; one reached mutably is reached by one thread only and is `Send`. So T2's conclusion holds: there is no data
   race in safe code.
 
+### Async tasks (L1; ADR 0031, type-system.md §40)
+
+- **A1 — Frames never move.** A task's frame is placed once (§40.6) and freed only after the task returns, never while
+  it is suspended. A reference into a frame, held across an `await`, therefore points to live storage, and a buffer
+  lent to the kernel by a suspended task stays valid until the kernel is done with it.
+- **A2 — No task outlives what it borrows.** A task is awaited where it is called, or spawned into a scope that
+  returns only after its children (§40.5). Its loans are those of a call (an awaited task) or of an element of a
+  scoped collection (a child), so the B-rules end them only after the task returns.
+- **A3 — Tasks stay on their thread.** A task never moves to another thread, so its frame needs no `Send`. A value
+  crosses threads only through T1–T4 (`Async.blocking` checks its captures as `Thread.both` does).
+- **A4 — Cancellation destroys nothing.** Cancelling sets a flag that the library's waiting operations turn into
+  `Err(AsyncError.Cancelled)`. The task then returns by ordinary code, and its locals are dropped in order. There is
+  no path on which a suspended frame is dropped.
+
 ### Unsafe
 
 - **U1 — Capabilities.** Raw pointer dereference, pointer arithmetic, calls to

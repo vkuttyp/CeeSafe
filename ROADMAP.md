@@ -560,6 +560,41 @@ Dependencies: P8.
 Gate: parity, fixed point, CLI parity and release evidence are complete. Hosted CosmoOS support, an outside audit and
 publication are reported separately.
 
+### Language track L1 — async/await (ADR 0031)
+
+CeeSafe's own language work after the fork (Decisions 0006, 0007). The design is `docs/async-await-proposal.md`; the
+decision will be ADR 0031. Each phase is spec first, and each must keep the fixed point and `tools/contract_tests.py`
+green.
+
+- [x] **Library ownership** (Decision 0008, 2026-10-31): `lib/` is CeeSafe's and `tools/gen_library.py` reads it.
+- [x] **A0, specification** (2026-10-31; ADR 0031 accepted and amended §6):
+  - ADR 0031;
+  - `grammar.md`, `type-system.md` (§32 `suspend`, §36.3, a new §40), `ownership.md`, `lifetimes.md`,
+    `intermediate-representation.md`, `c-backend.md`, `profiles.md`;
+  - `diagnostics.md` rows N0341–N0345.
+
+  Gate: `spec_check` and `guide_check` are clean, and the owner accepts ADR 0031. Passed 2026-10-31.
+- [ ] **A1, a single task:**
+  - `async fn`, `await`, `Async.run`;
+  - the `suspend` effect and its contexts;
+  - frames and flat resume functions;
+  - `lib/std/async.cee` (timers, console);
+  - the interpreter, and `run_corpus.py --interp`.
+
+  Gate: async run-pass programs give the same result in C and in the interpreter; ASan, UBSan and leak checks are
+  clean.
+- [ ] **A2, scopes and cancellation:**
+  - async closures; `scope`/`scopeIn`, `spawn`, `race`, `all`, `shield`, `checkpoint`, `blocking`;
+  - channels (ADR 0032);
+  - kqueue and epoll; `Async.Mutex`; sockets;
+  - the interpreter scheduler;
+  - `tools/cancel_sweep.py`.
+
+  Gate: the cancellation sweep and the determinism check pass.
+- [ ] **A3, sizes:** frames shrunk by liveness; `--explain-frames`; `Async.boxed`; async interface methods; the debugger
+  `tasks` command.
+- [ ] **A4, platforms:** io_uring and IOCP; a freestanding executor hook and a CosmoOS boot; `Send` work stealing.
+
 ## 5. Bootstrap protocol (planned interfaces; none exist yet)
 
 ```text
@@ -681,6 +716,8 @@ Progress is measured in completed contracts and gates. There is no calendar esti
 | 2026-10-30 | P7: closure specialisation (`src/nir/closure_specialisation.cee`), placement (`src/nir/control_flow.cee`, `src/backend/placement.cee`), check elimination (`src/backend/check_elimination.cee`), structured C (`src/backend/c_structurer.cee`), all default on with their switches and `--explain-*` reports; `tools/compare_reports.py`, `tools/compare_self.py`, the contract suite and fixed point in the default form; Decision 0004 (C prefix at P8) | P7 gate passed: C identical to novac's default form over 308 programs (flat, `--split`, `-g`, both) and for CeeSafe itself; the four reports identical; emit-c 24/24; run corpus under Apple clang 21, clang 18 and GCC 12 (the recorded GCC report aside) and ASan+UBSan; fault sweep 783 points and collections 30/30 on both hosts; fixed point with production defaults and `--split` on macOS and Linux, the same C on both |
 | 2026-10-31 | Benchmarks and the first CeeSafe-only C (Decision 0007): `benchmarks/` (16 workloads against Rust, Rust with overflow checks and C; `run.py`), an ablation of ceesafec's C finding the costs; `runtime/` CeeSafe's own (`tools/gen_runtime.py` reads it; the regenerated embedding identical but its header); arena bump allocation inline (`ceesafe_region_alloc_fast`); zeroed boxes through `ceesafe_alloc_zeroed` (`ceeBZ_`, `calloc`); `emit-c` snapshots CeeSafe's own; `src/support/` standalone again (`none()` in `src/support/none.cee`), `tests/support` as `.cee`, `tools/fault_sweep.py` with the `CEESAFE_` variables; `guide/performance.md` | macOS arm64, Apple clang 21, rustc 1.99.1, 5 runs: CeeSafe 0.96× Rust's time (geometric mean; 1.01× before), 0.88× Rust with overflow checks; `arena` 1.37× → 0.95×, `large-objects` 1.26× → 1.02×. Fixed point holds; reference corpus all families pass with leak checks (emit-c 24/24 after the reviewed `arena.c` edit); `tests/support` 8/8 with leak checks; fault sweep 573/573; guide_check 92 examples and spec_check 76 documents, 0 problems; `fmt --check` clean |
 | 2026-10-31 | CosmoOS's move to CeeSafe, CeeSafe's side: `integrations/cosmoos/ports.py` runs CosmoOS's own `scripts/cee-gen.py` (its `generated`, `refused`) with the ceesafec under test, and with `--pinned` compares every generated file with that compiler's but for the banner's version; `c2cee.py verify` sets `CEESAFEC` and runs `make cee-check` (`--ceesafec`), and refuses a Nova-era tree; `c2cee port`'s `BUILD.md` describes the new layout and its analysis uses the kernel's include path (`out/cee/kernel/include`, `boot/protocol`, `drivers/include`); `spec/tooling.md` §9 and the integration README follow | `ports.py` on CosmoOS's local `ceesafe-migration` (`47964c10`) with ceesafec 0.3.0-dev and `--pinned` 0.2.0: 17 ports, 1 negative source, 28 generated files equal, 0 problems; on `origin/main` (still Nova) refused as intended; `c2cee selftest` PASS; `c2cee port kernel/core/bootinfo.c` drafts (it failed before on `cosmoboot.h`); `verify` refuses a Nova-era tree; spec_check and guide_check 0 problems |
+| 2026-10-31 | L1 async/await, library ownership and A0 drafts: Decision 0008 (`lib/` recovered from `src/library/sources.cee`, equal to `map_forward` of `tests/reference/lib/` for all 13 files; `tools/gen_library.py` reads `lib/`; `spec_check` documents `lib/core`); ADR 0031 proposed; `docs/async-await-proposal.md`; roadmap track L1. `python3 tools/contract_tests.py --ceesafec out/ceesafec` (macOS arm64, Apple clang 21) | regenerated `sources.cee` differs only in its header and one doc comment; all 13 contract steps ok (fixed point, corpus, -Werror, ASan, support, sweeps, mutations, collections, freestanding, spec, guide, debugger); `fmt --check` clean. ADR 0031 awaits the owner |
+| 2026-10-31 | L1 A0: ADR 0031 accepted ("I accept it as written."), then amended (§6: the scope's out-of-memory error is named by the caller, the owner's choice; `checkpoint(cancelled)`; `AsyncError`; `Async.race`/`all`; the `await` operand wording). Spec: `grammar.md`, `type-system.md` §32, §36.3, new §40, `ownership.md` A1–A4, `lifetimes.md` §8, `intermediate-representation.md` §3, `c-backend.md` §2.1, §3a, §6, `diagnostics.md` N0341–N0345 with N0290/N0295, `profiles.md`, `testing.md` §1; `gen_catalog.py`, `gen_docs.py`. `python3 tools/contract_tests.py --ceesafec out/ceesafec` | all 13 steps ok (spec_check: 137 codes explained); `fmt --check` clean. A0 gate passed |
 
 **Tests run for the skeleton** (2026-10-30, novac 0.3.1, Apple clang 21.0.0):
 - `novac check` and `novac fmt --check`: clean.
