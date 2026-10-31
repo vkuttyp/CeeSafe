@@ -1,4 +1,4 @@
-// src/support/map.nova against a naive model (linear search over insertion-ordered vectors) on 20,000 seeded
+// src/support/map.cee against a naive model (linear search over insertion-ordered vectors) on 20,000 seeded
 // operations, checked after every step; the summary is pinned by tools/oracles/support_models.py.
 // expect-stdout: map: ops 20000, keys 600, puts 14920, hits 4852, misses 228, checksum 15942794981482534691
 // expect-stdout: map: bytes keys ok

@@ -1,4 +1,4 @@
-// src/support/json.nova against two oracles:
+// src/support/json.cee against two oracles:
 // - the sweep: one JSON string per BMP scalar value, every 997th astral one, and fixed strings (escapes, ill-formed
 //   UTF-8), compared by length and FNV-1a with .NET 10.0.12's Utf8JsonWriter on the same strings
 //   (tools/oracles/JsonSweep.cs, run 2026-10-30: 418506 bytes, fnv 10205824560866192387);

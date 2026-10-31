@@ -1,4 +1,4 @@
-// src/support/interner.nova against a naive model (a list of names searched linearly) on 5,000 seeded interns of
+// src/support/interner.cee against a naive model (a list of names searched linearly) on 5,000 seeded interns of
 // short names over a four-letter alphabet (many repeats); ids must be first-seen order. The summary is pinned by
 // tools/oracles/support_models.py.
 // expect-stdout: interner: 5000 interns, 1653 names, 8577 bytes, checksum 16359793352618596385

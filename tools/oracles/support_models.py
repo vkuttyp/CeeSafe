@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Independent oracle for tests/support (ROADMAP P1: "each one is tested against an independent model").
 
-Recomputes, in Python, the summary lines that tests/support/run-pass/*.nova print, from the same seeded operation
+Recomputes, in Python, the summary lines that tests/support/run-pass/*.cee print, from the same seeded operation
 sequences. The Nova tests also compare against a naive model inside the program on every step; this script pins the
 summaries to values computed outside Nova. Run it and compare with the tests' `// expect-stdout:` lines:
 

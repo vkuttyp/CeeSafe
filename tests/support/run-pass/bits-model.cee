@@ -1,5 +1,5 @@
-// src/support/bits.nova against two vectors of booleans on 30,000 seeded sets and clears, then union, intersection
-// and difference; and src/support/bytes.nova's ordinal order. Summaries pinned by tools/oracles/support_models.py.
+// src/support/bits.cee against two vectors of booleans on 30,000 seeded sets and clears, then union, intersection
+// and difference; and src/support/bytes.cee's ordinal order. Summaries pinned by tools/oracles/support_models.py.
 // expect-stdout: bits: a 529, b 523, union 795, intersection 257, difference 272
 // expect-stdout: order: 0 5 6 1 10 2 3 4 7 8 9
 

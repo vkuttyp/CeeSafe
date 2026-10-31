@@ -2,9 +2,7 @@
 // `Copy` value in its category's table, found by its index; children are indexes, and lists of children are ranges
 // into `lists`, one shared table of indexes whose meaning the owning field gives. `none()` marks an absent optional
 // child. Text the tree keeps (string literal values, doc comments, ABIs, float digits) is a range of `text`. Spans
-// are byte offsets into the file, kept beside each table.
-
-fn none() -> u32 => 0xFFFFFFFF;
+// are byte offsets into the file, kept beside each table. `none()` is in src/support/none.cee.
 
 /// A run of `count` indexes in `Ast.lists` from `start`, or of bytes in `Ast.text`.
 struct Range {

@@ -1,0 +1,4 @@
+// The absent index: every table (the syntax tree's, HIR's, NIR's, the JSON reader's) marks a missing optional entry
+// with it. In the support library so that `src/support/` builds on its own (its tests: tests/support).
+
+fn none() -> u32 => 0xFFFFFFFF;
