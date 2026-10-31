@@ -127,6 +127,9 @@ export default defineConfig({
           : `https://github.com/vkuttyp/CeeSafe/edit/main/${filePath}`,
       text: "Edit this page on GitHub",
     },
-    footer: { message: "Pre-1.0: the language and its tools are still changing. CeeSafe forked from Nova 0.6.0." },
+    footer: {
+      message: "Pre-1.0: the language and its tools are still changing. CeeSafe forked from Nova 0.6.0.",
+      copyright: "GPL-2.0-only, with a runtime exception for the code CeeSafe puts into the programs it compiles. Copyright © 2026 Veeran Puthumkara.",
+    },
   },
 });
